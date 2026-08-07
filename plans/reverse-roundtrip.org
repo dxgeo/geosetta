@@ -1,0 +1,112 @@
+#+TITLE: Plan: Reverse Direction (Round-Trip First)
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Reverse Direction — GeoParquet → GeoJSON (round-trip first)
+
+** GOAL
+Read back the GeoParquet that Pantograph itself writes and reproduce an
+equivalent GeoJSON =FeatureCollection=. Success criterion: for any GeoJSON we
+convert to GeoParquet, converting it back yields the same features (geometry and
+properties), modulo the documented lossy points below.
+
+This deliberately targets *our own output* only. Reading foreign GeoParquet
+(dictionary encoding, multiple row groups/pages, other codecs) is a separate
+plan: see [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]].
+
+** SCOPE / ASSUMPTIONS
+The reader may assume everything the writer guarantees today:
+- One row group, one PLAIN =DATA_PAGE= per column, SNAPPY codec.
+- Every column =OPTIONAL= (max definition level 1), no repetition levels.
+- Definition levels encoded as RLE-only runs (no bit-packed runs).
+- Physical types: BOOLEAN, INT64, DOUBLE, BYTE_ARRAY (UTF8 or the geometry
+  WKB blob).
+- 2D coordinates; geometry is WKB produced by =geometry/wkb.rs=.
+The reader should *validate* these assumptions and error clearly when violated,
+rather than silently misread — this is what makes the jump to arbitrary files
+safe later.
+
+** WORK ITEMS
+Each encoder in the write stack gets a matching decoder.
+
+*** 1. Un-gate the Snappy decoder
+=parquet/snappy.rs::decompress= (and its =copy_match= / =read_uvarint= helpers)
+already exist under =#[cfg(test)]=. Promote to normal =pub(crate)= code and keep
+the round-trip tests. Essentially free.
+
+*** 2. Thrift compact reader — =parquet/thrift.rs=
+Add =CompactReader= mirroring =CompactWriter=:
+- unsigned varint + zigzag varint decode
+- field header parsing (delta field ids, the compact type nibble)
+- struct begin/end (the =0x00= stop byte), lists (=ct::= element types)
+- typed readers: =read_i32=, =read_i64=, =read_string=, =read_binary=
+Enough to parse =FileMetaData= and =PageHeader=. Unit-test by round-tripping the
+existing =CompactWriter= output.
+
+*** 3. Parquet file reader — new =parquet/reader.rs=
+- Verify leading/trailing =PAR1=; read the =u32= footer length before the
+  trailing magic; parse =FileMetaData=.
+- From =FileMetaData=: schema leaves (name, physical type, converted type),
+  =num_rows=, and the single row group's column chunks (data_page_offset,
+  codec, num_values, sizes).
+- Locate the =geo= entry in =key_value_metadata= (needed to know which column is
+  the primary geometry column; cross-check against =geo::GEOMETRY_COLUMN=).
+
+*** 4. Page + value decode — =parquet/reader.rs=
+Per column chunk:
+- Read =PageHeader= at data_page_offset; take =compressed_page_size= bytes of
+  body; =snappy::decompress= to =uncompressed_page_size=.
+- Body layout mirrors the writer: =[u32 len][RLE def levels][PLAIN values]=.
+  - RLE decode the definition levels (bit width 1) → per-row present/null mask.
+    Mirror of =writer::encode_rle_levels=; only RLE runs expected.
+  - PLAIN decode present values by physical type:
+    - BOOLEAN: bit-unpack, LSB first (mirror =pack_bits=)
+    - INT64 / DOUBLE: 8-byte little-endian
+    - BYTE_ARRAY: =[u32 len][bytes]= repeated
+- Produce, per column, a =Vec<Cell>= (reusing =schema::Cell=) aligned to rows,
+  with nulls where the def level is 0.
+
+*** 5. WKB decoder — =geometry/wkb.rs=
+Add =decode(bytes) -> Result<Geometry>= mirroring =encode=:
+- byte-order flag, 32-bit geometry type code
+- Point / LineString / Polygon / Multi* / GeometryCollection as the writer emits
+- 2D positions only (error on Z/M for now)
+Round-trip test: =decode(encode(g)) == g= for each variant already covered in
+the wkb tests.
+
+*** 6. GeoJSON serializer — =geojson/mod.rs=
+Add =to_json(&FeatureCollection) -> JsonValue= (then reuse
+=JsonValue::to_json_string=). Needs a =Geometry -> JsonValue= mapping (inverse of
+=from_json='s geometry parsing) and =Cell -> JsonValue= for properties. Preserve
+property key order where practical (columns are ordered; per-feature object is
+rebuilt from the column set).
+
+*** 7. Pipeline + CLI wiring
+- =convert.rs=: add =geoparquet_to_geojson(bytes: &[u8]) -> Result<String>=.
+- =main.rs=: add the =(Format::Parquet, Format::GeoJson)= arm (read bytes, write
+  string). CLI format inference already supports both directions.
+- Extend =error.rs= with the new failure modes (malformed footer, unexpected
+  encoding/codec, bad WKB).
+
+** LOSSY / ROUND-TRIP CAVEATS (document, don't fight)
+- Property types are the *inferred* column types: an integer-valued JSON number
+  round-trips as INT64, a mixed/nested column round-trips as its JSON-string
+  fallback (string in → string out), not the original nested structure.
+- Column order is the inferred order, not necessarily original key order.
+- Feature-level =id= and foreign members are not currently modeled by
+  =geojson::Feature= — confirm what =from_json= keeps before promising fidelity.
+- Bbox / crs come from =geo= metadata, not re-derived.
+
+** TESTING STRATEGY
+- Unit: decoder round-trips for thrift, RLE levels, PLAIN types, WKB, snappy.
+- Integration: =geojson_to_geoparquet= then =geoparquet_to_geojson= on
+  =examples/sample.geojson=; assert the parsed =FeatureCollection= matches the
+  original (compare structurally, not byte-for-byte JSON text).
+- External cross-check: the file we read is the same one DuckDB already
+  validates, so any read discrepancy is ours.
+
+** SUGGESTED ORDER
+1 (snappy un-gate) → 2 (thrift reader) → 3 (footer) → 4 (page/value) →
+5 (wkb decode) → 6 (geojson serialize) → 7 (wire) → integration test.
+Stop points 2, 4, and 5 are independently unit-testable before anything is
+wired together.

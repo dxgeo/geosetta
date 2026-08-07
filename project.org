@@ -56,3 +56,5 @@ A runnable example lives in [[file:examples/sample.geojson][examples/sample.geoj
 ** ROADMAP
 - The reverse path (GeoParquet to GeoJSON), requiring a Thrift/Parquet reader
 - Additional formats toward the any-to-any hub described above
+
+Detailed design notes live in [[file:plans/README.org][plans/]].

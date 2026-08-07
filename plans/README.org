@@ -1,0 +1,15 @@
+#+TITLE: Pantograph Plans
+#+AUTHOR: Daniel Okuniewicz Jr.
+
+* Plans
+Design notes for work not yet implemented. Each file is a self-contained plan;
+they are ordered by dependency.
+
+- [[file:reverse-roundtrip.org][reverse-roundtrip.org]] :: GeoParquet → GeoJSON,
+  reading back Pantograph's *own* output. The reader skeleton (thrift reader,
+  footer parsing, single-page PLAIN/RLE decode, WKB decode, GeoJSON serialize).
+  *Do this first.*
+- [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]] :: Extend that
+  reader to files from DuckDB / GDAL / Arrow — dictionary encoding, the general
+  RLE/bit-pack hybrid, multiple pages/row groups, more codecs and types.
+  *Depends on the round-trip reader.*

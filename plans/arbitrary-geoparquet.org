@@ -1,0 +1,100 @@
+#+TITLE: Plan: Reading Arbitrary GeoParquet
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Reading Arbitrary GeoParquet (files from DuckDB / GDAL / Arrow / pyarrow)
+
+** GOAL
+Extend the round-trip reader (see
+[[file:reverse-roundtrip.org][reverse-roundtrip.org]]) so Pantograph can read
+GeoParquet produced by other tools, not just its own output. This is where the
+Parquet format's real surface area lives; the round-trip reader is the skeleton
+we hang these features on.
+
+** PRECONDITION
+The round-trip reader is done: thrift =CompactReader=, footer/schema parsing,
+single-page PLAIN + RLE decode, snappy decompress, WKB decode, GeoJSON
+serialize, and the =(Parquet, GeoJson)= pipeline arm all exist and are tested.
+
+** THE BIG ONE: DICTIONARY ENCODING
+Arrow, pyarrow, and GDAL encode most columns as a =DICTIONARY_PAGE= followed by
+data pages using =RLE_DICTIONARY= (a.k.a. =PLAIN_DICTIONARY=). A reader that
+only handles PLAIN fails on the *majority* of real-world files. Required:
+- Recognize a leading =DICTIONARY_PAGE= in a column chunk (=PageType= 2) and
+  PLAIN-decode its values into a dictionary vector.
+- Decode data pages whose encoding is =RLE_DICTIONARY=: the body is a single
+  leading byte = bit width, then an RLE/bit-pack hybrid stream of dictionary
+  indices. Map indices back through the dictionary.
+- This forces the *general* RLE/bit-pack hybrid decoder (see below), since
+  dictionary index streams use bit-packed runs heavily.
+
+** GENERAL RLE / BIT-PACK HYBRID DECODER
+The round-trip reader only handles RLE runs (bit width 1, our own def levels).
+Foreign files require the full hybrid:
+- run header varint: low bit 0 = RLE run (=len<<1=), low bit 1 = bit-packed run
+  (=(groups<<1)|1=, groups of 8 values).
+- bit-packed groups: LSB-first bit unpacking at an arbitrary bit width.
+- Used for definition levels (bit width from max def level), repetition levels,
+  and dictionary indices.
+Generalize the round-trip level decoder into a reusable
+=rle_bitpack_decode(data, bit_width, count)=.
+
+** MULTIPLE PAGES AND ROW GROUPS
+- A column chunk may hold *many* data pages (and an optional dictionary page);
+  iterate pages until =num_values= for the chunk is consumed.
+- A file may hold *multiple row groups*; concatenate rows across them in order.
+- =DATA_PAGE_V2= (=PageType= 3): a distinct header (separate
+  definition/repetition level byte counts, an =is_compressed= flag, levels are
+  *not* compressed even when the values are). Detect and handle, or error
+  explicitly if we choose to defer it.
+
+** ADDITIONAL COMPRESSION CODECS
+Column chunk =codec= may be:
+- UNCOMPRESSED (=0=) — trivial (pass through)
+- SNAPPY (=1=) — already have it
+- GZIP (=2=), ZSTD (=6=), LZ4/LZ4_RAW (=5=/=7=), BROTLI (=4=)
+Dependency-free means implementing each decoder from spec, which is substantial.
+Pragmatic staging:
+1. UNCOMPRESSED + SNAPPY (free / done).
+2. GZIP (DEFLATE / RFC 1951 inflate) — most common after snappy; a from-scratch
+   inflate is well-bounded and reusable.
+3. ZSTD — large; likely a later milestone or an explicit "unsupported codec"
+   error until then.
+Emit a clear error naming the unsupported codec rather than mis-decoding.
+
+** ADDITIONAL PHYSICAL / LOGICAL TYPES
+Our writer only emits BOOLEAN/INT64/DOUBLE/BYTE_ARRAY. Foreign files add:
+- INT32, FLOAT, INT96 (legacy timestamps), FIXED_LEN_BYTE_ARRAY
+- Logical/converted types: DATE, TIMESTAMP, DECIMAL, JSON, etc. — decide which
+  map cleanly onto GeoJSON property values and which become strings.
+- PLAIN encoding widths differ (INT32 = 4 bytes LE, FLOAT = 4 bytes IEEE).
+
+** GEOMETRY VARIATION
+- WKB with Z / M / ZM coordinates (3D/4D) — extend =wkb::decode= and the
+  =Geometry= model, or project to 2D with a documented note.
+- The =geo= metadata may name a different primary column, list multiple geometry
+  columns, or use a non-CRS84 CRS — read =geo= rather than assuming defaults.
+- Some writers use the newer Parquet native =GEOMETRY= logical type instead of
+  the GeoParquet =geo= key/value convention — detect which is present.
+
+** ROBUSTNESS / VALIDATION
+- Bounds-check every offset and length from the footer before slicing.
+- Treat the file as untrusted input: no panics on malformed data; return
+  =Error= with context. Fuzz the thrift + page decoders.
+- Optional statistics, page indexes, bloom filters: skip safely.
+
+** SUGGESTED MILESTONES
+1. Dictionary encoding + general RLE/bit-pack hybrid (unlocks most Arrow/GDAL
+   files that use snappy).
+2. Multiple pages + multiple row groups.
+3. GZIP (inflate) codec.
+4. Extra physical/logical types as needed for real datasets.
+5. DATA_PAGE_V2; ZSTD; 3D geometry — as demand appears.
+Validate each milestone against real files from DuckDB =COPY ... (FORMAT
+PARQUET)=, GDAL =ogr2ogr=, and pyarrow, kept as fixtures.
+
+** OPEN QUESTIONS
+- Do we commit to fully dependency-free ZSTD, or draw the line and document a
+  supported-codec matrix?
+- How faithfully must property *types* round-trip vs. being best-effort mapped
+  onto GeoJSON's JSON value model?

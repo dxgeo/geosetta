@@ -21,10 +21,12 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
+Current version: *0.2.0*.
+
 The first conversion path is implemented and working: *GeoJSON to GeoParquet*,
 written in Rust using only the standard library (zero external crates, in
-keeping with the dependency-free goal). Output is validated by DuckDB's spatial
-engine as genuine, queryable GeoParquet.
+keeping with the dependency-free goal). Output is Snappy-compressed and
+validated by DuckDB's spatial engine as genuine, queryable GeoParquet.
 
 ** IMPLEMENTATION
 Language: Rust (edition 2024). Every wire format is implemented from its
@@ -37,9 +39,10 @@ specification rather than pulled from a crate:
   =geo= metadata, and the Parquet file writer
 - =cli.rs= / =convert.rs= :: argument parsing and the conversion pipeline
 
-Design choices for this first version: uncompressed Parquet pages, 2D
-coordinates, one row group, and property columns typed by scanning all features
-(heterogeneous or nested values fall back to a JSON string).
+Design choices for this first version: Snappy-compressed Parquet pages (the
+codec implemented from scratch in =parquet/snappy.rs=, keeping the zero-crate
+goal), 2D coordinates, one row group, and property columns typed by scanning all
+features (heterogeneous or nested values fall back to a JSON string).
 
 ** USAGE
 #+begin_src sh
@@ -51,6 +54,5 @@ panto in.txt out.bin --from geojson --to parquet
 A runnable example lives in [[file:examples/sample.geojson][examples/sample.geojson]].
 
 ** ROADMAP
-- Snappy page compression (still dependency-free)
 - The reverse path (GeoParquet to GeoJSON), requiring a Thrift/Parquet reader
 - Additional formats toward the any-to-any hub described above

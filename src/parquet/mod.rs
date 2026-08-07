@@ -2,6 +2,7 @@
 
 mod geo;
 mod schema;
+mod snappy;
 mod thrift;
 mod types;
 mod writer;

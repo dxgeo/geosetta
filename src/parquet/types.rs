@@ -33,6 +33,7 @@ pub mod encoding {
 /// Compression codecs (`CompressionCodec`).
 pub mod codec {
     pub const UNCOMPRESSED: i32 = 0;
+    pub const SNAPPY: i32 = 1;
 }
 
 /// Page types (`PageType`).

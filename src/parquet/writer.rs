@@ -3,7 +3,7 @@
 //! Layout produced:
 //! ```text
 //! "PAR1"                       magic
-//! <data page> * N              one uncompressed DATA_PAGE per column
+//! <data page> * N              one Snappy-compressed DATA_PAGE per column
 //! <FileMetaData>               Thrift compact protocol
 //! <u32 le>                     length of FileMetaData
 //! "PAR1"                       magic
@@ -13,6 +13,7 @@
 
 use super::geo::GEOMETRY_COLUMN;
 use super::schema::{Cell, Column, ColumnType};
+use super::snappy;
 use super::thrift::{ct, CompactWriter};
 use super::types::{codec, converted, encoding, page, ptype, repetition};
 
@@ -32,12 +33,14 @@ struct Prepared {
     values: Vec<u8>,
 }
 
-/// Where a written column chunk landed, for the footer.
+/// Where a written column chunk landed, for the footer. Sizes include the page
+/// header (which is never compressed) and the page body.
 struct ChunkInfo {
     name: String,
     ptype: i32,
     data_page_offset: i64,
-    total_size: i64,
+    compressed_size: i64,
+    uncompressed_size: i64,
     num_values: i64,
 }
 
@@ -62,7 +65,7 @@ pub fn write_geoparquet(
         infos.push(write_column_page(&mut file, pc));
     }
 
-    let total_byte_size: i64 = infos.iter().map(|c| c.total_size).sum();
+    let total_byte_size: i64 = infos.iter().map(|c| c.uncompressed_size).sum();
     let footer = build_file_metadata(&infos, num_rows, total_byte_size, geo_metadata);
 
     file.extend_from_slice(&footer);
@@ -164,7 +167,8 @@ fn pack_bits(bits: &[bool]) -> Vec<u8> {
 
 // --- page + footer serialization ------------------------------------------
 
-/// Append one DATA_PAGE (header + body) for `pc` and report its placement.
+/// Append one Snappy-compressed DATA_PAGE (header + body) for `pc` and report
+/// its placement.
 fn write_column_page(file: &mut Vec<u8>, pc: &Prepared) -> ChunkInfo {
     let data_page_offset = file.len() as i64;
 
@@ -174,14 +178,18 @@ fn write_column_page(file: &mut Vec<u8>, pc: &Prepared) -> ChunkInfo {
     body.extend_from_slice(&(rle.len() as u32).to_le_bytes());
     body.extend_from_slice(&rle);
     body.extend_from_slice(&pc.values);
-    let page_size = body.len() as i32;
+
+    // The codec applies to the page body only; the header stays uncompressed.
+    let compressed = snappy::compress(&body);
+    let uncompressed_page_size = body.len() as i32;
+    let compressed_page_size = compressed.len() as i32;
 
     // PageHeader (compact protocol).
     let mut h = CompactWriter::new();
     h.struct_begin();
     h.field_i32(1, page::DATA_PAGE); // type
-    h.field_i32(2, page_size); // uncompressed_page_size
-    h.field_i32(3, page_size); // compressed_page_size
+    h.field_i32(2, uncompressed_page_size); // uncompressed_page_size
+    h.field_i32(3, compressed_page_size); // compressed_page_size
     h.field_struct(5); // data_page_header
     h.field_i32(1, pc.num_values as i32);
     h.field_i32(2, encoding::PLAIN); // value encoding
@@ -192,13 +200,14 @@ fn write_column_page(file: &mut Vec<u8>, pc: &Prepared) -> ChunkInfo {
     let header = h.into_bytes();
 
     file.extend_from_slice(&header);
-    file.extend_from_slice(&body);
+    file.extend_from_slice(&compressed);
 
     ChunkInfo {
         name: pc.name.clone(),
         ptype: pc.ptype,
         data_page_offset,
-        total_size: (header.len() + body.len()) as i64,
+        compressed_size: (header.len() + compressed.len()) as i64,
+        uncompressed_size: (header.len() + body.len()) as i64,
         num_values: pc.num_values as i64,
     }
 }
@@ -252,10 +261,10 @@ fn build_file_metadata(
         w.raw_i32(encoding::RLE);
         w.field_list(3, ct::BINARY, 1); // path_in_schema
         w.raw_string(&c.name);
-        w.field_i32(4, codec::UNCOMPRESSED); // codec
+        w.field_i32(4, codec::SNAPPY); // codec
         w.field_i64(5, c.num_values); // num_values
-        w.field_i64(6, c.total_size); // total_uncompressed_size
-        w.field_i64(7, c.total_size); // total_compressed_size
+        w.field_i64(6, c.uncompressed_size); // total_uncompressed_size
+        w.field_i64(7, c.compressed_size); // total_compressed_size
         w.field_i64(9, c.data_page_offset); // data_page_offset
         w.struct_end(); // ColumnMetaData
         w.struct_end(); // ColumnChunk

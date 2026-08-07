@@ -7,6 +7,7 @@ mod snappy;
 mod thrift;
 mod types;
 mod writer;
+mod zstd;
 
 pub use geo::metadata as geo_metadata;
 pub use reader::read_geoparquet;

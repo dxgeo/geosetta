@@ -10,9 +10,9 @@
 //! misread. See `plans/arbitrary-geoparquet.org` for what remains.
 
 use super::geo::GEOMETRY_COLUMN;
-use super::snappy;
 use super::thrift::{CompactReader, Field};
 use super::types::{codec, encoding, page, ptype, repetition};
+use super::{snappy, zstd};
 use crate::error::{Error, Result};
 use crate::json::{self, JsonValue};
 
@@ -390,6 +390,7 @@ fn decompress(codec: i32, comp: &[u8], uncompressed_size: usize) -> Result<Vec<u
             snappy::decompress(comp).ok_or_else(|| Error::Parquet("snappy decode failed".into()))?
         }
         c if c == codec::UNCOMPRESSED => comp.to_vec(),
+        c if c == codec::ZSTD => zstd::decompress(comp, uncompressed_size)?,
         other => {
             return Err(Error::Parquet(format!(
                 "unsupported compression codec {}",

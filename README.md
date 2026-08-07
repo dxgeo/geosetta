@@ -22,7 +22,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.3.0**.
+Current version: **0.4.0**.
 
 Both directions of the **GeoJSON ⇄ GeoParquet** path are implemented and working,
 written in Rust using only the standard library (zero external crates, in
@@ -31,9 +31,11 @@ validated by DuckDB's spatial engine as genuine, queryable GeoParquet; the
 reader recovers a GeoParquet file Pantograph wrote back to equivalent GeoJSON,
 and the geojson→parquet→geojson→parquet round trip is byte-for-byte stable.
 
-The reader currently targets Pantograph's own output. Reading arbitrary
-GeoParquet (dictionary encoding, multiple pages/row groups, other codecs) is
-planned — see [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
+The reader also handles common **foreign** GeoParquet: DuckDB's default output
+(dictionary-encoded columns, multiple row groups, SNAPPY or no compression)
+reads back correctly, geometry included. Remaining gaps — ZSTD/GZIP codecs,
+`DATA_PAGE_V2`, nested columns, 3D geometry — are reported as clear errors and
+tracked in [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
 
 
 ## IMPLEMENTATION
@@ -46,8 +48,9 @@ specification rather than pulled from a crate:
 -   **`geometry/`:** geometry model, bounding box, and WKB (Well-Known Binary) encoder
 -   **`parquet/`:** Thrift compact-protocol writer, schema inference, GeoParquet
     `geo` metadata, and the Parquet file writer
--   **`parquet/reader.rs`:** the inverse — footer/schema parsing, page decode
-    (Snappy inflate, RLE levels, PLAIN values), reading our GeoParquet back
+-   **`parquet/reader.rs`:** the inverse — footer/schema parsing, page iteration
+    (dictionary + data pages), Snappy inflate, RLE/bit-pack levels, PLAIN and
+    dictionary value decoding, across multiple row groups
 -   **`cli.rs` / `convert.rs`:** argument parsing and the conversion pipeline
     (both directions)
 
@@ -98,9 +101,10 @@ tail of formats that GDAL and Arrow already handle robustly.
 
 ## ROADMAP
 
--   Reading arbitrary GeoParquet (dictionary encoding, multiple pages/row
-    groups, more codecs) — extends the round-trip reader; see
-    [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org)
+-   Broader GeoParquet reading: ZSTD/GZIP codecs, `DATA_PAGE_V2`, more
+    physical/logical types, 3D geometry — the remaining
+    [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org) milestones
+    (dictionary encoding and multiple row groups are done)
 -   Additional formats toward the any-to-any hub described above (FlatGeobuf and
     WKT/CSV are natural next spokes — small, open, and dependency-free to parse)
 -   CRS handling beyond the CRS84 default, once a second CRS-bearing format lands

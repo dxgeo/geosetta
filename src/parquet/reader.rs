@@ -1,17 +1,18 @@
-//! Read back the GeoParquet that [`super::writer`] produces.
+//! Read GeoParquet back into features.
 //!
-//! This is the *round-trip* reader: it assumes the narrow shape Pantograph
-//! writes — one row group, one PLAIN `DATA_PAGE` per column, SNAPPY (or
-//! UNCOMPRESSED) codec, every column OPTIONAL with RLE definition levels, 2D
-//! WKB geometry. It validates those assumptions and errors on anything else
-//! rather than misreading. Reading foreign GeoParquet (dictionary encoding,
-//! multiple pages/row groups, other codecs) is a separate effort — see
-//! `plans/arbitrary-geoparquet.org`.
+//! Handles the shape Pantograph writes and the common shape other tools
+//! (DuckDB, Arrow, GDAL) emit: multiple row groups, one dictionary page plus
+//! one or more data pages per column chunk, PLAIN and dictionary
+//! (`PLAIN_DICTIONARY` / `RLE_DICTIONARY`) value encodings, RLE/bit-pack
+//! definition levels, SNAPPY or no compression, flat (non-nested) 2D WKB
+//! geometry. Anything outside that — other codecs (ZSTD/GZIP), `DATA_PAGE_V2`,
+//! nested/repeated columns — is reported as a specific error rather than
+//! misread. See `plans/arbitrary-geoparquet.org` for what remains.
 
 use super::geo::GEOMETRY_COLUMN;
 use super::snappy;
 use super::thrift::{CompactReader, Field};
-use super::types::{codec, ptype};
+use super::types::{codec, encoding, page, ptype, repetition};
 use crate::error::{Error, Result};
 use crate::json::{self, JsonValue};
 
@@ -49,27 +50,48 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
     let meta = parse_file_metadata(footer)?;
     let num_rows = meta.num_rows as usize;
 
-    let mut properties = Vec::new();
-    let mut geometry: Option<Vec<Option<Vec<u8>>>> = None;
-    for col in &meta.columns {
-        let data = decode_column(bytes, col, num_rows)?;
-        if col.name == meta.geometry_column {
-            geometry = Some(match data {
-                ColumnData::Bytes(v) => v,
-                _ => return Err(Error::Parquet("geometry column is not BYTE_ARRAY".into())),
-            });
-        } else {
-            properties.push(PropertyColumn {
-                name: col.name.clone(),
-                values: column_to_json(data)?,
-            });
+    // Accumulate each column across all row groups, in file order.
+    let mut properties: Vec<PropertyColumn> = Vec::new();
+    let mut geometry: Vec<Option<Vec<u8>>> = Vec::new();
+    let mut has_geometry = false;
+
+    for (rg_idx, rg) in meta.row_groups.iter().enumerate() {
+        let rg_rows = rg.num_rows as usize;
+        let mut prop_idx = 0;
+        for col in &rg.columns {
+            let data = decode_column(bytes, col, rg_rows)?;
+            if col.name == meta.geometry_column {
+                has_geometry = true;
+                match data {
+                    ColumnData::Bytes(v) => geometry.extend(v),
+                    _ => return Err(Error::Parquet("geometry column is not BYTE_ARRAY".into())),
+                }
+            } else {
+                let values = column_to_json(data)?;
+                if rg_idx == 0 {
+                    properties.push(PropertyColumn {
+                        name: col.name.clone(),
+                        values,
+                    });
+                } else {
+                    properties
+                        .get_mut(prop_idx)
+                        .ok_or_else(|| Error::Parquet("row groups disagree on columns".into()))?
+                        .values
+                        .extend(values);
+                }
+                prop_idx += 1;
+            }
         }
     }
 
+    if !has_geometry {
+        geometry = vec![None; num_rows];
+    }
     Ok(GeoParquet {
         num_rows,
         properties,
-        geometry: geometry.unwrap_or_else(|| vec![None; num_rows]),
+        geometry,
     })
 }
 
@@ -77,8 +99,13 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
 
 struct Meta {
     num_rows: i64,
-    columns: Vec<ColumnMeta>,
+    row_groups: Vec<RowGroup>,
     geometry_column: String,
+}
+
+struct RowGroup {
+    num_rows: i64,
+    columns: Vec<ColumnMeta>,
 }
 
 struct ColumnMeta {
@@ -86,29 +113,36 @@ struct ColumnMeta {
     physical: i32,
     codec: i32,
     data_page_offset: i64,
+    dictionary_page_offset: Option<i64>,
+    /// 0 for a REQUIRED leaf (no definition levels), 1 for an OPTIONAL one.
+    max_def_level: u32,
 }
 
 fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     let mut r = CompactReader::new(footer);
     let mut num_rows = 0i64;
-    let mut columns: Vec<ColumnMeta> = Vec::new();
+    let mut row_groups: Vec<RowGroup> = Vec::new();
     let mut geometry_column = GEOMETRY_COLUMN.to_string();
+    // Leaf name -> repetition_type, used to derive each column's def level.
+    let mut reps: Vec<(String, i32)> = Vec::new();
 
     r.struct_begin();
     loop {
         match r.read_field()? {
             Field::Stop => break,
             Field::Begin { id, ty } => match id {
-                3 => num_rows = r.read_i64()?, // num_rows
+                2 => {
+                    // schema: list<SchemaElement>
+                    let (_elem, len) = r.read_list_header()?;
+                    for _ in 0..len {
+                        reps.push(parse_schema_element(&mut r)?);
+                    }
+                }
+                3 => num_rows = r.read_i64()?,
                 4 => {
-                    // row_groups: take the first, ignore any others.
-                    let (elem, len) = r.read_list_header()?;
-                    for i in 0..len {
-                        let cols = parse_row_group(&mut r)?;
-                        if i == 0 {
-                            columns = cols;
-                        }
-                        let _ = elem;
+                    let (_elem, len) = r.read_list_header()?;
+                    for _ in 0..len {
+                        row_groups.push(parse_row_group(&mut r)?);
                     }
                 }
                 5 => {
@@ -123,22 +157,55 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
                         }
                     }
                 }
-                // version (1), schema (2), created_by (6), etc.: not needed.
-                _ => r.skip(ty)?,
+                _ => r.skip(ty)?, // version (1), created_by (6), etc.
             },
         }
     }
     r.struct_end();
 
+    // Attach the max definition level to every column from the schema.
+    for rg in &mut row_groups {
+        for col in &mut rg.columns {
+            let rep = reps
+                .iter()
+                .find(|(name, _)| *name == col.name)
+                .map(|(_, r)| *r)
+                .unwrap_or(repetition::OPTIONAL);
+            col.max_def_level = if rep == repetition::REQUIRED { 0 } else { 1 };
+        }
+    }
+
     Ok(Meta {
         num_rows,
-        columns,
+        row_groups,
         geometry_column,
     })
 }
 
-fn parse_row_group(r: &mut CompactReader) -> Result<Vec<ColumnMeta>> {
+/// A schema element reduced to `(name, repetition_type)`. The root element and
+/// any non-leaf carry a name too, but they never match a column path, so we
+/// keep them all and look up leaves by name.
+fn parse_schema_element(r: &mut CompactReader) -> Result<(String, i32)> {
+    let mut name = String::new();
+    let mut rep = repetition::REQUIRED;
+    r.struct_begin();
+    loop {
+        match r.read_field()? {
+            Field::Stop => break,
+            Field::Begin { id, ty } => match id {
+                3 => rep = r.read_i32()?,
+                4 => name = r.read_string()?,
+                _ => r.skip(ty)?,
+            },
+        }
+    }
+    r.struct_end();
+    Ok((name, rep))
+}
+
+fn parse_row_group(r: &mut CompactReader) -> Result<RowGroup> {
     let mut columns = Vec::new();
+    let mut num_rows = 0i64;
     r.struct_begin();
     loop {
         match r.read_field()? {
@@ -150,12 +217,13 @@ fn parse_row_group(r: &mut CompactReader) -> Result<Vec<ColumnMeta>> {
                         columns.push(parse_column_chunk(r)?);
                     }
                 }
+                3 => num_rows = r.read_i64()?,
                 _ => r.skip(ty)?,
             },
         }
     }
     r.struct_end();
-    Ok(columns)
+    Ok(RowGroup { num_rows, columns })
 }
 
 fn parse_column_chunk(r: &mut CompactReader) -> Result<ColumnMeta> {
@@ -178,6 +246,7 @@ fn parse_column_meta(r: &mut CompactReader) -> Result<ColumnMeta> {
     let mut physical = -1i32;
     let mut codec = -1i32;
     let mut data_page_offset = -1i64;
+    let mut dictionary_page_offset = None;
     let mut path: Vec<String> = Vec::new();
 
     r.struct_begin();
@@ -195,6 +264,7 @@ fn parse_column_meta(r: &mut CompactReader) -> Result<ColumnMeta> {
                 }
                 4 => codec = r.read_i32()?,
                 9 => data_page_offset = r.read_i64()?,
+                11 => dictionary_page_offset = Some(r.read_i64()?),
                 _ => r.skip(ty)?,
             },
         }
@@ -209,6 +279,8 @@ fn parse_column_meta(r: &mut CompactReader) -> Result<ColumnMeta> {
         physical,
         codec,
         data_page_offset,
+        dictionary_page_offset,
+        max_def_level: 1, // set from the schema in parse_file_metadata
     })
 }
 
@@ -249,36 +321,161 @@ enum ColumnData {
     Bytes(Vec<Option<Vec<u8>>>),
 }
 
-struct PageHeader {
-    compressed_size: usize,
-    uncompressed_size: usize,
+/// A decoded dictionary page, indexed by the data pages that follow it.
+enum Dict {
+    Int(Vec<i64>),
+    Double(Vec<f64>),
+    Bytes(Vec<Vec<u8>>),
 }
 
-fn decode_column(file: &[u8], col: &ColumnMeta, num_rows: usize) -> Result<ColumnData> {
-    let off = col.data_page_offset as usize;
-    let after_offset = file
-        .get(off..)
-        .ok_or_else(|| Error::Parquet("data_page_offset out of range".into()))?;
+struct PageHeader {
+    page_type: i32,
+    compressed_size: usize,
+    uncompressed_size: usize,
+    /// Value count from the data- or dictionary-page sub-header.
+    num_values: i32,
+    /// Value encoding from the sub-header.
+    encoding: i32,
+}
 
-    let mut r = CompactReader::new(after_offset);
-    let ph = parse_page_header(&mut r)?;
-    let body_start = off + r.position();
-    let body = file
-        .get(body_start..body_start + ph.compressed_size)
-        .ok_or_else(|| Error::Parquet("page body out of range".into()))?;
+/// Decode one column chunk (all its pages, across the whole chunk) into
+/// `rg_rows` aligned values.
+fn decode_column(file: &[u8], col: &ColumnMeta, rg_rows: usize) -> Result<ColumnData> {
+    // A dictionary page, if present, precedes the data pages.
+    let start = col
+        .dictionary_page_offset
+        .filter(|&o| o >= 0)
+        .unwrap_or(col.data_page_offset) as usize;
 
-    let body = match col.codec {
-        c if c == codec::SNAPPY => {
-            snappy::decompress(body).ok_or_else(|| Error::Parquet("snappy decode failed".into()))?
+    let mut out = empty_column(col.physical)?;
+    let mut dict: Option<Dict> = None;
+    let mut pos = start;
+    let mut rows_done = 0usize;
+
+    while rows_done < rg_rows {
+        let after = file
+            .get(pos..)
+            .ok_or_else(|| Error::Parquet("page offset out of range".into()))?;
+        let mut r = CompactReader::new(after);
+        let ph = parse_page_header(&mut r)?;
+        let body_start = pos + r.position();
+        let comp = file
+            .get(body_start..body_start + ph.compressed_size)
+            .ok_or_else(|| Error::Parquet("page body out of range".into()))?;
+        let body = decompress(col.codec, comp, ph.uncompressed_size)?;
+        pos = body_start + ph.compressed_size;
+
+        match ph.page_type {
+            t if t == page::DICTIONARY_PAGE => {
+                dict = Some(decode_dictionary(&body, col.physical, ph.num_values as usize)?);
+            }
+            t if t == page::DATA_PAGE => {
+                let page_rows = ph.num_values as usize;
+                decode_data_page(&body, col, ph.encoding, page_rows, dict.as_ref(), &mut out)?;
+                rows_done += page_rows;
+            }
+            t if t == page::DATA_PAGE_V2 => {
+                return Err(Error::Parquet("DATA_PAGE_V2 is not supported yet".into()));
+            }
+            other => return Err(Error::Parquet(format!("unsupported page type {other}"))),
         }
-        c if c == codec::UNCOMPRESSED => body.to_vec(),
-        other => return Err(Error::Parquet(format!("unsupported codec {other}"))),
+    }
+    Ok(out)
+}
+
+/// Decompress a page body and check it against the header's expected size.
+fn decompress(codec: i32, comp: &[u8], uncompressed_size: usize) -> Result<Vec<u8>> {
+    let body = match codec {
+        c if c == codec::SNAPPY => {
+            snappy::decompress(comp).ok_or_else(|| Error::Parquet("snappy decode failed".into()))?
+        }
+        c if c == codec::UNCOMPRESSED => comp.to_vec(),
+        other => {
+            return Err(Error::Parquet(format!(
+                "unsupported compression codec {}",
+                codec_name(other)
+            )));
+        }
     };
-    if body.len() != ph.uncompressed_size {
+    if body.len() != uncompressed_size {
         return Err(Error::Parquet("page size mismatch after decompression".into()));
     }
+    Ok(body)
+}
 
-    // Body = [u32 len][RLE definition levels (bit width 1)][PLAIN values].
+/// Name a compression codec by its `CompressionCodec` id, for error messages.
+fn codec_name(id: i32) -> String {
+    match id {
+        2 => "GZIP".into(),
+        3 => "LZO".into(),
+        4 => "BROTLI".into(),
+        5 => "LZ4".into(),
+        6 => "ZSTD".into(),
+        7 => "LZ4_RAW".into(),
+        other => format!("#{other}"),
+    }
+}
+
+fn empty_column(physical: i32) -> Result<ColumnData> {
+    Ok(match physical {
+        p if p == ptype::BOOLEAN => ColumnData::Bool(Vec::new()),
+        p if p == ptype::INT64 => ColumnData::Int(Vec::new()),
+        p if p == ptype::DOUBLE => ColumnData::Double(Vec::new()),
+        p if p == ptype::BYTE_ARRAY => ColumnData::Bytes(Vec::new()),
+        other => return Err(Error::Parquet(format!("unsupported physical type {other}"))),
+    })
+}
+
+fn decode_dictionary(body: &[u8], physical: i32, count: usize) -> Result<Dict> {
+    Ok(match physical {
+        p if p == ptype::INT64 => Dict::Int(plain_i64(body, count)?),
+        p if p == ptype::DOUBLE => Dict::Double(plain_f64(body, count)?),
+        p if p == ptype::BYTE_ARRAY => Dict::Bytes(plain_byte_arrays(body, count)?),
+        other => {
+            return Err(Error::Parquet(format!(
+                "dictionary encoding unsupported for physical type {other}"
+            )));
+        }
+    })
+}
+
+/// Decode one DATA_PAGE body, appending its rows to `out`.
+fn decode_data_page(
+    body: &[u8],
+    col: &ColumnMeta,
+    page_encoding: i32,
+    page_rows: usize,
+    dict: Option<&Dict>,
+    out: &mut ColumnData,
+) -> Result<()> {
+    let (present, values) = split_definition_levels(body, col.max_def_level, page_rows)?;
+    let n_present = present.iter().filter(|&&d| d == 1).count();
+
+    match page_encoding {
+        e if e == encoding::PLAIN => decode_plain(out, values, &present, n_present),
+        e if e == encoding::PLAIN_DICTIONARY || e == encoding::RLE_DICTIONARY => {
+            let dict = dict.ok_or_else(|| {
+                Error::Parquet("dictionary-encoded data page without a dictionary".into())
+            })?;
+            decode_dict_indices(out, dict, values, &present, n_present)
+        }
+        other => Err(Error::Parquet(format!(
+            "unsupported page encoding {other}"
+        ))),
+    }
+}
+
+/// Split a data-page body into a per-row present/null mask and the value bytes.
+/// A REQUIRED column (`max_def_level == 0`) carries no definition levels.
+fn split_definition_levels(
+    body: &[u8],
+    max_def_level: u32,
+    page_rows: usize,
+) -> Result<(Vec<u64>, &[u8])> {
+    if max_def_level == 0 {
+        return Ok((vec![1; page_rows], body));
+    }
+    let bit_width = bits_needed(max_def_level);
     let rle_len = body
         .get(..4)
         .map(|b| u32::from_le_bytes(b.try_into().unwrap()) as usize)
@@ -287,47 +484,133 @@ fn decode_column(file: &[u8], col: &ColumnMeta, num_rows: usize) -> Result<Colum
         .get(4..4 + rle_len)
         .ok_or_else(|| Error::Parquet("definition-level section out of range".into()))?;
     let values = &body[4 + rle_len..];
+    let present = decode_levels(levels, bit_width, page_rows)?
+        .into_iter()
+        .map(|d| (d == max_def_level as u64) as u64)
+        .collect();
+    Ok((present, values))
+}
 
-    let present = decode_levels(levels, 1, num_rows)?;
-    let n_present = present.iter().filter(|&&d| d == 1).count();
+fn decode_plain(out: &mut ColumnData, values: &[u8], present: &[u64], n: usize) -> Result<()> {
+    match out {
+        ColumnData::Bool(v) => v.extend(align(present, plain_bools(values, n)?)),
+        ColumnData::Int(v) => v.extend(align(present, plain_i64(values, n)?)),
+        ColumnData::Double(v) => v.extend(align(present, plain_f64(values, n)?)),
+        ColumnData::Bytes(v) => v.extend(align(present, plain_byte_arrays(values, n)?)),
+    }
+    Ok(())
+}
 
-    let data = match col.physical {
-        p if p == ptype::BOOLEAN => ColumnData::Bool(align(&present, plain_bools(values, n_present)?)),
-        p if p == ptype::INT64 => ColumnData::Int(align(&present, plain_i64(values, n_present)?)),
-        p if p == ptype::DOUBLE => ColumnData::Double(align(&present, plain_f64(values, n_present)?)),
-        p if p == ptype::BYTE_ARRAY => {
-            ColumnData::Bytes(align(&present, plain_byte_arrays(values, n_present)?))
-        }
-        other => return Err(Error::Parquet(format!("unsupported physical type {other}"))),
+/// Decode a dictionary-index data page: `[1 byte bit width][RLE/bit-pack
+/// indices]`, mapped through `dict`.
+fn decode_dict_indices(
+    out: &mut ColumnData,
+    dict: &Dict,
+    values: &[u8],
+    present: &[u64],
+    n: usize,
+) -> Result<()> {
+    let indices = if n == 0 {
+        Vec::new()
+    } else {
+        let bit_width = *values
+            .first()
+            .ok_or_else(|| Error::Parquet("dictionary page missing bit width".into()))?
+            as u32;
+        decode_levels(&values[1..], bit_width, n)?
     };
-    Ok(data)
+
+    match (out, dict) {
+        (ColumnData::Int(v), Dict::Int(d)) => {
+            v.extend(align(present, map_indices(&indices, d, |x| *x)?))
+        }
+        (ColumnData::Double(v), Dict::Double(d)) => {
+            v.extend(align(present, map_indices(&indices, d, |x| *x)?))
+        }
+        (ColumnData::Bytes(v), Dict::Bytes(d)) => {
+            v.extend(align(present, map_indices(&indices, d, |x| x.clone())?))
+        }
+        _ => return Err(Error::Parquet("dictionary type mismatch".into())),
+    }
+    Ok(())
+}
+
+/// Map dictionary indices to values via `f`, erroring on any out-of-range index.
+fn map_indices<T, U>(indices: &[u64], dict: &[T], f: impl Fn(&T) -> U) -> Result<Vec<U>> {
+    indices
+        .iter()
+        .map(|&i| {
+            dict.get(i as usize)
+                .map(&f)
+                .ok_or_else(|| Error::Parquet("dictionary index out of range".into()))
+        })
+        .collect()
 }
 
 fn parse_page_header(r: &mut CompactReader) -> Result<PageHeader> {
+    let mut page_type = -1i32;
     let mut compressed = -1i32;
     let mut uncompressed = -1i32;
+    let mut num_values = 0i32;
+    let mut encoding = -1i32;
+
     r.struct_begin();
     loop {
         match r.read_field()? {
             Field::Stop => break,
             Field::Begin { id, ty } => match id {
+                1 => page_type = r.read_i32()?,
                 2 => uncompressed = r.read_i32()?,
                 3 => compressed = r.read_i32()?,
+                // data_page_header (5) and dictionary_page_header (7) both begin
+                // with num_values (1) then the value encoding (2).
+                5 | 7 => {
+                    let (nv, enc) = parse_page_subheader(r)?;
+                    num_values = nv;
+                    encoding = enc;
+                }
                 _ => r.skip(ty)?,
             },
         }
     }
     r.struct_end();
-    if compressed < 0 || uncompressed < 0 {
-        return Err(Error::Parquet("page header missing sizes".into()));
+
+    if compressed < 0 || uncompressed < 0 || page_type < 0 {
+        return Err(Error::Parquet("incomplete page header".into()));
     }
     Ok(PageHeader {
+        page_type,
         compressed_size: compressed as usize,
         uncompressed_size: uncompressed as usize,
+        num_values,
+        encoding,
     })
 }
 
-/// Distribute `present` values across rows: a `1` level takes the next value,
+fn parse_page_subheader(r: &mut CompactReader) -> Result<(i32, i32)> {
+    let mut num_values = 0i32;
+    let mut encoding = -1i32;
+    r.struct_begin();
+    loop {
+        match r.read_field()? {
+            Field::Stop => break,
+            Field::Begin { id, ty } => match id {
+                1 => num_values = r.read_i32()?,
+                2 => encoding = r.read_i32()?,
+                _ => r.skip(ty)?,
+            },
+        }
+    }
+    r.struct_end();
+    Ok((num_values, encoding))
+}
+
+/// Bits needed to represent values in `0..=max`.
+fn bits_needed(max: u32) -> u32 {
+    if max == 0 { 0 } else { 32 - max.leading_zeros() }
+}
+
+/// Distribute `n` present values across rows: a `1` level takes the next value,
 /// a `0` level is null.
 fn align<T>(levels: &[u64], values: Vec<T>) -> Vec<Option<T>> {
     let mut it = values.into_iter();
@@ -337,9 +620,8 @@ fn align<T>(levels: &[u64], values: Vec<T>) -> Vec<Option<T>> {
         .collect()
 }
 
-/// Decode an RLE/bit-pack hybrid level stream, yielding `count` values. Our
-/// writer only emits RLE runs at bit width 1, but the bit-packed form is
-/// handled too so the decoder is correct for any conforming stream.
+/// Decode an RLE/bit-pack hybrid stream (definition levels or dictionary
+/// indices), yielding `count` values at `bit_width`.
 fn decode_levels(data: &[u8], bit_width: u32, count: usize) -> Result<Vec<u64>> {
     if bit_width == 0 {
         return Ok(vec![0; count]);
@@ -522,10 +804,21 @@ mod tests {
     }
 
     #[test]
-    fn decode_levels_alternating() {
-        // 1,0,1 as three RLE runs of length 1.
-        let levels = decode_levels(&[0x02, 0x01, 0x02, 0x00, 0x02, 0x01], 1, 3).unwrap();
-        assert_eq!(levels, vec![1, 0, 1]);
+    fn decode_levels_bit_packed() {
+        // One bit-packed group of 8 values at bit width 3: 0..8.
+        // header = (1 groups << 1) | 1 = 3. Packed LSB-first, 3 bytes.
+        let data = [0x03, 0b1000_1000, 0b1100_0110, 0b1111_1010];
+        let out = decode_levels(&data, 3, 8).unwrap();
+        assert_eq!(out, vec![0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    #[test]
+    fn bits_needed_matches_dictionary_sizing() {
+        assert_eq!(bits_needed(0), 0);
+        assert_eq!(bits_needed(1), 1);
+        assert_eq!(bits_needed(2), 2);
+        assert_eq!(bits_needed(4), 3);
+        assert_eq!(bits_needed(255), 8);
     }
 
     #[test]
@@ -542,5 +835,31 @@ mod tests {
     fn align_places_nulls() {
         let out = align(&[1, 0, 1], vec![10i64, 20]);
         assert_eq!(out, vec![Some(10), None, Some(20)]);
+    }
+
+    #[test]
+    fn dictionary_indices_map_through_dict() {
+        // Dict of 3 strings; a data page selecting them by RLE_DICTIONARY.
+        let dict = Dict::Bytes(vec![b"red".to_vec(), b"green".to_vec(), b"blue".to_vec()]);
+        // 4 present values, indices [2,1,0,2], bit width 2, one bit-packed group.
+        // values = [bit_width][run header][packed bytes]; run header (1<<1)|1 = 3
+        // means one bit-packed group of 8 (2 bytes at width 2). Packed LSB-first:
+        // idx0=10, idx1=01, idx2=00, idx3=10 -> byte0 = 0x86, byte1 (unused) = 0.
+        let values = [2u8, 0x03, 0x86, 0x00];
+        let present = vec![1u64; 4];
+        let mut out = ColumnData::Bytes(Vec::new());
+        decode_dict_indices(&mut out, &dict, &values, &present, 4).unwrap();
+        match out {
+            ColumnData::Bytes(v) => assert_eq!(
+                v,
+                vec![
+                    Some(b"blue".to_vec()),
+                    Some(b"green".to_vec()),
+                    Some(b"red".to_vec()),
+                    Some(b"blue".to_vec()),
+                ]
+            ),
+            _ => panic!("wrong variant"),
+        }
     }
 }

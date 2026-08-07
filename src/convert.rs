@@ -116,4 +116,40 @@ mod tests {
         let pq2 = geojson_to_geoparquet(&geojson).unwrap();
         assert_eq!(pq1, pq2);
     }
+
+    #[test]
+    fn reads_duckdb_dictionary_encoded_file() {
+        // A DuckDB-written GeoParquet where the INT64 (`bucket`), string
+        // (`color`), and geometry columns are all PLAIN_DICTIONARY-encoded,
+        // and `even` is PLAIN. Generated with:
+        //   COPY (SELECT (i%7)::BIGINT bucket, ('color_'||(i%3)) color,
+        //                (i%2=0) even, ST_Point((i%4), (i%4)*2) geometry
+        //         FROM range(5000) t(i)) TO '...' (FORMAT PARQUET);
+        let bytes = include_bytes!("../tests/fixtures/duckdb_dict.parquet");
+        let out = geoparquet_to_geojson(bytes).unwrap();
+        let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
+        assert_eq!(fc.features.len(), 5000);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties
+                .iter()
+                .find(|(name, _)| name == k)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        for i in [0usize, 1, 3, 2499, 4999] {
+            let f = &fc.features[i];
+            assert_eq!(prop(f, "bucket").as_f64(), Some((i % 7) as f64));
+            assert_eq!(prop(f, "color").as_str(), Some(format!("color_{}", i % 3).as_str()));
+            assert_eq!(
+                prop(f, "even"),
+                crate::json::JsonValue::Bool(i % 2 == 0)
+            );
+            let g = (i % 4) as f64;
+            assert_eq!(
+                f.geometry,
+                Some(crate::geometry::Geometry::Point([g, g * 2.0]))
+            );
+        }
+    }
 }

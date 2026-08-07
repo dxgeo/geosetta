@@ -27,7 +27,11 @@ pub mod repetition {
 /// Value/level encodings (`Encoding`).
 pub mod encoding {
     pub const PLAIN: i32 = 0;
+    /// Deprecated dictionary-index encoding; still emitted by e.g. DuckDB.
+    pub const PLAIN_DICTIONARY: i32 = 2;
     pub const RLE: i32 = 3;
+    /// Modern dictionary-index encoding (same on-wire form as PLAIN_DICTIONARY).
+    pub const RLE_DICTIONARY: i32 = 8;
 }
 
 /// Compression codecs (`CompressionCodec`).
@@ -39,6 +43,8 @@ pub mod codec {
 /// Page types (`PageType`).
 pub mod page {
     pub const DATA_PAGE: i32 = 0;
+    pub const DICTIONARY_PAGE: i32 = 2;
+    pub const DATA_PAGE_V2: i32 = 3;
 }
 
 /// Legacy converted types (`ConvertedType`). Kept for broad reader

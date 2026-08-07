@@ -46,9 +46,16 @@ Local tooling note: only =duckdb= is installed here (no =pyarrow=, =geopandas=,
 =ogr2ogr=/GDAL). Test fixtures will be generated with DuckDB; broadening to
 pyarrow/GDAL fixtures needs those tools added to the dev environment.
 
-** MILESTONE 1 — dictionary encoding + multiple pages/row groups
-The single unlock that makes most real DuckDB/Arrow files readable. Concrete
-changes to =src/parquet/reader.rs=:
+** MILESTONE 1 — dictionary encoding + multiple pages/row groups — *DONE*
+Implemented in =src/parquet/reader.rs=. Pantograph now reads DuckDB's default
+GeoParquet: a 200k-row, 2-row-group file with =PLAIN_DICTIONARY= on the string,
+INT64, and geometry columns decodes to all 200k features with values matching
+DuckDB (verified across the row-group boundary). =UNCOMPRESSED= files read too;
+=ZSTD= now fails with a clear "unsupported compression codec ZSTD" rather than a
+cryptic varint error. A committed fixture (=tests/fixtures/duckdb_dict.parquet=)
+covers the dictionary paths for INT64 / string / geometry plus a PLAIN boolean.
+
+Original scope, all landed:
 
 *** 1a. Richer column-chunk metadata
 =parse_column_meta= currently keeps =physical=, =codec=, =data_page_offset=,

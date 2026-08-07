@@ -1,0 +1,11 @@
+[package]
+name = "pantograph-rs"
+version = "0.1.0"
+edition = "2024"
+description = "Convert between open vector geospatial formats (GeoJSON → GeoParquet), dependency-free."
+
+[[bin]]
+name = "panto"
+path = "src/main.rs"
+
+[dependencies]

@@ -1,0 +1,25 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-73.9857, 40.7484] },
+      "properties": { "name": "Empire State", "height_m": 381, "landmark": true, "rating": 4.7 }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "LineString", "coordinates": [[-73.99, 40.75], [-73.98, 40.76], [-73.97, 40.75]] },
+      "properties": { "name": "A Path", "height_m": null, "landmark": false, "rating": 3.2 }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Polygon", "coordinates": [[[-74.0, 40.70], [-73.95, 40.70], [-73.95, 40.75], [-74.0, 40.75], [-74.0, 40.70]]] },
+      "properties": { "name": "A Zone", "height_m": 12, "rating": 5 }
+    },
+    {
+      "type": "Feature",
+      "geometry": { "type": "Point", "coordinates": [-73.9680, 40.7851] },
+      "properties": { "name": "Café ☕", "landmark": true, "tags": ["a", "b"] }
+    }
+  ]
+}

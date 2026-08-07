@@ -1,0 +1,56 @@
+#+TITLE: Pantograph
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+#+EXPORT_FILENAME: project
+
+* Pantograph
+
+** OVERVIEW
+Pantograph is a library for exporting any vector geospatial format to any other vector geospatial format.
+The basic idea is to have one library, with no other dependencies, that can take any input vector geospatial file and output any other conceivable vector format, provided it is an open standard.
+If you've heard of [[https://pandoc.org/][Pandoc]], the idea is similar here.
+
+** ARCHITECTURE
+This is the list of priorities for this project in terms of design/architecture.
+The project aims to be:
+
+- Extensible
+- Performant
+- Universal
+- Lightweight
+- Dependency-free
+
+** STATUS
+The first conversion path is implemented and working: *GeoJSON to GeoParquet*,
+written in Rust using only the standard library (zero external crates, in
+keeping with the dependency-free goal). Output is validated by DuckDB's spatial
+engine as genuine, queryable GeoParquet.
+
+** IMPLEMENTATION
+Language: Rust (edition 2024). Every wire format is implemented from its
+specification rather than pulled from a crate:
+
+- =json/= :: standard-library JSON parser and value model
+- =geojson/= :: FeatureCollection / Feature / geometry parsing
+- =geometry/= :: geometry model, bounding box, and WKB (Well-Known Binary) encoder
+- =parquet/= :: Thrift compact-protocol writer, schema inference, GeoParquet
+  =geo= metadata, and the Parquet file writer
+- =cli.rs= / =convert.rs= :: argument parsing and the conversion pipeline
+
+Design choices for this first version: uncompressed Parquet pages, 2D
+coordinates, one row group, and property columns typed by scanning all features
+(heterogeneous or nested values fall back to a JSON string).
+
+** USAGE
+#+begin_src sh
+panto input.geojson output.parquet
+# formats may also be given explicitly:
+panto in.txt out.bin --from geojson --to parquet
+#+end_src
+
+A runnable example lives in [[file:examples/sample.geojson][examples/sample.geojson]].
+
+** ROADMAP
+- Snappy page compression (still dependency-free)
+- The reverse path (GeoParquet to GeoJSON), requiring a Thrift/Parquet reader
+- Additional formats toward the any-to-any hub described above

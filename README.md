@@ -107,3 +107,8 @@ tail of formats that GDAL and Arrow already handle robustly.
 
 Detailed design notes live in [plans/](plans/README.org).
 
+
+## LICENSE
+
+Released under the [MIT License](LICENSE).
+

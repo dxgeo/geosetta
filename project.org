@@ -99,3 +99,6 @@ tail of formats that GDAL and Arrow already handle robustly.
 - CRS handling beyond the CRS84 default, once a second CRS-bearing format lands
 
 Detailed design notes live in [[file:plans/README.org][plans/]].
+
+** LICENSE
+Released under the [[file:LICENSE][MIT License]].

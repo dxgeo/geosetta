@@ -83,7 +83,7 @@ does it, not *that* it does it.
 
 What none of them are is *dependency-free*. GDAL needs a C/C++ toolchain plus
 PROJ/GEOS; the Rust options pull in crates, and every Parquet path leans on
-Apache Arrow (C++ or the =arrow=/=parquet= crates). Pantograph's distinguishing
+Apache Arrow (C++ or the =arrow= and =parquet= crates). Pantograph's distinguishing
 constraint is exactly that: pure standard-library Rust, every wire format
 implemented from its specification. The payoff is a small, embeddable,
 audit-friendly, no-supply-chain build (WASM, constrained environments); the cost

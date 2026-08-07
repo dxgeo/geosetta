@@ -161,6 +161,182 @@ impl CompactWriter {
     }
 }
 
+// --- reader ----------------------------------------------------------------
+
+use crate::error::{Error, Result};
+
+/// One field header read from a struct: either the STOP marker or a field.
+pub enum Field {
+    Stop,
+    Begin { id: i16, ty: u8 },
+}
+
+/// Reads the compact-protocol structures Parquet writes (the inverse of
+/// [`CompactWriter`]). The caller drives it against a known schema: open a
+/// struct with [`struct_begin`], read fields with [`read_field`] until
+/// [`Field::Stop`], then [`struct_end`]; skip fields it doesn't care about with
+/// [`skip`].
+///
+/// [`struct_begin`]: CompactReader::struct_begin
+/// [`read_field`]: CompactReader::read_field
+/// [`struct_end`]: CompactReader::struct_end
+/// [`skip`]: CompactReader::skip
+pub struct CompactReader<'a> {
+    buf: &'a [u8],
+    pos: usize,
+    /// Stack of the last field id read in each open struct (delta base).
+    last_ids: Vec<i16>,
+}
+
+impl<'a> CompactReader<'a> {
+    pub fn new(buf: &'a [u8]) -> Self {
+        CompactReader {
+            buf,
+            pos: 0,
+            last_ids: vec![0],
+        }
+    }
+
+    /// Bytes consumed so far (used to locate a page body after its header).
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    fn byte(&mut self) -> Result<u8> {
+        let b = *self.buf.get(self.pos).ok_or_else(Self::eof)?;
+        self.pos += 1;
+        Ok(b)
+    }
+
+    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
+        let end = self.pos.checked_add(n).ok_or_else(Self::eof)?;
+        let s = self.buf.get(self.pos..end).ok_or_else(Self::eof)?;
+        self.pos = end;
+        Ok(s)
+    }
+
+    fn eof() -> Error {
+        Error::Parquet("unexpected end of thrift data".into())
+    }
+
+    pub fn read_varint(&mut self) -> Result<u64> {
+        let mut result = 0u64;
+        let mut shift = 0u32;
+        loop {
+            let b = self.byte()?;
+            result |= ((b & 0x7f) as u64) << shift;
+            if b & 0x80 == 0 {
+                break;
+            }
+            shift += 7;
+            if shift >= 64 {
+                return Err(Error::Parquet("varint too long".into()));
+            }
+        }
+        Ok(result)
+    }
+
+    pub fn read_zigzag(&mut self) -> Result<i64> {
+        let u = self.read_varint()?;
+        Ok(((u >> 1) as i64) ^ -((u & 1) as i64))
+    }
+
+    pub fn struct_begin(&mut self) {
+        self.last_ids.push(0);
+    }
+
+    pub fn struct_end(&mut self) {
+        self.last_ids.pop();
+    }
+
+    /// Read the next field header within the current struct.
+    pub fn read_field(&mut self) -> Result<Field> {
+        let b = self.byte()?;
+        if b == ct::STOP {
+            return Ok(Field::Stop);
+        }
+        let ty = b & 0x0f;
+        let delta = (b >> 4) as i16;
+        let id = if delta == 0 {
+            self.read_zigzag()? as i16
+        } else {
+            *self.last_ids.last().unwrap() + delta
+        };
+        *self.last_ids.last_mut().unwrap() = id;
+        Ok(Field::Begin { id, ty })
+    }
+
+    pub fn read_i32(&mut self) -> Result<i32> {
+        Ok(self.read_zigzag()? as i32)
+    }
+
+    pub fn read_i64(&mut self) -> Result<i64> {
+        self.read_zigzag()
+    }
+
+    pub fn read_double(&mut self) -> Result<f64> {
+        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
+    pub fn read_binary(&mut self) -> Result<Vec<u8>> {
+        let n = self.read_varint()? as usize;
+        Ok(self.take(n)?.to_vec())
+    }
+
+    pub fn read_string(&mut self) -> Result<String> {
+        String::from_utf8(self.read_binary()?)
+            .map_err(|_| Error::Parquet("invalid utf-8 string".into()))
+    }
+
+    /// Read a list header, returning `(element_type, len)`.
+    pub fn read_list_header(&mut self) -> Result<(u8, usize)> {
+        let b = self.byte()?;
+        let elem = b & 0x0f;
+        let size = (b >> 4) as usize;
+        let len = if size == 15 {
+            self.read_varint()? as usize
+        } else {
+            size
+        };
+        Ok((elem, len))
+    }
+
+    /// Consume a value of compact type `ty` without interpreting it.
+    pub fn skip(&mut self, ty: u8) -> Result<()> {
+        match ty {
+            ct::BOOL_TRUE | ct::BOOL_FALSE => {} // value lives in the header
+            ct::I32 | ct::I64 => {
+                self.read_varint()?;
+            }
+            ct::DOUBLE => {
+                self.take(8)?;
+            }
+            ct::BINARY => {
+                let n = self.read_varint()? as usize;
+                self.take(n)?;
+            }
+            ct::LIST => {
+                let (elem, len) = self.read_list_header()?;
+                for _ in 0..len {
+                    self.skip(elem)?;
+                }
+            }
+            ct::STRUCT => {
+                self.struct_begin();
+                loop {
+                    match self.read_field()? {
+                        Field::Stop => break,
+                        Field::Begin { ty, .. } => self.skip(ty)?,
+                    }
+                }
+                self.struct_end();
+            }
+            other => return Err(Error::Parquet(format!("unknown compact type {other}"))),
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -229,5 +405,93 @@ mod tests {
         });
         // type byte I32=0x05, field id zigzag(20)=40=0x28, value 0, STOP
         assert_eq!(out, vec![0x05, 0x28, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn reader_round_trips_writer() {
+        // A small struct exercising i32, i64, string, a nested struct, and a
+        // list — the shapes the footer/page parsers walk.
+        let bytes = bytes_of(|w| {
+            w.struct_begin();
+            w.field_i32(1, 7);
+            w.field_i64(3, -100);
+            w.field_string(4, "geo");
+            w.field_struct(5); // nested struct at id 5
+            w.field_i32(1, 42);
+            w.struct_end();
+            w.field_list(6, ct::I32, 3);
+            w.raw_i32(10);
+            w.raw_i32(20);
+            w.raw_i32(30);
+            w.struct_end();
+        });
+
+        let mut r = CompactReader::new(&bytes);
+        r.struct_begin();
+        let mut seen = Vec::new();
+        loop {
+            match r.read_field().unwrap() {
+                Field::Stop => break,
+                Field::Begin { id, ty } => match id {
+                    1 => seen.push(("i32", r.read_i32().unwrap() as i64)),
+                    3 => seen.push(("i64", r.read_i64().unwrap())),
+                    4 => {
+                        assert_eq!(r.read_string().unwrap(), "geo");
+                        seen.push(("str", 0));
+                    }
+                    5 => {
+                        // Nested struct: one i32 field then STOP.
+                        r.struct_begin();
+                        if let Field::Begin { ty, .. } = r.read_field().unwrap() {
+                            assert_eq!(ty, ct::I32);
+                            seen.push(("nested", r.read_i32().unwrap() as i64));
+                        }
+                        assert!(matches!(r.read_field().unwrap(), Field::Stop));
+                        r.struct_end();
+                    }
+                    6 => {
+                        let (elem, len) = r.read_list_header().unwrap();
+                        assert_eq!(elem, ct::I32);
+                        let sum: i64 = (0..len).map(|_| r.read_i32().unwrap() as i64).sum();
+                        seen.push(("list_sum", sum));
+                    }
+                    _ => r.skip(ty).unwrap(),
+                },
+            }
+        }
+        r.struct_end();
+        assert_eq!(
+            seen,
+            vec![
+                ("i32", 7),
+                ("i64", -100),
+                ("str", 0),
+                ("nested", 42),
+                ("list_sum", 60),
+            ]
+        );
+        assert_eq!(r.position(), bytes.len());
+    }
+
+    #[test]
+    fn skip_consumes_whole_value() {
+        let bytes = bytes_of(|w| {
+            w.struct_begin();
+            w.field_string(1, "skip me");
+            w.field_i32(2, 99);
+            w.struct_end();
+        });
+        let mut r = CompactReader::new(&bytes);
+        r.struct_begin();
+        // Skip the string field, then read the i32.
+        match r.read_field().unwrap() {
+            Field::Begin { ty, .. } => r.skip(ty).unwrap(),
+            Field::Stop => panic!(),
+        }
+        match r.read_field().unwrap() {
+            Field::Begin { id, .. } => assert_eq!((id, r.read_i32().unwrap()), (2, 99)),
+            Field::Stop => panic!(),
+        }
+        assert!(matches!(r.read_field().unwrap(), Field::Stop));
     }
 }

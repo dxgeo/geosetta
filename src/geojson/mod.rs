@@ -50,6 +50,78 @@ pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
     }
 }
 
+// --- serialization ---------------------------------------------------------
+
+/// Render a [`FeatureCollection`] back to a [`JsonValue`] (the inverse of
+/// [`from_json`]); stringify with [`JsonValue::to_json_string`].
+pub fn to_json(fc: &FeatureCollection) -> JsonValue {
+    let features = fc.features.iter().map(feature_to_json).collect();
+    obj(vec![
+        ("type", JsonValue::String("FeatureCollection".into())),
+        ("features", JsonValue::Array(features)),
+    ])
+}
+
+fn feature_to_json(f: &Feature) -> JsonValue {
+    let geometry = match &f.geometry {
+        Some(g) => geometry_to_json(g),
+        None => JsonValue::Null,
+    };
+    obj(vec![
+        ("type", JsonValue::String("Feature".into())),
+        ("geometry", geometry),
+        ("properties", JsonValue::Object(f.properties.clone())),
+    ])
+}
+
+fn geometry_to_json(g: &Geometry) -> JsonValue {
+    if let Geometry::GeometryCollection(geoms) = g {
+        let arr = geoms.iter().map(geometry_to_json).collect();
+        return obj(vec![
+            ("type", JsonValue::String("GeometryCollection".into())),
+            ("geometries", JsonValue::Array(arr)),
+        ]);
+    }
+    let coords = match g {
+        Geometry::Point(p) => position_to_json(*p),
+        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => positions_to_json(ps),
+        Geometry::Polygon(r) | Geometry::MultiLineString(r) => rings_to_json(r),
+        Geometry::MultiPolygon(polys) => {
+            JsonValue::Array(polys.iter().map(|p| rings_to_json(p)).collect())
+        }
+        Geometry::GeometryCollection(_) => unreachable!("handled above"),
+    };
+    obj(vec![
+        ("type", JsonValue::String(g.type_name().into())),
+        ("coordinates", coords),
+    ])
+}
+
+fn position_to_json(p: Position) -> JsonValue {
+    JsonValue::Array(vec![coord(p[0]), coord(p[1])])
+}
+
+fn positions_to_json(ps: &[Position]) -> JsonValue {
+    JsonValue::Array(ps.iter().map(|p| position_to_json(*p)).collect())
+}
+
+fn rings_to_json(rings: &[Vec<Position>]) -> JsonValue {
+    JsonValue::Array(rings.iter().map(|r| positions_to_json(r)).collect())
+}
+
+/// A coordinate ordinate as a (non-integer) JSON number.
+fn coord(v: f64) -> JsonValue {
+    JsonValue::Number {
+        value: v,
+        is_int: false,
+    }
+}
+
+/// Build an object from `&str` keys, saving `.to_string()` at each call site.
+fn obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
+    JsonValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
+}
+
 fn parse_feature(value: &JsonValue) -> Result<Feature> {
     let geometry = match value.get("geometry") {
         None | Some(JsonValue::Null) => None,

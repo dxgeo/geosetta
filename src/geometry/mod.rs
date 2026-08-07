@@ -5,6 +5,7 @@
 
 mod wkb;
 
+pub use wkb::decode as from_wkb;
 pub use wkb::encode as to_wkb;
 
 /// A single 2D coordinate: `[x, y]`.

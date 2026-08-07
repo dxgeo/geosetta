@@ -12,6 +12,9 @@ pub enum Error {
     Json { offset: usize, message: String },
     /// The JSON was valid but not a well-formed GeoJSON document.
     GeoJson(String),
+    /// A malformed or unsupported Parquet input (bad footer, unexpected
+    /// encoding/codec, truncated page, etc.).
+    Parquet(String),
     /// A CLI usage problem (bad/missing arguments, unknown format).
     Usage(String),
     /// Anything that goes wrong while building the Parquet output. Reserved
@@ -28,6 +31,7 @@ impl fmt::Display for Error {
                 write!(f, "json parse error at byte {offset}: {message}")
             }
             Error::GeoJson(m) => write!(f, "invalid geojson: {m}"),
+            Error::Parquet(m) => write!(f, "invalid parquet: {m}"),
             Error::Usage(m) => write!(f, "{m}"),
             Error::Convert(m) => write!(f, "conversion error: {m}"),
         }

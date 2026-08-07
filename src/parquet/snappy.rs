@@ -222,9 +222,7 @@ fn write_uvarint(out: &mut Vec<u8>, mut v: u64) {
     }
 }
 
-/// Decode a raw Snappy block. Returns `None` on malformed input. Present for
-/// round-trip testing of [`compress`].
-#[cfg(test)]
+/// Decode a raw Snappy block. Returns `None` on malformed input.
 pub fn decompress(input: &[u8]) -> Option<Vec<u8>> {
     let (expected_len, mut pos) = read_uvarint(input)?;
     let mut out = Vec::with_capacity(expected_len as usize);
@@ -292,7 +290,6 @@ pub fn decompress(input: &[u8]) -> Option<Vec<u8>> {
 
 /// Append a back-reference, byte by byte so overlapping copies (offset < len)
 /// read what earlier iterations just wrote.
-#[cfg(test)]
 fn copy_match(out: &mut Vec<u8>, offset: usize, len: usize) -> Option<()> {
     if offset == 0 || offset > out.len() {
         return None;
@@ -304,7 +301,6 @@ fn copy_match(out: &mut Vec<u8>, offset: usize, len: usize) -> Option<()> {
     Some(())
 }
 
-#[cfg(test)]
 fn read_uvarint(input: &[u8]) -> Option<(u64, usize)> {
     let mut result = 0u64;
     let mut shift = 0u32;

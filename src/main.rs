@@ -32,8 +32,18 @@ fn run() -> Result<()> {
             eprintln!("wrote {} ({} bytes)", args.output, bytes.len());
             Ok(())
         }
+        (Format::Parquet, Format::GeoJson) => {
+            let bytes = std::fs::read(&args.input)?;
+            let text = convert::geoparquet_to_geojson(&bytes)?;
+            std::fs::write(&args.output, text.as_bytes())?;
+            eprintln!("wrote {} ({} bytes)", args.output, text.len());
+            Ok(())
+        }
+        (from, to) if from == to => Err(Error::Usage(format!(
+            "input and output are the same format ({from:?}); nothing to convert"
+        ))),
         _ => Err(Error::Usage(
-            "only geojson -> parquet is supported so far".into(),
+            "only geojson <-> parquet is supported so far".into(),
         )),
     }
 }

@@ -100,21 +100,29 @@ that still use the per-layer hub internally: read a layer → =FeatureCollection
 → =write(to, fc)=; or =read(from, input)= → upsert into the gpkg's layer set.
 Add =Format::Gpkg= and the =.gpkg= extension, and a =--layer= option to =Args=.
 
-** STATUS
-*Read direction DONE.* =src/sqlite.rs= (from-scratch SQLite reader: header,
-b-tree walk with overflow chains, record decode, CREATE TABLE column/rowid-alias
-parsing) and =src/geopackage/= (parse =gpkg_contents= / =gpkg_geometry_columns=,
-strip the GeoPackage Binary header → =from_wkb=, map each feature table to a
-=FeatureCollection=). CLI fan-out is wired with the decided naming rule (=--layer=,
-directory vs single-file). Validated against a DuckDB-written =.gpkg=: GPKG →
-GeoJSON / GeoParquet / CSV all work through the hub. Fixture:
-=tests/fixtures/points.gpkg=.
+** STATUS — *DONE* (both directions)
+- *Read.* =src/sqlite.rs= (SQLite reader: header, b-tree walk with overflow
+  chains, record decode, CREATE TABLE column/rowid-alias parsing) and
+  =src/geopackage/reader.rs= (parse =gpkg_contents= / =gpkg_geometry_columns=,
+  strip the GeoPackage Binary header → =from_wkb=, map each feature table to a
+  =FeatureCollection=). CLI fan-out uses the decided naming rule (=--layer=,
+  directory vs single-file; a directory output needs =--to= since the extension
+  can't be inferred). Fixture: =tests/fixtures/points.gpkg=.
+- *Write.* =src/sqlite.rs= gained a whole-file writer (=write_database=: record
+  encoding, leaf packing, interior levels, overflow pages, =sqlite_master= on
+  page one). =src/geopackage/writer.rs= builds the required GPKG metadata tables
+  plus one feature table per layer, wraps WKB in the GeoPackage Binary header,
+  and implements create-or-append (read-modify-write, upserting by layer name).
+  Note: metadata DDL avoids =TEXT PRIMARY KEY= / =UNIQUE= / composite keys and
+  =AUTOINCREMENT=, which would require auto-indexes / =sqlite_sequence= we don't
+  build; =INTEGER PRIMARY KEY= (a plain rowid alias) is fine.
 
-*Remaining:* the write direction — the SQLite whole-file writer (item 2) and
-GeoPackage write + create/append (item 3-write). Until then =*→ gpkg= and
-=gpkg → gpkg= error cleanly. Multi-layer read fan-out (directory output) is
-implemented but not yet tested end-to-end — DuckDB's =COPY= overwrites, so a
-multi-layer fixture needs =ogr2ogr= or our own writer once it lands.
+Validated: =PRAGMA integrity_check= passes and GDAL (via DuckDB =ST_Read=) reads
+our output — points through multipolygons, with append, upsert, and multi-layer
+fan-out all working.
+
+*Deferred (optional):* the packed R-tree spatial index and the GPKG extension
+tables; our files are index-less but valid and readable.
 
 ** SUGGESTED ORDER (read-first)
 1. SQLite reader (item 1) — validate by dumping tables/rows of a DuckDB-written

@@ -35,9 +35,7 @@ fn run() -> Result<()> {
     // GeoPackage is a multi-layer container, so it doesn't fit the plain
     // single-collection convert path.
     match (args.from, args.to) {
-        (Format::Gpkg, Format::Gpkg) | (_, Format::Gpkg) => {
-            return Err(Error::Usage("writing GeoPackage is not supported yet".into()));
-        }
+        (_, Format::Gpkg) => return run_geopackage_write(&args),
         (Format::Gpkg, _) => return run_geopackage_read(&args),
         _ => {}
     }
@@ -99,4 +97,44 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
         eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
     }
     Ok(())
+}
+
+/// Write a layer into a GeoPackage, creating it or appending (upserting the
+/// layer if it already exists). The layer name defaults to the input file stem.
+fn run_geopackage_write(args: &cli::Args) -> Result<()> {
+    let input = std::fs::read(&args.input)?;
+
+    let new_layers = if args.from == Format::Gpkg {
+        // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
+        let mut ls = geopackage::read_layers(&input)?;
+        if let Some(name) = &args.layer {
+            ls.retain(|(n, _)| n == name);
+            if ls.is_empty() {
+                return Err(Error::Usage(format!("no layer named \"{name}\"")));
+            }
+        }
+        ls
+    } else {
+        let fc = convert::read_features(args.from, &input)?;
+        let name = args
+            .layer
+            .clone()
+            .unwrap_or_else(|| layer_stem(&args.input));
+        vec![(name, fc)]
+    };
+
+    // Append into the existing GeoPackage if the output already exists.
+    let existing = std::fs::read(&args.output).ok();
+    let bytes = geopackage::write_layers(existing.as_deref(), &new_layers)?;
+    std::fs::write(&args.output, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", args.output, bytes.len());
+    Ok(())
+}
+
+/// The file stem of `path`, used as a default layer name.
+fn layer_stem(path: &str) -> String {
+    std::path::Path::new(path)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "layer".into())
 }

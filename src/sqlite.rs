@@ -1,11 +1,14 @@
-//! A minimal, read-only SQLite file-format reader, implemented from the format
-//! spec rather than a crate (keeping the project dependency-free). Enough to
-//! enumerate tables and scan their rows — the basis for reading GeoPackage.
+//! A minimal SQLite file-format reader and writer, implemented from the format
+//! spec rather than a crate (keeping the project dependency-free) — the basis
+//! for reading and writing GeoPackage.
 //!
-//! It reads the 100-byte database header, walks table b-trees (interior + leaf
-//! pages, following overflow chains), and decodes the record format
-//! (serial-type varints → typed values). Multi-byte integers in the header and
-//! b-tree structures are big-endian.
+//! The reader reads the 100-byte database header, walks table b-trees (both
+//! interior and leaf pages, following overflow chains), and decodes the record
+//! format (serial-type varints → typed values). The [`write_database`] writer
+//! produces a complete database from a set of tables (rows are `rowid`-ordered):
+//! it encodes records, packs cells into leaf pages, builds interior levels,
+//! spills large payloads to overflow pages, and writes `sqlite_master` on page
+//! one. Multi-byte integers in the header and b-tree structures are big-endian.
 
 use crate::error::{Error, Result};
 
@@ -424,6 +427,340 @@ fn as_int(row: &[Value], i: usize) -> Option<i64> {
     }
 }
 
+// --- writer ----------------------------------------------------------------
+
+const WRITE_PAGE_SIZE: usize = 4096;
+
+/// A table to write: its DDL (`CREATE TABLE …`, recorded in `sqlite_master`)
+/// and its rows as `(rowid, values)`, rowid-ordered. A value at the
+/// INTEGER PRIMARY KEY column should be `Null` (the rowid carries it).
+pub struct TableSpec {
+    pub name: String,
+    pub sql: String,
+    pub rows: Vec<(i64, Vec<Value>)>,
+}
+
+/// Write a complete SQLite database from `tables`. `application_id` and
+/// `user_version` populate the corresponding header fields (0 for plain SQLite).
+pub fn write_database(
+    tables: &[TableSpec],
+    application_id: u32,
+    user_version: u32,
+) -> Result<Vec<u8>> {
+    let mut w = Writer {
+        pages: std::collections::BTreeMap::new(),
+        next_page: 2, // page 1 is reserved for sqlite_master
+    };
+
+    // Build each user table; collect a sqlite_master row per table.
+    let mut master_rows: Vec<(i64, Vec<Value>)> = Vec::new();
+    for (i, t) in tables.iter().enumerate() {
+        let cells: Vec<(i64, Vec<u8>)> = t
+            .rows
+            .iter()
+            .map(|(rowid, values)| (*rowid, w.leaf_cell(*rowid, &encode_record(values))))
+            .collect();
+        let root = w.build_btree(&cells)?;
+        master_rows.push((
+            (i + 1) as i64,
+            vec![
+                Value::Text("table".into()),
+                Value::Text(t.name.clone()),
+                Value::Text(t.name.clone()),
+                Value::Int(root as i64),
+                Value::Text(t.sql.clone()),
+            ],
+        ));
+    }
+
+    // sqlite_master lives on page 1, a single leaf page whose header sits after
+    // the 100-byte database header.
+    let master_cells: Vec<(i64, Vec<u8>)> = master_rows
+        .iter()
+        .map(|(rowid, values)| (*rowid, w.leaf_cell(*rowid, &encode_record(values))))
+        .collect();
+    let page1 = w.render_leaf(100, &master_cells)?;
+    w.pages.insert(1, page1);
+
+    let total_pages = *w.pages.keys().max().unwrap_or(&1);
+    let mut out = vec![0u8; total_pages as usize * WRITE_PAGE_SIZE];
+    for (n, bytes) in &w.pages {
+        let start = (*n as usize - 1) * WRITE_PAGE_SIZE;
+        out[start..start + WRITE_PAGE_SIZE].copy_from_slice(bytes);
+    }
+    write_db_header(&mut out, total_pages, application_id, user_version);
+    Ok(out)
+}
+
+struct Writer {
+    pages: std::collections::BTreeMap<u32, Vec<u8>>,
+    next_page: u32,
+}
+
+impl Writer {
+    fn alloc(&mut self) -> u32 {
+        let p = self.next_page;
+        self.next_page += 1;
+        p
+    }
+
+    /// Assemble one leaf-cell's on-page bytes: `varint(payload_len)
+    /// varint(rowid) [inline payload] [overflow-page]`, spilling to overflow
+    /// pages when the record is too large for the page.
+    fn leaf_cell(&mut self, rowid: i64, record: &[u8]) -> Vec<u8> {
+        let u = WRITE_PAGE_SIZE;
+        let max_local = u - 35;
+        let (local, overflow) = if record.len() <= max_local {
+            (record.len(), false)
+        } else {
+            let min_local = ((u - 12) * 32 / 255) - 23;
+            let k = min_local + (record.len() - min_local) % (u - 4);
+            (if k <= max_local { k } else { min_local }, true)
+        };
+
+        let mut cell = Vec::new();
+        write_varint(&mut cell, record.len() as u64);
+        write_varint(&mut cell, rowid as u64);
+        cell.extend_from_slice(&record[..local]);
+        if overflow {
+            let first = self.write_overflow(&record[local..]);
+            cell.extend_from_slice(&first.to_be_bytes());
+        }
+        cell
+    }
+
+    fn write_overflow(&mut self, data: &[u8]) -> u32 {
+        let cap = WRITE_PAGE_SIZE - 4;
+        let n = data.len().div_ceil(cap);
+        let page_nos: Vec<u32> = (0..n).map(|_| self.alloc()).collect();
+        for i in 0..n {
+            let mut page = vec![0u8; WRITE_PAGE_SIZE];
+            let next = if i + 1 < n { page_nos[i + 1] } else { 0 };
+            page[0..4].copy_from_slice(&next.to_be_bytes());
+            let start = i * cap;
+            let end = (start + cap).min(data.len());
+            page[4..4 + (end - start)].copy_from_slice(&data[start..end]);
+            self.pages.insert(page_nos[i], page);
+        }
+        page_nos[0]
+    }
+
+    /// Build a table b-tree from rowid-ordered cells; returns the root page.
+    fn build_btree(&mut self, cells: &[(i64, Vec<u8>)]) -> Result<u32> {
+        let mut level = self.pack_leaves(cells)?;
+        while level.len() > 1 {
+            level = self.pack_interior(&level)?;
+        }
+        Ok(level[0].0)
+    }
+
+    /// Pack cells into leaf pages; returns `(page, max_rowid)` per page.
+    fn pack_leaves(&mut self, cells: &[(i64, Vec<u8>)]) -> Result<Vec<(u32, i64)>> {
+        let cap = WRITE_PAGE_SIZE - 8;
+        let mut out = Vec::new();
+        let mut i = 0;
+        // An empty table still needs one (empty) leaf page as its root.
+        if cells.is_empty() {
+            let page_no = self.alloc();
+            let page = self.render_leaf_at(0, &[])?;
+            self.pages.insert(page_no, page);
+            return Ok(vec![(page_no, 0)]);
+        }
+        while i < cells.len() {
+            let mut used = 0;
+            let mut group: Vec<&(i64, Vec<u8>)> = Vec::new();
+            while i < cells.len() {
+                let sz = 2 + cells[i].1.len();
+                if !group.is_empty() && used + sz > cap {
+                    break;
+                }
+                if sz > cap {
+                    return err("cell too large to fit a page");
+                }
+                used += sz;
+                group.push(&cells[i]);
+                i += 1;
+            }
+            let page_no = self.alloc();
+            let page = self.render_leaf_at(0, &group)?;
+            self.pages.insert(page_no, page);
+            out.push((page_no, group.last().unwrap().0));
+        }
+        Ok(out)
+    }
+
+    /// One interior level over `children` (`(page, max_rowid)`).
+    fn pack_interior(&mut self, children: &[(u32, i64)]) -> Result<Vec<(u32, i64)>> {
+        let cap = WRITE_PAGE_SIZE - 12;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < children.len() {
+            let mut used = 0;
+            let mut j = i;
+            while j < children.len() {
+                let cost = 2 + 4 + varint_len(children[j].1 as u64);
+                if j > i && used + cost > cap {
+                    break;
+                }
+                used += cost;
+                j += 1;
+            }
+            let group = &children[i..j];
+            let page_no = self.render_interior(group);
+            out.push((page_no, group.last().unwrap().1));
+            i = j;
+        }
+        Ok(out)
+    }
+
+    fn render_leaf(&self, header_offset: usize, cells: &[(i64, Vec<u8>)]) -> Result<Vec<u8>> {
+        let refs: Vec<&(i64, Vec<u8>)> = cells.iter().collect();
+        self.render_leaf_at(header_offset, &refs)
+    }
+
+    fn render_leaf_at(&self, header_offset: usize, cells: &[&(i64, Vec<u8>)]) -> Result<Vec<u8>> {
+        let mut page = vec![0u8; WRITE_PAGE_SIZE];
+        let mut content = WRITE_PAGE_SIZE;
+        let mut ptrs = Vec::with_capacity(cells.len());
+        for (_, cell) in cells {
+            content -= cell.len();
+            page[content..content + cell.len()].copy_from_slice(cell);
+            ptrs.push(content as u16);
+        }
+        if header_offset + 8 + 2 * cells.len() > content {
+            return err("leaf page overflow");
+        }
+        page[header_offset] = 0x0d;
+        page[header_offset + 3..header_offset + 5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+        page[header_offset + 5..header_offset + 7].copy_from_slice(&(content as u16).to_be_bytes());
+        for (k, p) in ptrs.iter().enumerate() {
+            let at = header_offset + 8 + k * 2;
+            page[at..at + 2].copy_from_slice(&p.to_be_bytes());
+        }
+        Ok(page)
+    }
+
+    fn render_interior(&mut self, group: &[(u32, i64)]) -> u32 {
+        let page_no = self.alloc();
+        let mut page = vec![0u8; WRITE_PAGE_SIZE];
+        let right = group.last().unwrap().0;
+
+        let cells: Vec<Vec<u8>> = group[..group.len() - 1]
+            .iter()
+            .map(|(child, key)| {
+                let mut c = child.to_be_bytes().to_vec();
+                write_varint(&mut c, *key as u64);
+                c
+            })
+            .collect();
+
+        let mut content = WRITE_PAGE_SIZE;
+        let mut ptrs = Vec::with_capacity(cells.len());
+        for cell in &cells {
+            content -= cell.len();
+            page[content..content + cell.len()].copy_from_slice(cell);
+            ptrs.push(content as u16);
+        }
+        page[0] = 0x05;
+        page[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+        page[5..7].copy_from_slice(&(content as u16).to_be_bytes());
+        page[8..12].copy_from_slice(&right.to_be_bytes());
+        for (k, p) in ptrs.iter().enumerate() {
+            page[12 + k * 2..12 + k * 2 + 2].copy_from_slice(&p.to_be_bytes());
+        }
+        self.pages.insert(page_no, page);
+        page_no
+    }
+}
+
+/// Encode a row into the SQLite record format: `varint(header_len)` + serial
+/// types + value bodies.
+fn encode_record(values: &[Value]) -> Vec<u8> {
+    let mut serials = Vec::new();
+    let mut body = Vec::new();
+    for v in values {
+        let (serial, bytes) = encode_value(v);
+        write_varint(&mut serials, serial);
+        body.extend_from_slice(&bytes);
+    }
+    // header_len includes its own varint; solve the tiny fixpoint.
+    let mut header_len = serials.len() + 1;
+    while varint_len(header_len as u64) + serials.len() != header_len {
+        header_len = varint_len(header_len as u64) + serials.len();
+    }
+    let mut out = Vec::new();
+    write_varint(&mut out, header_len as u64);
+    out.extend_from_slice(&serials);
+    out.extend_from_slice(&body);
+    out
+}
+
+fn encode_value(v: &Value) -> (u64, Vec<u8>) {
+    match v {
+        Value::Null => (0, Vec::new()),
+        Value::Int(0) => (8, Vec::new()),
+        Value::Int(1) => (9, Vec::new()),
+        Value::Int(n) => (6, n.to_be_bytes().to_vec()),
+        Value::Real(f) => (7, f.to_be_bytes().to_vec()),
+        Value::Text(s) => (13 + 2 * s.len() as u64, s.as_bytes().to_vec()),
+        Value::Blob(b) => (12 + 2 * b.len() as u64, b.clone()),
+    }
+}
+
+fn write_varint(out: &mut Vec<u8>, mut v: u64) {
+    if v & 0xff00_0000_0000_0000 != 0 {
+        // 9-byte form: 8 groups of 7 bits then a full trailing byte.
+        let mut buf = [0u8; 9];
+        buf[8] = (v & 0xff) as u8;
+        v >>= 8;
+        for j in (0..8).rev() {
+            buf[j] = ((v & 0x7f) | 0x80) as u8;
+            v >>= 7;
+        }
+        out.extend_from_slice(&buf);
+        return;
+    }
+    let mut groups = Vec::new();
+    loop {
+        groups.push((v & 0x7f) as u8);
+        v >>= 7;
+        if v == 0 {
+            break;
+        }
+    }
+    for k in (0..groups.len()).rev() {
+        let b = if k == 0 { groups[k] } else { groups[k] | 0x80 };
+        out.push(b);
+    }
+}
+
+fn varint_len(v: u64) -> usize {
+    let mut tmp = Vec::new();
+    write_varint(&mut tmp, v);
+    tmp.len()
+}
+
+/// Fill in the 100-byte database header on page 1.
+fn write_db_header(out: &mut [u8], total_pages: u32, application_id: u32, user_version: u32) {
+    out[0..16].copy_from_slice(HEADER_MAGIC);
+    out[16..18].copy_from_slice(&(WRITE_PAGE_SIZE as u16).to_be_bytes());
+    out[18] = 1; // write version (legacy)
+    out[19] = 1; // read version (legacy)
+    out[20] = 0; // reserved bytes per page
+    out[21] = 64; // max embedded payload fraction
+    out[22] = 32; // min embedded payload fraction
+    out[23] = 32; // leaf payload fraction
+    out[24..28].copy_from_slice(&1u32.to_be_bytes()); // file change counter
+    out[28..32].copy_from_slice(&total_pages.to_be_bytes());
+    out[40..44].copy_from_slice(&1u32.to_be_bytes()); // schema cookie
+    out[44..48].copy_from_slice(&4u32.to_be_bytes()); // schema format
+    out[56..60].copy_from_slice(&1u32.to_be_bytes()); // text encoding = UTF-8
+    out[60..64].copy_from_slice(&user_version.to_be_bytes());
+    out[68..72].copy_from_slice(&application_id.to_be_bytes());
+    out[92..96].copy_from_slice(&1u32.to_be_bytes()); // version-valid-for
+    out[96..100].copy_from_slice(&3_045_000u32.to_be_bytes()); // SQLITE_VERSION_NUMBER
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -442,6 +779,45 @@ mod tests {
         let (cols, alias) = parse_columns(sql);
         assert_eq!(cols, vec!["fid", "geom", "name", "pop", "score"]);
         assert_eq!(alias, Some(0));
+    }
+
+    #[test]
+    fn writer_round_trips_through_reader() {
+        // A table with a rowid alias, mixed types, and a large blob that forces
+        // an overflow chain; plus enough rows to span multiple leaf pages.
+        let big = vec![0xABu8; 9000];
+        let mut rows = Vec::new();
+        for i in 1..=300i64 {
+            rows.push((
+                i,
+                vec![
+                    Value::Null, // id INTEGER PRIMARY KEY -> carried by the rowid
+                    Value::Text(format!("row {i}")),
+                    Value::Int(i * 10),
+                    Value::Real(i as f64 / 4.0),
+                    if i == 1 { Value::Blob(big.clone()) } else { Value::Null },
+                ],
+            ));
+        }
+        let spec = TableSpec {
+            name: "t".into(),
+            sql: r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "name" TEXT, "n" INTEGER, "r" REAL, "data" BLOB)"#.into(),
+            rows,
+        };
+        let bytes = write_database(&[spec], 0, 0).unwrap();
+
+        let db = Database::open(&bytes).unwrap();
+        let table = db.tables().unwrap().into_iter().find(|t| t.name == "t").unwrap();
+        assert_eq!(table.columns, vec!["id", "name", "n", "r", "data"]);
+        let out = db.read_rows(&table).unwrap();
+        assert_eq!(out.len(), 300);
+        assert_eq!(out[0][0], Value::Int(1)); // rowid alias filled
+        assert_eq!(out[0][1], Value::Text("row 1".into()));
+        assert_eq!(out[0][2], Value::Int(10));
+        assert_eq!(out[0][3], Value::Real(0.25));
+        assert_eq!(out[0][4], Value::Blob(big)); // survived the overflow chain
+        assert_eq!(out[299][0], Value::Int(300));
+        assert_eq!(out[299][2], Value::Int(3000));
     }
 
     #[test]

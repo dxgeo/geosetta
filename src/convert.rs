@@ -13,11 +13,11 @@ use crate::{csv, flatgeobuf, geojson, json, parquet};
 
 /// Convert `input` bytes from one format to another via the Feature IR.
 pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
-    write_features(to, &read(from, input)?)
+    write_features(to, &read_features(from, input)?)
 }
 
 /// Decode any supported input format into the shared Feature IR.
-fn read(format: Format, input: &[u8]) -> Result<FeatureCollection> {
+pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> {
     match format {
         Format::GeoJson => {
             let text = std::str::from_utf8(input)

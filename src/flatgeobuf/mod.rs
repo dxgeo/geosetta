@@ -7,5 +7,7 @@
 //! `plans/flatgeobuf.org`. The `.fbs` schema field indices are encoded below.
 
 mod reader;
+mod writer;
 
 pub use reader::read;
+pub use writer::write;

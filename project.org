@@ -21,13 +21,15 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.10.0*.
+Current version: *0.11.0*.
 
-*FlatGeobuf* can be read (=.fgb= → anything), built on a from-scratch
-FlatBuffers reader; the write direction is not done yet. All conversion now
-routes through a shared feature IR (=read(from) → FeatureCollection → write(to)=),
-so any input format composes with any output format automatically — reading FGB
-gives both FGB→GeoJSON and FGB→GeoParquet without a bespoke path.
+*FlatGeobuf* is fully supported, both directions, built on a from-scratch
+FlatBuffers reader and builder. All conversion routes through a shared feature
+IR (=read(from) → FeatureCollection → write(to)=), so every format composes with
+every other automatically: GeoJSON, GeoParquet, and FlatGeobuf convert to and
+from each other in any combination, with no per-pair code. FGB is written
+index-less (=index_node_size = 0=); GDAL/DuckDB read our output correctly in
+both directions.
 
 Both directions of the *GeoJSON ⇄ GeoParquet* path are implemented and working,
 written in Rust using only the standard library (zero external crates, in
@@ -56,10 +58,13 @@ specification rather than pulled from a crate:
   to and from; all spokes depend on it, not on each other
 - =json/= :: standard-library JSON parser and value model
 - =geojson/= :: GeoJSON parsing and serialization (both directions)
-- =flatbuffers.rs= :: a minimal, from-scratch FlatBuffers reader (vtables,
-  offsets, vectors, strings, tables)
-- =flatgeobuf/= :: FlatGeobuf reader — magic + header, spatial-index skip, and
-  feature/geometry/property decode via =flatbuffers.rs=
+- =schema.rs= :: property-column inference (type lattice, per-row cells) shared
+  by the Parquet and FlatGeobuf writers
+- =flatbuffers.rs= :: a minimal, from-scratch FlatBuffers reader *and* builder
+  (vtables, offsets, alignment, vectors, strings, tables)
+- =flatgeobuf/= :: FlatGeobuf reader and writer — magic + header, spatial-index
+  skip on read (index-less on write), and feature/geometry/property coding via
+  =flatbuffers.rs=
 - =geometry/= :: geometry model, bounding box, and WKB (Well-Known Binary)
   encoder/decoder — the shared geometry hub
 - =compress/= :: format-agnostic =bytes -> bytes= codecs implemented from spec —
@@ -84,6 +89,8 @@ panto input.geojson output.parquet   # GeoJSON    -> GeoParquet
 panto input.parquet output.geojson   # GeoParquet -> GeoJSON
 panto input.fgb     output.geojson   # FlatGeobuf -> GeoJSON
 panto input.fgb     output.parquet   # FlatGeobuf -> GeoParquet
+panto input.geojson output.fgb       # GeoJSON    -> FlatGeobuf
+panto input.parquet output.fgb       # GeoParquet -> FlatGeobuf
 # formats may also be given explicitly:
 panto in.txt out.bin --from geojson --to parquet
 #+end_src
@@ -123,11 +130,11 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
-- *FlatGeobuf write direction* — the reader is done; the writer needs a
-  from-scratch FlatBuffers *writer* (vtables/offsets/alignment) and, optionally,
-  the packed Hilbert R-tree index. See [[file:plans/flatgeobuf.org][plans/flatgeobuf.org]].
 - *More format spokes* — WKT/CSV are small, open, dependency-free next additions
-  toward the any-to-any hub.
+  toward the any-to-any hub. GeoPackage (SQLite) is a larger one.
+- *FlatGeobuf spatial index* (optional) — write the packed Hilbert R-tree so
+  other tools get fast spatial queries; we currently write index-less files.
+  See [[file:plans/flatgeobuf.org][plans/flatgeobuf.org]].
 - *Deferred, lower-priority GeoParquet milestones* (parked in
   [[file:plans/arbitrary-geoparquet.org][plans/arbitrary-geoparquet.org]]; diminishing returns / testing friction):
   - =DATA_PAGE_V2= — DuckDB doesn't emit it; a test fixture needs pyarrow.

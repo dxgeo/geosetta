@@ -34,16 +34,14 @@ fn write(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
     match format {
         Format::GeoJson => Ok(geojson::to_json(fc).to_json_string().into_bytes()),
         Format::Parquet => Ok(features_to_parquet(fc)),
-        Format::FlatGeobuf => {
-            Err(Error::Usage("writing FlatGeobuf is not supported yet".into()))
-        }
+        Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
     }
 }
 
 /// Feature IR → GeoParquet bytes.
 fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
     // Property columns (schema inferred by scanning all features).
-    let columns = parquet::infer_columns(&fc.features);
+    let columns = crate::schema::infer_columns(&fc.features);
 
     // Geometry column: WKB per feature, plus bbox and the set of types.
     let mut bbox = Bbox::empty();
@@ -330,5 +328,34 @@ mod tests {
             g
         };
         assert_eq!(geoms(&direct), geoms(&via_parquet));
+    }
+
+    fn sorted_geoms(fc: &FeatureCollection) -> Vec<Option<crate::geometry::Geometry>> {
+        let mut g: Vec<_> = fc.features.iter().map(|f| f.geometry.clone()).collect();
+        g.sort_by_key(|g| format!("{g:?}"));
+        g
+    }
+
+    #[test]
+    fn geojson_to_flatgeobuf_preserves_features() {
+        // GeoJSON -> FGB (our writer) -> back, via the hub.
+        let fgb = convert(Format::GeoJson, Format::FlatGeobuf, SAMPLE.as_bytes()).unwrap();
+        let back = fgb_to_fc(&fgb);
+        let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
+        assert_eq!(back.features.len(), orig.features.len());
+        for (o, b) in orig.features.iter().zip(&back.features) {
+            assert_eq!(o.geometry, b.geometry);
+        }
+    }
+
+    #[test]
+    fn flatgeobuf_write_round_trips_all_geometry_types() {
+        // Read a DuckDB FGB, rewrite it with our writer, read again — all
+        // geometry types (incl. polygon-with-hole and multipolygon) survive.
+        let src = include_bytes!("../tests/fixtures/duckdb_geoms.fgb");
+        let original = fgb_to_fc(src);
+        let ours = convert(Format::FlatGeobuf, Format::FlatGeobuf, src).unwrap();
+        let reread = fgb_to_fc(&ours);
+        assert_eq!(sorted_geoms(&original), sorted_geoms(&reread));
     }
 }

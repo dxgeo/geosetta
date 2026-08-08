@@ -89,14 +89,22 @@ FGB→GeoJSON and FGB→GeoParquet both light up) → validate against DuckDB-wr
 FGB → 3 (FlatBuffers writer + FGB writer) → validate by having DuckDB read our
 output. The spatial index (write side) is a later, optional milestone.
 
-*** Status
-*Read direction DONE* (items 1, 2, 4). =src/flatbuffers.rs= (reader),
-=src/flatgeobuf/= (FGB reader), and hub routing in =convert.rs= are implemented
-and validated against DuckDB-written FGB: Point / LineString / Polygon-with-hole
-/ MultiPolygon / MultiPoint and mixed-type files decode correctly, and both
-FGB→GeoJSON and FGB→GeoParquet work. Committed fixtures:
+*** Status — *DONE* (both directions)
+Read (items 1, 2, 4) and write (item 3) are implemented and validated:
+- =src/flatbuffers.rs= — a from-scratch FlatBuffers *reader and builder*
+  (back-to-front, vtables, alignment, offsets), each round-tripped against the
+  other in unit tests.
+- =src/flatgeobuf/= — FGB reader and writer. Column inference is shared via the
+  hoisted =src/schema.rs= (moved out of =parquet/=), so both writers use it.
+- Hub routing in =convert.rs=: any format → FGB and FGB → any format.
+Validated against DuckDB's GDAL FlatGeobuf driver in *both* directions —
+Point / LineString / Polygon-with-hole / MultiPolygon / MultiLineString /
+MultiPoint decode from and encode to files GDAL reads correctly. Fixtures:
 =tests/fixtures/duckdb_geoms.fgb=, =duckdb_props.fgb=.
-*Remaining:* item 3, the write direction (FlatBuffers writer + FGB writer).
+
+*Deferred (optional):* the packed Hilbert R-tree spatial index on write — files
+are written with =index_node_size = 0= (valid, index-less), which GDAL/DuckDB
+read fine; an index would speed up spatial queries in other tools.
 
 ** TESTING
 - Fixtures written by DuckDB (=DRIVER 'FlatGeobuf'=), committed small under

@@ -14,6 +14,7 @@ mod geojson;
 mod geometry;
 mod json;
 mod parquet;
+mod schema;
 
 use error::{Error, Result};
 

@@ -12,7 +12,7 @@
 //! so each page body is `[u32 len][RLE definition levels][PLAIN values]`.
 
 use super::geo::GEOMETRY_COLUMN;
-use super::schema::{Cell, Column, ColumnType};
+use crate::schema::{Cell, Column, ColumnType};
 use crate::compress::snappy;
 use super::thrift::{ct, CompactWriter};
 use super::types::{codec, converted, encoding, page, ptype, repetition};

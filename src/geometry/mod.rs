@@ -45,6 +45,13 @@ impl Geometry {
         }
     }
 
+    /// This geometry's own bounding box.
+    pub fn bbox(&self) -> Bbox {
+        let mut b = Bbox::empty();
+        self.extend_bbox(&mut b);
+        b
+    }
+
     /// Fold every coordinate in the geometry into `bbox`.
     pub fn extend_bbox(&self, bbox: &mut Bbox) {
         match self {

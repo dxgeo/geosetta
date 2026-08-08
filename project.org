@@ -21,7 +21,7 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.14.0*.
+Current version: *0.15.0*.
 
 Six formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -30,7 +30,7 @@ every other automatically — no per-pair code:
 - *GeoJSON* (read + write)
 - *GeoParquet* (read + write; reads common foreign files — see below)
 - *FlatGeobuf* (read + write) on a from-scratch FlatBuffers reader and builder;
-  written index-less (=index_node_size = 0=), which GDAL/DuckDB read fine
+  written with a *packed Hilbert R-tree* spatial index (GDAL bbox queries work)
 - *CSV* with a WKT geometry column (read + write), types lightly inferred
 - *WKT* — one geometry per line (read + write)
 - *GeoPackage* (read + write) on a from-scratch SQLite reader *and* writer. A
@@ -73,13 +73,15 @@ specification rather than pulled from a crate:
   by the Parquet and FlatGeobuf writers
 - =flatbuffers.rs= :: a minimal, from-scratch FlatBuffers reader *and* builder
   (vtables, offsets, alignment, vectors, strings, tables)
-- =flatgeobuf/= :: FlatGeobuf reader and writer — magic + header, spatial-index
-  skip on read (index-less on write), and feature/geometry/property coding via
-  =flatbuffers.rs=
+- =flatgeobuf/= :: FlatGeobuf reader and writer — magic + header, the packed
+  Hilbert R-tree spatial index (skipped on read, built on write via
+  =spatial.rs=), and feature/geometry/property coding via =flatbuffers.rs=
 - =geometry/= :: geometry model, bounding box, and the shared geometry codecs —
   WKB (=wkb.rs=) and WKT (=wkt.rs=), each encoder + decoder
 - =csv.rs= :: CSV spoke — RFC 4180 rows with a WKT geometry column and
   type-inferred property columns
+- =spatial.rs= :: shared spatial-ordering primitives — a Hilbert-curve encoder
+  and feature-locality sort, used to build FlatGeobuf's packed R-tree
 - =sqlite.rs= :: a minimal, from-scratch SQLite reader *and* whole-file writer
   (header, b-tree walk/pack with overflow chains, record coding, CREATE TABLE
   parsing) — the file our GeoPackage output passes =integrity_check= on
@@ -155,11 +157,10 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
-- *Spatial indexing* — shared per-feature bbox + Hilbert-curve primitives, then
-  the FlatGeobuf packed Hilbert R-tree on write, optional GeoParquet Hilbert
-  clustering, and (stretch) the GeoPackage R*Tree extension. Scoped in
-  [[file:plans/spatial-index.org][plans/spatial-index.org]]. Our FGB/GPKG output is currently valid but
-  index-less.
+- *Spatial indexing* — the shared Hilbert primitives and the FlatGeobuf packed
+  R-tree are done; optional GeoParquet Hilbert row clustering and the (stretch)
+  GeoPackage R*Tree extension remain, scoped in
+  [[file:plans/spatial-index.org][plans/spatial-index.org]]. Our GPKG output is still index-less.
 - *More format spokes* — Shapefile is another classic (multi-file .shp/.dbf/.shx).
 - *FlatGeobuf spatial index* (optional) — write the packed Hilbert R-tree so
   other tools get fast spatial queries; we currently write index-less files.

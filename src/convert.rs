@@ -377,14 +377,13 @@ mod tests {
 
     #[test]
     fn geojson_to_flatgeobuf_preserves_features() {
-        // GeoJSON -> FGB (our writer) -> back, via the hub.
+        // GeoJSON -> FGB (our writer) -> back, via the hub. FGB now writes a
+        // packed Hilbert R-tree, which reorders features, so compare as a set.
         let fgb = convert(Format::GeoJson, Format::FlatGeobuf, SAMPLE.as_bytes()).unwrap();
         let back = fgb_to_fc(&fgb);
         let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
         assert_eq!(back.features.len(), orig.features.len());
-        for (o, b) in orig.features.iter().zip(&back.features) {
-            assert_eq!(o.geometry, b.geometry);
-        }
+        assert_eq!(sorted_geoms(&orig), sorted_geoms(&back));
     }
 
     #[test]

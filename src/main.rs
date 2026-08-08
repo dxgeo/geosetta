@@ -17,6 +17,7 @@ mod geopackage;
 mod json;
 mod parquet;
 mod schema;
+mod spatial;
 mod sqlite;
 
 use cli::Format;

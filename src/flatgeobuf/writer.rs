@@ -10,6 +10,11 @@ use crate::schema::{Cell, ColumnType, infer_columns};
 
 const MAGIC: [u8; 8] = [b'f', b'g', b'b', 3, b'f', b'g', b'b', 1];
 
+/// Packed R-tree fan-out (FlatGeobuf's default) and the on-disk NodeItem size
+/// (4 × f64 bbox + u64 offset).
+const NODE_SIZE: u16 = 16;
+const NODE_ITEM_SIZE: usize = 40;
+
 // GeometryType enum (ubyte).
 mod gtype {
     pub const UNKNOWN: u8 = 0;
@@ -81,20 +86,43 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
         gtype::UNKNOWN
     };
 
+    // A packed Hilbert R-tree needs a bbox per feature, so index only when every
+    // feature has geometry; otherwise write index-less in input order.
+    let feature_bboxes: Vec<Bbox> = fc.features.iter().map(feature_bbox).collect();
+    let indexed = !fc.features.is_empty() && fc.features.iter().all(|f| f.geometry.is_some());
+    let order: Vec<usize> = if indexed {
+        crate::spatial::hilbert_order(&feature_bboxes)
+    } else {
+        (0..fc.features.len()).collect()
+    };
+    let node_size = if indexed { NODE_SIZE } else { 0 };
+
+    // Encode features in `order`, recording each framed feature's byte offset
+    // within the feature section (for the R-tree leaf pointers).
+    let mut feature_section = Vec::new();
+    let mut offsets = Vec::with_capacity(order.len());
+    for &idx in &order {
+        offsets.push(feature_section.len() as u64);
+        let bytes = build_feature(fc.features[idx].geometry.as_ref(), &columns, idx);
+        feature_section.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        feature_section.extend_from_slice(&bytes);
+    }
+
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-
-    let header = build_header(&columns, &bbox, header_type, fc.features.len() as u64);
+    let header = build_header(&columns, &bbox, header_type, fc.features.len() as u64, node_size);
     out.extend_from_slice(&(header.len() as u32).to_le_bytes());
     out.extend_from_slice(&header);
-    // No spatial index (index_node_size = 0).
-
-    for (row, feat) in fc.features.iter().enumerate() {
-        let bytes = build_feature(feat.geometry.as_ref(), &columns, row);
-        out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
-        out.extend_from_slice(&bytes);
+    if indexed {
+        let ordered: Vec<Bbox> = order.iter().map(|&i| feature_bboxes[i]).collect();
+        out.extend_from_slice(&packed_rtree(&ordered, &offsets, node_size));
     }
+    out.extend_from_slice(&feature_section);
     out
+}
+
+fn feature_bbox(f: &crate::feature::Feature) -> Bbox {
+    f.geometry.as_ref().map(|g| g.bbox()).unwrap_or_else(Bbox::empty)
 }
 
 fn build_header(
@@ -102,6 +130,7 @@ fn build_header(
     bbox: &Bbox,
     header_type: u8,
     features_count: u64,
+    node_size: u16,
 ) -> Vec<u8> {
     let mut b = Builder::new();
 
@@ -127,8 +156,9 @@ fn build_header(
     b.add_u8(header::GEOMETRY_TYPE, header_type, gtype::UNKNOWN);
     b.add_offset(header::COLUMNS, columns_vec);
     b.add_u64(header::FEATURES_COUNT, features_count, 0);
-    // Default index_node_size is 16; write 0 to declare "no index".
-    b.add_u16(header::INDEX_NODE_SIZE, 0, 16);
+    // Default index_node_size is 16, so an indexed file (16) omits the field and
+    // an index-less one writes 0.
+    b.add_u16(header::INDEX_NODE_SIZE, node_size, 16);
     let root = b.end_table();
     b.finish(root)
 }
@@ -272,4 +302,145 @@ fn ring_ends(rings: &[Vec<Position>]) -> Vec<u32> {
         ends.push(total);
     }
     ends
+}
+
+// --- packed Hilbert R-tree -------------------------------------------------
+
+/// Build the FlatGeobuf packed Hilbert R-tree. `bboxes` and `offsets` are in
+/// Hilbert order; `offsets[i]` is feature i's byte offset in the feature
+/// section. Returns the node array (`num_nodes * 40` bytes), root first down to
+/// leaves — the layout GDAL and our reader expect.
+fn packed_rtree(bboxes: &[Bbox], offsets: &[u64], node_size: u16) -> Vec<u8> {
+    let node_size = (node_size as usize).max(2);
+    let num_items = bboxes.len();
+
+    // Level sizes, leaves first up to the single-node root.
+    let mut level_sizes = vec![num_items];
+    let mut n = num_items;
+    let mut num_nodes = num_items;
+    loop {
+        n = n.div_ceil(node_size);
+        num_nodes += n;
+        level_sizes.push(n);
+        if n == 1 {
+            break;
+        }
+    }
+    // Each level's [start, end) in the node array (same leaves-first order).
+    let mut level_bounds = Vec::with_capacity(level_sizes.len());
+    let mut acc = num_nodes;
+    for &size in &level_sizes {
+        acc -= size;
+        level_bounds.push((acc, acc + size));
+    }
+
+    let mut nodes = vec![Node::empty(); num_nodes];
+    let leaf_start = num_nodes - num_items;
+    for i in 0..num_items {
+        nodes[leaf_start + i] = Node::leaf(&bboxes[i], offsets[i]);
+    }
+    // Build parents bottom-up; a parent unions up to node_size children and
+    // stores the first child's node index as its offset.
+    for level in 0..level_bounds.len() - 1 {
+        let (mut pos, end) = level_bounds[level];
+        let mut parent = level_bounds[level + 1].0;
+        while pos < end {
+            let mut node = Node::internal(pos as u64);
+            let mut k = 0;
+            while k < node_size && pos < end {
+                node.expand(&nodes[pos]);
+                pos += 1;
+                k += 1;
+            }
+            nodes[parent] = node;
+            parent += 1;
+        }
+    }
+
+    let mut out = Vec::with_capacity(num_nodes * NODE_ITEM_SIZE);
+    for node in &nodes {
+        out.extend_from_slice(&node.min_x.to_le_bytes());
+        out.extend_from_slice(&node.min_y.to_le_bytes());
+        out.extend_from_slice(&node.max_x.to_le_bytes());
+        out.extend_from_slice(&node.max_y.to_le_bytes());
+        out.extend_from_slice(&node.offset.to_le_bytes());
+    }
+    out
+}
+
+#[derive(Clone)]
+struct Node {
+    min_x: f64,
+    min_y: f64,
+    max_x: f64,
+    max_y: f64,
+    offset: u64,
+}
+
+impl Node {
+    fn empty() -> Node {
+        Node {
+            min_x: f64::INFINITY,
+            min_y: f64::INFINITY,
+            max_x: f64::NEG_INFINITY,
+            max_y: f64::NEG_INFINITY,
+            offset: 0,
+        }
+    }
+    fn leaf(b: &Bbox, offset: u64) -> Node {
+        Node {
+            min_x: b.min_x,
+            min_y: b.min_y,
+            max_x: b.max_x,
+            max_y: b.max_y,
+            offset,
+        }
+    }
+    fn internal(offset: u64) -> Node {
+        Node {
+            offset,
+            ..Node::empty()
+        }
+    }
+    fn expand(&mut self, o: &Node) {
+        self.min_x = self.min_x.min(o.min_x);
+        self.min_y = self.min_y.min(o.min_y);
+        self.max_x = self.max_x.max(o.max_x);
+        self.max_y = self.max_y.max(o.max_y);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feature::Feature;
+    use crate::json::JsonValue;
+
+    #[test]
+    fn indexed_round_trip_many_points() {
+        // 50 points -> a packed R-tree with interior nodes. index_node_size
+        // defaults to 16 (omitted from the header), so on read the index size is
+        // computed and skipped; a correct round trip proves that sizing.
+        let features: Vec<Feature> = (0..50)
+            .map(|i| Feature {
+                geometry: Some(Geometry::Point([(i % 10) as f64, (i / 10) as f64])),
+                properties: vec![(
+                    "id".into(),
+                    JsonValue::Number { value: i as f64, is_int: true },
+                )],
+            })
+            .collect();
+        let bytes = write(&FeatureCollection { features });
+
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+        assert_eq!(back.features.len(), 50);
+        // Features are Hilbert-reordered, so check the id set is intact.
+        let mut ids: Vec<i64> = back
+            .features
+            .iter()
+            .map(|f| f.properties.iter().find(|(k, _)| k == "id").unwrap().1.as_f64().unwrap() as i64)
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, (0..50).collect::<Vec<_>>());
+    }
 }

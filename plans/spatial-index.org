@@ -39,14 +39,19 @@ The common threads: a *per-feature bounding box* and a *Hilbert curve encoding*
 
 ** MILESTONES (ordered)
 
-*** A. Foundation — bbox + Hilbert primitives
-=src/spatial/= with the per-feature bbox, the Hilbert encoder, and a
-"sort features by Hilbert over their combined extent" helper. Unit-test the
-Hilbert mapping against known values and check it's a bijection on a small grid.
-Small, self-contained, and unlocks the rest.
+*** A. Foundation — bbox + Hilbert primitives — *DONE*
+=src/spatial.rs= (=hilbert=, =hilbert_bbox=, =hilbert_order=) plus
+=Geometry::bbox()=. The Hilbert mapping uses FlatGeobuf's 16-bit convention;
+unit-tested as a bijection on a small grid and for clustering locality.
 
-*** B. FlatGeobuf packed Hilbert R-tree (write) — highest value
-Extend =flatgeobuf/writer.rs=:
+*** B. FlatGeobuf packed Hilbert R-tree (write) — *DONE*
+Implemented in =flatgeobuf/writer.rs=: features are Hilbert-sorted, the packed
+R-tree is built bottom-up (=NodeItem= = 4 f64 bbox + u64 offset, root first down
+to leaves) and written between header and features, with =index_node_size = 16=.
+Indexed only when every feature has geometry (else index-less, input order).
+Validated: GDAL reads our indexed =.fgb= and a bbox-filtered =ST_Read= returns
+the correct subset; our own reader still round-trips (it skips an index whose
+computed size must now match). The original design:
 - Sort features by Hilbert value (A) and write feature data in that order.
 - Build the *packed R-tree* bottom-up over the sorted features: leaves are one
   =NodeItem= per feature (=minX,minY,maxX,maxY= as 4 f64 + =offset= u64 = 40

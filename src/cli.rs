@@ -16,6 +16,7 @@ pub enum Format {
     FlatGeobuf,
     Csv,
     Wkt,
+    Gpkg,
 }
 
 impl Format {
@@ -27,6 +28,7 @@ impl Format {
             "flatgeobuf" | "fgb" => Ok(Format::FlatGeobuf),
             "csv" => Ok(Format::Csv),
             "wkt" => Ok(Format::Wkt),
+            "gpkg" | "geopackage" => Ok(Format::Gpkg),
             other => Err(Error::Usage(format!("unknown format \"{other}\""))),
         }
     }
@@ -40,7 +42,20 @@ impl Format {
             "fgb" => Some(Format::FlatGeobuf),
             "csv" => Some(Format::Csv),
             "wkt" => Some(Format::Wkt),
+            "gpkg" => Some(Format::Gpkg),
             _ => None,
+        }
+    }
+
+    /// The canonical file extension, used to name fan-out outputs.
+    pub fn extension(self) -> &'static str {
+        match self {
+            Format::GeoJson => "geojson",
+            Format::Parquet => "parquet",
+            Format::FlatGeobuf => "fgb",
+            Format::Csv => "csv",
+            Format::Wkt => "wkt",
+            Format::Gpkg => "gpkg",
         }
     }
 }
@@ -52,10 +67,12 @@ pub struct Args {
     pub output: String,
     pub from: Format,
     pub to: Format,
+    /// A specific GeoPackage layer to read (or the layer name when writing one).
+    pub layer: Option<String>,
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: panto <input> <output> [--from FMT] [--to FMT]";
+pub const USAGE: &str = "usage: panto <input> <output> [--from FMT] [--to FMT] [--layer NAME]";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -66,6 +83,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let mut positional: Vec<String> = Vec::new();
     let mut from: Option<Format> = None;
     let mut to: Option<Format> = None;
+    let mut layer: Option<String> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -81,6 +99,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
                     .next()
                     .ok_or_else(|| Error::Usage("--to needs a value".into()))?;
                 to = Some(Format::parse(&v)?);
+            }
+            "--layer" => {
+                layer = Some(
+                    iter.next()
+                        .ok_or_else(|| Error::Usage("--layer needs a value".into()))?,
+                );
             }
             other if other.starts_with('-') => {
                 return Err(Error::Usage(format!("unknown option \"{other}\"")));
@@ -107,6 +131,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         output,
         from,
         to,
+        layer,
     })
 }
 

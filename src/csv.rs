@@ -156,13 +156,13 @@ fn infer_value(cell: &str) -> JsonValue {
                 is_int: true,
             };
         }
-        if let Ok(f) = cell.parse::<f64>() {
-            if f.is_finite() {
-                return JsonValue::Number {
-                    value: f,
-                    is_int: false,
-                };
-            }
+        if let Ok(f) = cell.parse::<f64>()
+            && f.is_finite()
+        {
+            return JsonValue::Number {
+                value: f,
+                is_int: false,
+            };
         }
     }
     JsonValue::String(cell.to_string())

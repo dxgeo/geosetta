@@ -100,6 +100,22 @@ that still use the per-layer hub internally: read a layer → =FeatureCollection
 → =write(to, fc)=; or =read(from, input)= → upsert into the gpkg's layer set.
 Add =Format::Gpkg= and the =.gpkg= extension, and a =--layer= option to =Args=.
 
+** STATUS
+*Read direction DONE.* =src/sqlite.rs= (from-scratch SQLite reader: header,
+b-tree walk with overflow chains, record decode, CREATE TABLE column/rowid-alias
+parsing) and =src/geopackage/= (parse =gpkg_contents= / =gpkg_geometry_columns=,
+strip the GeoPackage Binary header → =from_wkb=, map each feature table to a
+=FeatureCollection=). CLI fan-out is wired with the decided naming rule (=--layer=,
+directory vs single-file). Validated against a DuckDB-written =.gpkg=: GPKG →
+GeoJSON / GeoParquet / CSV all work through the hub. Fixture:
+=tests/fixtures/points.gpkg=.
+
+*Remaining:* the write direction — the SQLite whole-file writer (item 2) and
+GeoPackage write + create/append (item 3-write). Until then =*→ gpkg= and
+=gpkg → gpkg= error cleanly. Multi-layer read fan-out (directory output) is
+implemented but not yet tested end-to-end — DuckDB's =COPY= overwrites, so a
+multi-layer fixture needs =ogr2ogr= or our own writer once it lands.
+
 ** SUGGESTED ORDER (read-first)
 1. SQLite reader (item 1) — validate by dumping tables/rows of a DuckDB-written
    =.gpkg=.

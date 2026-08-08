@@ -6,10 +6,6 @@
 //! pages, following overflow chains), and decodes the record format
 //! (serial-type varints → typed values). Multi-byte integers in the header and
 //! b-tree structures are big-endian.
-//!
-//! Standalone building block: consumed by the GeoPackage spoke (not yet wired),
-//! so the public API is allowed to be unused for now.
-#![allow(dead_code)]
 
 use crate::error::{Error, Result};
 
@@ -37,6 +33,13 @@ pub struct Table {
     /// Index of the `INTEGER PRIMARY KEY` column (a rowid alias), if any: its
     /// stored value is NULL and the real value is the rowid.
     rowid_alias: Option<usize>,
+}
+
+impl Table {
+    /// The index of the `INTEGER PRIMARY KEY` (rowid-alias) column, if any.
+    pub fn rowid_alias(&self) -> Option<usize> {
+        self.rowid_alias
+    }
 }
 
 pub struct Database<'a> {
@@ -96,18 +99,17 @@ impl<'a> Database<'a> {
             let kind = as_text(&row, 0);
             let root = as_int(&row, 3);
             let sql = as_text(&row, 4);
-            if kind.as_deref() == Some("table") {
-                if let (Some(name), Some(root), Some(sql)) = (as_text(&row, 1), root, sql) {
-                    if root > 0 {
-                        let (columns, rowid_alias) = parse_columns(&sql);
-                        tables.push(Table {
-                            name,
-                            columns,
-                            root_page: root as u32,
-                            rowid_alias,
-                        });
-                    }
-                }
+            if kind.as_deref() == Some("table")
+                && let (Some(name), Some(root), Some(sql)) = (as_text(&row, 1), root, sql)
+                && root > 0
+            {
+                let (columns, rowid_alias) = parse_columns(&sql);
+                tables.push(Table {
+                    name,
+                    columns,
+                    root_page: root as u32,
+                    rowid_alias,
+                });
             }
         }
         Ok(tables)
@@ -124,10 +126,10 @@ impl<'a> Database<'a> {
             let mut values = decode_record(&payload)?;
             values.resize(ncols, Value::Null); // pad/truncate to the column count
             values.truncate(ncols);
-            if let Some(i) = table.rowid_alias {
-                if matches!(values.get(i), Some(Value::Null)) {
-                    values[i] = Value::Int(rowid);
-                }
+            if let Some(i) = table.rowid_alias
+                && matches!(values.get(i), Some(Value::Null))
+            {
+                values[i] = Value::Int(rowid);
             }
             rows.push(values);
         }

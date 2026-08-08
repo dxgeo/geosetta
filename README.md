@@ -22,9 +22,9 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.12.0**.
+Current version: **0.13.0**.
 
-Five formats are supported, all routed through a shared feature IR
+Six formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
 every other automatically — no per-pair code:
 
@@ -34,9 +34,12 @@ every other automatically — no per-pair code:
     written index-less (`index_node_size = 0`), which GDAL/DuckDB read fine
 -   **CSV** with a WKT geometry column (read + write), types lightly inferred
 -   **WKT** — one geometry per line (read + write)
+-   **GeoPackage** (read; write pending) on a from-scratch SQLite reader. A `.gpkg`
+    is multi-layer, so reading fans out over all feature tables; the `--layer`
+    option and directory-vs-single-file output rules handle the fan-out.
 
 Any input converts to any output: e.g. CSV→GeoParquet, FlatGeobuf→GeoJSON,
-GeoParquet→FlatGeobuf all work. Validated against DuckDB / GDAL.
+GeoPackage→GeoParquet all work. Validated against DuckDB / GDAL.
 
 Both directions of the **GeoJSON ⇄ GeoParquet** path are implemented and working,
 written in Rust using only the standard library (zero external crates, in
@@ -78,6 +81,10 @@ specification rather than pulled from a crate:
     WKB (`wkb.rs`) and WKT (`wkt.rs`), each encoder + decoder
 -   **`csv.rs`:** CSV spoke — RFC 4180 rows with a WKT geometry column and
     type-inferred property columns
+-   **`sqlite.rs`:** a minimal, from-scratch read-only SQLite reader (header,
+    b-tree walk with overflow chains, record decode, CREATE TABLE parsing)
+-   **`geopackage/`:** GeoPackage reader on top of `sqlite.rs` — layer list from
+    `gpkg_contents`, geometry from the GeoPackage Binary header wrapping WKB
 -   **`compress/`:** format-agnostic `bytes -> bytes` codecs implemented from spec —
     Snappy, GZIP/DEFLATE (RFC 1951/1952), ZSTD (RFC 8878, FSE + Huffman +
     sequences), and LZ4 block. Not Parquet-specific, so reusable by future formats
@@ -105,6 +112,8 @@ features (heterogeneous or nested values fall back to a JSON string).
     panto input.parquet output.fgb       # GeoParquet -> FlatGeobuf
     panto input.csv     output.parquet   # CSV (WKT)  -> GeoParquet
     panto input.fgb     output.csv       # FlatGeobuf -> CSV (WKT)
+    panto input.gpkg    output.geojson   # GeoPackage -> GeoJSON (--layer NAME to pick one)
+    panto input.gpkg    out/             # multi-layer GeoPackage -> one file per layer
     # formats may also be given explicitly:
     panto in.txt out.bin --from geojson --to parquet
 
@@ -147,10 +156,10 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
--   **More format spokes** — GeoPackage is the natural next one (a from-scratch
-    SQLite reader/writer; multi-layer, so it's a layer-aware wrapper around the
-    single-layer IR) — scoped in [plans/geopackage.org](plans/geopackage.org).
-    Shapefile is another classic.
+-   **GeoPackage write** — the read direction is done; the writer needs a
+    from-scratch SQLite **whole-file writer** plus create-or-append (upsert) layer
+    semantics. See [plans/geopackage.org](plans/geopackage.org).
+-   **More format spokes** — Shapefile is another classic (multi-file .shp/.dbf/.shx).
 -   **FlatGeobuf spatial index** (optional) — write the packed Hilbert R-tree so
     other tools get fast spatial queries; we currently write index-less files.
     See [plans/flatgeobuf.org](plans/flatgeobuf.org).

@@ -13,7 +13,7 @@ use crate::{csv, flatgeobuf, geojson, json, parquet};
 
 /// Convert `input` bytes from one format to another via the Feature IR.
 pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
-    write(to, &read(from, input)?)
+    write_features(to, &read(from, input)?)
 }
 
 /// Decode any supported input format into the shared Feature IR.
@@ -28,17 +28,23 @@ fn read(format: Format, input: &[u8]) -> Result<FeatureCollection> {
         Format::FlatGeobuf => flatgeobuf::read(input),
         Format::Csv => csv::read(input),
         Format::Wkt => read_wkt_lines(input),
+        // GeoPackage is multi-layer, so it's read via geopackage::read_layers in
+        // main.rs rather than through this single-collection path.
+        Format::Gpkg => Err(Error::Usage(
+            "GeoPackage input is handled per-layer; this path should not be reached".into(),
+        )),
     }
 }
 
 /// Encode the Feature IR into a supported output format.
-fn write(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
+pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
     match format {
         Format::GeoJson => Ok(geojson::to_json(fc).to_json_string().into_bytes()),
         Format::Parquet => Ok(features_to_parquet(fc)),
         Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
         Format::Csv => Ok(csv::write(fc)),
         Format::Wkt => Ok(write_wkt_lines(fc)),
+        Format::Gpkg => Err(Error::Usage("writing GeoPackage is not supported yet".into())),
     }
 }
 

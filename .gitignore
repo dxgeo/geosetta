@@ -1,5 +1,7 @@
 /target
 **/*.rs.bk
+# macOS Finder metadata
+.DS_Store
 *.parquet
 # ...except committed test fixtures the build embeds via include_bytes!.
 !tests/fixtures/*.parquet

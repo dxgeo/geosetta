@@ -26,7 +26,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.17.0**.
+Current version: **0.17.1**.
 
 Six formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
@@ -133,6 +133,7 @@ features (heterogeneous or nested values fall back to a JSON string).
     panto rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
     panto roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
     panto big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
+    panto big.geojson   big.parquet --progress      # report each stage on stderr
     # formats may also be given explicitly:
     panto in.txt out.bin --from geojson --to parquet
 

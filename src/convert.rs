@@ -11,7 +11,10 @@ use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox};
 use crate::{csv, flatgeobuf, geojson, json, parquet};
 
-/// Convert `input` bytes from one format to another via the Feature IR.
+/// Convert `input` bytes from one format to another via the Feature IR. The
+/// hub entry point in one call; `main` unrolls it into read/parse/write stages
+/// so it can report `--progress`, so this is used mainly by the tests below.
+#[allow(dead_code)]
 pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
     write_features(to, &read_features(from, input)?)
 }

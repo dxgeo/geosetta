@@ -49,15 +49,27 @@ fn run() -> Result<()> {
     }
 
     // Everything else routes through the shared feature IR, so any input format
-    // converts to any output format the writers support.
+    // converts to any output format the writers support. The stages are made
+    // visible under --progress (the pipeline is batch, so this is per-stage, not
+    // sub-stage).
     let input = std::fs::read(&args.input)?;
-    let output = if args.sort_hilbert {
-        let mut fc = convert::read_features(args.from, &input)?;
+    if args.progress {
+        eprintln!("read {} ({} bytes)", args.input, input.len());
+    }
+    let mut fc = convert::read_features(args.from, &input)?;
+    if args.progress {
+        eprintln!("parsed {} features from {}", fc.features.len(), args.from.extension());
+    }
+    if args.sort_hilbert {
         convert::reorder_hilbert(&mut fc);
-        convert::write_features(args.to, &fc)?
-    } else {
-        convert::convert(args.from, args.to, &input)?
-    };
+        if args.progress {
+            eprintln!("sorted {} features by Hilbert locality", fc.features.len());
+        }
+    }
+    if args.progress {
+        eprintln!("writing {}...", args.to.extension());
+    }
+    let output = convert::write_features(args.to, &fc)?;
     std::fs::write(&args.output, &output)?;
     eprintln!("wrote {} ({} bytes)", args.output, output.len());
     Ok(())
@@ -69,7 +81,16 @@ fn run() -> Result<()> {
 /// plain path is an error unless `--layer` selects one.
 fn run_geopackage_read(args: &cli::Args) -> Result<()> {
     let input = std::fs::read(&args.input)?;
+    if args.progress {
+        eprintln!("read {} ({} bytes)", args.input, input.len());
+    }
     let mut layers = geopackage::read_layers(&input)?;
+    if args.progress {
+        eprintln!("found {} layer(s)", layers.len());
+        for (name, fc) in &layers {
+            eprintln!("  layer {name}: {} features", fc.features.len());
+        }
+    }
 
     if let Some(name) = &args.layer {
         layers.retain(|(n, _)| n == name);
@@ -115,6 +136,9 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
 /// layer if it already exists). The layer name defaults to the input file stem.
 fn run_geopackage_write(args: &cli::Args) -> Result<()> {
     let input = std::fs::read(&args.input)?;
+    if args.progress {
+        eprintln!("read {} ({} bytes)", args.input, input.len());
+    }
 
     let mut new_layers = if args.from == Format::Gpkg {
         // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
@@ -134,6 +158,11 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
             .unwrap_or_else(|| layer_stem(&args.input));
         vec![(name, fc)]
     };
+    if args.progress {
+        for (name, fc) in &new_layers {
+            eprintln!("layer {name}: {} features", fc.features.len());
+        }
+    }
     if args.sort_hilbert {
         for (_, fc) in &mut new_layers {
             convert::reorder_hilbert(fc);
@@ -142,6 +171,11 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
 
     // Append into the existing GeoPackage if the output already exists.
     let existing = std::fs::read(&args.output).ok();
+    if args.progress {
+        let verb = if existing.is_some() { "appending to" } else { "writing" };
+        let idx = if args.rtree { " (+rtree index)" } else { "" };
+        eprintln!("{verb} {}{idx}...", args.output);
+    }
     let bytes = geopackage::write_layers(existing.as_deref(), &new_layers, args.rtree)?;
     std::fs::write(&args.output, &bytes)?;
     eprintln!("wrote {} ({} bytes)", args.output, bytes.len());

@@ -75,13 +75,31 @@ path and the GeoPackage read/write paths. Off by default since it changes row
 order; benefits GeoParquet clustering most (and compression) — a 50-point grid
 writes in Hilbert order instead of row-major. No new on-disk index.
 
-*** D. GeoPackage RTree extension (stretch / harder)
+*** D. GeoPackage RTree extension (opt-in =--rtree=) — *DONE*
 GPKG's index is SQLite's *R*Tree virtual table*, not a packed Hilbert R-tree:
 =rtree_<t>_<c>= backed by shadow tables (=..._node=, =..._rowid=, =..._parent=)
 with SQLite's own node blob format, plus registration in =gpkg_extensions= and
-insert/update triggers. Writing this from scratch means emulating the R*Tree
-module's on-disk structure — substantial. Our =.gpkg= is valid and readable
-without it, so this is a deferred stretch goal; scope separately if pursued.
+insert/update triggers. Implemented from scratch in =geopackage/rtree.rs= behind
+an opt-in =--rtree= flag (index-less GPKG is valid, so it stays the default):
+- We build a *packed* R-tree bottom-up over feature bounding boxes,
+  Hilbert-ordered for leaf locality (reusing =spatial.rs=) — no incremental
+  insertion needed. Node blob = 4-byte header (2-byte depth on the root, 2-byte
+  cell count) + fixed 24-byte cells (8-byte rowid/child + four big-endian f32
+  =minx,maxx,miny,maxy=). Coordinates are rounded *outward* on f64→f32 so every
+  stored box still contains its geometry. Nodes are zero-padded to a fixed
+  =1228=-byte size (SQLite reads node size from the root blob's length).
+- The virtual table (=CREATE VIRTUAL TABLE … USING rtree=) and the
+  GeoPackage-standard maintenance triggers are written as schema-only
+  =sqlite_master= rows (=rootpage 0=); shadow tables are ordinary b-trees. This
+  required teaching =sqlite.rs='s writer two things: schema-only master entries
+  (=MasterEntry=), and a real multi-page =sqlite_master= b-tree rooted on page 1
+  (the many trigger rows overflow a single page — the interior root now stays on
+  page 1, which the reader already handled).
+- Validated: =PRAGMA integrity_check= and =rtreecheck()= both pass; a bbox query
+  through the index returns the same subset as brute force; DuckDB/GDAL reads
+  every layer; append (upsert) re-indexes correctly; our own reader still
+  round-trips (the virtual table's =rootpage 0= is skipped, shadow tables aren't
+  in =gpkg_contents=).
 
 ** CONTROL / DEFAULTS
 - FGB with an index *requires* Hilbert-ordered features, so enabling the index
@@ -101,5 +119,7 @@ without it, so this is a deferred stretch goal; scope separately if pursued.
 ** OPEN QUESTIONS
 - Default resolution/anchor for the Hilbert quantization (center vs min; 16-bit
   to match FGB vs higher) — match FGB for B; revisit for C/D.
-- Is the GPKG R*Tree worth the substantial effort, or document it as
-  unsupported and ship index-less GPKG indefinitely?
+- The GPKG R*Tree now ships opt-in (=--rtree=, milestone D). Revisit whether to
+  flip it on by default once it has seen more real-world files — it doesn't
+  change row order, so the main reason to keep it opt-in is caution over the
+  from-scratch node format, which =rtreecheck()= and GDAL validation now cover.

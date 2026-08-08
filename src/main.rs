@@ -142,7 +142,7 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
 
     // Append into the existing GeoPackage if the output already exists.
     let existing = std::fs::read(&args.output).ok();
-    let bytes = geopackage::write_layers(existing.as_deref(), &new_layers)?;
+    let bytes = geopackage::write_layers(existing.as_deref(), &new_layers, args.rtree)?;
     std::fs::write(&args.output, &bytes)?;
     eprintln!("wrote {} ({} bytes)", args.output, bytes.len());
     Ok(())

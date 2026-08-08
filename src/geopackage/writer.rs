@@ -7,9 +7,10 @@ use crate::error::Result;
 use crate::feature::FeatureCollection;
 use crate::geometry::{to_wkb, Bbox, Geometry};
 use crate::schema::{infer_columns, Cell, ColumnType};
-use crate::sqlite::{TableSpec, Value, write_database};
+use crate::sqlite::{MasterEntry, TableSpec, Value, write_database};
 
 use super::reader::read_layers;
+use super::rtree;
 
 const APPLICATION_ID: u32 = 0x4750_4B47; // "GPKG"
 const USER_VERSION: u32 = 10200; // 1.2.0
@@ -20,10 +21,12 @@ const WGS84_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\
 
 /// Upsert `new_layers` into an existing GeoPackage (or a fresh one if `existing`
 /// is `None`), returning the complete file. Layers of the same name are
-/// replaced.
+/// replaced. With `rtree`, every layer gets a SQLite R*Tree spatial index (the
+/// opt-in GeoPackage RTree extension).
 pub fn write_layers(
     existing: Option<&[u8]>,
     new_layers: &[(String, FeatureCollection)],
+    rtree: bool,
 ) -> Result<Vec<u8>> {
     let mut layers: Vec<(String, FeatureCollection)> = match existing {
         Some(bytes) => read_layers(bytes)?,
@@ -33,15 +36,32 @@ pub fn write_layers(
         layers.retain(|(n, _)| n != name);
         layers.push((name.clone(), fc.clone()));
     }
-    build(&layers)
+    build(&layers, rtree)
 }
 
-fn build(layers: &[(String, FeatureCollection)]) -> Result<Vec<u8>> {
+fn build(layers: &[(String, FeatureCollection)], rtree: bool) -> Result<Vec<u8>> {
     let mut specs = vec![spatial_ref_sys(), gpkg_contents(layers), geometry_columns(layers)];
+    if rtree {
+        let names: Vec<String> = layers.iter().map(|(n, _)| n.clone()).collect();
+        specs.push(rtree::extensions_table(&names));
+    }
     for (name, fc) in layers {
         specs.push(feature_table(name, fc));
     }
-    write_database(&specs, APPLICATION_ID, USER_VERSION)
+
+    // The spatial indexes (shadow tables) and their virtual-table + trigger
+    // schema entries, if requested. Shadow tables are appended after the
+    // feature tables so their b-trees are built alongside the rest.
+    let mut master: Vec<MasterEntry> = Vec::new();
+    if rtree {
+        for (name, fc) in layers {
+            let index = rtree::build(name, fc);
+            specs.extend(index.tables);
+            master.extend(index.master);
+        }
+    }
+
+    write_database(&specs, &master, APPLICATION_ID, USER_VERSION)
 }
 
 fn spatial_ref_sys() -> TableSpec {
@@ -250,7 +270,7 @@ mod tests {
                 ],
             },
         ]);
-        let bytes = write_layers(None, &[("places".into(), layer)]).unwrap();
+        let bytes = write_layers(None, &[("places".into(), layer)], false).unwrap();
         let back = read_layers(&bytes).unwrap();
 
         assert_eq!(back.len(), 1);
@@ -264,6 +284,32 @@ mod tests {
     }
 
     #[test]
+    fn rtree_index_is_emitted_and_round_trips() {
+        // A layer big enough to force interior rtree nodes (> one node of cells)
+        // and a multi-page sqlite_master (many trigger rows).
+        let feats: Vec<Feature> = (0..120)
+            .map(|i| Feature { geometry: point(i as f64, (i % 7) as f64), properties: vec![] })
+            .collect();
+        let bytes = write_layers(None, &[("grid".into(), fc(feats))], true).unwrap();
+
+        // The virtual table, its shadow tables, and gpkg_extensions are present.
+        use crate::sqlite::Database;
+        let db = Database::open(&bytes).unwrap();
+        let names: Vec<String> = db.tables().unwrap().into_iter().map(|t| t.name).collect();
+        assert!(names.iter().any(|n| n == "gpkg_extensions"));
+        assert!(names.iter().any(|n| n == "rtree_grid_geom_node"));
+        assert!(names.iter().any(|n| n == "rtree_grid_geom_rowid"));
+        assert!(names.iter().any(|n| n == "rtree_grid_geom_parent"));
+        // The rtree virtual table itself has rootpage 0, so our table reader
+        // (which needs a real root) skips it — a layer read still sees only the
+        // feature layer.
+        let back = read_layers(&bytes).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].0, "grid");
+        assert_eq!(back[0].1.features.len(), 120);
+    }
+
+    #[test]
     fn append_adds_a_layer_then_upsert_replaces() {
         let a = fc(vec![Feature { geometry: point(0.0, 0.0), properties: vec![] }]);
         let b = fc(vec![
@@ -271,8 +317,8 @@ mod tests {
             Feature { geometry: point(2.0, 2.0), properties: vec![] },
         ]);
 
-        let g1 = write_layers(None, &[("a".into(), a)]).unwrap();
-        let g2 = write_layers(Some(&g1), &[("b".into(), b)]).unwrap();
+        let g1 = write_layers(None, &[("a".into(), a)], false).unwrap();
+        let g2 = write_layers(Some(&g1), &[("b".into(), b)], false).unwrap();
         let layers = read_layers(&g2).unwrap();
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().any(|(n, _)| n == "a"));
@@ -280,7 +326,7 @@ mod tests {
 
         // Upsert "a" with three features -> still two layers, "a" replaced.
         let a2 = fc(vec![Feature { geometry: point(9.0, 9.0), properties: vec![] }; 3]);
-        let g3 = write_layers(Some(&g2), &[("a".into(), a2)]).unwrap();
+        let g3 = write_layers(Some(&g2), &[("a".into(), a2)], false).unwrap();
         let layers = read_layers(&g3).unwrap();
         assert_eq!(layers.len(), 2);
         assert_eq!(layers.iter().find(|(n, _)| n == "a").unwrap().1.features.len(), 3);

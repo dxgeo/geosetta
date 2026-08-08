@@ -72,11 +72,13 @@ pub struct Args {
     /// Reorder features by Hilbert-curve locality before writing (clusters rows
     /// for GeoParquet; a no-op ordering-wise for already-sorted FlatGeobuf).
     pub sort_hilbert: bool,
+    /// Write a spatial index into GeoPackage output (the opt-in GeoPackage
+    /// RTree extension). Ignored for other output formats.
+    pub rtree: bool,
 }
 
 /// One-line usage string.
-pub const USAGE: &str =
-    "usage: panto <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert]";
+pub const USAGE: &str = "usage: panto <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert] [--rtree]";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -89,11 +91,13 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let mut to: Option<Format> = None;
     let mut layer: Option<String> = None;
     let mut sort_hilbert = false;
+    let mut rtree = false;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => return Err(Error::Usage(USAGE.to_string())),
             "--sort-hilbert" => sort_hilbert = true,
+            "--rtree" => rtree = true,
             "--from" => {
                 let v = iter
                     .next()
@@ -139,6 +143,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         to,
         layer,
         sort_hilbert,
+        rtree,
     })
 }
 
@@ -164,6 +169,14 @@ mod tests {
             .unwrap();
         assert_eq!(a.from, Format::GeoJson);
         assert_eq!(a.to, Format::Parquet);
+    }
+
+    #[test]
+    fn parses_rtree_flag() {
+        let a = args(&["panto", "in.geojson", "out.gpkg", "--rtree"]).unwrap();
+        assert!(a.rtree);
+        let b = args(&["panto", "in.geojson", "out.gpkg"]).unwrap();
+        assert!(!b.rtree);
     }
 
     #[test]

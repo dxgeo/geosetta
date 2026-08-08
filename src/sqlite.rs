@@ -440,10 +440,26 @@ pub struct TableSpec {
     pub rows: Vec<(i64, Vec<Value>)>,
 }
 
-/// Write a complete SQLite database from `tables`. `application_id` and
+/// A schema-only `sqlite_master` entry with no b-tree of its own (`rootpage`
+/// 0): a virtual table (`CREATE VIRTUAL TABLE …`) or a trigger. Used by the
+/// GeoPackage R*Tree extension, whose virtual table is backed by ordinary
+/// shadow [`TableSpec`]s and whose triggers are pure schema.
+pub struct MasterEntry {
+    /// `sqlite_master.type` — `"table"` for a virtual table, `"trigger"`.
+    pub kind: String,
+    pub name: String,
+    /// The table this entry is attached to (its own name for a virtual table,
+    /// the triggering table for a trigger).
+    pub tbl_name: String,
+    pub sql: String,
+}
+
+/// Write a complete SQLite database from `tables` plus any schema-only
+/// `extra_master` entries (virtual tables, triggers). `application_id` and
 /// `user_version` populate the corresponding header fields (0 for plain SQLite).
 pub fn write_database(
     tables: &[TableSpec],
+    extra_master: &[MasterEntry],
     application_id: u32,
     user_version: u32,
 ) -> Result<Vec<u8>> {
@@ -473,14 +489,31 @@ pub fn write_database(
         ));
     }
 
-    // sqlite_master lives on page 1, a single leaf page whose header sits after
-    // the 100-byte database header.
+    // Schema-only entries follow the tables, keeping rowid order. Their
+    // `rootpage` is 0 — they own no b-tree (a virtual table lives in its shadow
+    // tables; a trigger is pure schema).
+    for (j, e) in extra_master.iter().enumerate() {
+        master_rows.push((
+            (tables.len() + j + 1) as i64,
+            vec![
+                Value::Text(e.kind.clone()),
+                Value::Text(e.name.clone()),
+                Value::Text(e.tbl_name.clone()),
+                Value::Int(0),
+                Value::Text(e.sql.clone()),
+            ],
+        ));
+    }
+
+    // sqlite_master is a table b-tree rooted at page 1, whose page header sits
+    // after the 100-byte database header. Small schemas fit one leaf on page 1;
+    // larger ones (e.g. many R*Tree triggers) grow into a proper b-tree whose
+    // interior root stays on page 1.
     let master_cells: Vec<(i64, Vec<u8>)> = master_rows
         .iter()
         .map(|(rowid, values)| (*rowid, w.leaf_cell(*rowid, &encode_record(values))))
         .collect();
-    let page1 = w.render_leaf(100, &master_cells)?;
-    w.pages.insert(1, page1);
+    w.build_master(&master_cells)?;
 
     let total_pages = *w.pages.keys().max().unwrap_or(&1);
     let mut out = vec![0u8; total_pages as usize * WRITE_PAGE_SIZE];
@@ -546,17 +579,52 @@ impl Writer {
     }
 
     /// Build a table b-tree from rowid-ordered cells; returns the root page.
+    /// The root may land on any page ≥ 2 (unlike `sqlite_master`, which must
+    /// root on page 1 — see [`Writer::build_master`]).
     fn build_btree(&mut self, cells: &[(i64, Vec<u8>)]) -> Result<u32> {
-        let mut level = self.pack_leaves(cells)?;
+        let mut level = self.pack_leaves(cells, WRITE_PAGE_SIZE - 8)?;
         while level.len() > 1 {
-            level = self.pack_interior(&level)?;
+            level = self.pack_interior(&level, WRITE_PAGE_SIZE - 12)?;
         }
         Ok(level[0].0)
     }
 
-    /// Pack cells into leaf pages; returns `(page, max_rowid)` per page.
-    fn pack_leaves(&mut self, cells: &[(i64, Vec<u8>)]) -> Result<Vec<(u32, i64)>> {
-        let cap = WRITE_PAGE_SIZE - 8;
+    /// Build the `sqlite_master` b-tree with its root on page 1, whose header
+    /// starts after the 100-byte database header. A schema that fits one leaf
+    /// becomes a leaf page 1; otherwise leaves and inner nodes live on pages
+    /// ≥ 2 and the interior root sits on page 1. Interior nodes are packed with
+    /// the page-1 capacity so the eventual root always fits there.
+    fn build_master(&mut self, cells: &[(i64, Vec<u8>)]) -> Result<()> {
+        const H: usize = 100;
+
+        // Fits a single leaf on page 1?
+        let leaf_used: usize = cells.iter().map(|(_, c)| 2 + c.len()).sum();
+        if H + 8 + leaf_used <= WRITE_PAGE_SIZE {
+            let refs: Vec<&(i64, Vec<u8>)> = cells.iter().collect();
+            let page1 = self.render_leaf_at(H, &refs)?;
+            self.pages.insert(1, page1);
+            return Ok(());
+        }
+
+        // Otherwise: leaves on pages ≥ 2 (capped at the page-1 leaf size, so a
+        // schema that overflowed page 1 always yields ≥ 2 leaves — never a
+        // degenerate single-child root), then interior levels until the root
+        // fits page 1.
+        let mut level = self.pack_leaves(cells, WRITE_PAGE_SIZE - H - 8)?;
+        loop {
+            if interior_fits(&level, WRITE_PAGE_SIZE - H - 12) {
+                let mut page = vec![0u8; WRITE_PAGE_SIZE];
+                write_interior(&mut page, H, &level)?;
+                self.pages.insert(1, page);
+                return Ok(());
+            }
+            level = self.pack_interior(&level, WRITE_PAGE_SIZE - H - 12)?;
+        }
+    }
+
+    /// Pack cells into leaf pages of capacity `cap`; returns `(page, max_rowid)`
+    /// per page.
+    fn pack_leaves(&mut self, cells: &[(i64, Vec<u8>)], cap: usize) -> Result<Vec<(u32, i64)>> {
         let mut out = Vec::new();
         let mut i = 0;
         // An empty table still needs one (empty) leaf page as its root.
@@ -589,9 +657,9 @@ impl Writer {
         Ok(out)
     }
 
-    /// One interior level over `children` (`(page, max_rowid)`).
-    fn pack_interior(&mut self, children: &[(u32, i64)]) -> Result<Vec<(u32, i64)>> {
-        let cap = WRITE_PAGE_SIZE - 12;
+    /// One interior level over `children` (`(page, max_rowid)`), each node
+    /// packed to capacity `cap`.
+    fn pack_interior(&mut self, children: &[(u32, i64)], cap: usize) -> Result<Vec<(u32, i64)>> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < children.len() {
@@ -606,16 +674,14 @@ impl Writer {
                 j += 1;
             }
             let group = &children[i..j];
-            let page_no = self.render_interior(group);
+            let page_no = self.alloc();
+            let mut page = vec![0u8; WRITE_PAGE_SIZE];
+            write_interior(&mut page, 0, group)?;
+            self.pages.insert(page_no, page);
             out.push((page_no, group.last().unwrap().1));
             i = j;
         }
         Ok(out)
-    }
-
-    fn render_leaf(&self, header_offset: usize, cells: &[(i64, Vec<u8>)]) -> Result<Vec<u8>> {
-        let refs: Vec<&(i64, Vec<u8>)> = cells.iter().collect();
-        self.render_leaf_at(header_offset, &refs)
     }
 
     fn render_leaf_at(&self, header_offset: usize, cells: &[&(i64, Vec<u8>)]) -> Result<Vec<u8>> {
@@ -640,37 +706,55 @@ impl Writer {
         Ok(page)
     }
 
-    fn render_interior(&mut self, group: &[(u32, i64)]) -> u32 {
-        let page_no = self.alloc();
-        let mut page = vec![0u8; WRITE_PAGE_SIZE];
-        let right = group.last().unwrap().0;
+}
 
-        let cells: Vec<Vec<u8>> = group[..group.len() - 1]
-            .iter()
-            .map(|(child, key)| {
-                let mut c = child.to_be_bytes().to_vec();
-                write_varint(&mut c, *key as u64);
-                c
-            })
-            .collect();
-
-        let mut content = WRITE_PAGE_SIZE;
-        let mut ptrs = Vec::with_capacity(cells.len());
-        for cell in &cells {
-            content -= cell.len();
-            page[content..content + cell.len()].copy_from_slice(cell);
-            ptrs.push(content as u16);
-        }
-        page[0] = 0x05;
-        page[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
-        page[5..7].copy_from_slice(&(content as u16).to_be_bytes());
-        page[8..12].copy_from_slice(&right.to_be_bytes());
-        for (k, p) in ptrs.iter().enumerate() {
-            page[12 + k * 2..12 + k * 2 + 2].copy_from_slice(&p.to_be_bytes());
-        }
-        self.pages.insert(page_no, page);
-        page_no
+/// Whether an interior page over `children` fits in `cap` bytes (all cells but
+/// the last, which becomes the right-pointer, plus their pointer-array slots).
+fn interior_fits(children: &[(u32, i64)], cap: usize) -> bool {
+    if children.len() <= 1 {
+        return true;
     }
+    let used: usize = children[..children.len() - 1]
+        .iter()
+        .map(|(_, key)| 2 + 4 + varint_len(*key as u64))
+        .sum();
+    used <= cap
+}
+
+/// Render an interior table page into `page` with its header at `header_offset`
+/// (0 for an ordinary page, 100 for the `sqlite_master` root on page 1). The
+/// last child becomes the right-most pointer; the rest are `(child, max_rowid)`
+/// cells.
+fn write_interior(page: &mut [u8], header_offset: usize, group: &[(u32, i64)]) -> Result<()> {
+    let right = group.last().unwrap().0;
+    let cells: Vec<Vec<u8>> = group[..group.len() - 1]
+        .iter()
+        .map(|(child, key)| {
+            let mut c = child.to_be_bytes().to_vec();
+            write_varint(&mut c, *key as u64);
+            c
+        })
+        .collect();
+
+    let mut content = WRITE_PAGE_SIZE;
+    let mut ptrs = Vec::with_capacity(cells.len());
+    for cell in &cells {
+        content -= cell.len();
+        page[content..content + cell.len()].copy_from_slice(cell);
+        ptrs.push(content as u16);
+    }
+    if header_offset + 12 + 2 * cells.len() > content {
+        return err("interior page overflow");
+    }
+    page[header_offset] = 0x05;
+    page[header_offset + 3..header_offset + 5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    page[header_offset + 5..header_offset + 7].copy_from_slice(&(content as u16).to_be_bytes());
+    page[header_offset + 8..header_offset + 12].copy_from_slice(&right.to_be_bytes());
+    for (k, p) in ptrs.iter().enumerate() {
+        let at = header_offset + 12 + k * 2;
+        page[at..at + 2].copy_from_slice(&p.to_be_bytes());
+    }
+    Ok(())
 }
 
 /// Encode a row into the SQLite record format: `varint(header_len)` + serial
@@ -804,7 +888,7 @@ mod tests {
             sql: r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "name" TEXT, "n" INTEGER, "r" REAL, "data" BLOB)"#.into(),
             rows,
         };
-        let bytes = write_database(&[spec], 0, 0).unwrap();
+        let bytes = write_database(&[spec], &[], 0, 0).unwrap();
 
         let db = Database::open(&bytes).unwrap();
         let table = db.tables().unwrap().into_iter().find(|t| t.name == "t").unwrap();

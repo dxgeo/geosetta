@@ -7,6 +7,7 @@
 //! decode. See `plans/geopackage.org`.
 
 mod reader;
+mod rtree;
 mod writer;
 
 pub use reader::read_layers;

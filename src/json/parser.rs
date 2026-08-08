@@ -9,10 +9,7 @@ use crate::error::{Error, Result};
 /// Parse a complete JSON document. Trailing content (after optional
 /// whitespace) is rejected.
 pub fn parse(input: &str) -> Result<JsonValue> {
-    let mut p = Parser {
-        bytes: input.as_bytes(),
-        pos: 0,
-    };
+    let mut p = Parser::new(input);
     p.skip_ws();
     let value = p.parse_value()?;
     p.skip_ws();
@@ -22,24 +19,32 @@ pub fn parse(input: &str) -> Result<JsonValue> {
     Ok(value)
 }
 
-struct Parser<'a> {
+/// A streaming JSON cursor. Exposed within the crate so specialized readers
+/// (e.g. the GeoJSON reader) can drive it directly — parsing structure by hand
+/// and dipping into [`Parser::parse_value`] only where arbitrary JSON is needed
+/// — instead of materializing a whole [`JsonValue`] tree.
+pub(crate) struct Parser<'a> {
     bytes: &'a [u8],
     pos: usize,
 }
 
 impl<'a> Parser<'a> {
-    fn err(&self, message: &str) -> Error {
+    pub(crate) fn new(input: &'a str) -> Self {
+        Parser { bytes: input.as_bytes(), pos: 0 }
+    }
+
+    pub(crate) fn err(&self, message: &str) -> Error {
         Error::Json {
             offset: self.pos,
             message: message.to_string(),
         }
     }
 
-    fn peek(&self) -> Option<u8> {
+    pub(crate) fn peek(&self) -> Option<u8> {
         self.bytes.get(self.pos).copied()
     }
 
-    fn bump(&mut self) -> Option<u8> {
+    pub(crate) fn bump(&mut self) -> Option<u8> {
         let b = self.peek();
         if b.is_some() {
             self.pos += 1;
@@ -47,7 +52,7 @@ impl<'a> Parser<'a> {
         b
     }
 
-    fn skip_ws(&mut self) {
+    pub(crate) fn skip_ws(&mut self) {
         while let Some(b) = self.peek() {
             match b {
                 b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
@@ -56,8 +61,30 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// True once only optional whitespace remains (used to reject trailing junk).
+    pub(crate) fn at_end(&mut self) -> bool {
+        self.skip_ws();
+        self.pos >= self.bytes.len()
+    }
+
+    /// Parse a number token as an `f64` (coordinates don't need the int/float
+    /// distinction the [`JsonValue`] number keeps).
+    pub(crate) fn parse_f64(&mut self) -> Result<f64> {
+        match self.parse_number()? {
+            JsonValue::Number { value, .. } => Ok(value),
+            _ => unreachable!("parse_number yields a Number"),
+        }
+    }
+
+    /// Consume and discard the next value (any type), for members a specialized
+    /// reader doesn't care about. Small/rare in the hot paths, so it reuses the
+    /// general value parser rather than a bespoke skipper.
+    pub(crate) fn skip_value(&mut self) -> Result<()> {
+        self.parse_value().map(|_| ())
+    }
+
     /// Consume `expected` exactly, or error.
-    fn expect(&mut self, expected: u8) -> Result<()> {
+    pub(crate) fn expect(&mut self, expected: u8) -> Result<()> {
         match self.peek() {
             Some(b) if b == expected => {
                 self.pos += 1;
@@ -67,7 +94,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_value(&mut self) -> Result<JsonValue> {
+    pub(crate) fn parse_value(&mut self) -> Result<JsonValue> {
         self.skip_ws();
         match self.peek() {
             Some(b'{') => self.parse_object(),
@@ -177,7 +204,7 @@ impl<'a> Parser<'a> {
     }
 
     /// Parse a JSON string, with the opening quote at the cursor.
-    fn parse_string(&mut self) -> Result<String> {
+    pub(crate) fn parse_string(&mut self) -> Result<String> {
         self.expect(b'"')?;
         let mut out = String::new();
         loop {

@@ -9,7 +9,11 @@ use crate::cli::Format;
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox};
-use crate::{csv, flatgeobuf, geojson, json, parquet};
+use crate::{csv, flatgeobuf, geojson, parquet};
+// `json` is only needed by the test helpers below (the read path streams
+// GeoJSON directly rather than through a JsonValue tree).
+#[cfg(test)]
+use crate::json;
 
 /// Convert `input` bytes from one format to another via the Feature IR. The
 /// hub entry point in one call; `main` unrolls it into read/parse/write stages
@@ -38,7 +42,7 @@ pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> 
         Format::GeoJson => {
             let text = std::str::from_utf8(input)
                 .map_err(|_| Error::GeoJson("input is not valid utf-8".into()))?;
-            geojson::from_json(&json::parse(text)?)
+            geojson::from_geojson_str(text)
         }
         Format::Parquet => parquet_to_features(input),
         Format::FlatGeobuf => flatgeobuf::read(input),

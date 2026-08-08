@@ -6,7 +6,7 @@ use crate::geometry::Geometry;
 use crate::json::JsonValue;
 
 /// A vector feature: an optional geometry plus ordered properties.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Feature {
     pub geometry: Option<Geometry>,
     /// Property members, in order. Empty when there are no properties.
@@ -14,7 +14,7 @@ pub struct Feature {
 }
 
 /// A collection of features.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FeatureCollection {
     pub features: Vec<Feature>,
 }

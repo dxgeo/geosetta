@@ -39,16 +39,24 @@ allocating a temporary =String= per number (helps every JSON/GeoParquet-string
 path), and the JSON string parser bulk-copies runs of ordinary bytes with one
 =push_str= instead of a =char= at a time (helps string-heavy input).
 
-** NEXT — GeoJSON reader bypasses the JsonValue tree (the symmetric win)
-Reading GeoJSON is now the throughput floor (~0.8M ft/s vs ~1.6M+ writing): the
-parser builds the same heavy =JsonValue= tree (a 2-element =Vec= per coordinate,
-etc.) which =from_json= then walks into =Feature=s. A *specialized reader* that
-parses the FeatureCollection structure directly into the =Feature= IR —
-coordinates straight into =Vec<Position>=, properties still as =JsonValue= — would
-mirror the writer win and roughly halve read time. Larger and higher-risk than
-the writer (it must handle every GeoJSON shape and keep the byte-offset errors),
-so it is scoped here rather than done inline. Validate the same way: assert the
-specialized reader agrees with =from_json(parse(..))= across all fixtures.
+** DONE — GeoJSON reader bypasses the JsonValue tree
+=geojson::from_geojson_str= streams a FeatureCollection's =features= array
+straight into the =Feature= IR: coordinates parse directly into =Vec<Position>=
+(no 2-element =Vec<JsonValue>= per coordinate), driving the JSON =Parser=
+primitives (now =pub(crate)=) by hand and dipping into =parse_value= only for
+=properties= (arbitrary JSON). Member order is handled by dispatching on key,
+with a =JsonValue= fallback if =coordinates= precede =type=. The rare, tiny
+single-=Feature= / bare-geometry documents fall back to the tree reader. A test
+asserts it agrees with =from_json(parse(..))= across geometry types, null
+geometry, out-of-order members, z-ordinates, GeometryCollection, and
+pretty-printed whitespace.
+
+Result (N=400k): GeoJSON read ~*1.35× faster* (820k → 1.11M ft/s;
+=geojson→wkt= 488→361 ms, =geojson→parquet= 520→374 ms, =geojson→fgb=
+654→481 ms). Short of a full 2× because *properties still go through
+=JsonValue=* — legitimate, since property values are arbitrary JSON — and the
+benchmark features carry four properties each. Streaming simple scalar
+properties directly is a possible further micro-opt, with diminishing returns.
 
 ** OTHER CANDIDATES (unmeasured / lower priority)
 - =get()= on JSON objects is a linear scan; fine for small feature/geometry

@@ -68,10 +68,12 @@ computed size must now match). The original design:
   right subset (exercises the index), and =*.fgb → our reader → *= still works
   (we already skip the index, and its computed size must now match).
 
-*** C. GeoParquet spatial clustering (optional, light)
-Reorder rows by Hilbert value before writing (improves clustering and, once we
-write multiple row groups, row-group bbox pruning). The coarse =geo= bbox is
-already emitted. No new on-disk index — just an ordering pass reusing A.
+*** C. GeoParquet spatial clustering (optional) — *DONE*
+An opt-in =--sort-hilbert= flag reorders features by Hilbert locality before
+writing (=convert::reorder_hilbert=, reusing A). Applied to the normal convert
+path and the GeoPackage read/write paths. Off by default since it changes row
+order; benefits GeoParquet clustering most (and compression) — a 50-point grid
+writes in Hilbert order instead of row-major. No new on-disk index.
 
 *** D. GeoPackage RTree extension (stretch / harder)
 GPKG's index is SQLite's *R*Tree virtual table*, not a packed Hilbert R-tree:

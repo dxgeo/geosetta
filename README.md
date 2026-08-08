@@ -22,7 +22,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.15.0**.
+Current version: **0.16.0**.
 
 Six formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
@@ -122,6 +122,7 @@ features (heterogeneous or nested values fall back to a JSON string).
     panto input.gpkg    out/ --to geojson # multi-layer GeoPackage -> one file per layer
     panto roads.geojson data.gpkg        # create data.gpkg with layer "roads"
     panto rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
+    panto big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
     # formats may also be given explicitly:
     panto in.txt out.bin --from geojson --to parquet
 
@@ -164,9 +165,9 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
--   **Spatial indexing** — the shared Hilbert primitives and the FlatGeobuf packed
-    R-tree are done; optional GeoParquet Hilbert row clustering and the (stretch)
-    GeoPackage R\*Tree extension remain, scoped in
+-   **Spatial indexing** — the shared Hilbert primitives, the FlatGeobuf packed
+    R-tree, and the opt-in `--sort-hilbert` row clustering are done; only the
+    (stretch) GeoPackage R\*Tree extension remains, scoped in
     [plans/spatial-index.org](plans/spatial-index.org). Our GPKG output is still index-less.
 -   **More format spokes** — Shapefile is another classic (multi-file .shp/.dbf/.shx).
 -   **FlatGeobuf spatial index** (optional) — write the packed Hilbert R-tree so

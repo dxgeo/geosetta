@@ -51,7 +51,13 @@ fn run() -> Result<()> {
     // Everything else routes through the shared feature IR, so any input format
     // converts to any output format the writers support.
     let input = std::fs::read(&args.input)?;
-    let output = convert::convert(args.from, args.to, &input)?;
+    let output = if args.sort_hilbert {
+        let mut fc = convert::read_features(args.from, &input)?;
+        convert::reorder_hilbert(&mut fc);
+        convert::write_features(args.to, &fc)?
+    } else {
+        convert::convert(args.from, args.to, &input)?
+    };
     std::fs::write(&args.output, &output)?;
     eprintln!("wrote {} ({} bytes)", args.output, output.len());
     Ok(())
@@ -73,6 +79,11 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
     }
     if layers.is_empty() {
         return Err(Error::Usage("GeoPackage has no feature layers".into()));
+    }
+    if args.sort_hilbert {
+        for (_, fc) in &mut layers {
+            convert::reorder_hilbert(fc);
+        }
     }
 
     let as_dir = args.output.ends_with('/') || std::path::Path::new(&args.output).is_dir();
@@ -105,7 +116,7 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
 fn run_geopackage_write(args: &cli::Args) -> Result<()> {
     let input = std::fs::read(&args.input)?;
 
-    let new_layers = if args.from == Format::Gpkg {
+    let mut new_layers = if args.from == Format::Gpkg {
         // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
         let mut ls = geopackage::read_layers(&input)?;
         if let Some(name) = &args.layer {
@@ -123,6 +134,11 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
             .unwrap_or_else(|| layer_stem(&args.input));
         vec![(name, fc)]
     };
+    if args.sort_hilbert {
+        for (_, fc) in &mut new_layers {
+            convert::reorder_hilbert(fc);
+        }
+    }
 
     // Append into the existing GeoPackage if the output already exists.
     let existing = std::fs::read(&args.output).ok();

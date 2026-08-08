@@ -16,6 +16,19 @@ pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
     write_features(to, &read_features(from, input)?)
 }
 
+/// Reorder features by Hilbert-curve locality, so spatially-close features are
+/// adjacent (better GeoParquet row-group clustering and compression).
+pub fn reorder_hilbert(fc: &mut FeatureCollection) {
+    let bboxes: Vec<Bbox> = fc
+        .features
+        .iter()
+        .map(|f| f.geometry.as_ref().map(|g| g.bbox()).unwrap_or_else(Bbox::empty))
+        .collect();
+    let order = crate::spatial::hilbert_order(&bboxes);
+    let mut slots: Vec<Option<Feature>> = std::mem::take(&mut fc.features).into_iter().map(Some).collect();
+    fc.features = order.into_iter().map(|i| slots[i].take().unwrap()).collect();
+}
+
 /// Decode any supported input format into the shared Feature IR.
 pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> {
     match format {
@@ -432,6 +445,23 @@ mod tests {
         let pq = convert(Format::Csv, Format::Parquet, bytes).unwrap();
         let via_pq = geojson::from_json(&json::parse(&geoparquet_to_geojson(&pq).unwrap()).unwrap()).unwrap();
         assert_eq!(sorted_geoms(&direct), sorted_geoms(&via_pq));
+    }
+
+    #[test]
+    fn hilbert_reorder_preserves_the_feature_set() {
+        use crate::geometry::Geometry::Point;
+        let mut fc = FeatureCollection {
+            features: vec![
+                Feature { geometry: Some(Point([100.0, 100.0])), properties: vec![] },
+                Feature { geometry: Some(Point([0.0, 0.0])), properties: vec![] },
+                Feature { geometry: Some(Point([1.0, 1.0])), properties: vec![] },
+            ],
+        };
+        let before = sorted_geoms(&fc);
+        reorder_hilbert(&mut fc);
+        assert_eq!(sorted_geoms(&fc), before); // same set, reordered
+        // The far point ends up last; the origin cluster is first.
+        assert_eq!(fc.features.last().unwrap().geometry, Some(Point([100.0, 100.0])));
     }
 
     #[test]

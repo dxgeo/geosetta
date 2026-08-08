@@ -69,10 +69,14 @@ pub struct Args {
     pub to: Format,
     /// A specific GeoPackage layer to read (or the layer name when writing one).
     pub layer: Option<String>,
+    /// Reorder features by Hilbert-curve locality before writing (clusters rows
+    /// for GeoParquet; a no-op ordering-wise for already-sorted FlatGeobuf).
+    pub sort_hilbert: bool,
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: panto <input> <output> [--from FMT] [--to FMT] [--layer NAME]";
+pub const USAGE: &str =
+    "usage: panto <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert]";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -84,10 +88,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let mut from: Option<Format> = None;
     let mut to: Option<Format> = None;
     let mut layer: Option<String> = None;
+    let mut sort_hilbert = false;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
             "-h" | "--help" => return Err(Error::Usage(USAGE.to_string())),
+            "--sort-hilbert" => sort_hilbert = true,
             "--from" => {
                 let v = iter
                     .next()
@@ -132,6 +138,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         from,
         to,
         layer,
+        sort_hilbert,
     })
 }
 

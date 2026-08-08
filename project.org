@@ -21,7 +21,13 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.9.0*.
+Current version: *0.10.0*.
+
+*FlatGeobuf* can be read (=.fgb= → anything), built on a from-scratch
+FlatBuffers reader; the write direction is not done yet. All conversion now
+routes through a shared feature IR (=read(from) → FeatureCollection → write(to)=),
+so any input format composes with any output format automatically — reading FGB
+gives both FGB→GeoJSON and FGB→GeoParquet without a bespoke path.
 
 Both directions of the *GeoJSON ⇄ GeoParquet* path are implemented and working,
 written in Rust using only the standard library (zero external crates, in
@@ -47,9 +53,13 @@ specification rather than pulled from a crate:
 
 - =feature.rs= :: the shared, format-neutral feature model (=Feature= /
   =FeatureCollection=) — the intermediate representation every format converts
-  to and from; both =geojson= and =parquet= depend on it, not on each other
+  to and from; all spokes depend on it, not on each other
 - =json/= :: standard-library JSON parser and value model
 - =geojson/= :: GeoJSON parsing and serialization (both directions)
+- =flatbuffers.rs= :: a minimal, from-scratch FlatBuffers reader (vtables,
+  offsets, vectors, strings, tables)
+- =flatgeobuf/= :: FlatGeobuf reader — magic + header, spatial-index skip, and
+  feature/geometry/property decode via =flatbuffers.rs=
 - =geometry/= :: geometry model, bounding box, and WKB (Well-Known Binary)
   encoder/decoder — the shared geometry hub
 - =compress/= :: format-agnostic =bytes -> bytes= codecs implemented from spec —
@@ -60,8 +70,8 @@ specification rather than pulled from a crate:
 - =parquet/reader.rs= :: the inverse — footer/schema parsing, page iteration
   (dictionary + data pages), decompression via =compress/=, RLE/bit-pack levels,
   PLAIN and dictionary value decoding, across multiple row groups
-- =cli.rs= / =convert.rs= :: argument parsing and the conversion pipeline
-  (both directions)
+- =cli.rs= / =convert.rs= :: argument parsing and the hub-and-spoke conversion
+  pipeline (=read(from) → FeatureCollection → write(to)=)
 
 Design choices for the writer: Snappy-compressed Parquet pages (the codec
 implemented from scratch in =compress/snappy.rs=, keeping the zero-crate goal),
@@ -70,8 +80,10 @@ features (heterogeneous or nested values fall back to a JSON string).
 
 ** USAGE
 #+begin_src sh
-panto input.geojson output.parquet   # GeoJSON  -> GeoParquet
+panto input.geojson output.parquet   # GeoJSON    -> GeoParquet
 panto input.parquet output.geojson   # GeoParquet -> GeoJSON
+panto input.fgb     output.geojson   # FlatGeobuf -> GeoJSON
+panto input.fgb     output.parquet   # FlatGeobuf -> GeoParquet
 # formats may also be given explicitly:
 panto in.txt out.bin --from geojson --to parquet
 #+end_src
@@ -111,9 +123,11 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
-- *New format spokes* — the more impactful direction: FlatGeobuf and WKT/CSV are
-  natural next additions toward the any-to-any hub (small, open, dependency-free
-  to parse), broadening reach rather than deepening an already-solid reader.
+- *FlatGeobuf write direction* — the reader is done; the writer needs a
+  from-scratch FlatBuffers *writer* (vtables/offsets/alignment) and, optionally,
+  the packed Hilbert R-tree index. See [[file:plans/flatgeobuf.org][plans/flatgeobuf.org]].
+- *More format spokes* — WKT/CSV are small, open, dependency-free next additions
+  toward the any-to-any hub.
 - *Deferred, lower-priority GeoParquet milestones* (parked in
   [[file:plans/arbitrary-geoparquet.org][plans/arbitrary-geoparquet.org]]; diminishing returns / testing friction):
   - =DATA_PAGE_V2= — DuckDB doesn't emit it; a test fixture needs pyarrow.

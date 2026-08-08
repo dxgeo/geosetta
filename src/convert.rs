@@ -1,17 +1,47 @@
-//! Orchestrates conversions between GeoJSON and GeoParquet, both directions.
+//! Orchestrates conversions between formats, routed through the shared
+//! [`FeatureCollection`] IR: `read(from) -> FeatureCollection -> write(to)`.
+//! Adding a format is one reader and one writer against the IR; every from/to
+//! pair then composes automatically (hub-and-spoke).
 
 use std::collections::BTreeSet;
 
-use crate::error::Result;
+use crate::cli::Format;
+use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkb, to_wkb, Bbox};
-use crate::{geojson, json, parquet};
+use crate::{flatgeobuf, geojson, json, parquet};
 
-/// Convert the text of a GeoJSON document into GeoParquet bytes.
-pub fn geojson_to_geoparquet(input: &str) -> Result<Vec<u8>> {
-    let value = json::parse(input)?;
-    let fc = geojson::from_json(&value)?;
+/// Convert `input` bytes from one format to another via the Feature IR.
+pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
+    write(to, &read(from, input)?)
+}
 
+/// Decode any supported input format into the shared Feature IR.
+fn read(format: Format, input: &[u8]) -> Result<FeatureCollection> {
+    match format {
+        Format::GeoJson => {
+            let text = std::str::from_utf8(input)
+                .map_err(|_| Error::GeoJson("input is not valid utf-8".into()))?;
+            geojson::from_json(&json::parse(text)?)
+        }
+        Format::Parquet => parquet_to_features(input),
+        Format::FlatGeobuf => flatgeobuf::read(input),
+    }
+}
+
+/// Encode the Feature IR into a supported output format.
+fn write(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
+    match format {
+        Format::GeoJson => Ok(geojson::to_json(fc).to_json_string().into_bytes()),
+        Format::Parquet => Ok(features_to_parquet(fc)),
+        Format::FlatGeobuf => {
+            Err(Error::Usage("writing FlatGeobuf is not supported yet".into()))
+        }
+    }
+}
+
+/// Feature IR → GeoParquet bytes.
+fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
     // Property columns (schema inferred by scanning all features).
     let columns = parquet::infer_columns(&fc.features);
 
@@ -32,14 +62,12 @@ pub fn geojson_to_geoparquet(input: &str) -> Result<Vec<u8>> {
 
     let type_names: Vec<String> = types.into_iter().map(String::from).collect();
     let geo = parquet::geo_metadata(&type_names, &bbox);
-
-    Ok(parquet::write_geoparquet(&columns, &geometry, &geo))
+    parquet::write_geoparquet(&columns, &geometry, &geo)
 }
 
-/// Convert GeoParquet bytes back into GeoJSON text.
-pub fn geoparquet_to_geojson(bytes: &[u8]) -> Result<String> {
+/// GeoParquet bytes → Feature IR.
+fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
     let parsed = parquet::read_geoparquet(bytes)?;
-
     let mut features = Vec::with_capacity(parsed.num_rows);
     for row in 0..parsed.num_rows {
         let geometry = match &parsed.geometry[row] {
@@ -57,9 +85,19 @@ pub fn geoparquet_to_geojson(bytes: &[u8]) -> Result<String> {
             properties,
         });
     }
+    Ok(FeatureCollection { features })
+}
 
-    let fc = FeatureCollection { features };
-    Ok(geojson::to_json(&fc).to_json_string())
+// Thin named wrappers used by the tests below.
+
+#[cfg(test)]
+fn geojson_to_geoparquet(input: &str) -> Result<Vec<u8>> {
+    Ok(features_to_parquet(&geojson::from_json(&json::parse(input)?)?))
+}
+
+#[cfg(test)]
+fn geoparquet_to_geojson(bytes: &[u8]) -> Result<String> {
+    Ok(geojson::to_json(&parquet_to_features(bytes)?).to_json_string())
 }
 
 #[cfg(test)]
@@ -221,5 +259,76 @@ mod tests {
                 Some(crate::geometry::Geometry::Point([i as f64, (i * 2) as f64]))
             );
         }
+    }
+
+    fn fgb_to_fc(bytes: &[u8]) -> FeatureCollection {
+        let out = convert(Format::FlatGeobuf, Format::GeoJson, bytes).unwrap();
+        geojson::from_json(&json::parse(std::str::from_utf8(&out).unwrap()).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn reads_flatgeobuf_geometries() {
+        use crate::geometry::Geometry::*;
+        // DuckDB-written FGB with mixed geometry types (per-feature type).
+        let fc = fgb_to_fc(include_bytes!("../tests/fixtures/duckdb_geoms.fgb"));
+        let by_id = |id: i64| {
+            fc.features
+                .iter()
+                .find(|f| f.properties.iter().any(|(k, v)| k == "id" && v.as_f64() == Some(id as f64)))
+                .unwrap()
+                .geometry
+                .clone()
+                .unwrap()
+        };
+        assert_eq!(by_id(1), LineString(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]));
+        assert_eq!(
+            by_id(2),
+            Polygon(vec![
+                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
+                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+            ])
+        );
+        assert_eq!(
+            by_id(3),
+            MultiPolygon(vec![
+                vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
+                vec![vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 5.0]]],
+            ])
+        );
+        assert_eq!(by_id(4), MultiPoint(vec![[0.0, 0.0], [1.0, 1.0]]));
+    }
+
+    #[test]
+    fn reads_flatgeobuf_property_types() {
+        let fc = fgb_to_fc(include_bytes!("../tests/fixtures/duckdb_props.fgb"));
+        let feat = fc
+            .features
+            .iter()
+            .find(|f| f.properties.iter().any(|(k, v)| k == "n" && v.as_f64() == Some(10.0)))
+            .unwrap();
+        let prop = |k: &str| feat.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+        assert_eq!(prop("label").as_str(), Some("alpha"));
+        assert_eq!(prop("score").as_f64(), Some(1.5));
+        assert_eq!(prop("ok"), crate::json::JsonValue::Bool(true));
+        assert_eq!(feat.geometry, Some(crate::geometry::Geometry::Point([-73.9, 40.7])));
+    }
+
+    #[test]
+    fn flatgeobuf_composes_to_parquet_via_hub() {
+        // The hub payoff: FGB -> Parquet (a path never written explicitly) then
+        // Parquet -> GeoJSON must reproduce the same features as FGB -> GeoJSON.
+        let fgb = include_bytes!("../tests/fixtures/duckdb_geoms.fgb");
+        let direct = fgb_to_fc(fgb);
+        let pq = convert(Format::FlatGeobuf, Format::Parquet, fgb).unwrap();
+        let via_parquet = geojson::from_json(
+            &json::parse(&geoparquet_to_geojson(&pq).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let geoms = |fc: &FeatureCollection| {
+            let mut g: Vec<_> = fc.features.iter().map(|f| f.geometry.clone()).collect();
+            g.sort_by_key(|g| format!("{g:?}"));
+            g
+        };
+        assert_eq!(geoms(&direct), geoms(&via_parquet));
     }
 }

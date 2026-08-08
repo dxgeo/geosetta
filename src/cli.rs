@@ -13,6 +13,7 @@ use crate::error::{Error, Result};
 pub enum Format {
     GeoJson,
     Parquet,
+    FlatGeobuf,
 }
 
 impl Format {
@@ -21,6 +22,7 @@ impl Format {
         match name.to_ascii_lowercase().as_str() {
             "geojson" | "json" => Ok(Format::GeoJson),
             "parquet" | "geoparquet" => Ok(Format::Parquet),
+            "flatgeobuf" | "fgb" => Ok(Format::FlatGeobuf),
             other => Err(Error::Usage(format!("unknown format \"{other}\""))),
         }
     }
@@ -31,6 +33,7 @@ impl Format {
         match ext.as_str() {
             "geojson" | "json" => Some(Format::GeoJson),
             "parquet" => Some(Format::Parquet),
+            "fgb" => Some(Format::FlatGeobuf),
             _ => None,
         }
     }

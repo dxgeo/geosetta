@@ -15,6 +15,9 @@ pub enum Error {
     /// A malformed or unsupported Parquet input (bad footer, unexpected
     /// encoding/codec, truncated page, etc.).
     Parquet(String),
+    /// A malformed or unsupported FlatGeobuf input (bad magic, FlatBuffers
+    /// structure, geometry, etc.).
+    FlatGeobuf(String),
     /// A CLI usage problem (bad/missing arguments, unknown format).
     Usage(String),
     /// Anything that goes wrong while building the Parquet output. Reserved
@@ -32,6 +35,7 @@ impl fmt::Display for Error {
             }
             Error::GeoJson(m) => write!(f, "invalid geojson: {m}"),
             Error::Parquet(m) => write!(f, "invalid parquet: {m}"),
+            Error::FlatGeobuf(m) => write!(f, "invalid flatgeobuf: {m}"),
             Error::Usage(m) => write!(f, "{m}"),
             Error::Convert(m) => write!(f, "conversion error: {m}"),
         }

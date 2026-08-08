@@ -6,6 +6,7 @@
 mod cli;
 mod compress;
 mod convert;
+mod csv;
 mod error;
 mod feature;
 mod flatbuffers;

@@ -14,6 +14,8 @@ pub enum Format {
     GeoJson,
     Parquet,
     FlatGeobuf,
+    Csv,
+    Wkt,
 }
 
 impl Format {
@@ -23,6 +25,8 @@ impl Format {
             "geojson" | "json" => Ok(Format::GeoJson),
             "parquet" | "geoparquet" => Ok(Format::Parquet),
             "flatgeobuf" | "fgb" => Ok(Format::FlatGeobuf),
+            "csv" => Ok(Format::Csv),
+            "wkt" => Ok(Format::Wkt),
             other => Err(Error::Usage(format!("unknown format \"{other}\""))),
         }
     }
@@ -34,6 +38,8 @@ impl Format {
             "geojson" | "json" => Some(Format::GeoJson),
             "parquet" => Some(Format::Parquet),
             "fgb" => Some(Format::FlatGeobuf),
+            "csv" => Some(Format::Csv),
+            "wkt" => Some(Format::Wkt),
             _ => None,
         }
     }

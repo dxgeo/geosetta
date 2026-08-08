@@ -4,9 +4,12 @@
 //! in the source (e.g. elevation) are dropped for this first version.
 
 mod wkb;
+mod wkt;
 
 pub use wkb::decode as from_wkb;
 pub use wkb::encode as to_wkb;
+pub use wkt::decode as from_wkt;
+pub use wkt::encode as to_wkt;
 
 /// A single 2D coordinate: `[x, y]`.
 pub type Position = [f64; 2];

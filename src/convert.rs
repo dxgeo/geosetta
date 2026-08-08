@@ -8,8 +8,8 @@ use std::collections::BTreeSet;
 use crate::cli::Format;
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
-use crate::geometry::{from_wkb, to_wkb, Bbox};
-use crate::{flatgeobuf, geojson, json, parquet};
+use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox};
+use crate::{csv, flatgeobuf, geojson, json, parquet};
 
 /// Convert `input` bytes from one format to another via the Feature IR.
 pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
@@ -26,6 +26,8 @@ fn read(format: Format, input: &[u8]) -> Result<FeatureCollection> {
         }
         Format::Parquet => parquet_to_features(input),
         Format::FlatGeobuf => flatgeobuf::read(input),
+        Format::Csv => csv::read(input),
+        Format::Wkt => read_wkt_lines(input),
     }
 }
 
@@ -35,7 +37,38 @@ fn write(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
         Format::GeoJson => Ok(geojson::to_json(fc).to_json_string().into_bytes()),
         Format::Parquet => Ok(features_to_parquet(fc)),
         Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
+        Format::Csv => Ok(csv::write(fc)),
+        Format::Wkt => Ok(write_wkt_lines(fc)),
     }
+}
+
+/// Read one WKT geometry per non-blank line (geometry only, no properties).
+fn read_wkt_lines(input: &[u8]) -> Result<FeatureCollection> {
+    let text = std::str::from_utf8(input)
+        .map_err(|_| Error::Convert("wkt: input is not valid utf-8".into()))?;
+    let mut features = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            features.push(Feature {
+                geometry: Some(from_wkt(line)?),
+                properties: Vec::new(),
+            });
+        }
+    }
+    Ok(FeatureCollection { features })
+}
+
+/// Write one WKT geometry per line (properties are dropped).
+fn write_wkt_lines(fc: &FeatureCollection) -> Vec<u8> {
+    let mut out = String::new();
+    for f in &fc.features {
+        if let Some(g) = &f.geometry {
+            out.push_str(&to_wkt(g));
+        }
+        out.push('\n');
+    }
+    out.into_bytes()
 }
 
 /// Feature IR → GeoParquet bytes.
@@ -357,5 +390,56 @@ mod tests {
         let ours = convert(Format::FlatGeobuf, Format::FlatGeobuf, src).unwrap();
         let reread = fgb_to_fc(&ours);
         assert_eq!(sorted_geoms(&original), sorted_geoms(&reread));
+    }
+
+    #[test]
+    fn reads_csv_with_wkt_and_types() {
+        use crate::geometry::Geometry;
+        let bytes = include_bytes!("../tests/fixtures/cities.csv");
+        let out = convert(Format::Csv, Format::GeoJson, bytes).unwrap();
+        let fc = geojson::from_json(&json::parse(std::str::from_utf8(&out).unwrap()).unwrap()).unwrap();
+        assert_eq!(fc.features.len(), 3);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(fc.features[0].geometry, Some(Geometry::Point([10.0, 20.0])));
+        assert_eq!(prop(&fc.features[0], "population").as_f64(), Some(120000.0));
+        assert_eq!(prop(&fc.features[0], "capital"), crate::json::JsonValue::Bool(true));
+        // Quoted field with an embedded comma.
+        assert_eq!(prop(&fc.features[1], "name").as_str(), Some("Beta, City"));
+        assert!(matches!(
+            fc.features[1].geometry,
+            Some(Geometry::LineString(_))
+        ));
+        // Empty numeric cell -> null.
+        assert_eq!(prop(&fc.features[2], "population"), crate::json::JsonValue::Null);
+    }
+
+    #[test]
+    fn csv_composes_to_parquet_and_back() {
+        // CSV -> GeoParquet -> GeoJSON reproduces the CSV's geometries (hub).
+        let bytes = include_bytes!("../tests/fixtures/cities.csv");
+        let direct = geojson::from_json(
+            &json::parse(std::str::from_utf8(&convert(Format::Csv, Format::GeoJson, bytes).unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let pq = convert(Format::Csv, Format::Parquet, bytes).unwrap();
+        let via_pq = geojson::from_json(&json::parse(&geoparquet_to_geojson(&pq).unwrap()).unwrap()).unwrap();
+        assert_eq!(sorted_geoms(&direct), sorted_geoms(&via_pq));
+    }
+
+    #[test]
+    fn wkt_lines_round_trip() {
+        // GeoJSON -> .wkt (geometry only) -> GeoJSON keeps the geometries.
+        let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
+        let wkt = convert(Format::GeoJson, Format::Wkt, SAMPLE.as_bytes()).unwrap();
+        let back = geojson::from_json(
+            &json::parse(std::str::from_utf8(&convert(Format::Wkt, Format::GeoJson, &wkt).unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let geoms: Vec<_> = orig.features.iter().map(|f| f.geometry.clone()).collect();
+        let back_geoms: Vec<_> = back.features.iter().map(|f| f.geometry.clone()).collect();
+        assert_eq!(geoms, back_geoms);
     }
 }

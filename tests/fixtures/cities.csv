@@ -1,0 +1,4 @@
+name,population,capital,geometry
+Alphaville,120000,true,POINT (10 20)
+"Beta, City",90000,false,"LINESTRING (0 0, 1 1, 2 0)"
+Gamma,,true,"POLYGON ((0 0, 4 0, 4 4, 0 4, 0 0))"

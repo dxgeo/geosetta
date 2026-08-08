@@ -168,6 +168,13 @@ mod tests {
     }
 
     #[test]
+    fn reads_duckdb_dictionary_lz4() {
+        // Same data, LZ4_RAW page compression — exercises the from-scratch lz4
+        // block decoder through the full pipeline.
+        check_duckdb_fixture(include_bytes!("../tests/fixtures/duckdb_lz4.parquet"));
+    }
+
+    #[test]
     fn reads_int32_and_float_columns() {
         // DuckDB file with PLAIN INT32 (`i32`) and FLOAT (`f32`) columns:
         //   COPY (SELECT i::INTEGER i32, (i*1.25)::FLOAT f32,

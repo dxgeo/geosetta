@@ -40,6 +40,7 @@ pub mod codec {
     pub const SNAPPY: i32 = 1;
     pub const GZIP: i32 = 2;
     pub const ZSTD: i32 = 6;
+    pub const LZ4_RAW: i32 = 7;
 }
 
 /// Page types (`PageType`).

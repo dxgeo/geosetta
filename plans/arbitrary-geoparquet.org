@@ -147,6 +147,14 @@ DEFLATE). Verified against Python =gzip= vectors (text / repetitive /
 incompressible / small, levels 1–9) and DuckDB GZIP GeoParquet, including a 200k
 multi-row-group file. Committed fixture: =tests/fixtures/duckdb_gzip.parquet=.
 
+*** 3b. LZ4 codec — *DONE*
+=LZ4_RAW= (codec 7, what DuckDB/Arrow emit) implemented from the LZ4 block spec
+in =src/parquet/lz4.rs= — a small LZ77 sequence decoder (token, variable
+literal/match lengths, 2-byte offsets, overlapping copies), no entropy coding.
+Verified against DuckDB LZ4 GeoParquet (200k rows) and a committed fixture
+=tests/fixtures/duckdb_lz4.parquet=. The legacy Hadoop-framed =LZ4= (codec 5)
+still errors cleanly; Brotli remains unimplemented.
+
 *** 4. Additional physical / logical types — *PARTIAL*
 =INT32= (4-byte LE) and =FLOAT= (4-byte IEEE) are done: they widen into the i64
 and f64 columns respectively, surfacing as ordinary JSON numbers, in both PLAIN

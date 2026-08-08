@@ -2,6 +2,7 @@
 
 mod geo;
 mod gzip;
+mod lz4;
 mod reader;
 mod schema;
 mod snappy;

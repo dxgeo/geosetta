@@ -22,9 +22,20 @@ fn feature_count() -> usize {
     std::env::var("PANTO_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(200_000)
 }
 
+/// Property count for the wide-table benchmark (default 30).
+fn wide_cols() -> usize {
+    std::env::var("PANTO_BENCH_COLS").ok().and_then(|s| s.parse().ok()).unwrap_or(30)
+}
+
 /// A private scratch directory for the run's fixtures.
 fn scratch() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("panto-perf-{}", std::process::id()));
+    scratch_named("main")
+}
+
+/// A private scratch directory tagged with `name`, so benchmarks that run in
+/// parallel don't share (and delete) each other's fixtures.
+fn scratch_named(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("panto-perf-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -60,6 +71,43 @@ fn gen_geojson(n: usize) -> String {
             (i as f64) * 1.5,
             i % 2 == 0
         );
+    }
+    s.push_str("]}");
+    s
+}
+
+/// Generate a FeatureCollection of `n` points, each carrying `cols` typed
+/// properties (int / float / string / bool, cycling by column). Geometry is a
+/// trivial point, so property handling dominates: this isolates the cost of
+/// `schema::infer_columns` (which scales with the *square* of the column count)
+/// and the per-row property key/value (de)construction — neither of which the
+/// narrow four-property `gen_geojson` exercises.
+fn gen_wide_geojson(n: usize, cols: usize) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(n * (48 + cols * 16));
+    s.push_str("{\"type\":\"FeatureCollection\",\"features\":[");
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        let x = -180.0 + (i as f64 * 0.001) % 360.0;
+        let y = -90.0 + (i as f64 * 0.0007) % 180.0;
+        let _ = write!(
+            s,
+            "{{\"type\":\"Feature\",\"geometry\":{{\"type\":\"Point\",\"coordinates\":[{x:.6},{y:.6}]}},\"properties\":{{"
+        );
+        for j in 0..cols {
+            if j > 0 {
+                s.push(',');
+            }
+            match j % 4 {
+                0 => { let _ = write!(s, "\"c{j}\":{}", i as i64 + j as i64); }
+                1 => { let _ = write!(s, "\"c{j}\":{:.3}", (i + j) as f64 * 1.5); }
+                2 => { let _ = write!(s, "\"c{j}\":\"v{i}_{j}\""); }
+                _ => { let _ = write!(s, "\"c{j}\":{}", (i + j) % 2 == 0); }
+            }
+        }
+        s.push_str("}}");
     }
     s.push_str("]}");
     s
@@ -148,6 +196,41 @@ fn throughput() {
 
     // Sanity: a full round trip preserves the feature count.
     let back = std::fs::read_to_string(g("out1.geojson")).unwrap();
+    assert_eq!(back.matches("\"Feature\"").count(), n, "feature count preserved");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Wide-table benchmark: the same feature count, but many property columns, to
+/// expose the per-column costs the narrow `throughput` run hides. On the write
+/// side this stresses `schema::infer_columns` (currently O(rows × cols²)); on
+/// the read side, the per-row rebuild of each feature's properties (one key
+/// `String` allocation and one value clone per cell). Watch how the reported
+/// feat/s degrades as `PANTO_BENCH_COLS` grows — a linear-in-cols schema pass
+/// should keep it roughly flat per cell.
+#[test]
+#[ignore = "benchmark; run with --release --ignored --nocapture"]
+fn wide_table() {
+    let n = feature_count();
+    let cols = wide_cols();
+    let dir = scratch_named("wide");
+    let geojson = dir.join("wide.geojson");
+    let text = gen_wide_geojson(n, cols);
+    std::fs::write(&geojson, &text).unwrap();
+    let geo_bytes = text.len() as u64;
+    println!(
+        "\n=== panto wide-table: {n} features x {cols} props, geojson {geo_bytes} bytes ===",
+    );
+
+    // Write path: schema inference + columnar materialization dominate.
+    bench("geojson->parquet (wide)", &geojson, geo_bytes, n, &dir.join("wide.parquet"), &[]);
+    bench("geojson->fgb (wide)", &geojson, geo_bytes, n, &dir.join("wide.fgb"), &[]);
+
+    // Read path: per-row property reconstruction (key clone + value clone).
+    let pq = std::fs::metadata(dir.join("wide.parquet")).map(|m| m.len()).unwrap_or(0);
+    bench("parquet->geojson (wide)", &dir.join("wide.parquet"), pq, n, &dir.join("wide_out.geojson"), &[]);
+
+    let back = std::fs::read_to_string(dir.join("wide_out.geojson")).unwrap();
     assert_eq!(back.matches("\"Feature\"").count(), n, "feature count preserved");
 
     let _ = std::fs::remove_dir_all(&dir);

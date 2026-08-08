@@ -1,0 +1,98 @@
+#+TITLE: Plan: Spatial Indexing (R-trees & Hilbert Curves)
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Spatial Indexing: R-trees and Hilbert Ordering
+
+** WHY — the shared payoff
+Spatial ordering and indexing are a cross-cutting capability that several
+outputs benefit from. Rather than one-off code per format, build shared
+primitives once and reuse them:
+
+- *FlatGeobuf* — its spatial index *is* a packed Hilbert R-tree. We currently
+  write index-less files (=index_node_size = 0=) and skip the index on read.
+  Writing it makes our FGB spatially queryable by GDAL / QGIS.
+- *GeoParquet* — no index structure, but *Hilbert row ordering* clusters nearby
+  features so row-group bbox stats prune well (and spatially-close rows compress
+  better). The =geo= metadata bbox we already emit is the coarse version.
+- *GeoPackage* — has an optional RTree extension (SQLite's R*Tree) enabling
+  =rtree_...= spatial queries. Hardest of the three (see milestone D).
+- *General* — Hilbert-sorting features improves locality (smaller bboxes, better
+  compression) regardless of format.
+
+The common threads: a *per-feature bounding box* and a *Hilbert curve encoding*
+(map a point to a 1-D distance) used to sort features spatially.
+
+** SHARED PRIMITIVES (new =src/spatial/= module)
+1. *Per-feature bbox.* We have =geometry::Bbox= over a whole collection; add a
+   =Geometry::bbox() -> Bbox= (or a helper) for a single geometry.
+2. *Hilbert curve.* A pure =hilbert(x: u32, y: u32, order: u32) -> u64= mapping
+   integer grid coordinates to a Hilbert distance (the standard rotate/reflect
+   bit algorithm). Feature grid coordinates come from quantizing the bbox center
+   (or min) to =[0, 2^order)= over the dataset extent. FlatGeobuf uses a fixed
+   16-bit resolution over the dataset envelope; match that so our index agrees
+   with GDAL's.
+3. *Hilbert sort.* Given features + the dataset extent, produce the permutation
+   that orders features by Hilbert distance. This is a prerequisite for the FGB
+   index (features must be stored in the same order as the index leaves) and the
+   optional reordering for Parquet.
+
+** MILESTONES (ordered)
+
+*** A. Foundation — bbox + Hilbert primitives
+=src/spatial/= with the per-feature bbox, the Hilbert encoder, and a
+"sort features by Hilbert over their combined extent" helper. Unit-test the
+Hilbert mapping against known values and check it's a bijection on a small grid.
+Small, self-contained, and unlocks the rest.
+
+*** B. FlatGeobuf packed Hilbert R-tree (write) — highest value
+Extend =flatgeobuf/writer.rs=:
+- Sort features by Hilbert value (A) and write feature data in that order.
+- Build the *packed R-tree* bottom-up over the sorted features: leaves are one
+  =NodeItem= per feature (=minX,minY,maxX,maxY= as 4 f64 + =offset= u64 = 40
+  bytes), grouped =node_size= at a time (default 16) into parent nodes whose
+  bbox is the union of their children; repeat to a single root. Node layout is a
+  flat array, root level first down to leaves — the same layout our reader
+  already computes the size of and skips.
+- Leaf =offset= = the byte offset of the feature within the data section, so
+  feature sizes must be computed before the index is written; sequence:
+  encode features → offsets → build index → assemble
+  =magic · header · index · features=.
+- Set =index_node_size= in the header (16), not 0.
+- Validate: GDAL / DuckDB read the file; a bbox-filtered =ST_Read= returns the
+  right subset (exercises the index), and =*.fgb → our reader → *= still works
+  (we already skip the index, and its computed size must now match).
+
+*** C. GeoParquet spatial clustering (optional, light)
+Reorder rows by Hilbert value before writing (improves clustering and, once we
+write multiple row groups, row-group bbox pruning). The coarse =geo= bbox is
+already emitted. No new on-disk index — just an ordering pass reusing A.
+
+*** D. GeoPackage RTree extension (stretch / harder)
+GPKG's index is SQLite's *R*Tree virtual table*, not a packed Hilbert R-tree:
+=rtree_<t>_<c>= backed by shadow tables (=..._node=, =..._rowid=, =..._parent=)
+with SQLite's own node blob format, plus registration in =gpkg_extensions= and
+insert/update triggers. Writing this from scratch means emulating the R*Tree
+module's on-disk structure — substantial. Our =.gpkg= is valid and readable
+without it, so this is a deferred stretch goal; scope separately if pursued.
+
+** CONTROL / DEFAULTS
+- FGB with an index *requires* Hilbert-ordered features, so enabling the index
+  reorders features. Decide: write the index (and thus reorder) by default for
+  FGB, or gate behind a flag (e.g. =--index= / =--sort-hilbert=)? Reordering
+  changes feature/row order, which is observable — a flag is safer; a sensible
+  default is "index FGB, leave others as-is."
+- Parquet/GPKG reordering should be opt-in since it changes row order.
+
+** TESTING
+- Hilbert unit tests (known mappings, bijection on a small grid).
+- FGB: build with an index, have GDAL do a spatial (bbox) query and check the
+  result set; confirm =PackedRTree= size matches what our reader skips.
+- Cross-check reordered outputs still round-trip through the hub (geometry set
+  unchanged, just reordered).
+
+** OPEN QUESTIONS
+- Default resolution/anchor for the Hilbert quantization (center vs min; 16-bit
+  to match FGB vs higher) — match FGB for B; revisit for C/D.
+- Is the GPKG R*Tree worth the substantial effort, or document it as
+  unsupported and ship index-less GPKG indefinitely?

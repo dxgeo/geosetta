@@ -162,9 +162,12 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
--   **More format spokes** — Shapefile is another classic (multi-file
-    .shp/.dbf/.shx). GeoPackage's optional R-tree spatial index is a smaller
-    follow-up (our `.gpkg` files are valid but index-less).
+-   **Spatial indexing** — shared per-feature bbox + Hilbert-curve primitives, then
+    the FlatGeobuf packed Hilbert R-tree on write, optional GeoParquet Hilbert
+    clustering, and (stretch) the GeoPackage R\*Tree extension. Scoped in
+    [plans/spatial-index.org](plans/spatial-index.org). Our FGB/GPKG output is currently valid but
+    index-less.
+-   **More format spokes** — Shapefile is another classic (multi-file .shp/.dbf/.shx).
 -   **FlatGeobuf spatial index** (optional) — write the packed Hilbert R-tree so
     other tools get fast spatial queries; we currently write index-less files.
     See [plans/flatgeobuf.org](plans/flatgeobuf.org).

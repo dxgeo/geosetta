@@ -22,4 +22,9 @@ they are ordered by dependency.
 - [[file:geopackage.org][geopackage.org]] :: Add GeoPackage — a from-scratch
   SQLite reader/writer, treating the multi-layer =.gpkg= as a layer-aware
   wrapper around the single-layer IR (read fans out over all layers; write
-  creates-or-appends one layer, rewriting the whole file).
+  creates-or-appends one layer, rewriting the whole file). *DONE* (both
+  directions).
+- [[file:spatial-index.org][spatial-index.org]] :: Spatial ordering and indexing
+  — shared per-feature bbox + Hilbert curve primitives, the FlatGeobuf packed
+  Hilbert R-tree on write, optional GeoParquet Hilbert clustering, and (stretch)
+  the GeoPackage R*Tree extension.

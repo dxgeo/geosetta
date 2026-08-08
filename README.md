@@ -22,7 +22,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.6.0**.
+Current version: **0.7.0**.
 
 Both directions of the **GeoJSON ⇄ GeoParquet** path are implemented and working,
 written in Rust using only the standard library (zero external crates, in
@@ -35,9 +35,11 @@ The reader also handles common **foreign** GeoParquet: DuckDB's default output
 (dictionary-encoded columns, multiple row groups) reads back correctly,
 geometry included, under SNAPPY, GZIP, ZSTD, or no compression — the ZSTD and
 GZIP/DEFLATE decoders are implemented from scratch (RFC 8878 / RFC 1951-1952) in
-`parquet/zstd.rs` and `parquet/gzip.rs`. Remaining gaps — `DATA_PAGE_V2`, nested
-columns, 3D geometry, other codecs (LZ4/Brotli) — are reported as clear errors
-and tracked in [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
+`parquet/zstd.rs` and `parquet/gzip.rs`. Property columns may be `BOOLEAN`,
+`INT32=/=INT64`, `FLOAT=/=DOUBLE`, or `BYTE_ARRAY` strings. Remaining gaps —
+`DATA_PAGE_V2`, logical-type semantics (dates/timestamps), nested columns, 3D
+geometry, other codecs (LZ4/Brotli) — are reported as clear errors and tracked
+in [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
 
 
 ## IMPLEMENTATION
@@ -107,11 +109,12 @@ tail of formats that GDAL and Arrow already handle robustly.
 
 ## ROADMAP
 
--   Broader GeoParquet reading: `DATA_PAGE_V2`, more physical/logical types, 3D
-    geometry, other codecs (LZ4/Brotli) — the remaining
+-   Broader GeoParquet reading: `DATA_PAGE_V2`, logical-type semantics
+    (dates/timestamps), `INT96=/=FIXED_LEN_BYTE_ARRAY`, 3D geometry, LZ4/Brotli
+    codecs — the remaining
     [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org) milestones
-    (dictionary encoding, multiple row groups, and the SNAPPY/GZIP/ZSTD codecs
-    are done)
+    (dictionary encoding, multiple row groups, the SNAPPY/GZIP/ZSTD codecs, and
+    INT32/FLOAT columns are done)
 -   Additional formats toward the any-to-any hub described above (FlatGeobuf and
     WKT/CSV are natural next spokes — small, open, and dependency-free to parse)
 -   CRS handling beyond the CRS84 default, once a second CRS-bearing format lands

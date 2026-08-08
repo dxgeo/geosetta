@@ -166,4 +166,30 @@ mod tests {
         // gzip/DEFLATE decoder through the full pipeline.
         check_duckdb_fixture(include_bytes!("../tests/fixtures/duckdb_gzip.parquet"));
     }
+
+    #[test]
+    fn reads_int32_and_float_columns() {
+        // DuckDB file with PLAIN INT32 (`i32`) and FLOAT (`f32`) columns:
+        //   COPY (SELECT i::INTEGER i32, (i*1.25)::FLOAT f32,
+        //                ST_Point(i, i*2) geometry FROM range(400) t(i)) TO ...
+        // INT32 widens to a JSON integer, FLOAT to a JSON number.
+        let bytes = include_bytes!("../tests/fixtures/duckdb_int32_float.parquet");
+        let out = geoparquet_to_geojson(bytes).unwrap();
+        let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
+        assert_eq!(fc.features.len(), 400);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        for i in [0usize, 1, 7, 399] {
+            let f = &fc.features[i];
+            assert_eq!(prop(f, "i32").as_f64(), Some(i as f64));
+            // f32 value round-trips exactly through f64.
+            assert_eq!(prop(f, "f32").as_f64(), Some((i as f32 * 1.25) as f64));
+            assert_eq!(
+                f.geometry,
+                Some(crate::geometry::Geometry::Point([i as f64, (i * 2) as f64]))
+            );
+        }
+    }
 }

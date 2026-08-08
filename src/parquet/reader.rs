@@ -421,8 +421,10 @@ fn codec_name(id: i32) -> String {
 fn empty_column(physical: i32) -> Result<ColumnData> {
     Ok(match physical {
         p if p == ptype::BOOLEAN => ColumnData::Bool(Vec::new()),
-        p if p == ptype::INT64 => ColumnData::Int(Vec::new()),
-        p if p == ptype::DOUBLE => ColumnData::Double(Vec::new()),
+        // INT32 widens into the i64 column; FLOAT widens into the f64 column,
+        // so both surface as ordinary JSON numbers.
+        p if p == ptype::INT32 || p == ptype::INT64 => ColumnData::Int(Vec::new()),
+        p if p == ptype::FLOAT || p == ptype::DOUBLE => ColumnData::Double(Vec::new()),
         p if p == ptype::BYTE_ARRAY => ColumnData::Bytes(Vec::new()),
         other => return Err(Error::Parquet(format!("unsupported physical type {other}"))),
     })
@@ -430,7 +432,9 @@ fn empty_column(physical: i32) -> Result<ColumnData> {
 
 fn decode_dictionary(body: &[u8], physical: i32, count: usize) -> Result<Dict> {
     Ok(match physical {
+        p if p == ptype::INT32 => Dict::Int(plain_i32(body, count)?),
         p if p == ptype::INT64 => Dict::Int(plain_i64(body, count)?),
+        p if p == ptype::FLOAT => Dict::Double(plain_f32(body, count)?),
         p if p == ptype::DOUBLE => Dict::Double(plain_f64(body, count)?),
         p if p == ptype::BYTE_ARRAY => Dict::Bytes(plain_byte_arrays(body, count)?),
         other => {
@@ -454,7 +458,7 @@ fn decode_data_page(
     let n_present = present.iter().filter(|&&d| d == 1).count();
 
     match page_encoding {
-        e if e == encoding::PLAIN => decode_plain(out, values, &present, n_present),
+        e if e == encoding::PLAIN => decode_plain(out, col.physical, values, &present, n_present),
         e if e == encoding::PLAIN_DICTIONARY || e == encoding::RLE_DICTIONARY => {
             let dict = dict.ok_or_else(|| {
                 Error::Parquet("dictionary-encoded data page without a dictionary".into())
@@ -493,11 +497,31 @@ fn split_definition_levels(
     Ok((present, values))
 }
 
-fn decode_plain(out: &mut ColumnData, values: &[u8], present: &[u64], n: usize) -> Result<()> {
+fn decode_plain(
+    out: &mut ColumnData,
+    physical: i32,
+    values: &[u8],
+    present: &[u64],
+    n: usize,
+) -> Result<()> {
     match out {
         ColumnData::Bool(v) => v.extend(align(present, plain_bools(values, n)?)),
-        ColumnData::Int(v) => v.extend(align(present, plain_i64(values, n)?)),
-        ColumnData::Double(v) => v.extend(align(present, plain_f64(values, n)?)),
+        ColumnData::Int(v) => {
+            let decoded = if physical == ptype::INT32 {
+                plain_i32(values, n)?
+            } else {
+                plain_i64(values, n)?
+            };
+            v.extend(align(present, decoded));
+        }
+        ColumnData::Double(v) => {
+            let decoded = if physical == ptype::FLOAT {
+                plain_f32(values, n)?
+            } else {
+                plain_f64(values, n)?
+            };
+            v.extend(align(present, decoded));
+        }
         ColumnData::Bytes(v) => v.extend(align(present, plain_byte_arrays(values, n)?)),
     }
     Ok(())
@@ -716,9 +740,23 @@ fn plain_bools(data: &[u8], count: usize) -> Result<Vec<bool>> {
     Ok((0..count).map(|i| (data[i / 8] >> (i % 8)) & 1 == 1).collect())
 }
 
+fn plain_i32(data: &[u8], count: usize) -> Result<Vec<i64>> {
+    let slots = fixed_slots(data, count, 4)?;
+    Ok(slots
+        .map(|s| i32::from_le_bytes(s.try_into().unwrap()) as i64)
+        .collect())
+}
+
 fn plain_i64(data: &[u8], count: usize) -> Result<Vec<i64>> {
     let slots = fixed_slots(data, count, 8)?;
     Ok(slots.map(|s| i64::from_le_bytes(s.try_into().unwrap())).collect())
+}
+
+fn plain_f32(data: &[u8], count: usize) -> Result<Vec<f64>> {
+    let slots = fixed_slots(data, count, 4)?;
+    Ok(slots
+        .map(|s| f32::from_le_bytes(s.try_into().unwrap()) as f64)
+        .collect())
 }
 
 fn plain_f64(data: &[u8], count: usize) -> Result<Vec<f64>> {

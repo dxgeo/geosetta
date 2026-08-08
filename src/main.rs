@@ -16,6 +16,7 @@ mod geometry;
 mod json;
 mod parquet;
 mod schema;
+mod sqlite;
 
 use error::{Error, Result};
 

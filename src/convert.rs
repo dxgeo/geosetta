@@ -159,4 +159,11 @@ mod tests {
         // decoder through the full pipeline.
         check_duckdb_fixture(include_bytes!("../tests/fixtures/duckdb_zstd.parquet"));
     }
+
+    #[test]
+    fn reads_duckdb_dictionary_gzip() {
+        // Same data, GZIP page compression — exercises the from-scratch
+        // gzip/DEFLATE decoder through the full pipeline.
+        check_duckdb_fixture(include_bytes!("../tests/fixtures/duckdb_gzip.parquet"));
+    }
 }

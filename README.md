@@ -22,7 +22,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.5.0**.
+Current version: **0.6.0**.
 
 Both directions of the **GeoJSON ⇄ GeoParquet** path are implemented and working,
 written in Rust using only the standard library (zero external crates, in
@@ -33,10 +33,11 @@ and the geojson→parquet→geojson→parquet round trip is byte-for-byte stable
 
 The reader also handles common **foreign** GeoParquet: DuckDB's default output
 (dictionary-encoded columns, multiple row groups) reads back correctly,
-geometry included, under SNAPPY, ZSTD, or no compression — the ZSTD decoder is
-implemented from scratch (RFC 8878) in `parquet/zstd.rs`. Remaining gaps — GZIP,
-`DATA_PAGE_V2`, nested columns, 3D geometry — are reported as clear errors and
-tracked in [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
+geometry included, under SNAPPY, GZIP, ZSTD, or no compression — the ZSTD and
+GZIP/DEFLATE decoders are implemented from scratch (RFC 8878 / RFC 1951-1952) in
+`parquet/zstd.rs` and `parquet/gzip.rs`. Remaining gaps — `DATA_PAGE_V2`, nested
+columns, 3D geometry, other codecs (LZ4/Brotli) — are reported as clear errors
+and tracked in [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
 
 
 ## IMPLEMENTATION
@@ -54,6 +55,8 @@ specification rather than pulled from a crate:
     dictionary value decoding, across multiple row groups
 -   **`parquet/zstd.rs`:** from-scratch ZSTD decoder (FSE, Huffman, sequences) for
     ZSTD-compressed pages
+-   **`parquet/gzip.rs`:** from-scratch GZIP/DEFLATE inflate (RFC 1951/1952) for
+    GZIP-compressed pages
 -   **`cli.rs` / `convert.rs`:** argument parsing and the conversion pipeline
     (both directions)
 
@@ -104,10 +107,11 @@ tail of formats that GDAL and Arrow already handle robustly.
 
 ## ROADMAP
 
--   Broader GeoParquet reading: GZIP codec, `DATA_PAGE_V2`, more
-    physical/logical types, 3D geometry — the remaining
+-   Broader GeoParquet reading: `DATA_PAGE_V2`, more physical/logical types, 3D
+    geometry, other codecs (LZ4/Brotli) — the remaining
     [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org) milestones
-    (dictionary encoding, multiple row groups, and the ZSTD codec are done)
+    (dictionary encoding, multiple row groups, and the SNAPPY/GZIP/ZSTD codecs
+    are done)
 -   Additional formats toward the any-to-any hub described above (FlatGeobuf and
     WKT/CSV are natural next spokes — small, open, and dependency-free to parse)
 -   CRS handling beyond the CRS84 default, once a second CRS-bearing format lands

@@ -1,6 +1,7 @@
 //! A minimal, dependency-free GeoParquet writer.
 
 mod geo;
+mod gzip;
 mod reader;
 mod schema;
 mod snappy;

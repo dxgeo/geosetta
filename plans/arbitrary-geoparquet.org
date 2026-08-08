@@ -139,10 +139,13 @@ Provenance: independent implementation from the RFC, not derived from Meta's
 BSD/GPLv2. The =zstd= CLI is used only as a test oracle. Documented in the
 module header.
 
-*** 3. GZIP codec
-Not emitted by DuckDB but common elsewhere. A from-scratch DEFLATE/RFC-1951
-=inflate= is well-bounded and reusable; lower urgency than dictionary but easier
-than ZSTD.
+*** 3. GZIP codec — *DONE*
+Implemented from scratch in =src/parquet/gzip.rs=: RFC 1951 DEFLATE =inflate=
+(stored / fixed / dynamic Huffman, canonical-code decoding, length/distance
+matches) plus the RFC 1952 gzip container (also tolerant of bare zlib or raw
+DEFLATE). Verified against Python =gzip= vectors (text / repetitive /
+incompressible / small, levels 1–9) and DuckDB GZIP GeoParquet, including a 200k
+multi-row-group file. Committed fixture: =tests/fixtures/duckdb_gzip.parquet=.
 
 *** 4. Additional physical / logical types
 Our writer only emits =BOOLEAN=/=INT64=/=DOUBLE=/=BYTE_ARRAY=. Foreign files add

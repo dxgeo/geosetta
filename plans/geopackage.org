@@ -1,0 +1,131 @@
+#+TITLE: Plan: GeoPackage Format Spoke
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Adding GeoPackage (GPKG) as a Format Spoke
+
+** WHAT MAKES GPKG DIFFERENT
+Every spoke so far is *single-layer*: one GeoJSON / GeoParquet / FlatGeobuf /
+CSV / WKT holds one collection of features, matching our single =FeatureCollection=
+IR. GeoPackage is the first *container of datasets*: a =.gpkg= is a SQLite
+database that can hold many feature tables ("layers"), each with its own schema,
+geometry type, and SRS, listed in =gpkg_contents=.
+
+We keep the IR single-layer and treat GPKG as a *layer-aware wrapper* around the
+existing per-layer hub — the IR and the other spokes do not change.
+
+** BEHAVIOR MODEL (decided)
+- *Read*: enumerate all feature tables and convert *every* layer (fan-out).
+- *Write*: one layer per conversion, create-or-append:
+  - target =.gpkg= does not exist → create it containing this layer;
+  - target exists → add the layer, replacing it if a layer of that name is
+    already present (upsert).
+- Because write is append/upsert, *sequential invocations accumulate layers*
+  with no special batch mode:
+  #+begin_src sh
+  panto roads.geojson data.gpkg     # create data.gpkg with layer "roads"
+  panto rivers.csv    data.gpkg     # append layer "rivers"
+  #+end_src
+  A future batch form (=panto a.geojson b.csv out.gpkg=) is just a convenience.
+
+*** Key simplification: append via read-modify-write
+In-place editing of a SQLite file from scratch (b-tree insertion, freelists,
+page allocation, schema-cookie bumps) is hard. We avoid it: to append a layer we
+*read the whole existing =.gpkg= into layers (via the SQLite reader we need
+anyway), upsert the new layer, and rewrite the complete file.* So the SQLite
+*writer only ever emits a complete database from scratch* — never mutates one in
+place. That is the difference between "hard" and "very hard," and it falls out
+of the append model for free. (Rewriting the whole file per append is fine for
+typical sizes.)
+
+** LAYER NAMING & OUTPUT RULES (decided)
+*** Layer name on write
+Default to the *input file stem* (=roads.geojson= → layer =roads=), overridable
+with =--layer <name>=.
+
+*** Output naming on read fan-out
+Reading a multi-layer =.gpkg= into a single-layer format produces several files.
+Detect from the output path, no extra flag:
+- Output path is a *directory* (exists as one, or ends with =/=) → one file per
+  layer, named by the layer with the target extension: =out/roads.geojson=,
+  =out/rivers.geojson= (clean, re-importable names).
+- Output path is a *plain filename* and the gpkg has *one* layer → write it
+  there directly (the common case, no filename cruft).
+- Output path is a *plain filename* and the gpkg has *multiple* layers → error
+  with a clear message ("multi-layer input; give a directory or =--layer <name>=");
+  =--layer= selects a single layer to write to that filename.
+- GPKG → GPKG copies all layers into the new file (no per-file naming needed).
+
+This avoids confusing =out.roads.geojson= infix names and never forces directory
+semantics on the common single-layer case.
+
+** COMPONENTS (effort, roughly ordered)
+*** 1. SQLite reader — the big rock (new shared module, e.g. =src/sqlite/=)
+Read the SQLite file format from scratch: the 100-byte header (page size, text
+encoding), b-tree pages (interior + leaf table pages), the record format
+(serial-type varints → NULL / ints / floats / text / blob), overflow pages for
+large records, and the =sqlite_master= schema table. Enough to enumerate tables
+and iterate rows. GPKG uses ordinary rowid tables (not =WITHOUT ROWID=), which
+keeps scope down. Not GPKG-specific, so it lives outside =geopackage/=.
+
+*** 2. SQLite whole-file writer
+Emit a valid SQLite database from a set of tables (schema rows in
+=sqlite_master= + a b-tree per table). Only ever writes complete files (see the
+read-modify-write note), so no incremental b-tree edits, freelist management, or
+schema-cookie surgery. Still substantial — b-tree page layout, record encoding,
+overflow pages — but bounded.
+
+*** 3. GeoPackage layer on top of SQLite
+- Read: parse =gpkg_contents= (layer list, data_type='features') and
+  =gpkg_geometry_columns= (geometry column name/type per table); for each feature
+  table, map columns → properties and the geometry column → geometry.
+- Write: create the required GPKG metadata tables (=gpkg_spatial_ref_sys=,
+  =gpkg_contents=, =gpkg_geometry_columns=) plus one table per layer.
+- Column type mapping ↔ SQLite storage classes and our =schema::Cell= types
+  (reuse =schema::infer_columns= for the write side, as Parquet/FGB do).
+
+*** 4. GeoPackage Binary geometry — trivial
+The geometry blob is a small header (magic "GP", version, flags with an envelope,
+=srs_id=) wrapping *standard WKB*, which we already encode/decode in
+=geometry/wkb.rs=. So geometry is essentially free: read/skip the header, reuse
+=from_wkb= / =to_wkb=, emit the header on write.
+
+*** 5. Layer-aware CLI / pipeline
+GPKG does not fit the pure =convert(from, to, bytes) -> bytes= shape:
+- Write needs the *output path* (to check existence and read the existing file)
+  and the *layer name* (from the input stem or =--layer=).
+- Read *fans out* to several outputs.
+So =main.rs= special-cases GPKG at the I/O layer, calling layer-aware helpers
+that still use the per-layer hub internally: read a layer → =FeatureCollection=
+→ =write(to, fc)=; or =read(from, input)= → upsert into the gpkg's layer set.
+Add =Format::Gpkg= and the =.gpkg= extension, and a =--layer= option to =Args=.
+
+** SUGGESTED ORDER (read-first)
+1. SQLite reader (item 1) — validate by dumping tables/rows of a DuckDB-written
+   =.gpkg=.
+2. GeoPackage read (items 3-read, 4) + fan-out CLI (item 5-read): GPKG → GeoJSON
+   / GeoParquet / … lights up; validate each layer against DuckDB's =ST_Read=.
+3. SQLite writer (item 2) + GeoPackage write + append (items 3-write, 5-write):
+   validate by having DuckDB =ST_Read= our =.gpkg=, and round-trip
+   gpkg→(layers)→gpkg.
+
+** TESTING
+- *Oracle:* DuckDB =ST_Read('file.gpkg', layer='name')= reads GPKG per layer —
+  validates our reader and our writer's output. Confirmed working locally.
+- *Caveat:* DuckDB =COPY … (DRIVER 'GPKG')= *overwrites* the file (it does not
+  append layers), so it can only produce *single-layer* fixtures. Multi-layer
+  test fixtures need =ogr2ogr= (not currently installed) — or we generate them
+  with our own writer once it exists (self-consistency), then cross-check each
+  layer against DuckDB.
+- Unit-test the SQLite reader/writer against small hand-built / round-tripped
+  databases; unit-test the GPKG geometry header wrapper around =wkb=.
+
+** OPEN QUESTIONS / NOTES
+- SQLite feature scope: which serial types and page features are truly needed for
+  GPKG feature tables (overflow pages yes; =WITHOUT ROWID= no; indexes can be
+  ignored on read and omitted on write). Confirm as we go.
+- CRS/SRS: GPKG stores an SRS per layer (=gpkg_spatial_ref_sys=). For now assume
+  CRS84, consistent with the rest of the project; ties into the existing CRS
+  roadmap item.
+- Raster/tile and attribute-only tables in a GPKG: skip (only =data_type =
+  'features'= tables are converted).

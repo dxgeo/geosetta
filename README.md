@@ -147,8 +147,10 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
--   **More format spokes** — GeoPackage (SQLite-based) is the natural next one,
-    though larger; Shapefile is another classic.
+-   **More format spokes** — GeoPackage is the natural next one (a from-scratch
+    SQLite reader/writer; multi-layer, so it's a layer-aware wrapper around the
+    single-layer IR) — scoped in [plans/geopackage.org](plans/geopackage.org).
+    Shapefile is another classic.
 -   **FlatGeobuf spatial index** (optional) — write the packed Hilbert R-tree so
     other tools get fast spatial queries; we currently write index-less files.
     See [plans/flatgeobuf.org](plans/flatgeobuf.org).

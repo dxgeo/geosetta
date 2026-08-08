@@ -18,4 +18,8 @@ they are ordered by dependency.
 - [[file:flatgeobuf.org][flatgeobuf.org]] :: Add FlatGeobuf as a new format
   spoke — a from-scratch FlatBuffers codec, an FGB reader/writer against the
   shared =Feature= IR, and hub routing so FGB composes with GeoJSON and
-  GeoParquet automatically.
+  GeoParquet automatically. *DONE* (both directions).
+- [[file:geopackage.org][geopackage.org]] :: Add GeoPackage — a from-scratch
+  SQLite reader/writer, treating the multi-layer =.gpkg= as a layer-aware
+  wrapper around the single-layer IR (read fans out over all layers; write
+  creates-or-appends one layer, rewriting the whole file).

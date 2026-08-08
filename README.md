@@ -7,6 +7,10 @@ Pantograph is a library for exporting any vector geospatial format to any other 
 The basic idea is to have one library, with no other dependencies, that can take any input vector geospatial file and output any other conceivable vector format, provided it is an open standard.
 If you've heard of [Pandoc](https://pandoc.org/), the idea is similar here.
 
+Vector is the focus today. **Raster** formats are a planned future direction —
+they need a second intermediate representation alongside the feature IR (a
+coverage/grid model rather than `FeatureCollection`); see the roadmap.
+
 
 ## ARCHITECTURE
 
@@ -22,7 +26,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.16.0**.
+Current version: **0.17.0**.
 
 Six formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
@@ -38,15 +42,16 @@ every other automatically — no per-pair code:
     `.gpkg` is multi-layer, so reading fans out over all feature tables and writing
     a layer creates the file or appends to it (upserting by name); the `--layer`
     option and directory-vs-single-file output rules handle the fan-out. Our output
-    passes SQLite's `integrity_check` and is read by GDAL.
+    passes SQLite's `integrity_check` and is read by GDAL. An opt-in `--rtree` flag
+    also writes the GeoPackage RTree extension (SQLite's R\*Tree virtual table,
+    built from scratch); the index passes `rtreecheck()` and answers GDAL/DuckDB
+    bbox queries.
 
 Any input converts to any output: e.g. CSV→GeoParquet, FlatGeobuf→GeoJSON,
 GeoPackage→GeoParquet, GeoJSON→GeoPackage all work. Validated against DuckDB / GDAL.
 
-Both directions of the **GeoJSON ⇄ GeoParquet** path are implemented and working,
-written in Rust using only the standard library (zero external crates, in
-keeping with the dependency-free goal). Write output is Snappy-compressed and
-validated by DuckDB's spatial engine as genuine, queryable GeoParquet; the
+The **GeoParquet** path is the most exercised. Write output is Snappy-compressed
+and validated by DuckDB's spatial engine as genuine, queryable GeoParquet; the
 reader recovers a GeoParquet file Pantograph wrote back to equivalent GeoJSON,
 and the geojson→parquet→geojson→parquet round trip is byte-for-byte stable.
 
@@ -86,11 +91,15 @@ specification rather than pulled from a crate:
 -   **`spatial.rs`:** shared spatial-ordering primitives — a Hilbert-curve encoder
     and feature-locality sort, used to build FlatGeobuf's packed R-tree
 -   **`sqlite.rs`:** a minimal, from-scratch SQLite reader **and** whole-file writer
-    (header, b-tree walk/pack with overflow chains, record coding, CREATE TABLE
-    parsing) — the file our GeoPackage output passes `integrity_check` on
+    (header, multi-page b-tree walk/pack with overflow chains — including a
+    `sqlite_master` that grows past page 1 — schema-only master rows for virtual
+    tables and triggers, record coding, CREATE TABLE parsing) — the file our
+    GeoPackage output passes `integrity_check` on
 -   **`geopackage/`:** GeoPackage reader and writer on top of `sqlite.rs` — layer
     fan-out from `gpkg_contents`, GeoPackage Binary geometry wrapping WKB, and
-    create-or-append (upsert) writes
+    create-or-append (upsert) writes. `geopackage/rtree.rs` builds the opt-in
+    RTree extension: a packed R\*Tree in SQLite's node blob format, its shadow
+    tables, and the maintenance triggers
 -   **`compress/`:** format-agnostic `bytes -> bytes` codecs implemented from spec —
     Snappy, GZIP/DEFLATE (RFC 1951/1952), ZSTD (RFC 8878, FSE + Huffman +
     sequences), and LZ4 block. Not Parquet-specific, so reusable by future formats
@@ -122,6 +131,7 @@ features (heterogeneous or nested values fall back to a JSON string).
     panto input.gpkg    out/ --to geojson # multi-layer GeoPackage -> one file per layer
     panto roads.geojson data.gpkg        # create data.gpkg with layer "roads"
     panto rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
+    panto roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
     panto big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
     # formats may also be given explicitly:
     panto in.txt out.bin --from geojson --to parquet
@@ -165,14 +175,18 @@ produce in practice: dictionary encoding, multiple row groups, the
 SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
--   **Spatial indexing** — the shared Hilbert primitives, the FlatGeobuf packed
-    R-tree, and the opt-in `--sort-hilbert` row clustering are done; only the
-    (stretch) GeoPackage R\*Tree extension remains, scoped in
-    [plans/spatial-index.org](plans/spatial-index.org). Our GPKG output is still index-less.
+-   **Spatial indexing** — done across all three formats: the shared Hilbert
+    primitives, the FlatGeobuf packed R-tree, the opt-in `--sort-hilbert` row
+    clustering, and now the opt-in `--rtree` GeoPackage R\*Tree extension (scoped in
+    [plans/spatial-index.org](plans/spatial-index.org)). Whether to make `--rtree` the default is the one
+    remaining open question there.
 -   **More format spokes** — Shapefile is another classic (multi-file .shp/.dbf/.shx).
--   **FlatGeobuf spatial index** (optional) — write the packed Hilbert R-tree so
-    other tools get fast spatial queries; we currently write index-less files.
-    See [plans/flatgeobuf.org](plans/flatgeobuf.org).
+-   **Raster formats** (larger effort, planned) — a genuinely new axis. Raster data
+    is a grid of cells, not a set of features, so it needs a second intermediate
+    representation (a coverage/grid model) beside the feature IR, with its own
+    read/write spokes — e.g. GeoTIFF and Cloud-Optimized GeoTIFF. Conversions
+    would compose within the raster IR the same hub-and-spoke way; vector⇄raster
+    (rasterize / vectorize) is a separate, further-out concern.
 -   **Deferred, lower-priority GeoParquet milestones** (parked in
     [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org); diminishing returns / testing friction):
     -   `DATA_PAGE_V2` — DuckDB doesn't emit it; a test fixture needs pyarrow.
@@ -180,7 +194,7 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
     -   `DECIMAL` / `INT96` / `FIXED_LEN_BYTE_ARRAY`, and 3D (Z/M) geometry — niche.
 -   **CRS handling** beyond the CRS84 default, once a second CRS-bearing format lands.
 
-Detailed design notes live in [plans/](plans/README.md).
+Detailed design notes live in [plans/](plans/README.org).
 
 
 ## LICENSE

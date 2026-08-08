@@ -2,7 +2,7 @@
 name = "pantograph-rs"
 version = "0.17.0"
 edition = "2024"
-description = "Convert between open vector geospatial formats (GeoJSON → GeoParquet), dependency-free."
+description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, CSV, WKT), dependency-free."
 license = "MIT"
 
 [[bin]]

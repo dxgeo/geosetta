@@ -175,6 +175,29 @@ mod tests {
     }
 
     #[test]
+    fn reads_date_and_timestamp_columns() {
+        // DuckDB file with a DATE (INT32) and TIMESTAMP_MICROS (INT64) column,
+        // which the reader renders as ISO 8601 strings:
+        //   COPY (SELECT DATE '2020-01-01' + i::INTEGER d,
+        //                TIMESTAMP '2020-01-01' + (i*INTERVAL 1 HOUR) ts,
+        //                ST_Point(i,0) geometry FROM range(300) t(i)) TO ...
+        let bytes = include_bytes!("../tests/fixtures/duckdb_dates.parquet");
+        let out = geoparquet_to_geojson(bytes).unwrap();
+        let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
+        assert_eq!(fc.features.len(), 300);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        let f0 = &fc.features[0];
+        assert_eq!(prop(f0, "d").as_str(), Some("2020-01-01"));
+        assert_eq!(prop(f0, "ts").as_str(), Some("2020-01-01T00:00:00"));
+        let f2 = &fc.features[2];
+        assert_eq!(prop(f2, "d").as_str(), Some("2020-01-03"));
+        assert_eq!(prop(f2, "ts").as_str(), Some("2020-01-01T02:00:00"));
+    }
+
+    #[test]
     fn reads_int32_and_float_columns() {
         // DuckDB file with PLAIN INT32 (`i32`) and FLOAT (`f32`) columns:
         //   COPY (SELECT i::INTEGER i32, (i*1.25)::FLOAT f32,

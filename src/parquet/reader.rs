@@ -11,7 +11,7 @@
 
 use super::geo::GEOMETRY_COLUMN;
 use super::thrift::{CompactReader, Field};
-use super::types::{codec, encoding, page, ptype, repetition};
+use super::types::{codec, converted, encoding, page, ptype, repetition};
 use super::{gzip, lz4, snappy, zstd};
 use crate::error::{Error, Result};
 use crate::json::{self, JsonValue};
@@ -67,7 +67,7 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
                     _ => return Err(Error::Parquet("geometry column is not BYTE_ARRAY".into())),
                 }
             } else {
-                let values = column_to_json(data)?;
+                let values = column_to_json(data, col.converted_type)?;
                 if rg_idx == 0 {
                     properties.push(PropertyColumn {
                         name: col.name.clone(),
@@ -116,6 +116,8 @@ struct ColumnMeta {
     dictionary_page_offset: Option<i64>,
     /// 0 for a REQUIRED leaf (no definition levels), 1 for an OPTIONAL one.
     max_def_level: u32,
+    /// The schema's converted_type, if any (e.g. DATE, TIMESTAMP_*).
+    converted_type: Option<i32>,
 }
 
 fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
@@ -123,8 +125,9 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     let mut num_rows = 0i64;
     let mut row_groups: Vec<RowGroup> = Vec::new();
     let mut geometry_column = GEOMETRY_COLUMN.to_string();
-    // Leaf name -> repetition_type, used to derive each column's def level.
-    let mut reps: Vec<(String, i32)> = Vec::new();
+    // Leaf name -> (repetition_type, converted_type), used to derive each
+    // column's definition level and any date/timestamp interpretation.
+    let mut reps: Vec<(String, i32, Option<i32>)> = Vec::new();
 
     r.struct_begin();
     loop {
@@ -163,15 +166,13 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     }
     r.struct_end();
 
-    // Attach the max definition level to every column from the schema.
+    // Attach schema info (definition level, converted type) to every column.
     for rg in &mut row_groups {
         for col in &mut rg.columns {
-            let rep = reps
-                .iter()
-                .find(|(name, _)| *name == col.name)
-                .map(|(_, r)| *r)
-                .unwrap_or(repetition::OPTIONAL);
+            let leaf = reps.iter().find(|(name, ..)| *name == col.name);
+            let rep = leaf.map(|(_, r, _)| *r).unwrap_or(repetition::OPTIONAL);
             col.max_def_level = if rep == repetition::REQUIRED { 0 } else { 1 };
+            col.converted_type = leaf.and_then(|(.., c)| *c);
         }
     }
 
@@ -182,12 +183,13 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     })
 }
 
-/// A schema element reduced to `(name, repetition_type)`. The root element and
-/// any non-leaf carry a name too, but they never match a column path, so we
-/// keep them all and look up leaves by name.
-fn parse_schema_element(r: &mut CompactReader) -> Result<(String, i32)> {
+/// A schema element reduced to `(name, repetition_type, converted_type)`. The
+/// root and non-leaf elements carry names too but never match a column path, so
+/// we keep them all and look up leaves by name.
+fn parse_schema_element(r: &mut CompactReader) -> Result<(String, i32, Option<i32>)> {
     let mut name = String::new();
     let mut rep = repetition::REQUIRED;
+    let mut converted = None;
     r.struct_begin();
     loop {
         match r.read_field()? {
@@ -195,12 +197,13 @@ fn parse_schema_element(r: &mut CompactReader) -> Result<(String, i32)> {
             Field::Begin { id, ty } => match id {
                 3 => rep = r.read_i32()?,
                 4 => name = r.read_string()?,
+                6 => converted = Some(r.read_i32()?),
                 _ => r.skip(ty)?,
             },
         }
     }
     r.struct_end();
-    Ok((name, rep))
+    Ok((name, rep, converted))
 }
 
 fn parse_row_group(r: &mut CompactReader) -> Result<RowGroup> {
@@ -281,6 +284,7 @@ fn parse_column_meta(r: &mut CompactReader) -> Result<ColumnMeta> {
         data_page_offset,
         dictionary_page_offset,
         max_def_level: 1, // set from the schema in parse_file_metadata
+        converted_type: None, // set from the schema in parse_file_metadata
     })
 }
 
@@ -791,12 +795,72 @@ fn plain_byte_arrays(data: &[u8], count: usize) -> Result<Vec<Vec<u8>>> {
     Ok(out)
 }
 
+/// Whether a converted type is a date or timestamp we render as a string.
+fn is_temporal(converted: Option<i32>) -> bool {
+    matches!(
+        converted,
+        Some(converted::DATE | converted::TIMESTAMP_MILLIS | converted::TIMESTAMP_MICROS)
+    )
+}
+
+/// Format an integer temporal value as ISO 8601, given its converted type.
+/// DATE is days since the Unix epoch; TIMESTAMP_* are milli/microseconds.
+fn format_temporal(value: i64, converted: Option<i32>) -> String {
+    match converted {
+        Some(converted::DATE) => format_date(value),
+        Some(converted::TIMESTAMP_MILLIS) => format_timestamp(value, 3),
+        Some(converted::TIMESTAMP_MICROS) => format_timestamp(value, 6),
+        _ => value.to_string(),
+    }
+}
+
+/// Civil year/month/day from a day count since 1970-01-01 (Hinnant's algorithm,
+/// valid for any day in the proleptic Gregorian calendar).
+fn civil_from_days(days: i64) -> (i64, u32, u32) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64; // day of era, [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365; // [0, 399]
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year, [0, 365]
+    let mp = (5 * doy + 2) / 153; // [0, 11]
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32; // [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32; // [1, 12]
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+fn format_date(days: i64) -> String {
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// `subsecond_digits` is 3 for milliseconds, 6 for microseconds.
+fn format_timestamp(value: i64, subsecond_digits: u32) -> String {
+    let per_second = 10i64.pow(subsecond_digits);
+    let secs = value.div_euclid(per_second);
+    let frac = value.rem_euclid(per_second);
+    let (y, m, d) = civil_from_days(secs.div_euclid(86_400));
+    let sod = secs.rem_euclid(86_400);
+    let (hh, mm, ss) = (sod / 3600, (sod % 3600) / 60, sod % 60);
+    let mut s = format!("{y:04}-{m:02}-{d:02}T{hh:02}:{mm:02}:{ss:02}");
+    if frac != 0 {
+        s.push_str(&format!(".{frac:0width$}", width = subsecond_digits as usize));
+    }
+    s
+}
+
 /// Turn a decoded column into per-row JSON property values.
-fn column_to_json(data: ColumnData) -> Result<Vec<JsonValue>> {
+fn column_to_json(data: ColumnData, converted: Option<i32>) -> Result<Vec<JsonValue>> {
     let values = match data {
         ColumnData::Bool(v) => v
             .into_iter()
             .map(|o| o.map_or(JsonValue::Null, JsonValue::Bool))
+            .collect(),
+        // DATE and TIMESTAMP columns are integers with a temporal converted
+        // type; render them as ISO 8601 strings. Everything else stays numeric.
+        ColumnData::Int(v) if is_temporal(converted) => v
+            .into_iter()
+            .map(|o| o.map_or(JsonValue::Null, |i| JsonValue::String(format_temporal(i, converted))))
             .collect(),
         ColumnData::Int(v) => v
             .into_iter()
@@ -876,6 +940,26 @@ mod tests {
     fn align_places_nulls() {
         let out = align(&[1, 0, 1], vec![10i64, 20]);
         assert_eq!(out, vec![Some(10), None, Some(20)]);
+    }
+
+    #[test]
+    fn formats_dates() {
+        assert_eq!(format_date(0), "1970-01-01"); // epoch
+        assert_eq!(format_date(18262), "2020-01-01");
+        assert_eq!(format_date(-1), "1969-12-31"); // before epoch
+        assert_eq!(format_date(59), "1970-03-01"); // 1970 not a leap year
+    }
+
+    #[test]
+    fn formats_timestamps() {
+        // 2020-01-01T00:00:00 in micros since epoch.
+        let base = 18262i64 * 86_400 * 1_000_000;
+        assert_eq!(format_timestamp(base, 6), "2020-01-01T00:00:00");
+        assert_eq!(format_timestamp(base + 3_600_000_000, 6), "2020-01-01T01:00:00");
+        // Sub-second micros are rendered with six digits.
+        assert_eq!(format_timestamp(base + 123_456, 6), "2020-01-01T00:00:00.123456");
+        // Milliseconds scale, three digits.
+        assert_eq!(format_timestamp(18262 * 86_400 * 1000 + 500, 3), "2020-01-01T00:00:00.500");
     }
 
     #[test]

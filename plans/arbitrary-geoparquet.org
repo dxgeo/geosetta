@@ -156,16 +156,18 @@ Verified against DuckDB LZ4 GeoParquet (200k rows) and a committed fixture
 still errors cleanly; Brotli remains unimplemented.
 
 *** 4. Additional physical / logical types — *PARTIAL*
-=INT32= (4-byte LE) and =FLOAT= (4-byte IEEE) are done: they widen into the i64
-and f64 columns respectively, surfacing as ordinary JSON numbers, in both PLAIN
-and dictionary encodings. Verified against DuckDB =INTEGER=/=FLOAT= columns
-(committed fixture =tests/fixtures/duckdb_int32_float.parquet=).
+Done:
+- =INT32= (4-byte LE) and =FLOAT= (4-byte IEEE) widen into the i64 and f64
+  columns respectively, surfacing as ordinary JSON numbers, in both PLAIN and
+  dictionary encodings (fixture =tests/fixtures/duckdb_int32_float.parquet=).
+- =DATE= (INT32 days) and =TIMESTAMP_MILLIS= / =TIMESTAMP_MICROS= (INT64) render
+  as ISO 8601 strings, read from the schema's =converted_type= (DuckDB writes
+  it, so no need to parse the =logicalType= union). Verified against DuckDB
+  read-back including sub-second micros (fixture =tests/fixtures/duckdb_dates.parquet=).
 
-Still to do: =INT96= (legacy timestamps), =FIXED_LEN_BYTE_ARRAY=, and semantic
-mapping of logical/converted types (=DATE=, =TIMESTAMP=, =DECIMAL=, =JSON=) onto
-GeoJSON values — currently a =DATE= column reads as its raw integer day count
-rather than an ISO string (reading the =logicalType= union from the schema is
-the extra work here).
+Still to do: =INT96= (legacy timestamps), =FIXED_LEN_BYTE_ARRAY=, and =DECIMAL= /
+=JSON= logical types. Writers that emit *only* =logicalType= (not the legacy
+=converted_type=) would need the union parsed; DuckDB writes both.
 
 *** 5. DATA_PAGE_V2
 Distinct header: separate definition/repetition byte counts, an =is_compressed=

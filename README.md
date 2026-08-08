@@ -22,7 +22,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.8.0**.
+Current version: **0.9.0**.
 
 Both directions of the **GeoJSON ⇄ GeoParquet** path are implemented and working,
 written in Rust using only the standard library (zero external crates, in
@@ -36,10 +36,11 @@ The reader also handles common **foreign** GeoParquet: DuckDB's default output
 geometry included, under SNAPPY, GZIP, ZSTD, LZ4<sub>RAW</sub>, or no compression — the
 ZSTD, GZIP/DEFLATE, and LZ4 decoders are implemented from scratch in
 `parquet/zstd.rs`, `parquet/gzip.rs`, and `parquet/lz4.rs`. Property columns may
-be `BOOLEAN`, `INT32=/=INT64`, `FLOAT=/=DOUBLE`, or `BYTE_ARRAY` strings.
-Remaining gaps — `DATA_PAGE_V2`, logical-type semantics (dates/timestamps),
-nested columns, 3D geometry, Brotli — are reported as clear errors and tracked
-in [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
+be `BOOLEAN`, `INT32=/=INT64`, `FLOAT=/=DOUBLE`, or `BYTE_ARRAY` strings, with
+`DATE` and `TIMESTAMP` columns rendered as ISO 8601 strings. Remaining gaps —
+`DATA_PAGE_V2`, `DECIMAL=/=INT96`, nested columns, 3D geometry, Brotli — are
+reported as clear errors and tracked in
+[plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
 
 
 ## IMPLEMENTATION
@@ -110,15 +111,20 @@ tail of formats that GDAL and Arrow already handle robustly.
 
 ## ROADMAP
 
--   Broader GeoParquet reading: `DATA_PAGE_V2`, logical-type semantics
-    (dates/timestamps), `INT96=/=FIXED_LEN_BYTE_ARRAY`, 3D geometry, Brotli codec
-    — the remaining
-    [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org) milestones
-    (dictionary encoding, multiple row groups, the SNAPPY/GZIP/ZSTD/LZ4 codecs,
-    and INT32/FLOAT columns are done)
--   Additional formats toward the any-to-any hub described above (FlatGeobuf and
-    WKT/CSV are natural next spokes — small, open, and dependency-free to parse)
--   CRS handling beyond the CRS84 default, once a second CRS-bearing format lands
+The GeoParquet reader now covers essentially every file DuckDB / Arrow / GDAL
+produce in practice: dictionary encoding, multiple row groups, the
+SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
+columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
+
+-   **New format spokes** — the more impactful direction: FlatGeobuf and WKT/CSV are
+    natural next additions toward the any-to-any hub (small, open, dependency-free
+    to parse), broadening reach rather than deepening an already-solid reader.
+-   **Deferred, lower-priority GeoParquet milestones** (parked in
+    [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org); diminishing returns / testing friction):
+    -   `DATA_PAGE_V2` — DuckDB doesn't emit it; a test fixture needs pyarrow.
+    -   Brotli — a full from-scratch codec on the scale of ZSTD, rarely used here.
+    -   `DECIMAL` / `INT96` / `FIXED_LEN_BYTE_ARRAY`, and 3D (Z/M) geometry — niche.
+-   **CRS handling** beyond the CRS84 default, once a second CRS-bearing format lands.
 
 Detailed design notes live in [plans/](plans/README.org).
 

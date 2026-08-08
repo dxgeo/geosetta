@@ -55,7 +55,7 @@ pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> 
 /// Encode the Feature IR into a supported output format.
 pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
     match format {
-        Format::GeoJson => Ok(geojson::to_json(fc).to_json_string().into_bytes()),
+        Format::GeoJson => Ok(geojson::to_geojson_string(fc).into_bytes()),
         Format::Parquet => Ok(features_to_parquet(fc)),
         Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
         Format::Csv => Ok(csv::write(fc)),

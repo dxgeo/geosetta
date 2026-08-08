@@ -7,7 +7,7 @@
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{Geometry, Position};
-use crate::json::JsonValue;
+use crate::json::{self, JsonValue};
 
 /// Interpret a JSON document as GeoJSON.
 pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
@@ -39,8 +39,112 @@ pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
 
 // --- serialization ---------------------------------------------------------
 
+/// Serialize a [`FeatureCollection`] straight to GeoJSON text, byte-for-byte
+/// identical to [`to_json`] + [`JsonValue::to_json_string`] but without building
+/// the intermediate `JsonValue` tree (which allocates a `Vec`/`Object` per
+/// coordinate, ring, and feature). This is the writer the CLI uses.
+pub fn to_geojson_string(fc: &FeatureCollection) -> String {
+    // Rough guess: geometry + a little overhead per feature.
+    let mut out = String::with_capacity(fc.features.len() * 96 + 64);
+    out.push_str("{\"type\":\"FeatureCollection\",\"features\":[");
+    for (i, f) in fc.features.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_feature(&mut out, f);
+    }
+    out.push_str("]}");
+    out
+}
+
+fn write_feature(out: &mut String, f: &Feature) {
+    out.push_str("{\"type\":\"Feature\",\"geometry\":");
+    match &f.geometry {
+        Some(g) => write_geometry(out, g),
+        None => out.push_str("null"),
+    }
+    out.push_str(",\"properties\":{");
+    for (i, (k, v)) in f.properties.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        json::escape_into(k, out);
+        out.push(':');
+        v.write_json_to(out);
+    }
+    out.push_str("}}");
+}
+
+fn write_geometry(out: &mut String, g: &Geometry) {
+    if let Geometry::GeometryCollection(geoms) = g {
+        out.push_str("{\"type\":\"GeometryCollection\",\"geometries\":[");
+        for (i, sub) in geoms.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_geometry(out, sub);
+        }
+        out.push_str("]}");
+        return;
+    }
+    out.push_str("{\"type\":\"");
+    out.push_str(g.type_name());
+    out.push_str("\",\"coordinates\":");
+    match g {
+        Geometry::Point(p) => write_position(out, *p),
+        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => write_positions(out, ps),
+        Geometry::Polygon(r) | Geometry::MultiLineString(r) => write_rings(out, r),
+        Geometry::MultiPolygon(polys) => {
+            out.push('[');
+            for (i, p) in polys.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_rings(out, p);
+            }
+            out.push(']');
+        }
+        Geometry::GeometryCollection(_) => unreachable!("handled above"),
+    }
+    out.push('}');
+}
+
+fn write_position(out: &mut String, p: Position) {
+    use std::fmt::Write;
+    out.push('[');
+    let _ = write!(out, "{}", p[0]);
+    out.push(',');
+    let _ = write!(out, "{}", p[1]);
+    out.push(']');
+}
+
+fn write_positions(out: &mut String, ps: &[Position]) {
+    out.push('[');
+    for (i, p) in ps.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_position(out, *p);
+    }
+    out.push(']');
+}
+
+fn write_rings(out: &mut String, rings: &[Vec<Position>]) {
+    out.push('[');
+    for (i, r) in rings.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_positions(out, r);
+    }
+    out.push(']');
+}
+
 /// Render a [`FeatureCollection`] back to a [`JsonValue`] (the inverse of
-/// [`from_json`]); stringify with [`JsonValue::to_json_string`].
+/// [`from_json`]). Kept as the reference model that [`to_geojson_string`] is
+/// tested byte-for-byte against; the CLI writes directly via that function, so
+/// this tree builder is only compiled for tests.
+#[cfg(test)]
 pub fn to_json(fc: &FeatureCollection) -> JsonValue {
     let features = fc.features.iter().map(feature_to_json).collect();
     obj(vec![
@@ -49,6 +153,7 @@ pub fn to_json(fc: &FeatureCollection) -> JsonValue {
     ])
 }
 
+#[cfg(test)]
 fn feature_to_json(f: &Feature) -> JsonValue {
     let geometry = match &f.geometry {
         Some(g) => geometry_to_json(g),
@@ -61,6 +166,7 @@ fn feature_to_json(f: &Feature) -> JsonValue {
     ])
 }
 
+#[cfg(test)]
 fn geometry_to_json(g: &Geometry) -> JsonValue {
     if let Geometry::GeometryCollection(geoms) = g {
         let arr = geoms.iter().map(geometry_to_json).collect();
@@ -84,19 +190,23 @@ fn geometry_to_json(g: &Geometry) -> JsonValue {
     ])
 }
 
+#[cfg(test)]
 fn position_to_json(p: Position) -> JsonValue {
     JsonValue::Array(vec![coord(p[0]), coord(p[1])])
 }
 
+#[cfg(test)]
 fn positions_to_json(ps: &[Position]) -> JsonValue {
     JsonValue::Array(ps.iter().map(|p| position_to_json(*p)).collect())
 }
 
+#[cfg(test)]
 fn rings_to_json(rings: &[Vec<Position>]) -> JsonValue {
     JsonValue::Array(rings.iter().map(|r| positions_to_json(r)).collect())
 }
 
 /// A coordinate ordinate as a (non-integer) JSON number.
+#[cfg(test)]
 fn coord(v: f64) -> JsonValue {
     JsonValue::Number {
         value: v,
@@ -105,6 +215,7 @@ fn coord(v: f64) -> JsonValue {
 }
 
 /// Build an object from `&str` keys, saving `.to_string()` at each call site.
+#[cfg(test)]
 fn obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
     JsonValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
@@ -223,6 +334,29 @@ mod tests {
         .unwrap();
         assert!(f.features[0].geometry.is_none());
         assert!(f.features[0].properties.is_empty());
+    }
+
+    #[test]
+    fn direct_writer_matches_tree_serialization() {
+        // to_geojson_string must be byte-for-byte identical to the JsonValue
+        // path across every geometry type, null geometry, and typed/nested
+        // properties (so switching the CLI to it changes nothing observable).
+        let doc = r#"{
+            "type": "FeatureCollection",
+            "features": [
+                {"type":"Feature","geometry":{"type":"Point","coordinates":[-73.9857,40.7484]},
+                 "properties":{"name":"Café ☕","h":381,"ok":true,"r":4.7,"tags":["a","b"],"z":null}},
+                {"type":"Feature","geometry":{"type":"LineString","coordinates":[[0,0],[1.5,2.25]]},
+                 "properties":{}},
+                {"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]},
+                 "properties":{"n":12}},
+                {"type":"Feature","geometry":{"type":"MultiPolygon","coordinates":[[[[0,0],[1,0],[1,1],[0,0]]]]},
+                 "properties":{}},
+                {"type":"Feature","geometry":null,"properties":{"only":"props"}}
+            ]
+        }"#;
+        let fc = from_json(&parse(doc).unwrap()).unwrap();
+        assert_eq!(to_geojson_string(&fc), to_json(&fc).to_json_string());
     }
 
     #[test]

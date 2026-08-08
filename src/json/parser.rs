@@ -181,28 +181,29 @@ impl<'a> Parser<'a> {
         self.expect(b'"')?;
         let mut out = String::new();
         loop {
+            // Bulk-scan a run of ordinary bytes (anything but a closing quote,
+            // an escape, or a control char). Multi-byte UTF-8 is just ordinary
+            // bytes here, and run boundaries fall on char boundaries, so the
+            // slice is always valid UTF-8 (the whole input is a `&str`). This
+            // copies each run in one `push_str` instead of a `char` at a time.
+            let start = self.pos;
+            while let Some(b) = self.peek() {
+                if b == b'"' || b == b'\\' || b < 0x20 {
+                    break;
+                }
+                self.pos += 1;
+            }
+            if self.pos > start {
+                let s = std::str::from_utf8(&self.bytes[start..self.pos])
+                    .map_err(|_| self.err("invalid utf-8"))?;
+                out.push_str(s);
+            }
             match self.bump() {
                 None => return Err(self.err("unterminated string")),
                 Some(b'"') => break,
                 Some(b'\\') => self.parse_escape(&mut out)?,
-                Some(b) if b < 0x20 => {
-                    return Err(self.err("control character in string"));
-                }
-                Some(b) if b < 0x80 => out.push(b as char),
-                Some(b) => {
-                    // Multi-byte UTF-8: collect the continuation bytes and
-                    // decode. We already consumed the lead byte `b`.
-                    let len = utf8_len(b);
-                    let start = self.pos - 1;
-                    for _ in 1..len {
-                        if self.bump().is_none() {
-                            return Err(self.err("truncated utf-8 sequence"));
-                        }
-                    }
-                    let s = std::str::from_utf8(&self.bytes[start..self.pos])
-                        .map_err(|_| self.err("invalid utf-8"))?;
-                    out.push_str(s);
-                }
+                // The scan only stops on these three; a control char is invalid.
+                _ => return Err(self.err("control character in string")),
             }
         }
         Ok(out)
@@ -258,17 +259,6 @@ impl<'a> Parser<'a> {
             v = (v << 4) | d;
         }
         Ok(v)
-    }
-}
-
-/// Expected total byte length of a UTF-8 sequence from its lead byte.
-fn utf8_len(lead: u8) -> usize {
-    if lead >= 0xF0 {
-        4
-    } else if lead >= 0xE0 {
-        3
-    } else {
-        2
     }
 }
 

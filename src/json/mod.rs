@@ -4,4 +4,4 @@ mod parser;
 mod value;
 
 pub use parser::parse;
-pub use value::JsonValue;
+pub use value::{escape_into, JsonValue};

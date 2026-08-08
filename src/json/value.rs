@@ -67,17 +67,26 @@ impl JsonValue {
         out
     }
 
+    /// Append this value's compact JSON to `out` (the public entry to the
+    /// serializer, so other spokes can stream values without a `JsonValue`
+    /// wrapper or an intermediate `String`).
+    pub fn write_json_to(&self, out: &mut String) {
+        self.write_json(out);
+    }
+
     fn write_json(&self, out: &mut String) {
+        use std::fmt::Write;
         match self {
             JsonValue::Null => out.push_str("null"),
             JsonValue::Bool(true) => out.push_str("true"),
             JsonValue::Bool(false) => out.push_str("false"),
             JsonValue::Number { value, is_int } => {
+                // Format straight into `out` (Display for i64/f64) rather than
+                // allocating a temporary String per number.
                 if *is_int {
-                    // Render without a fractional part.
-                    out.push_str(&(*value as i64).to_string());
+                    let _ = write!(out, "{}", *value as i64); // no fractional part
                 } else {
-                    out.push_str(&value.to_string());
+                    let _ = write!(out, "{value}");
                 }
             }
             JsonValue::String(s) => write_json_string(s, out),
@@ -105,6 +114,12 @@ impl JsonValue {
             }
         }
     }
+}
+
+/// Write `s` as a quoted, escaped JSON string (public so other serializers can
+/// emit keys/values without a `JsonValue` wrapper).
+pub fn escape_into(s: &str, out: &mut String) {
+    write_json_string(s, out);
 }
 
 /// Write `s` as a quoted, escaped JSON string.

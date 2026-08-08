@@ -1,0 +1,58 @@
+#+TITLE: Plan: Performance (read/write throughput)
+#+AUTHOR: Daniel Okuniewicz Jr.
+
+* Performance
+
+** BENCHMARKS
+=tests/perf.rs= drives the real =panto= binary end-to-end (the crate is bin-only,
+so there is no library target to micro-bench). It generates a synthetic GeoJSON
+FeatureCollection (mixed point/line/polygon, typed properties, fractional
+coordinates), derives the binary inputs from it, and times each conversion
+best-of-3, printing MB/s and features/s. Marked =#[ignore]= so a normal test run
+stays fast:
+#+begin_src sh
+cargo test --release --test perf -- --ignored --nocapture
+# PANTO_BENCH_N sets the feature count (default 200_000).
+#+end_src
+End-to-end timing includes process start + file IO, so it is noisy for small
+deltas; use a large =N= (≥400k) and read relative changes, not absolutes.
+
+** DONE — GeoJSON writer bypasses the JsonValue tree
+The writer used to build a whole =JsonValue= tree (=geojson::to_json=) and then
+serialize it — an =Array=/=Object= heap allocation per coordinate, ring, and
+feature, plus a temporary =String= per number. Replaced with
+=geojson::to_geojson_string=, which writes GeoJSON straight into the output
+buffer (numbers formatted in place via =fmt::Write=), reusing the existing value
+serializer only for property values. The old tree builder is kept =#[cfg(test)]=
+as the reference the direct writer is asserted byte-for-byte against.
+
+Result (N=400k, best-of-3): every =* → geojson= path roughly *2× faster*.
+| conversion       | before      | after       |
+|------------------+-------------+-------------|
+| parquet→geojson  | ~0.82M ft/s | ~1.63M ft/s |
+| fgb→geojson      | ~0.86M ft/s | ~1.83M ft/s |
+| csv→geojson      | ~0.66M ft/s | ~1.09M ft/s |
+| gpkg→geojson     | ~0.75M ft/s | ~1.39M ft/s |
+
+Also: =JsonValue= number serialization now formats into the buffer instead of
+allocating a temporary =String= per number (helps every JSON/GeoParquet-string
+path), and the JSON string parser bulk-copies runs of ordinary bytes with one
+=push_str= instead of a =char= at a time (helps string-heavy input).
+
+** NEXT — GeoJSON reader bypasses the JsonValue tree (the symmetric win)
+Reading GeoJSON is now the throughput floor (~0.8M ft/s vs ~1.6M+ writing): the
+parser builds the same heavy =JsonValue= tree (a 2-element =Vec= per coordinate,
+etc.) which =from_json= then walks into =Feature=s. A *specialized reader* that
+parses the FeatureCollection structure directly into the =Feature= IR —
+coordinates straight into =Vec<Position>=, properties still as =JsonValue= — would
+mirror the writer win and roughly halve read time. Larger and higher-risk than
+the writer (it must handle every GeoJSON shape and keep the byte-offset errors),
+so it is scoped here rather than done inline. Validate the same way: assert the
+specialized reader agrees with =from_json(parse(..))= across all fixtures.
+
+** OTHER CANDIDATES (unmeasured / lower priority)
+- =get()= on JSON objects is a linear scan; fine for small feature/geometry
+  objects, but a feature with very many properties re-scans per lookup.
+- Parquet/FlatGeobuf write loops allocate a fresh WKB =Vec= per feature; a reused
+  scratch buffer could cut allocation churn.
+- The compression codecs (Snappy on write) are untuned; profile before investing.

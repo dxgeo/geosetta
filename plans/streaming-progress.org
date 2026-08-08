@@ -1,0 +1,87 @@
+#+TITLE: Plan: Intra-stage Progress (streaming callbacks)
+#+AUTHOR: Daniel Okuniewicz Jr.
+
+* Intra-stage Progress Reporting
+
+** WHY
+The CLI has an opt-in =--progress= flag, but the pipeline is *batch*
+(=read(from) → FeatureCollection → write(to)=), so progress today is only
+*per-stage*: "parsed N features", "writing parquet…", "wrote N bytes". For a
+large input the expensive stages — decoding the input and encoding the output —
+are single opaque calls that can run for many seconds while the terminal shows
+nothing moving. This plan adds *sub-stage* progress: a callback fired
+periodically while a reader/writer works, so the CLI can show a live
+indicator ("45% · 1.3M/3.0M features").
+
+This is an enhancement, not a correctness fix; it is deferred behind the
+existing =--progress= flag and must add *zero* measurable cost when disabled.
+
+** WHAT WE CAN REPORT
+- *Write* knows the total up front (=fc.features.len()=), so it can report a true
+  percentage: features encoded / total.
+- *Read* does not know the feature count up front, but it *does* know the input
+  byte length, and every decoder walks the input sequentially. So report bytes
+  consumed / total input bytes (parser cursor position), which is a good proxy
+  for a percentage.
+- Fallback: when neither total is known (e.g. a streaming source), report a
+  monotonically increasing count with no denominator ("1.3M features").
+
+** DESIGN
+- A lightweight, allocation-free sink threaded as an =Option=:
+  #+begin_src rust
+  /// (done, total) — total is 0 when unknown.
+  pub type Progress<'a> = &'a mut dyn FnMut(u64, u64);
+  #+end_src
+  Passed as =Option<Progress>=; =None= is the fast path (a single branch,
+  no dispatch) so existing callers and benchmarks are unaffected.
+- *Throttling.* Firing per feature would dominate runtime. The reader/writer
+  fires at most every =STEP= features (e.g. 65 536) *and/or* on ≥1% movement, so
+  the callback overhead is negligible. The throttle lives in the spoke, not the
+  callback.
+- *Signature strategy.* Avoid churning every signature: add
+  =read_features_with(format, input, Option<Progress>)= /
+  =write_features_with(format, fc, Option<Progress>)= in =convert.rs=, keeping
+  =read_features=/=write_features= as =_with(.., None)= wrappers. Each spoke
+  grows one optional parameter (or an internal =report(done, total)= closure
+  captured once).
+
+** PER-FORMAT SCOPE
+Thread the sink through each spoke's per-feature loop:
+- =geojson= :: read — fire off the parser cursor vs input length; write — fire
+  off features serialized. (Pairs naturally with the direct-to-string writer.)
+- =parquet= :: read — the row loop in =reader.rs= (report row / num_rows);
+  write — the per-feature WKB/column encode loop.
+- =flatgeobuf= :: read/write feature loops.
+- =csv= :: row read / row write.
+- =geopackage= :: per feature within a layer, and per layer across the fan-out
+  (the layer loop already prints today; make it sub-layer too).
+- =wkt=/=wkb= :: trivial line/geometry loops; likely not worth wiring.
+
+** CLI
+- When =--progress= is set *and* stderr is a TTY (=std::io::IsTerminal=), render a
+  single updating line with =\r= (percentage + counts + a simple bar). When not a
+  TTY (piped/redirected), keep the current discrete stage lines so logs stay
+  clean — no =\r= spam.
+- Keep the final =wrote … (N bytes)= line unchanged.
+
+** TESTING
+- A recording sink (=Vec<(u64,u64)>=): assert calls are monotonically
+  non-decreasing, the last call has =done == total= (when total known), and the
+  callback fires more than once on a large input.
+- A benchmark assertion (see =tests/perf.rs=): the =None= path must not regress
+  throughput — disabled progress is free.
+
+** RISKS / NOTES
+- Threading an optional parameter through every reader/writer is broad but
+  mechanical; the =Option<Progress>= + =_with= wrappers keep the change additive.
+- Standard-library only: =IsTerminal= (stable since Rust 1.70) covers TTY
+  detection; no crates.
+- Order dependency: do the *direct GeoJSON writer* perf work first — the write
+  loop it introduces is the natural place to fire write progress, and building a
+  throwaway =JsonValue= tree has no per-feature seam to hook.
+
+** OPEN QUESTIONS
+- Throttle by feature count, input-byte delta, or wall-clock (e.g. ≤20 Hz)?
+  Wall-clock gives the smoothest bar but needs an =Instant= check per step.
+- Should =--progress= imply the bar on a TTY, or gate the bar behind a separate
+  =--progress=bar= value to keep =--progress= purely line-oriented?

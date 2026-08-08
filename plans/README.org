@@ -13,4 +13,9 @@ they are ordered by dependency.
 - [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]] :: Extend that
   reader to files from DuckDB / GDAL / Arrow — dictionary encoding, the general
   RLE/bit-pack hybrid, multiple pages/row groups, more codecs and types.
-  *Depends on the round-trip reader.*
+  *Depends on the round-trip reader.* Largely done (see the file for the
+  remaining deferred items).
+- [[file:flatgeobuf.org][flatgeobuf.org]] :: Add FlatGeobuf as a new format
+  spoke — a from-scratch FlatBuffers codec, an FGB reader/writer against the
+  shared =Feature= IR, and hub routing so FGB composes with GeoJSON and
+  GeoParquet automatically.

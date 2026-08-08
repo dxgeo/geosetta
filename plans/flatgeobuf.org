@@ -1,0 +1,104 @@
+#+TITLE: Plan: FlatGeobuf Format Spoke
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Adding FlatGeobuf (FGB) as a Format Spoke
+
+** GOAL
+Read and write FlatGeobuf, routed through the shared =Feature= IR so it composes
+with the existing GeoJSON and GeoParquet spokes. Because everything goes through
+the IR, one FGB reader + one FGB writer yields *four* conversions: FGB↔GeoJSON
+and FGB↔GeoParquet.
+
+Test oracle: DuckDB's spatial extension reads and writes FGB via GDAL
+(=COPY ... TO 'x.fgb' WITH (FORMAT GDAL, DRIVER 'FlatGeobuf')= and =ST_Read=),
+confirmed working locally.
+
+** THE FORMAT (confirmed by hexdump of a DuckDB-written file)
+- Magic: 8 bytes =66 67 62 03 66 67 62 01= — "fgb", spec major 3, "fgb", patch.
+- =[u32 len][Header]= — a FlatBuffers-encoded =Header= table: name, envelope
+  (bbox), geometry_type, columns[] (schema), features_count, index_node_size
+  (R-tree node size; 0 = no index), crs, …
+- Optional *packed Hilbert R-tree* spatial index, present iff index_node_size > 0.
+  Each node is a =NodeItem= = 4×f64 (min_x,min_y,max_x,max_y) + u64 offset = 40
+  bytes. Node count derives from features_count and node_size.
+- Features: each =[u32 len][Feature]= — a FlatBuffers =Feature= table holding a
+  =Geometry= table and a packed properties blob.
+
+** THE BIG ROCK: a from-scratch FlatBuffers codec
+FGB uses FlatBuffers the way GeoParquet uses Thrift. This is the gating work;
+everything else is small once it exists. FlatBuffers is more involved than the
+Thrift compact protocol we built: vtables, forward/backward offsets, alignment,
+vectors, strings, tables, structs.
+- *Reader* (bounded, ~300 lines): root offset → table (soffset to vtable) →
+  vtable (field offsets) → typed field accessors (scalars inline; vectors /
+  strings / tables via u32 offsets; structs inline).
+- *Writer* (the harder half): build vtables, dedupe them, manage offsets and
+  4/8-byte alignment, back-patch the root and length prefixes.
+Lives in a shared module (e.g. =src/flatbuffers.rs=), not under =flatgeobuf/=,
+so it stays reusable.
+
+** WORK ITEMS
+
+*** 1. FlatBuffers reader + FGB schema constants
+=flatbuffers.rs= reader, plus an FGB "types" module encoding the field indices
+and types of =Header=, =Column=, =Feature=, =Geometry= (from the FlatGeobuf
+=.fbs= schema).
+
+*** 2. FGB reader → Feature IR (=src/flatgeobuf/=)
+- Parse magic; read =[u32 len][Header]=; pull geometry_type, columns, features_count,
+  index_node_size, envelope.
+- Compute the packed R-tree size and *skip* it (full-scan read needs no index):
+  =num_nodes = sum of level sizes= (n=features_count; while n>1: n=ceil(n/node_size);
+  add each), bytes = num_nodes × 40.
+- Iterate features: decode =Geometry= (flat =xy= doubles + =ends= for polygon
+  rings + =parts= for Multi/collection + =type=) into our =Geometry= enum; decode
+  the properties blob (=[u16 col_index][typed value]…=, little-endian, string =
+  =[u32 len][utf8]=) against the header columns into =Vec<(String, JsonValue)>=.
+- Assemble a =FeatureCollection=.
+
+*** 3. FGB writer ← Feature IR
+- FlatBuffers writer.
+- Infer columns from features (reuse =parquet::schema::infer_columns= logic — a
+  candidate to hoist to a shared module), compute bbox and the geometry-type set.
+- Write header (=index_node_size = 0= to start — a valid index-less FGB), then
+  each feature's geometry + properties blob.
+- Building the packed Hilbert R-tree is a *deferred* enhancement (readers,
+  including ours and GDAL, accept index_node_size = 0).
+
+*** 4. Generalize the conversion pipeline to hub routing
+With a third format, replace =convert.rs='s explicit =(from, to)= arms with:
+- =fn read(format, bytes) -> Result<FeatureCollection>=
+- =fn write(format, &FeatureCollection) -> Result<Vec<u8>>=
+- =convert = write(to, read(from, input))=
+The GeoJSON and Parquet sides already build/consume =FeatureCollection=
+internally, so this is a small extraction (e.g. =geoparquet_to_geojson= splits
+into =read_geoparquet_features= + IR→geojson). Add =Format::FlatGeobuf= and the
+=.fgb= extension to =cli.rs=.
+
+*** 5. Geometry / CRS notes
+- FGB's geometry types map 1:1 onto our =Geometry= enum; 2D matches our model, so
+  no enum change now. 3D (z) stays out of scope, consistent with the rest.
+- CRS: FGB stores a CRS in the header; GeoParquet stores it in =geo= metadata;
+  GeoJSON assumes CRS84. Cross-format CRS fidelity is the existing open roadmap
+  item — for now assume CRS84, matching current behavior.
+
+** SUGGESTED ORDER (read-first)
+1 (FlatBuffers reader + FGB types) → 2 (FGB reader) → 4 (hub routing + CLI, so
+FGB→GeoJSON and FGB→GeoParquet both light up) → validate against DuckDB-written
+FGB → 3 (FlatBuffers writer + FGB writer) → validate by having DuckDB read our
+output. The spatial index (write side) is a later, optional milestone.
+
+** TESTING
+- Fixtures written by DuckDB (=DRIVER 'FlatGeobuf'=), committed small under
+  =tests/fixtures/=.
+- Read: assert our FGB→GeoJSON matches DuckDB's =ST_Read= of the same file.
+- Write: have DuckDB =ST_Read= our output and compare; also round-trip
+  FGB→IR→FGB and geojson→fgb→geojson.
+- Unit-test the FlatBuffers reader/writer against hand-built buffers.
+
+** OPEN QUESTIONS
+- Do we build the packed Hilbert R-tree on write (enables spatial queries in
+  other tools), or ship index-less FGB and defer it?
+- Hoist =infer_columns= (currently in =parquet/schema.rs=) to a shared module so
+  both the Parquet and FGB writers use it?

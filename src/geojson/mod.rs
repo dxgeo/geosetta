@@ -5,22 +5,9 @@
 //! only ever deals with a list of features.
 
 use crate::error::{Error, Result};
+use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
-
-/// A GeoJSON feature: an optional geometry plus ordered properties.
-#[derive(Debug, Clone)]
-pub struct Feature {
-    pub geometry: Option<Geometry>,
-    /// Property members, in document order. Empty when `properties` is null.
-    pub properties: Vec<(String, JsonValue)>,
-}
-
-/// A collection of features.
-#[derive(Debug, Clone)]
-pub struct FeatureCollection {
-    pub features: Vec<Feature>,
-}
 
 /// Interpret a JSON document as GeoJSON.
 pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {

@@ -3,7 +3,7 @@
 use std::collections::BTreeSet;
 
 use crate::error::Result;
-use crate::geojson::{Feature, FeatureCollection};
+use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkb, to_wkb, Bbox};
 use crate::{geojson, json, parquet};
 

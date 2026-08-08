@@ -13,7 +13,7 @@
 
 use super::geo::GEOMETRY_COLUMN;
 use super::schema::{Cell, Column, ColumnType};
-use super::snappy;
+use crate::compress::snappy;
 use super::thrift::{ct, CompactWriter};
 use super::types::{codec, converted, encoding, page, ptype, repetition};
 

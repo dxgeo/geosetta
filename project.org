@@ -45,25 +45,27 @@ reported as clear errors and tracked in
 Language: Rust (edition 2024). Every wire format is implemented from its
 specification rather than pulled from a crate:
 
+- =feature.rs= :: the shared, format-neutral feature model (=Feature= /
+  =FeatureCollection=) — the intermediate representation every format converts
+  to and from; both =geojson= and =parquet= depend on it, not on each other
 - =json/= :: standard-library JSON parser and value model
-- =geojson/= :: FeatureCollection / Feature / geometry parsing
-- =geometry/= :: geometry model, bounding box, and WKB (Well-Known Binary) encoder
+- =geojson/= :: GeoJSON parsing and serialization (both directions)
+- =geometry/= :: geometry model, bounding box, and WKB (Well-Known Binary)
+  encoder/decoder — the shared geometry hub
+- =compress/= :: format-agnostic =bytes -> bytes= codecs implemented from spec —
+  Snappy, GZIP/DEFLATE (RFC 1951/1952), ZSTD (RFC 8878, FSE + Huffman +
+  sequences), and LZ4 block. Not Parquet-specific, so reusable by future formats
 - =parquet/= :: Thrift compact-protocol writer, schema inference, GeoParquet
   =geo= metadata, and the Parquet file writer
 - =parquet/reader.rs= :: the inverse — footer/schema parsing, page iteration
-  (dictionary + data pages), Snappy inflate, RLE/bit-pack levels, PLAIN and
-  dictionary value decoding, across multiple row groups
-- =parquet/zstd.rs= :: from-scratch ZSTD decoder (FSE, Huffman, sequences) for
-  ZSTD-compressed pages
-- =parquet/gzip.rs= :: from-scratch GZIP/DEFLATE inflate (RFC 1951/1952) for
-  GZIP-compressed pages
-- =parquet/lz4.rs= :: from-scratch LZ4 block decoder for =LZ4_RAW= pages
+  (dictionary + data pages), decompression via =compress/=, RLE/bit-pack levels,
+  PLAIN and dictionary value decoding, across multiple row groups
 - =cli.rs= / =convert.rs= :: argument parsing and the conversion pipeline
   (both directions)
 
-Design choices for this first version: Snappy-compressed Parquet pages (the
-codec implemented from scratch in =parquet/snappy.rs=, keeping the zero-crate
-goal), 2D coordinates, one row group, and property columns typed by scanning all
+Design choices for the writer: Snappy-compressed Parquet pages (the codec
+implemented from scratch in =compress/snappy.rs=, keeping the zero-crate goal),
+2D coordinates, one row group, and property columns typed by scanning all
 features (heterogeneous or nested values fall back to a JSON string).
 
 ** USAGE

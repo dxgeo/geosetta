@@ -12,7 +12,7 @@
 use super::geo::GEOMETRY_COLUMN;
 use super::thrift::{CompactReader, Field};
 use super::types::{codec, converted, encoding, page, ptype, repetition};
-use super::{gzip, lz4, snappy, zstd};
+use crate::compress::{gzip, lz4, snappy, zstd};
 use crate::error::{Error, Result};
 use crate::json::{self, JsonValue};
 

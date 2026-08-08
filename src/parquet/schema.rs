@@ -9,7 +9,7 @@
 //!
 //! Columns appear in order of first appearance across the features.
 
-use crate::geojson::Feature;
+use crate::feature::Feature;
 use crate::json::JsonValue;
 
 /// The resolved physical type of a property column.

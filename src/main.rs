@@ -4,8 +4,10 @@
 //! library only (no third-party crates).
 
 mod cli;
+mod compress;
 mod convert;
 mod error;
+mod feature;
 mod geojson;
 mod geometry;
 mod json;

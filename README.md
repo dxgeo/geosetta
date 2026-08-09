@@ -59,7 +59,7 @@ The reader also handles common **foreign** GeoParquet: DuckDB's default output
 (dictionary-encoded columns, multiple row groups) reads back correctly,
 geometry included, under SNAPPY, GZIP, ZSTD, LZ4<sub>RAW</sub>, or no compression — the
 ZSTD, GZIP/DEFLATE, and LZ4 decoders are implemented from scratch in
-`parquet/zstd.rs`, `parquet/gzip.rs`, and `parquet/lz4.rs`. Property columns may
+`compress/zstd.rs`, `compress/gzip.rs`, and `compress/lz4.rs`. Property columns may
 be `BOOLEAN`, `INT32=/=INT64`, `FLOAT=/=DOUBLE`, or `BYTE_ARRAY` strings, with
 `DATE` and `TIMESTAMP` columns rendered as ISO 8601 strings. Remaining gaps —
 `DATA_PAGE_V2`, `DECIMAL=/=INT96`, nested columns, 3D geometry, Brotli — are

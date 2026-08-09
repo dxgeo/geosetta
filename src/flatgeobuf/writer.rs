@@ -438,7 +438,7 @@ mod tests {
         let mut ids: Vec<i64> = back
             .features
             .iter()
-            .map(|f| f.properties.iter().find(|(k, _)| k == "id").unwrap().1.as_f64().unwrap() as i64)
+            .map(|f| f.properties.iter().find(|(k, _)| &**k == "id").unwrap().1.as_f64().unwrap() as i64)
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..50).collect::<Vec<_>>());

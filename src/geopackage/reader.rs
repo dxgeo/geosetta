@@ -5,6 +5,7 @@ use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::from_wkb;
 use crate::json::JsonValue;
 use crate::sqlite::{Database, Table, Value};
+use std::rc::Rc;
 
 /// Read every feature layer from a GeoPackage as `(layer_name, features)`.
 pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
@@ -35,6 +36,8 @@ pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
 fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<FeatureCollection> {
     let rowid_alias = table.rowid_alias();
     let mut features = Vec::new();
+    // Intern each column's key once so every row shares one `Rc`.
+    let keys: Vec<Rc<str>> = table.columns.iter().map(|n| Rc::from(n.as_str())).collect();
 
     for row in db.read_rows(table)? {
         let geometry = match geom_idx.and_then(|i| row.get(i)) {
@@ -42,12 +45,11 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
             _ => None,
         };
         // Every column except the geometry and the rowid-alias becomes a property.
-        let properties = table
-            .columns
+        let properties = keys
             .iter()
             .enumerate()
             .filter(|(i, _)| Some(*i) != geom_idx && Some(*i) != rowid_alias)
-            .map(|(i, name)| (name.clone(), value_to_json(&row[i])))
+            .map(|(i, key)| (Rc::clone(key), value_to_json(&row[i])))
             .collect();
         features.push(Feature {
             geometry,
@@ -160,7 +162,7 @@ mod tests {
         // Geometry: GPKG-binary header stripped, WKB decoded.
         assert_eq!(fc.features[0].geometry, Some(Geometry::Point([10.0, 20.0])));
         // Properties exclude the geometry column and the fid rowid-alias.
-        let props: Vec<&str> = fc.features[0].properties.iter().map(|(k, _)| k.as_str()).collect();
+        let props: Vec<&str> = fc.features[0].properties.iter().map(|(k, _)| &**k).collect();
         assert_eq!(props, vec!["name", "pop", "score"]);
         assert_eq!(fc.features[1].properties[0].1.as_str(), Some("Beta"));
         assert_eq!(fc.features[1].properties[1].1.as_f64(), Some(200.0));

@@ -11,6 +11,7 @@ use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkt, to_wkt};
 use crate::json::JsonValue;
 use crate::schema::{Cell, infer_columns};
+use std::rc::Rc;
 
 const GEOMETRY_NAMES: [&str; 4] = ["geometry", "geom", "wkt", "the_geom"];
 
@@ -27,6 +28,9 @@ pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
         .iter()
         .position(|h| GEOMETRY_NAMES.contains(&h.trim().to_ascii_lowercase().as_str()));
 
+    // Intern each property column's key once so every row shares one `Rc`.
+    let keys: Vec<Rc<str>> = header.iter().map(|name| Rc::from(name.as_str())).collect();
+
     let mut features = Vec::new();
     for row in &rows[1..] {
         if row.iter().all(|f| f.is_empty()) {
@@ -39,11 +43,11 @@ pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
             },
             None => None,
         };
-        let properties = header
+        let properties = keys
             .iter()
             .enumerate()
             .filter(|(i, _)| Some(*i) != geom_col)
-            .map(|(i, name)| (name.clone(), infer_value(row.get(i).map_or("", |s| s))))
+            .map(|(i, key)| (Rc::clone(key), infer_value(row.get(i).map_or("", |s| s))))
             .collect();
         features.push(Feature {
             geometry,

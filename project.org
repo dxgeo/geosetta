@@ -25,7 +25,7 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.17.2*.
+Current version: *0.17.3*.
 
 Six formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with

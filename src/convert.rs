@@ -4,6 +4,7 @@
 //! pair then composes automatically (hub-and-spoke).
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use crate::cli::Format;
 use crate::error::{Error, Result};
@@ -125,22 +126,29 @@ fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
 /// GeoParquet bytes → Feature IR.
 fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
     let parsed = parquet::read_geoparquet(bytes)?;
+    let num_cols = parsed.properties.len();
+
+    // Seed one feature per row with its geometry and an empty property vec.
     let mut features = Vec::with_capacity(parsed.num_rows);
     for row in 0..parsed.num_rows {
         let geometry = match &parsed.geometry[row] {
             Some(wkb) => Some(from_wkb(wkb)?),
             None => None,
         };
-        // Rebuild each feature's properties from the columns, in column order.
-        let properties = parsed
-            .properties
-            .iter()
-            .map(|col| (col.name.clone(), col.values[row].clone()))
-            .collect();
         features.push(Feature {
             geometry,
-            properties,
+            properties: Vec::with_capacity(num_cols),
         });
+    }
+
+    // Transpose columns → rows by *draining* each column (values move rather
+    // than being cloned) and sharing one `Rc` key across every row. Columns are
+    // consumed in file order, so each row keeps that property order.
+    for col in parsed.properties {
+        let key: Rc<str> = Rc::from(col.name);
+        for (feature, value) in features.iter_mut().zip(col.values) {
+            feature.properties.push((Rc::clone(&key), value));
+        }
     }
     Ok(FeatureCollection { features })
 }
@@ -193,11 +201,11 @@ mod tests {
         );
         // A present string property, including non-ASCII.
         let cafe = &fc.features[3];
-        let name = cafe.properties.iter().find(|(k, _)| k == "name").unwrap();
+        let name = cafe.properties.iter().find(|(k, _)| &**k == "name").unwrap();
         assert_eq!(name.1.as_str(), Some("Café ☕"));
         // The nested-array property fell back to a JSON string on the way in,
         // so it comes back as that string.
-        let tags = cafe.properties.iter().find(|(k, _)| k == "tags").unwrap();
+        let tags = cafe.properties.iter().find(|(k, _)| &**k == "tags").unwrap();
         assert_eq!(tags.1.as_str(), Some("[\"a\",\"b\"]"));
     }
 
@@ -226,7 +234,7 @@ mod tests {
         let prop = |f: &Feature, k: &str| {
             f.properties
                 .iter()
-                .find(|(name, _)| name == k)
+                .find(|(name, _)| &**name == k)
                 .map(|(_, v)| v.clone())
                 .unwrap()
         };
@@ -282,7 +290,7 @@ mod tests {
         assert_eq!(fc.features.len(), 300);
 
         let prop = |f: &Feature, k: &str| {
-            f.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap()
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
         let f0 = &fc.features[0];
         assert_eq!(prop(f0, "d").as_str(), Some("2020-01-01"));
@@ -304,7 +312,7 @@ mod tests {
         assert_eq!(fc.features.len(), 400);
 
         let prop = |f: &Feature, k: &str| {
-            f.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap()
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
         for i in [0usize, 1, 7, 399] {
             let f = &fc.features[i];
@@ -331,7 +339,7 @@ mod tests {
         let by_id = |id: i64| {
             fc.features
                 .iter()
-                .find(|f| f.properties.iter().any(|(k, v)| k == "id" && v.as_f64() == Some(id as f64)))
+                .find(|f| f.properties.iter().any(|(k, v)| &**k == "id" && v.as_f64() == Some(id as f64)))
                 .unwrap()
                 .geometry
                 .clone()
@@ -361,9 +369,9 @@ mod tests {
         let feat = fc
             .features
             .iter()
-            .find(|f| f.properties.iter().any(|(k, v)| k == "n" && v.as_f64() == Some(10.0)))
+            .find(|f| f.properties.iter().any(|(k, v)| &**k == "n" && v.as_f64() == Some(10.0)))
             .unwrap();
-        let prop = |k: &str| feat.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap();
+        let prop = |k: &str| feat.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap();
         assert_eq!(prop("label").as_str(), Some("alpha"));
         assert_eq!(prop("score").as_f64(), Some(1.5));
         assert_eq!(prop("ok"), crate::json::JsonValue::Bool(true));
@@ -426,7 +434,7 @@ mod tests {
         assert_eq!(fc.features.len(), 3);
 
         let prop = |f: &Feature, k: &str| {
-            f.properties.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone()).unwrap()
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
         assert_eq!(fc.features[0].geometry, Some(Geometry::Point([10.0, 20.0])));
         assert_eq!(prop(&fc.features[0], "population").as_f64(), Some(120000.0));

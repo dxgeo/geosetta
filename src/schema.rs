@@ -11,6 +11,7 @@
 
 use crate::feature::Feature;
 use crate::json::JsonValue;
+use std::collections::HashMap;
 
 /// The resolved physical type of a property column.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,26 +84,48 @@ impl Infer {
 }
 
 /// Scan all features and build the property columns.
+///
+/// Single pass in `O(rows × cols)`: a `HashMap` assigns each property key a
+/// stable first-seen column index (no linear scan over known columns per
+/// property), each key's type is merged as values are seen, and every row's
+/// value is recorded per column with absent cells back-filled as `None`. A
+/// second pass then resolves each column's type and materializes its cells.
 pub fn infer_columns(features: &[Feature]) -> Vec<Column> {
-    // Collect keys in first-seen order, plus each key's inferred type.
-    let mut order: Vec<String> = Vec::new();
+    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut order: Vec<&str> = Vec::new();
     let mut types: Vec<Option<Infer>> = Vec::new();
+    // Per column, the value at each row (borrowed from `features`); `None` marks
+    // a row that omitted the key. Kept row-aligned as the pass proceeds.
+    let mut raw: Vec<Vec<Option<&JsonValue>>> = Vec::new();
 
-    for feature in features {
+    for (row, feature) in features.iter().enumerate() {
         for (key, value) in &feature.properties {
-            let idx = match order.iter().position(|k| k == key) {
-                Some(i) => i,
-                None => {
-                    order.push(key.clone());
-                    types.push(None);
-                    order.len() - 1
-                }
-            };
+            let idx = *index.entry(&**key).or_insert_with(|| {
+                let i = order.len();
+                order.push(&**key);
+                types.push(None);
+                // Back-fill the rows before this key first appeared.
+                let mut col = Vec::with_capacity(features.len());
+                col.resize(row, None);
+                raw.push(col);
+                i
+            });
             if let Some(inf) = Infer::of(value) {
                 types[idx] = Some(match types[idx] {
                     Some(existing) => existing.merge(inf),
                     None => inf,
                 });
+            }
+            // Record this row's value; on a duplicate key within the row the
+            // first occurrence wins (matching the old `find`-based lookup).
+            if raw[idx].len() == row {
+                raw[idx].push(Some(value));
+            }
+        }
+        // Any column not touched this row gets a Null cell for it.
+        for col in raw.iter_mut() {
+            if col.len() == row {
+                col.push(None);
             }
         }
     }
@@ -110,22 +133,17 @@ pub fn infer_columns(features: &[Feature]) -> Vec<Column> {
     // Materialize each column, filling missing/null cells with Null.
     order
         .into_iter()
-        .enumerate()
-        .map(|(idx, name)| {
+        .zip(types)
+        .zip(raw)
+        .map(|((name, ty), col)| {
             // Columns whose values were all null default to String.
-            let ty = types[idx].map(Infer::resolve).unwrap_or(ColumnType::String);
-            let values = features
-                .iter()
-                .map(|f| {
-                    let v = f
-                        .properties
-                        .iter()
-                        .find(|(k, _)| *k == name)
-                        .map(|(_, v)| v);
-                    materialize(ty, v)
-                })
-                .collect();
-            Column { name, ty, values }
+            let ty = ty.map(Infer::resolve).unwrap_or(ColumnType::String);
+            let values = col.into_iter().map(|v| materialize(ty, v)).collect();
+            Column {
+                name: name.to_string(),
+                ty,
+                values,
+            }
         })
         .collect()
 }
@@ -166,7 +184,13 @@ mod tests {
         docs.iter()
             .map(|d| Feature {
                 geometry: None,
-                properties: parse(d).unwrap().as_object().unwrap().to_vec(),
+                properties: parse(d)
+                    .unwrap()
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .map(|(k, v)| (std::rc::Rc::from(k.as_str()), v.clone()))
+                    .collect(),
             })
             .collect()
     }

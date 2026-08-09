@@ -5,6 +5,7 @@ use crate::feature::{Feature, FeatureCollection};
 use crate::flatbuffers::{Table, Vector};
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
+use std::rc::Rc;
 
 const MAGIC_LEN: usize = 8;
 const NODE_ITEM_SIZE: usize = 40; // 4 * f64 bbox + u64 offset
@@ -84,6 +85,8 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
     let features_count = header.read_u64(header::FEATURES_COUNT, 0)?;
     let index_node_size = header.read_u16(header::INDEX_NODE_SIZE, 16)?;
     let columns = read_columns(&header)?;
+    // Intern each column's key once so every feature shares one `Rc`.
+    let keys: Vec<Rc<str>> = columns.iter().map(|c| Rc::from(c.name.as_str())).collect();
 
     // Skip the packed R-tree spatial index, if present.
     let index_bytes = index_size(features_count as usize, index_node_size as usize);
@@ -104,7 +107,7 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
             None => None,
         };
         let properties = match table.read_vector(feature::PROPERTIES)? {
-            Some(v) => decode_properties(v.bytes()?, &columns)?,
+            Some(v) => decode_properties(v.bytes()?, &columns, &keys)?,
             None => Vec::new(),
         };
         features.push(Feature {
@@ -239,7 +242,11 @@ fn parts<'a>(g: &Table<'a>) -> Result<Vec<Table<'a>>> {
 
 /// Decode the packed properties blob against the column schema:
 /// `[u16 col_index][typed value]…`, little-endian.
-fn decode_properties(blob: &[u8], columns: &[Column]) -> Result<Vec<(String, JsonValue)>> {
+fn decode_properties(
+    blob: &[u8],
+    columns: &[Column],
+    keys: &[Rc<str>],
+) -> Result<Vec<(Rc<str>, JsonValue)>> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < blob.len() {
@@ -249,7 +256,7 @@ fn decode_properties(blob: &[u8], columns: &[Column]) -> Result<Vec<(String, Jso
             .get(idx)
             .ok_or_else(|| Error::FlatGeobuf("property column index out of range".into()))?;
         let value = read_property_value(blob, &mut pos, col.ty)?;
-        out.push((col.name.clone(), value));
+        out.push((Rc::clone(&keys[idx]), value));
     }
     Ok(out)
 }

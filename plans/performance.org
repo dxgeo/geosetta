@@ -93,69 +93,130 @@ per cell. The write paths degrade *3×*, i.e. super-linearly — the schema pass
 O(cols²). The read path degrades exactly 2× (linear) but is already heavy from
 per-cell cloning. Both are addressed below.
 
-*** 1. =schema::infer_columns= is O(rows × cols²)  [write path — biggest win]
-=src/schema.rs:86=. Runs on *every* Parquet/FlatGeobuf write (both share the
-schema pass). Two quadratic-in-=cols= scans:
-- key collection (=:93=): =order.iter().position(|k| k == key)= — a linear scan
-  over all known columns, per property, per feature.
-- materialization (=:117=): for each column it re-walks *all* features, and per
-  feature does =.find(|(k,_)| *k == name)= — another linear scan over that row's
-  properties. It also traverses the whole feature list once *per column*.
-Together O(rows × cols²). Fix: a single pass keyed by =HashMap<&str, usize>=
-(first-seen order preserved via a parallel =Vec=), pushing each value into its
-column and back-filling =Null= for columns a row omits — O(rows × cols). This is
-the single most likely source of a >2× win on wide-table writes; it should
-flatten the 3.1× above toward ~2×.
+*** DONE 1. =schema::infer_columns= was O(rows × cols²)  [write path]
+=src/schema.rs=. Ran on *every* Parquet/FlatGeobuf write (both share the schema
+pass). Had two quadratic-in-=cols= scans:
+- key collection: =order.iter().position(|k| k == key)= — a linear scan over all
+  known columns, per property, per feature.
+- materialization: for each column it re-walked *all* features, and per feature
+  did =.find(|(k,_)| *k == name)= — another linear scan over that row's
+  properties, once per column.
+Replaced with a single =O(rows × cols)= pass keyed by =HashMap<&str, usize>=
+(first-seen order preserved via a parallel =Vec=), recording each row's value per
+column (=Option<&JsonValue>=, borrowed from the features) and back-filling =None=
+for columns a row omits; a second pass resolves each column type and
+materializes. Duplicate keys within a row keep the first occurrence, matching the
+old =find=-based lookup. All 107 tests pass.
 
-*** 2. Release profile  [free, whole-project]
-=Cargo.toml= has no =[profile.release]=. Add =lto = true=,
-=codegen-units = 1= (and =panic = "abort"= if the =eprintln!= error path is
-acceptable to abort on). Expected ~5–15% everywhere for a one-time compile-time
-cost. Do this first so later measurements reflect the shipping profile.
+Result (=wide_table=, N=40k, best-of-3, release, with item 2 below):
+| conversion             | 30 cols (before→after) | 60 cols (before→after) | col-doubling |
+|------------------------+------------------------+------------------------+--------------|
+| geojson→parquet (wide) | 170.9k → 310.0k ft/s   | 56.9k → 161.3k ft/s    | 3.0× → 1.9×  |
+| geojson→fgb (wide)     | 166.6k → 291.0k ft/s   | 55.5k → 153.5k ft/s    | 3.0× → 1.9×  |
+The quadratic is gone: write paths now scale ~linearly (1.9×) instead of 3.0× on
+column-doubling, and absolute throughput at 60 cols is ~2.8× higher. The
+=parquet→geojson= read path is unchanged (it doesn't call =infer_columns=) — see
+items 3/5.
 
-*** 3. Parquet read: stop copying every value twice  [read path]
-=parquet_to_features= (=src/convert.rs:126=) rebuilds row-oriented properties
-with =col.values[row].clone()= — but the reader (=parquet/reader.rs=) *already*
-materialized =Vec<JsonValue>= per column. That is a second full copy of every
-value (strings included) plus the O(rows × cols) transpose. Consume the
-=GeoParquet= by value and *drain* each column into the rows instead of cloning.
-Related, same file: the reader builds =Vec<Option<T>>= via =align()=
-(=reader.rs:646=) and then re-walks it in =column_to_json= — decoding straight
-into =JsonValue= against the present-mask collapses the extra pass and the
-=Option= boxing.
+*** DONE 2. Release profile  [free, whole-project]
+Added =[profile.release]= with =lto = true= and =codegen-units = 1= to
+=Cargo.toml=. (=panic = "abort"= left off — the CLI reports errors via =Result=/
+=eprintln!=, not panics, and abort would only affect genuine bugs.) Folded into
+the item-1 measurement above; also lifts the 30-col write numbers and every
+non-wide path a few percent, for a one-time compile-time cost.
 
-*** 4. =write_json_string= decodes char-by-char  [string-heavy writes]
-=src/json/value.rs:126= iterates =s.chars()= — decoding UTF-8 to =char= and
-re-pushing one at a time for every string written (property values, CSV, WKT-in-
-CSV). Bulk-scan runs of "clean" bytes and =push_str= the slice, escaping only on
-the rare special byte — the mirror of what the *parser* already does on read
-(=json/parser.rs:207=). Low-risk ~2× on string-heavy output.
+*** DONE 3. Parquet read: stop copying every value twice  [read path]
+=parquet_to_features= (=src/convert.rs=) used to rebuild row-oriented properties
+with =col.values[row].clone()= — a second full copy of every value (strings
+included) on top of what the reader already materialized. Now it seeds one
+feature per row, then transposes by *consuming* =parsed.properties= and
+*draining* each column's =Vec<JsonValue>= into the rows (=zip= + =push=), so
+values move instead of being cloned; combined with the shared =Rc= key from item
+5 below, the per-cell allocation on read is gone.
 
-*** 5. Share property keys instead of re-allocating per row  [systemic]
-The IR stores properties as =Vec<(String, JsonValue)>= per =Feature=
-(=src/feature.rs:13=), so the *same* column name is heap-allocated once per row:
-Parquet read does =col.name.clone()= per row (=convert.rs:138=); GeoJSON read
-allocates each key per feature; wide-table read spends much of its time here
-(the linear 2× above). Move keys to =Rc<str>= (or an interned schema + integer
-column id). This is the main lever left on =parquet→geojson (wide)=. Invasive —
-touches every spoke and the streaming GeoJSON reader — so stage it after 1–4.
+Result (=throughput=, N=400k, best-of-3; jointly with item 5):
+| conversion      | before      | after       |
+|-----------------+-------------+-------------|
+| parquet→geojson | ~1.63M ft/s | 1.99M ft/s  |
+| fgb→geojson     | ~1.83M ft/s | 2.29M ft/s  |
+| csv→geojson     | ~1.09M ft/s | 1.27M ft/s  |
+| gpkg→geojson    | ~1.39M ft/s | 1.73M ft/s  |
+And =wide_table= =parquet→geojson=: 30 cols 434k→550k, 60 cols 214k→279k (~1.3×).
+
+Reader-internal fusion (also done): the reader used to build =Vec<Option<T>>=
+per column via =align()= and then re-walk it in =column_to_json=. Replaced the
+=ColumnData= (typed =Vec<Option<T>>=) accumulator with a =ColumnSink= that, for
+property columns, decodes *straight* into =Vec<JsonValue>= against the
+present-mask (=push_json= / =push_json_strings= / =emit_ints=) — one pass, no
+=Option<T>= intermediate. The geometry column keeps a raw-WKB (=Wkb=) sink via
+the unchanged =align=. =column_to_json= and =empty_column= are gone.
+
+Measured (=wide_table= =parquet→geojson=, 60 cols, N=40k, interleaved A/B to
+cancel thermal drift): ~263k → ~274k ft/s, a consistent ~4%. Modest because the
+cross-module double-copy removed above was the bigger cost; this also drops one
+allocation + one pass per column, so the win grows with column count and lowers
+peak memory.
+
+*** DONE 4. =write_json_string= decoded char-by-char  [string-heavy writes]
+=src/json/value.rs= iterated =s.chars()= — decoding UTF-8 to =char= and
+re-pushing one at a time for every string written (every property key on GeoJSON
+write, plus string values, CSV, WKT-in-CSV), and =format!='d a fresh =String= per
+control char. Now it bulk-scans runs of "clean" bytes and =push_str='s the slice,
+stopping only on a byte that must be escaped (=\"=, =\\=, or =< 0x20=) — the
+mirror of the parser on read (=json/parser.rs=). Escape bytes are all ASCII, so
+run boundaries fall on char boundaries; the =\u00XX= path writes hex digits
+directly instead of allocating. A unit test locks the exact output (specials,
+control chars, multi-byte UTF-8 passed through verbatim).
+
+Result (=throughput= =fgb→geojson=, N=400k, four interleaved A/B pairs to cancel
+thermal drift): consistently faster by ~5–6% (~2.07M → ~2.25M ft/s). =fgb→geojson=
+is write-dominated (FGB read is the fastest reader), so this isolates the GeoJSON
+writer; the gain scales with string length and how few bytes need escaping. Less
+dramatic than the projected ~2× because the benchmark's keys/values are short —
+long, clean text fields benefit most.
+
+*** DONE 5. Share property keys instead of re-allocating per row  [systemic]
+The IR stored properties as =Vec<(String, JsonValue)>= per =Feature=, so the
+*same* column name was heap-allocated once per row. Keys are now =Rc<str>=
+(=src/feature.rs=), shared across rows:
+- *Columnar readers* (Parquet, CSV, FlatGeobuf, GeoPackage) intern each column's
+  key *once* and clone the =Rc= (a refcount bump) per row instead of a fresh
+  =String=.
+- *GeoJSON reader* — keys are parsed per feature, so a small =KeyInterner=
+  (=HashSet<Rc<str>>=, looked up by =&str= via =Rc<str>: Borrow<str>=) dedups
+  repeated names across features: N×cols allocations become cols. Threaded
+  through both the streaming and the tree/fallback paths.
+=JsonValue::Object= keeps =String= keys (arbitrary nested JSON is unaffected);
+only the top-level feature key type changed. =Rc= (not =Arc=) since the pipeline
+is single-threaded. Measured jointly with item 3 (table above) — the ~1.2× on
+every =*→geojson= read and ~1.3× on =parquet→geojson (wide)=. GeoJSON read held
+the 4-property common case (no regression) and improved key-heavy reads.
 
 *** 6. Parquet level decoding + WKB churn  [lower priority, contained]
-- =decode_levels= (=reader.rs:656=) returns =Vec<u64>= — eight bytes to hold a
-  0/1 definition level — and =split_definition_levels= (=:481=) allocates a
-  *second* =Vec<u64>= present-mask. The common Pantograph-written file is
-  all-present = one RLE run; add a fast path (single run, value == max_def_level,
-  covering the page ⇒ mark all present, skip both allocations) and narrow the
-  element type to =u32=/=u8=.
-- WKB =encode= (=src/geometry/wkb.rs:24=) starts from =Vec::new()= and reallocs
-  as it grows; the exact size is computable, so one =with_capacity= (or a reused
-  scratch buffer across the feature loop in =features_to_parquet=) removes the
-  churn — one =Vec= per feature on every Parquet/FGB write.
-- Float formatting: coordinate output goes through =write!(…, "{}", …)=
-  (=geojson/mod.rs:395=, =value.rs:89=); std's shortest-float formatter dominates
-  coordinate-heavy writes. A hand-rolled shortest-round-trip dtoa could add
-  ~1.5–2× on GeoJSON write, but it is correctness-sensitive and the largest
-  effort here — do it last, if at all.
+- *DONE — level decoding.* =split_definition_levels= used to decode every
+  definition level into a =Vec<u64>= (eight bytes per 0/1 level) and map it to a
+  *second* =Vec<u64>= present-mask. Replaced the mask with a =Present= enum:
+  =Present::All(n)= for the all-present case (what Pantograph always writes — a
+  single RLE run of the max level, detected by =is_all_present_rle= *without*
+  decoding), so neither allocation nor the per-row scan happens; only a page that
+  truly contains nulls falls back to =Present::Mask(Vec<bool>)= (one byte per
+  row, down from eight). =push_json= / =push_json_strings= / =align= special-case
+  =All=. Measured (=throughput= =parquet→geojson=, N=400k, interleaved A/B):
+  ~1.90M → ~2.09M ft/s, ~6%.
+- *DONE — WKB churn.* =wkb::encode= started from =Vec::new()= and reallocated as
+  it grew — one =Vec= per feature on every GeoParquet/GeoPackage write. Added
+  =wkb_size= (exact byte length, mirroring the writer, unit-tested equal to the
+  encoded length) and =Vec::with_capacity=, so the write never reallocs. Measured
+  (=throughput= =geojson→parquet=, N=400k, interleaved A/B): ~1.01M → ~1.09M
+  ft/s, ~7%. (FlatGeobuf uses its own geometry coding, not WKB, so this helps the
+  Parquet/GeoPackage write paths.)
+- *Parked — float formatting (dtoa).* Coordinate output goes through
+  =write!(…, "{}", …)=, i.e. std's shortest-round-trip float formatter. A
+  hand-rolled dtoa could add ~1.5–2× on coordinate-heavy GeoJSON write, but it is
+  correctness-sensitive and the largest effort here (a Ryū/Grisu from scratch),
+  for a throughput-only gain — deliberately left for later, if ever. Note this is
+  *not* a dependency question: the current formatter is =std=, so there is no
+  crate to remove; the only question is speed vs. maintenance/correctness risk.
 
 *** Deferred / profile-first
 - =get()= on JSON objects is a linear scan; fine for small feature/geometry

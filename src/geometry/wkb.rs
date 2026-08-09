@@ -22,9 +22,35 @@ const WKB_GEOMETRYCOLLECTION: u32 = 7;
 
 /// Encode a geometry to a fresh WKB byte buffer.
 pub fn encode(geom: &Geometry) -> Vec<u8> {
-    let mut out = Vec::new();
+    // Pre-size the buffer to the exact byte length so the write never reallocs
+    // (one `Vec` per feature on every GeoParquet/FlatGeobuf write).
+    let mut out = Vec::with_capacity(wkb_size(geom));
     write_geometry(&mut out, geom);
     out
+}
+
+/// Exact WKB byte length of `geom`, mirroring [`write_geometry`].
+fn wkb_size(geom: &Geometry) -> usize {
+    const HEADER: usize = 5; // LE marker + u32 type code
+    const COUNT: usize = 4; // u32 length prefix
+    const COORD: usize = 16; // two little-endian f64
+    let ring = |r: &Vec<Position>| COUNT + r.len() * COORD;
+    let poly = |rings: &[Vec<Position>]| HEADER + COUNT + rings.iter().map(&ring).sum::<usize>();
+    match geom {
+        Geometry::Point(_) => HEADER + COORD,
+        Geometry::LineString(ps) => HEADER + COUNT + ps.len() * COORD,
+        Geometry::Polygon(rings) => poly(rings),
+        Geometry::MultiPoint(ps) => HEADER + COUNT + ps.len() * (HEADER + COORD),
+        Geometry::MultiLineString(lines) => {
+            HEADER + COUNT + lines.iter().map(|l| HEADER + COUNT + l.len() * COORD).sum::<usize>()
+        }
+        Geometry::MultiPolygon(polys) => {
+            HEADER + COUNT + polys.iter().map(|p| poly(p)).sum::<usize>()
+        }
+        Geometry::GeometryCollection(geoms) => {
+            HEADER + COUNT + geoms.iter().map(wkb_size).sum::<usize>()
+        }
+    }
 }
 
 fn write_geometry(out: &mut Vec<u8>, geom: &Geometry) {
@@ -282,6 +308,29 @@ mod tests {
             Geometry::Point([5.0, 6.0]),
             Geometry::LineString(vec![[0.0, 0.0], [1.0, 1.0]]),
         ]));
+    }
+
+    #[test]
+    fn wkb_size_matches_encoded_length() {
+        // The pre-sized capacity must equal the actual byte length for every
+        // variant, so `encode` never reallocs.
+        for g in [
+            Geometry::Point([-73.9857, 40.7484]),
+            Geometry::LineString(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]),
+            Geometry::Polygon(vec![
+                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 0.0]],
+                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 1.0]],
+            ]),
+            Geometry::MultiPoint(vec![[0.0, 0.0], [1.0, 1.0]]),
+            Geometry::MultiLineString(vec![vec![[0.0, 0.0], [1.0, 1.0]], vec![[2.0, 2.0]]]),
+            Geometry::MultiPolygon(vec![vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]]]),
+            Geometry::GeometryCollection(vec![
+                Geometry::Point([5.0, 6.0]),
+                Geometry::LineString(vec![[0.0, 0.0], [1.0, 1.0]]),
+            ]),
+        ] {
+            assert_eq!(wkb_size(&g), encode(&g).len(), "size mismatch for {g:?}");
+        }
     }
 
     #[test]

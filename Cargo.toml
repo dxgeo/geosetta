@@ -1,6 +1,6 @@
 [package]
 name = "pantograph-rs"
-version = "0.17.2"
+version = "0.17.3"
 edition = "2024"
 description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, CSV, WKT), dependency-free."
 license = "MIT"
@@ -10,3 +10,7 @@ name = "panto"
 path = "src/main.rs"
 
 [dependencies]
+
+[profile.release]
+lto = true
+codegen-units = 1

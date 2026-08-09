@@ -123,20 +123,67 @@ pub fn escape_into(s: &str, out: &mut String) {
 }
 
 /// Write `s` as a quoted, escaped JSON string.
+///
+/// Bulk-copies runs of ordinary bytes with one `push_str` and only stops on a
+/// byte that must be escaped (`"`, `\`, or a control char `< 0x20`) — the mirror
+/// of what the parser does on read, and far cheaper than decoding and
+/// re-pushing one `char` at a time. Every escape-triggering byte is ASCII, so
+/// run boundaries always fall on char boundaries and each slice is valid UTF-8.
 fn write_json_string(s: &str, out: &mut String) {
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0C}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if b != b'"' && b != b'\\' && b >= 0x20 {
+            continue;
         }
+        if start < i {
+            out.push_str(&s[start..i]);
+        }
+        match b {
+            b'"' => out.push_str("\\\""),
+            b'\\' => out.push_str("\\\\"),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            b'\t' => out.push_str("\\t"),
+            0x08 => out.push_str("\\b"),
+            0x0C => out.push_str("\\f"),
+            // Any other control char: \u00XX (b < 0x20, so the high byte is 00).
+            _ => {
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                out.push_str("\\u00");
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+        }
+        start = i + 1;
+    }
+    if start < bytes.len() {
+        out.push_str(&s[start..]);
     }
     out.push('"');
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn escaped(s: &str) -> String {
+        let mut out = String::new();
+        escape_into(s, &mut out);
+        out
+    }
+
+    #[test]
+    fn escapes_specials_and_copies_clean_runs() {
+        assert_eq!(escaped("plain"), "\"plain\"");
+        assert_eq!(escaped("a\"b\\c"), "\"a\\\"b\\\\c\"");
+        assert_eq!(escaped("tab\tnl\ncr\r"), "\"tab\\tnl\\ncr\\r\"");
+        assert_eq!(escaped("\u{08}\u{0c}"), "\"\\b\\f\"");
+        // Other control chars use lowercase \u00XX.
+        assert_eq!(escaped("\u{00}\u{1f}"), "\"\\u0000\\u001f\"");
+        // Multi-byte UTF-8 is copied verbatim (bytes >= 0x80 are never escaped).
+        assert_eq!(escaped("café ☕"), "\"café ☕\"");
+        assert_eq!(escaped(""), "\"\"");
+    }
 }

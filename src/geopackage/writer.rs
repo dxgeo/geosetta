@@ -278,7 +278,7 @@ mod tests {
         assert_eq!(back[0].1.features.len(), 2);
         assert_eq!(back[0].1.features[0].geometry, point(1.0, 2.0));
         // fid is excluded from properties.
-        let names: Vec<&str> = back[0].1.features[0].properties.iter().map(|(k, _)| k.as_str()).collect();
+        let names: Vec<&str> = back[0].1.features[0].properties.iter().map(|(k, _)| &**k).collect();
         assert_eq!(names, vec!["name", "n"]);
         assert_eq!(back[0].1.features[0].properties[1].1.as_f64(), Some(5.0));
     }

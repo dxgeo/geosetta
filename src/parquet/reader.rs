@@ -59,28 +59,27 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
         let rg_rows = rg.num_rows as usize;
         let mut prop_idx = 0;
         for col in &rg.columns {
-            let data = decode_column(bytes, col, rg_rows)?;
-            if col.name == meta.geometry_column {
-                has_geometry = true;
-                match data {
-                    ColumnData::Bytes(v) => geometry.extend(v),
-                    _ => return Err(Error::Parquet("geometry column is not BYTE_ARRAY".into())),
+            let is_geometry = col.name == meta.geometry_column;
+            match decode_column(bytes, col, rg_rows, is_geometry)? {
+                ColumnSink::Wkb(v) => {
+                    has_geometry = true;
+                    geometry.extend(v);
                 }
-            } else {
-                let values = column_to_json(data, col.converted_type)?;
-                if rg_idx == 0 {
-                    properties.push(PropertyColumn {
-                        name: col.name.clone(),
-                        values,
-                    });
-                } else {
-                    properties
-                        .get_mut(prop_idx)
-                        .ok_or_else(|| Error::Parquet("row groups disagree on columns".into()))?
-                        .values
-                        .extend(values);
+                ColumnSink::Json { out: values, .. } => {
+                    if rg_idx == 0 {
+                        properties.push(PropertyColumn {
+                            name: col.name.clone(),
+                            values,
+                        });
+                    } else {
+                        properties
+                            .get_mut(prop_idx)
+                            .ok_or_else(|| Error::Parquet("row groups disagree on columns".into()))?
+                            .values
+                            .extend(values);
+                    }
+                    prop_idx += 1;
                 }
-                prop_idx += 1;
             }
         }
     }
@@ -317,12 +316,19 @@ fn primary_column(geo: &str) -> Option<String> {
 
 // --- page + value decoding -------------------------------------------------
 
-/// Present-or-null values, aligned to rows, one variant per physical type.
-enum ColumnData {
-    Bool(Vec<Option<bool>>),
-    Int(Vec<Option<i64>>),
-    Double(Vec<Option<f64>>),
-    Bytes(Vec<Option<Vec<u8>>>),
+/// Where a decoded column chunk accumulates its rows.
+///
+/// Property columns decode *straight* into per-row [`JsonValue`] against the
+/// definition-level present-mask — no intermediate `Vec<Option<T>>` and no
+/// second pass to convert. The geometry column instead keeps its raw WKB blobs
+/// as bytes, which the caller hands to `from_wkb`.
+enum ColumnSink {
+    Json {
+        out: Vec<JsonValue>,
+        /// The schema's converted_type, driving DATE/TIMESTAMP rendering.
+        converted: Option<i32>,
+    },
+    Wkb(Vec<Option<Vec<u8>>>),
 }
 
 /// A decoded dictionary page, indexed by the data pages that follow it.
@@ -330,6 +336,27 @@ enum Dict {
     Int(Vec<i64>),
     Double(Vec<f64>),
     Bytes(Vec<Vec<u8>>),
+}
+
+/// Which rows of a data page carry a value.
+///
+/// The overwhelmingly common case — a column with no nulls, which Pantograph
+/// always writes as a single RLE run — is [`Present::All`], so no per-row mask
+/// is allocated or scanned. Only a page that actually contains nulls falls back
+/// to a one-byte-per-row [`Present::Mask`] (was a `Vec<u64>`, eight bytes each).
+enum Present {
+    All(usize),
+    Mask(Vec<bool>),
+}
+
+impl Present {
+    /// How many rows carry a value.
+    fn count(&self) -> usize {
+        match self {
+            Present::All(n) => *n,
+            Present::Mask(m) => m.iter().filter(|&&p| p).count(),
+        }
+    }
 }
 
 struct PageHeader {
@@ -343,15 +370,28 @@ struct PageHeader {
 }
 
 /// Decode one column chunk (all its pages, across the whole chunk) into
-/// `rg_rows` aligned values.
-fn decode_column(file: &[u8], col: &ColumnMeta, rg_rows: usize) -> Result<ColumnData> {
+/// `rg_rows` aligned values. A geometry column keeps raw WKB bytes; every other
+/// column decodes straight to per-row JSON.
+fn decode_column(
+    file: &[u8],
+    col: &ColumnMeta,
+    rg_rows: usize,
+    is_geometry: bool,
+) -> Result<ColumnSink> {
     // A dictionary page, if present, precedes the data pages.
     let start = col
         .dictionary_page_offset
         .filter(|&o| o >= 0)
         .unwrap_or(col.data_page_offset) as usize;
 
-    let mut out = empty_column(col.physical)?;
+    let mut out = if is_geometry {
+        ColumnSink::Wkb(Vec::with_capacity(rg_rows))
+    } else {
+        ColumnSink::Json {
+            out: Vec::with_capacity(rg_rows),
+            converted: col.converted_type,
+        }
+    };
     let mut dict: Option<Dict> = None;
     let mut pos = start;
     let mut rows_done = 0usize;
@@ -423,18 +463,6 @@ fn codec_name(id: i32) -> String {
     }
 }
 
-fn empty_column(physical: i32) -> Result<ColumnData> {
-    Ok(match physical {
-        p if p == ptype::BOOLEAN => ColumnData::Bool(Vec::new()),
-        // INT32 widens into the i64 column; FLOAT widens into the f64 column,
-        // so both surface as ordinary JSON numbers.
-        p if p == ptype::INT32 || p == ptype::INT64 => ColumnData::Int(Vec::new()),
-        p if p == ptype::FLOAT || p == ptype::DOUBLE => ColumnData::Double(Vec::new()),
-        p if p == ptype::BYTE_ARRAY => ColumnData::Bytes(Vec::new()),
-        other => return Err(Error::Parquet(format!("unsupported physical type {other}"))),
-    })
-}
-
 fn decode_dictionary(body: &[u8], physical: i32, count: usize) -> Result<Dict> {
     Ok(match physical {
         p if p == ptype::INT32 => Dict::Int(plain_i32(body, count)?),
@@ -457,10 +485,10 @@ fn decode_data_page(
     page_encoding: i32,
     page_rows: usize,
     dict: Option<&Dict>,
-    out: &mut ColumnData,
+    out: &mut ColumnSink,
 ) -> Result<()> {
     let (present, values) = split_definition_levels(body, col.max_def_level, page_rows)?;
-    let n_present = present.iter().filter(|&&d| d == 1).count();
+    let n_present = present.count();
 
     match page_encoding {
         e if e == encoding::PLAIN => decode_plain(out, col.physical, values, &present, n_present),
@@ -476,15 +504,15 @@ fn decode_data_page(
     }
 }
 
-/// Split a data-page body into a per-row present/null mask and the value bytes.
+/// Split a data-page body into a per-row present mask and the value bytes.
 /// A REQUIRED column (`max_def_level == 0`) carries no definition levels.
 fn split_definition_levels(
     body: &[u8],
     max_def_level: u32,
     page_rows: usize,
-) -> Result<(Vec<u64>, &[u8])> {
+) -> Result<(Present, &[u8])> {
     if max_def_level == 0 {
-        return Ok((vec![1; page_rows], body));
+        return Ok((Present::All(page_rows), body));
     }
     let bit_width = bits_needed(max_def_level);
     let rle_len = body
@@ -495,50 +523,90 @@ fn split_definition_levels(
         .get(4..4 + rle_len)
         .ok_or_else(|| Error::Parquet("definition-level section out of range".into()))?;
     let values = &body[4 + rle_len..];
-    let present = decode_levels(levels, bit_width, page_rows)?
+    Ok((decode_present(levels, bit_width, max_def_level, page_rows)?, values))
+}
+
+/// Decode a definition-level stream into a [`Present`] mask.
+fn decode_present(
+    levels: &[u8],
+    bit_width: u32,
+    max_def_level: u32,
+    page_rows: usize,
+) -> Result<Present> {
+    // Fast path: a single RLE run of the max level covering the whole page (what
+    // an all-present column serializes to) is all-present — no mask needed.
+    if is_all_present_rle(levels, bit_width, max_def_level, page_rows) {
+        return Ok(Present::All(page_rows));
+    }
+    let mask = decode_levels(levels, bit_width, page_rows)?
         .into_iter()
-        .map(|d| (d == max_def_level as u64) as u64)
+        .map(|d| d == max_def_level as u64)
         .collect();
-    Ok((present, values))
+    Ok(Present::Mask(mask))
+}
+
+/// Whether `levels` is a single RLE run of `max_def_level` covering the page —
+/// i.e. every row present — without materializing the levels.
+fn is_all_present_rle(levels: &[u8], bit_width: u32, max_def_level: u32, page_rows: usize) -> bool {
+    if bit_width == 0 {
+        return max_def_level == 0;
+    }
+    let Ok((header, adv)) = read_uvarint(levels, 0) else {
+        return false;
+    };
+    if header & 1 != 0 {
+        return false; // bit-packed, not a single RLE run
+    }
+    if ((header >> 1) as usize) < page_rows {
+        return false; // run doesn't cover the whole page
+    }
+    let byte_width = bit_width.div_ceil(8) as usize;
+    let Some(val_bytes) = levels.get(adv..adv + byte_width) else {
+        return false;
+    };
+    let mut val = 0u64;
+    for (k, &b) in val_bytes.iter().enumerate() {
+        val |= (b as u64) << (8 * k);
+    }
+    val == max_def_level as u64
 }
 
 fn decode_plain(
-    out: &mut ColumnData,
+    out: &mut ColumnSink,
     physical: i32,
     values: &[u8],
-    present: &[u64],
+    present: &Present,
     n: usize,
 ) -> Result<()> {
     match out {
-        ColumnData::Bool(v) => v.extend(align(present, plain_bools(values, n)?)),
-        ColumnData::Int(v) => {
-            let decoded = if physical == ptype::INT32 {
-                plain_i32(values, n)?
-            } else {
-                plain_i64(values, n)?
-            };
-            v.extend(align(present, decoded));
+        // Geometry: keep raw WKB bytes, aligned to rows.
+        ColumnSink::Wkb(v) => {
+            if physical != ptype::BYTE_ARRAY {
+                return Err(Error::Parquet("geometry column is not BYTE_ARRAY".into()));
+            }
+            v.extend(align(present, plain_byte_arrays(values, n)?));
         }
-        ColumnData::Double(v) => {
-            let decoded = if physical == ptype::FLOAT {
-                plain_f32(values, n)?
-            } else {
-                plain_f64(values, n)?
-            };
-            v.extend(align(present, decoded));
-        }
-        ColumnData::Bytes(v) => v.extend(align(present, plain_byte_arrays(values, n)?)),
+        // Everything else: decode straight to per-row JSON.
+        ColumnSink::Json { out, converted } => match physical {
+            p if p == ptype::BOOLEAN => push_json(out, present, plain_bools(values, n)?, JsonValue::Bool),
+            p if p == ptype::INT32 => emit_ints(out, *converted, present, plain_i32(values, n)?),
+            p if p == ptype::INT64 => emit_ints(out, *converted, present, plain_i64(values, n)?),
+            p if p == ptype::FLOAT => push_json(out, present, plain_f32(values, n)?, json_number),
+            p if p == ptype::DOUBLE => push_json(out, present, plain_f64(values, n)?, json_number),
+            p if p == ptype::BYTE_ARRAY => push_json_strings(out, present, plain_byte_arrays(values, n)?)?,
+            other => return Err(Error::Parquet(format!("unsupported physical type {other}"))),
+        },
     }
     Ok(())
 }
 
 /// Decode a dictionary-index data page: `[1 byte bit width][RLE/bit-pack
-/// indices]`, mapped through `dict`.
+/// indices]`, mapped through `dict` and emitted straight to the sink.
 fn decode_dict_indices(
-    out: &mut ColumnData,
+    out: &mut ColumnSink,
     dict: &Dict,
     values: &[u8],
-    present: &[u64],
+    present: &Present,
     n: usize,
 ) -> Result<()> {
     let indices = if n == 0 {
@@ -551,17 +619,103 @@ fn decode_dict_indices(
         decode_levels(&values[1..], bit_width, n)?
     };
 
-    match (out, dict) {
-        (ColumnData::Int(v), Dict::Int(d)) => {
-            v.extend(align(present, map_indices(&indices, d, |x| *x)?))
+    match out {
+        ColumnSink::Wkb(v) => match dict {
+            Dict::Bytes(d) => v.extend(align(present, map_indices(&indices, d, |x| x.clone())?)),
+            _ => return Err(Error::Parquet("geometry column is not BYTE_ARRAY".into())),
+        },
+        ColumnSink::Json { out, converted } => match dict {
+            Dict::Int(d) => emit_ints(out, *converted, present, map_indices(&indices, d, |x| *x)?),
+            Dict::Double(d) => {
+                push_json(out, present, map_indices(&indices, d, |x| *x)?, json_number)
+            }
+            Dict::Bytes(d) => {
+                push_json_strings(out, present, map_indices(&indices, d, |x| x.clone())?)?
+            }
+        },
+    }
+    Ok(())
+}
+
+/// A plain `f64` JSON number.
+fn json_number(value: f64) -> JsonValue {
+    JsonValue::Number { value, is_int: false }
+}
+
+/// Push `values` into `out` at the present rows, inserting `Null` for the rest —
+/// a single pass, no `Option<T>` intermediate. `Present::All` skips the mask.
+fn push_json<T>(
+    out: &mut Vec<JsonValue>,
+    present: &Present,
+    values: Vec<T>,
+    mut f: impl FnMut(T) -> JsonValue,
+) {
+    match present {
+        Present::All(_) => {
+            out.reserve(values.len());
+            out.extend(values.into_iter().map(&mut f));
         }
-        (ColumnData::Double(v), Dict::Double(d)) => {
-            v.extend(align(present, map_indices(&indices, d, |x| *x)?))
+        Present::Mask(mask) => {
+            out.reserve(mask.len());
+            let mut it = values.into_iter();
+            for &p in mask {
+                out.push(if p {
+                    it.next().map_or(JsonValue::Null, &mut f)
+                } else {
+                    JsonValue::Null
+                });
+            }
         }
-        (ColumnData::Bytes(v), Dict::Bytes(d)) => {
-            v.extend(align(present, map_indices(&indices, d, |x| x.clone())?))
+    }
+}
+
+/// Integers render as JSON numbers, except DATE/TIMESTAMP columns, which render
+/// as ISO 8601 strings.
+fn emit_ints(out: &mut Vec<JsonValue>, converted: Option<i32>, present: &Present, values: Vec<i64>) {
+    if is_temporal(converted) {
+        push_json(out, present, values, |i| {
+            JsonValue::String(format_temporal(i, converted))
+        });
+    } else {
+        push_json(out, present, values, |i| JsonValue::Number {
+            value: i as f64,
+            is_int: true,
+        });
+    }
+}
+
+/// Like [`push_json`] for `BYTE_ARRAY` string columns, validating UTF-8.
+fn push_json_strings(
+    out: &mut Vec<JsonValue>,
+    present: &Present,
+    values: Vec<Vec<u8>>,
+) -> Result<()> {
+    let to_json = |b: Vec<u8>| -> Result<JsonValue> {
+        String::from_utf8(b)
+            .map(JsonValue::String)
+            .map_err(|_| Error::Parquet("string column has invalid utf-8".into()))
+    };
+    match present {
+        Present::All(_) => {
+            out.reserve(values.len());
+            for b in values {
+                out.push(to_json(b)?);
+            }
         }
-        _ => return Err(Error::Parquet("dictionary type mismatch".into())),
+        Present::Mask(mask) => {
+            out.reserve(mask.len());
+            let mut it = values.into_iter();
+            for &p in mask {
+                out.push(if p {
+                    match it.next() {
+                        Some(b) => to_json(b)?,
+                        None => JsonValue::Null,
+                    }
+                } else {
+                    JsonValue::Null
+                });
+            }
+        }
     }
     Ok(())
 }
@@ -641,14 +795,18 @@ fn bits_needed(max: u32) -> u32 {
     if max == 0 { 0 } else { 32 - max.leading_zeros() }
 }
 
-/// Distribute `n` present values across rows: a `1` level takes the next value,
-/// a `0` level is null.
-fn align<T>(levels: &[u64], values: Vec<T>) -> Vec<Option<T>> {
-    let mut it = values.into_iter();
-    levels
-        .iter()
-        .map(|&d| if d == 1 { it.next() } else { None })
-        .collect()
+/// Distribute present values across rows: a present row takes the next value, a
+/// null row is `None`. `Present::All` is simply every value wrapped in `Some`.
+fn align<T>(present: &Present, values: Vec<T>) -> Vec<Option<T>> {
+    match present {
+        Present::All(_) => values.into_iter().map(Some).collect(),
+        Present::Mask(mask) => {
+            let mut it = values.into_iter();
+            mask.iter()
+                .map(|&p| if p { it.next() } else { None })
+                .collect()
+        }
+    }
 }
 
 /// Decode an RLE/bit-pack hybrid stream (definition levels or dictionary
@@ -849,54 +1007,6 @@ fn format_timestamp(value: i64, subsecond_digits: u32) -> String {
     s
 }
 
-/// Turn a decoded column into per-row JSON property values.
-fn column_to_json(data: ColumnData, converted: Option<i32>) -> Result<Vec<JsonValue>> {
-    let values = match data {
-        ColumnData::Bool(v) => v
-            .into_iter()
-            .map(|o| o.map_or(JsonValue::Null, JsonValue::Bool))
-            .collect(),
-        // DATE and TIMESTAMP columns are integers with a temporal converted
-        // type; render them as ISO 8601 strings. Everything else stays numeric.
-        ColumnData::Int(v) if is_temporal(converted) => v
-            .into_iter()
-            .map(|o| o.map_or(JsonValue::Null, |i| JsonValue::String(format_temporal(i, converted))))
-            .collect(),
-        ColumnData::Int(v) => v
-            .into_iter()
-            .map(|o| {
-                o.map_or(JsonValue::Null, |i| JsonValue::Number {
-                    value: i as f64,
-                    is_int: true,
-                })
-            })
-            .collect(),
-        ColumnData::Double(v) => v
-            .into_iter()
-            .map(|o| {
-                o.map_or(JsonValue::Null, |d| JsonValue::Number {
-                    value: d,
-                    is_int: false,
-                })
-            })
-            .collect(),
-        ColumnData::Bytes(v) => {
-            let mut out = Vec::with_capacity(v.len());
-            for cell in v {
-                out.push(match cell {
-                    None => JsonValue::Null,
-                    Some(b) => JsonValue::String(
-                        String::from_utf8(b)
-                            .map_err(|_| Error::Parquet("string column has invalid utf-8".into()))?,
-                    ),
-                });
-            }
-            out
-        }
-    };
-    Ok(values)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -938,8 +1048,23 @@ mod tests {
 
     #[test]
     fn align_places_nulls() {
-        let out = align(&[1, 0, 1], vec![10i64, 20]);
+        let out = align(&Present::Mask(vec![true, false, true]), vec![10i64, 20]);
         assert_eq!(out, vec![Some(10), None, Some(20)]);
+        // The all-present fast path wraps every value in `Some`.
+        assert_eq!(align(&Present::All(2), vec![1i64, 2]), vec![Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn all_present_rle_detects_single_max_run() {
+        // Writer's all-present encoding: RLE run of `1`, length = rows.
+        // header = (rows << 1) | 0, then one value byte (width 1 for max=1).
+        assert!(is_all_present_rle(&[0x0a, 0x01], 1, 1, 5)); // 5 rows, all level 1
+        // A run of level 0 (all null) is not all-present.
+        assert!(!is_all_present_rle(&[0x0a, 0x00], 1, 1, 5));
+        // A bit-packed run (header LSB set) is not the fast path.
+        assert!(!is_all_present_rle(&[0x03, 0x00], 1, 1, 5));
+        // A run shorter than the page is not all-present.
+        assert!(!is_all_present_rle(&[0x06, 0x01], 1, 1, 5)); // run_len 3 < 5
     }
 
     #[test]
@@ -971,11 +1096,12 @@ mod tests {
         // means one bit-packed group of 8 (2 bytes at width 2). Packed LSB-first:
         // idx0=10, idx1=01, idx2=00, idx3=10 -> byte0 = 0x86, byte1 (unused) = 0.
         let values = [2u8, 0x03, 0x86, 0x00];
-        let present = vec![1u64; 4];
-        let mut out = ColumnData::Bytes(Vec::new());
+        let present = Present::Mask(vec![true; 4]);
+        // Use the WKB sink to observe the mapped-through-dict bytes directly.
+        let mut out = ColumnSink::Wkb(Vec::new());
         decode_dict_indices(&mut out, &dict, &values, &present, 4).unwrap();
         match out {
-            ColumnData::Bytes(v) => assert_eq!(
+            ColumnSink::Wkb(v) => assert_eq!(
                 v,
                 vec![
                     Some(b"blue".to_vec()),

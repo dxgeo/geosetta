@@ -8,6 +8,28 @@ use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{Geometry, Position};
 use crate::json::{self, JsonValue, Parser};
+use std::collections::HashSet;
+use std::rc::Rc;
+
+/// Interns property keys within one collection so a name repeated across
+/// features is allocated once and shared as an `Rc`, not re-allocated per
+/// feature. Lookups borrow the key as `&str` (via `Rc<str>: Borrow<str>`), so a
+/// hit costs only a refcount bump.
+#[derive(Default)]
+struct KeyInterner {
+    seen: HashSet<Rc<str>>,
+}
+
+impl KeyInterner {
+    fn intern(&mut self, key: &str) -> Rc<str> {
+        if let Some(rc) = self.seen.get(key) {
+            return Rc::clone(rc);
+        }
+        let rc: Rc<str> = Rc::from(key);
+        self.seen.insert(Rc::clone(&rc));
+        rc
+    }
+}
 
 /// Interpret a JSON document as GeoJSON.
 pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
@@ -21,11 +43,15 @@ pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
             let features = value.get("features").and_then(JsonValue::as_array).ok_or_else(
                 || Error::GeoJson("FeatureCollection missing \"features\" array".into()),
             )?;
-            let features = features.iter().map(parse_feature).collect::<Result<_>>()?;
+            let mut keys = KeyInterner::default();
+            let features = features
+                .iter()
+                .map(|f| parse_feature(f, &mut keys))
+                .collect::<Result<_>>()?;
             Ok(FeatureCollection { features })
         }
         "Feature" => Ok(FeatureCollection {
-            features: vec![parse_feature(value)?],
+            features: vec![parse_feature(value, &mut KeyInterner::default())?],
         }),
         // A bare geometry object.
         _ => Ok(FeatureCollection {
@@ -112,8 +138,9 @@ fn stream_features(p: &mut Parser) -> Result<Vec<Feature>> {
         p.bump();
         return Ok(features);
     }
+    let mut keys = KeyInterner::default();
     loop {
-        features.push(stream_feature(p)?);
+        features.push(stream_feature(p, &mut keys)?);
         p.skip_ws();
         match p.bump() {
             Some(b',') => continue,
@@ -127,11 +154,11 @@ fn stream_features(p: &mut Parser) -> Result<Vec<Feature>> {
 /// Stream one Feature object into a [`Feature`], dispatching on member key so
 /// member order doesn't matter. `geometry` is parsed typed; `properties` stay
 /// arbitrary JSON; every other member (`type`, `id`, `bbox`, …) is skipped.
-fn stream_feature(p: &mut Parser) -> Result<Feature> {
+fn stream_feature(p: &mut Parser, keys: &mut KeyInterner) -> Result<Feature> {
     p.skip_ws();
     p.expect(b'{')?;
     let mut geometry = None;
-    let mut properties: Vec<(String, JsonValue)> = Vec::new();
+    let mut properties: Vec<(Rc<str>, JsonValue)> = Vec::new();
     p.skip_ws();
     if p.peek() == Some(b'}') {
         p.bump();
@@ -154,7 +181,10 @@ fn stream_feature(p: &mut Parser) -> Result<Feature> {
             // Properties are arbitrary JSON; a non-object (incl. null) means none.
             "properties" => {
                 if let JsonValue::Object(m) = p.parse_value()? {
-                    properties = m;
+                    properties = m
+                        .into_iter()
+                        .map(|(k, v)| (keys.intern(&k), v))
+                        .collect();
                 }
             }
             _ => p.skip_value()?,
@@ -442,7 +472,15 @@ fn feature_to_json(f: &Feature) -> JsonValue {
     obj(vec![
         ("type", JsonValue::String("Feature".into())),
         ("geometry", geometry),
-        ("properties", JsonValue::Object(f.properties.clone())),
+        (
+            "properties",
+            JsonValue::Object(
+                f.properties
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+            ),
+        ),
     ])
 }
 
@@ -500,13 +538,16 @@ fn obj(pairs: Vec<(&str, JsonValue)>) -> JsonValue {
     JsonValue::Object(pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect())
 }
 
-fn parse_feature(value: &JsonValue) -> Result<Feature> {
+fn parse_feature(value: &JsonValue, keys: &mut KeyInterner) -> Result<Feature> {
     let geometry = match value.get("geometry") {
         None | Some(JsonValue::Null) => None,
         Some(g) => Some(parse_geometry(g)?),
     };
     let properties = match value.get("properties") {
-        Some(JsonValue::Object(members)) => members.clone(),
+        Some(JsonValue::Object(members)) => members
+            .iter()
+            .map(|(k, v)| (keys.intern(k), v.clone()))
+            .collect(),
         _ => Vec::new(),
     };
     Ok(Feature {
@@ -607,7 +648,7 @@ mod tests {
         let fc = from_json(&parse(doc).unwrap()).unwrap();
         assert_eq!(fc.features.len(), 1);
         assert_eq!(fc.features[0].geometry, Some(Geometry::Point([1.0, 2.0])));
-        assert_eq!(fc.features[0].properties[0].0, "name");
+        assert_eq!(fc.features[0].properties[0].0.as_ref(), "name");
     }
 
     #[test]

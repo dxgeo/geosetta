@@ -4,13 +4,18 @@
 
 use crate::geometry::Geometry;
 use crate::json::JsonValue;
+use std::rc::Rc;
 
 /// A vector feature: an optional geometry plus ordered properties.
+///
+/// Property keys are `Rc<str>` rather than `String` so that a column name
+/// repeated across every row is allocated once and shared (a refcount bump per
+/// cell), not re-allocated per feature — the dominant cost on wide tables.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Feature {
     pub geometry: Option<Geometry>,
     /// Property members, in order. Empty when there are no properties.
-    pub properties: Vec<(String, JsonValue)>,
+    pub properties: Vec<(Rc<str>, JsonValue)>,
 }
 
 /// A collection of features.

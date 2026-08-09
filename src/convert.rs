@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::cli::Format;
+use crate::format::Format;
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox};

@@ -1,12 +1,12 @@
-#+TITLE: Pantograph
+#+TITLE: Geosetta
 #+AUTHOR: Daniel Okuniewicz Jr.
 #+DATE: {{{time(%Y-%m-%d)}}}
 #+EXPORT_FILENAME: project
 
-* Pantograph
+* Geosetta
 
 ** OVERVIEW
-Pantograph is a library for exporting any vector geospatial format to any other vector geospatial format.
+Geosetta is a library for exporting any vector geospatial format to any other vector geospatial format.
 The basic idea is to have one library, with no other dependencies, that can take any input vector geospatial file and output any other conceivable vector format, provided it is an open standard.
 If you've heard of [[https://pandoc.org/][Pandoc]], the idea is similar here.
 
@@ -25,7 +25,7 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.17.3*.
+Current version: *0.18.0*.
 
 Six formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -51,7 +51,7 @@ GeoPackage→GeoParquet, GeoJSON→GeoPackage all work. Validated against DuckDB
 
 The *GeoParquet* path is the most exercised. Write output is Snappy-compressed
 and validated by DuckDB's spatial engine as genuine, queryable GeoParquet; the
-reader recovers a GeoParquet file Pantograph wrote back to equivalent GeoJSON,
+reader recovers a GeoParquet file Geosetta wrote back to equivalent GeoJSON,
 and the geojson→parquet→geojson→parquet round trip is byte-for-byte stable.
 
 The reader also handles common *foreign* GeoParquet: DuckDB's default output
@@ -115,29 +115,29 @@ features (heterogeneous or nested values fall back to a JSON string).
 
 ** USAGE
 #+begin_src sh
-panto input.geojson output.parquet   # GeoJSON    -> GeoParquet
-panto input.parquet output.geojson   # GeoParquet -> GeoJSON
-panto input.fgb     output.geojson   # FlatGeobuf -> GeoJSON
-panto input.fgb     output.parquet   # FlatGeobuf -> GeoParquet
-panto input.geojson output.fgb       # GeoJSON    -> FlatGeobuf
-panto input.parquet output.fgb       # GeoParquet -> FlatGeobuf
-panto input.csv     output.parquet   # CSV (WKT)  -> GeoParquet
-panto input.fgb     output.csv       # FlatGeobuf -> CSV (WKT)
-panto input.gpkg    output.geojson   # GeoPackage -> GeoJSON (--layer NAME to pick one)
-panto input.gpkg    out/ --to geojson # multi-layer GeoPackage -> one file per layer
-panto roads.geojson data.gpkg        # create data.gpkg with layer "roads"
-panto rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
-panto roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
-panto big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
-panto big.geojson   big.parquet --progress      # report each stage on stderr
+geosetta input.geojson output.parquet   # GeoJSON    -> GeoParquet
+geosetta input.parquet output.geojson   # GeoParquet -> GeoJSON
+geosetta input.fgb     output.geojson   # FlatGeobuf -> GeoJSON
+geosetta input.fgb     output.parquet   # FlatGeobuf -> GeoParquet
+geosetta input.geojson output.fgb       # GeoJSON    -> FlatGeobuf
+geosetta input.parquet output.fgb       # GeoParquet -> FlatGeobuf
+geosetta input.csv     output.parquet   # CSV (WKT)  -> GeoParquet
+geosetta input.fgb     output.csv       # FlatGeobuf -> CSV (WKT)
+geosetta input.gpkg    output.geojson   # GeoPackage -> GeoJSON (--layer NAME to pick one)
+geosetta input.gpkg    out/ --to geojson # multi-layer GeoPackage -> one file per layer
+geosetta roads.geojson data.gpkg        # create data.gpkg with layer "roads"
+geosetta rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
+geosetta roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
+geosetta big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
+geosetta big.geojson   big.parquet --progress      # report each stage on stderr
 # formats may also be given explicitly:
-panto in.txt out.bin --from geojson --to parquet
+geosetta in.txt out.bin --from geojson --to parquet
 #+end_src
 
 A runnable example lives in [[file:examples/sample.geojson][examples/sample.geojson]].
 
 ** PRIOR ART / POSITIONING
-Format conversion itself is a solved problem; Pantograph's wager is *how* it
+Format conversion itself is a solved problem; Geosetta's wager is *how* it
 does it, not *that* it does it.
 
 - [[https://gdal.org/][GDAL/OGR]] (=ogr2ogr=) is the de facto universal translator:
@@ -156,7 +156,7 @@ does it, not *that* it does it.
 
 What none of them are is *dependency-free*. GDAL needs a C/C++ toolchain plus
 PROJ/GEOS; the Rust options pull in crates, and every Parquet path leans on
-Apache Arrow (C++ or the =arrow= and =parquet= crates). Pantograph's distinguishing
+Apache Arrow (C++ or the =arrow= and =parquet= crates). Geosetta's distinguishing
 constraint is exactly that: pure standard-library Rust, every wire format
 implemented from its specification. The payoff is a small, embeddable,
 audit-friendly, no-supply-chain build (WASM, constrained environments); the cost

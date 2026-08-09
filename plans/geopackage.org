@@ -23,10 +23,10 @@ existing per-layer hub — the IR and the other spokes do not change.
 - Because write is append/upsert, *sequential invocations accumulate layers*
   with no special batch mode:
   #+begin_src sh
-  panto roads.geojson data.gpkg     # create data.gpkg with layer "roads"
-  panto rivers.csv    data.gpkg     # append layer "rivers"
+  geosetta roads.geojson data.gpkg     # create data.gpkg with layer "roads"
+  geosetta rivers.csv    data.gpkg     # append layer "rivers"
   #+end_src
-  A future batch form (=panto a.geojson b.csv out.gpkg=) is just a convenience.
+  A future batch form (=geosetta a.geojson b.csv out.gpkg=) is just a convenience.
 
 *** Key simplification: append via read-modify-write
 In-place editing of a SQLite file from scratch (b-tree insertion, freelists,

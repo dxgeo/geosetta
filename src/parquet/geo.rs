@@ -6,7 +6,7 @@
 
 use crate::geometry::Bbox;
 
-/// The column name Pantograph uses for geometry.
+/// The column name Geosetta uses for geometry.
 pub const GEOMETRY_COLUMN: &str = "geometry";
 
 const GEOPARQUET_VERSION: &str = "1.1.0";

@@ -1,12 +1,16 @@
 [package]
-name = "pantograph-rs"
-version = "0.17.3"
+name = "geosetta"
+version = "0.18.0"
 edition = "2024"
 description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, CSV, WKT), dependency-free."
 license = "MIT"
 
+[lib]
+name = "geosetta"
+path = "src/lib.rs"
+
 [[bin]]
-name = "panto"
+name = "geosetta"
 path = "src/main.rs"
 
 [dependencies]

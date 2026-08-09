@@ -5,7 +5,7 @@
 * Reverse Direction — GeoParquet → GeoJSON (round-trip first)
 
 ** GOAL
-Read back the GeoParquet that Pantograph itself writes and reproduce an
+Read back the GeoParquet that Geosetta itself writes and reproduce an
 equivalent GeoJSON =FeatureCollection=. Success criterion: for any GeoJSON we
 convert to GeoParquet, converting it back yields the same features (geometry and
 properties), modulo the documented lossy points below.

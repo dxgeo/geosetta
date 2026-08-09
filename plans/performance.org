@@ -4,15 +4,15 @@
 * Performance
 
 ** BENCHMARKS
-=tests/perf.rs= drives the real =panto= binary end-to-end (the crate is bin-only,
-so there is no library target to micro-bench). It generates a synthetic GeoJSON
+=tests/perf.rs= drives the real =geosetta= binary end-to-end (whole-pipeline
+timing, including process startup and file I/O). It generates a synthetic GeoJSON
 FeatureCollection (mixed point/line/polygon, typed properties, fractional
 coordinates), derives the binary inputs from it, and times each conversion
 best-of-3, printing MB/s and features/s. Marked =#[ignore]= so a normal test run
 stays fast:
 #+begin_src sh
 cargo test --release --test perf -- --ignored --nocapture
-# PANTO_BENCH_N sets the feature count (default 200_000).
+# GEOSETTA_BENCH_N sets the feature count (default 200_000).
 #+end_src
 End-to-end timing includes process start + file IO, so it is noisy for small
 deltas; use a large =N= (≥400k) and read relative changes, not absolutes.
@@ -20,13 +20,13 @@ deltas; use a large =N= (≥400k) and read relative changes, not absolutes.
 There are two =#[ignore]= benchmarks:
 - =throughput= — the original mix (point/line/polygon, four typed properties),
   one conversion per read/write path. Good for geometry- and IO-bound changes.
-- =wide_table= — =n= trivial points, each with =PANTO_BENCH_COLS= (default 30)
+- =wide_table= — =n= trivial points, each with =GEOSETTA_BENCH_COLS= (default 30)
   typed property columns. Geometry is negligible, so *property handling
   dominates*: it isolates the schema/columnar cost on write and the per-row
   property rebuild on read, which the four-property =throughput= mix hides.
 #+begin_src sh
 cargo test --release --test perf wide_table -- --ignored --nocapture
-# PANTO_BENCH_COLS sets the column count; double it to expose super-linear
+# GEOSETTA_BENCH_COLS sets the column count; double it to expose super-linear
 # scaling in the column dimension.
 #+end_src
 
@@ -196,7 +196,7 @@ the 4-property common case (no regression) and improved key-heavy reads.
 - *DONE — level decoding.* =split_definition_levels= used to decode every
   definition level into a =Vec<u64>= (eight bytes per 0/1 level) and map it to a
   *second* =Vec<u64>= present-mask. Replaced the mask with a =Present= enum:
-  =Present::All(n)= for the all-present case (what Pantograph always writes — a
+  =Present::All(n)= for the all-present case (what Geosetta always writes — a
   single RLE run of the max level, detected by =is_all_present_rle= *without*
   decoding), so neither allocation nor the per-row scan happens; only a page that
   truly contains nulls falls back to =Present::Mask(Vec<bool>)= (one byte per

@@ -144,7 +144,7 @@ fn build_header(
         col_offsets.push(b.end_table());
     }
     let columns_vec = b.create_offset_vector(&col_offsets);
-    let name = b.create_string("pantograph");
+    let name = b.create_string("geosetta");
     let envelope = (!bbox.is_empty())
         .then(|| b.create_f64_vector(&[bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y]));
 

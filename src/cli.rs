@@ -2,63 +2,12 @@
 //!
 //! Usage:
 //! ```text
-//! panto <input> <output> [--from FMT] [--to FMT]
+//! geosetta <input> <output> [--from FMT] [--to FMT]
 //! ```
 //! Formats are inferred from file extensions when not given explicitly.
 
 use crate::error::{Error, Result};
-
-/// A supported vector format.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Format {
-    GeoJson,
-    Parquet,
-    FlatGeobuf,
-    Csv,
-    Wkt,
-    Gpkg,
-}
-
-impl Format {
-    /// Parse an explicit `--from`/`--to` value.
-    fn parse(name: &str) -> Result<Format> {
-        match name.to_ascii_lowercase().as_str() {
-            "geojson" | "json" => Ok(Format::GeoJson),
-            "parquet" | "geoparquet" => Ok(Format::Parquet),
-            "flatgeobuf" | "fgb" => Ok(Format::FlatGeobuf),
-            "csv" => Ok(Format::Csv),
-            "wkt" => Ok(Format::Wkt),
-            "gpkg" | "geopackage" => Ok(Format::Gpkg),
-            other => Err(Error::Usage(format!("unknown format \"{other}\""))),
-        }
-    }
-
-    /// Infer a format from a file path's extension.
-    fn from_path(path: &str) -> Option<Format> {
-        let ext = path.rsplit('.').next()?.to_ascii_lowercase();
-        match ext.as_str() {
-            "geojson" | "json" => Some(Format::GeoJson),
-            "parquet" => Some(Format::Parquet),
-            "fgb" => Some(Format::FlatGeobuf),
-            "csv" => Some(Format::Csv),
-            "wkt" => Some(Format::Wkt),
-            "gpkg" => Some(Format::Gpkg),
-            _ => None,
-        }
-    }
-
-    /// The canonical file extension, used to name fan-out outputs.
-    pub fn extension(self) -> &'static str {
-        match self {
-            Format::GeoJson => "geojson",
-            Format::Parquet => "parquet",
-            Format::FlatGeobuf => "fgb",
-            Format::Csv => "csv",
-            Format::Wkt => "wkt",
-            Format::Gpkg => "gpkg",
-        }
-    }
-}
+use crate::format::Format;
 
 /// Parsed command-line arguments.
 #[derive(Debug)]
@@ -81,7 +30,7 @@ pub struct Args {
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: panto <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert] [--rtree] [--progress]";
+pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert] [--rtree] [--progress]";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -163,7 +112,7 @@ mod tests {
 
     #[test]
     fn infers_formats_from_extensions() {
-        let a = args(&["panto", "in.geojson", "out.parquet"]).unwrap();
+        let a = args(&["geosetta", "in.geojson", "out.parquet"]).unwrap();
         assert_eq!(a.from, Format::GeoJson);
         assert_eq!(a.to, Format::Parquet);
         assert_eq!(a.input, "in.geojson");
@@ -171,7 +120,7 @@ mod tests {
 
     #[test]
     fn explicit_flags_override() {
-        let a = args(&["panto", "in.txt", "out.bin", "--from", "geojson", "--to", "parquet"])
+        let a = args(&["geosetta", "in.txt", "out.bin", "--from", "geojson", "--to", "parquet"])
             .unwrap();
         assert_eq!(a.from, Format::GeoJson);
         assert_eq!(a.to, Format::Parquet);
@@ -179,24 +128,24 @@ mod tests {
 
     #[test]
     fn parses_rtree_flag() {
-        let a = args(&["panto", "in.geojson", "out.gpkg", "--rtree"]).unwrap();
+        let a = args(&["geosetta", "in.geojson", "out.gpkg", "--rtree"]).unwrap();
         assert!(a.rtree);
-        let b = args(&["panto", "in.geojson", "out.gpkg"]).unwrap();
+        let b = args(&["geosetta", "in.geojson", "out.gpkg"]).unwrap();
         assert!(!b.rtree);
     }
 
     #[test]
     fn parses_progress_flag() {
-        let a = args(&["panto", "in.geojson", "out.parquet", "--progress"]).unwrap();
+        let a = args(&["geosetta", "in.geojson", "out.parquet", "--progress"]).unwrap();
         assert!(a.progress);
-        let b = args(&["panto", "in.geojson", "out.parquet"]).unwrap();
+        let b = args(&["geosetta", "in.geojson", "out.parquet"]).unwrap();
         assert!(!b.progress);
     }
 
     #[test]
     fn errors_on_bad_usage() {
-        assert!(args(&["panto", "only-one.geojson"]).is_err());
-        assert!(args(&["panto", "a.xyz", "b.parquet"]).is_err()); // unknown input ext
-        assert!(args(&["panto", "--help"]).is_err());
+        assert!(args(&["geosetta", "only-one.geojson"]).is_err());
+        assert!(args(&["geosetta", "a.xyz", "b.parquet"]).is_err()); // unknown input ext
+        assert!(args(&["geosetta", "--help"]).is_err());
     }
 }

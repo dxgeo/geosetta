@@ -280,7 +280,7 @@ fn build_file_metadata(
     w.field_string(2, geo_metadata);
     w.struct_end();
 
-    w.field_string(6, "pantograph");
+    w.field_string(6, "geosetta");
     w.struct_end(); // FileMetaData
     w.into_bytes()
 }

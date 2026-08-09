@@ -1,14 +1,15 @@
 //! Throughput benchmarks for the read/write paths.
 //!
-//! These drive the real `panto` binary end-to-end (the crate is bin-only, so
-//! there is no library target to bench against directly). They are marked
+//! These drive the real `geosetta` binary end-to-end (whole-pipeline timing,
+//! including process startup and file I/O, not just the library functions). They
+//! are marked
 //! `#[ignore]` so a normal `cargo test` stays fast; run them with:
 //!
 //! ```sh
 //! cargo test --release --test perf -- --ignored --nocapture
 //! ```
 //!
-//! Set `PANTO_BENCH_N` to change the feature count (default 200_000). Each
+//! Set `GEOSETTA_BENCH_N` to change the feature count (default 200_000). Each
 //! benchmark prints wall-clock, input MB/s, and features/s (best of a few
 //! runs); they assert only correctness, not timing, so they are not flaky.
 
@@ -16,15 +17,15 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-const PANTO: &str = env!("CARGO_BIN_EXE_panto");
+const GEOSETTA: &str = env!("CARGO_BIN_EXE_geosetta");
 
 fn feature_count() -> usize {
-    std::env::var("PANTO_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(200_000)
+    std::env::var("GEOSETTA_BENCH_N").ok().and_then(|s| s.parse().ok()).unwrap_or(200_000)
 }
 
 /// Property count for the wide-table benchmark (default 30).
 fn wide_cols() -> usize {
-    std::env::var("PANTO_BENCH_COLS").ok().and_then(|s| s.parse().ok()).unwrap_or(30)
+    std::env::var("GEOSETTA_BENCH_COLS").ok().and_then(|s| s.parse().ok()).unwrap_or(30)
 }
 
 /// A private scratch directory for the run's fixtures.
@@ -35,7 +36,7 @@ fn scratch() -> PathBuf {
 /// A private scratch directory tagged with `name`, so benchmarks that run in
 /// parallel don't share (and delete) each other's fixtures.
 fn scratch_named(name: &str) -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("panto-perf-{}-{name}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("geosetta-perf-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -113,19 +114,19 @@ fn gen_wide_geojson(n: usize, cols: usize) -> String {
     s
 }
 
-/// Run `panto in out [extra…]`, returning elapsed time and output size.
+/// Run `geosetta in out [extra…]`, returning elapsed time and output size.
 fn run(input: &Path, output: &Path, extra: &[&str]) -> (Duration, u64) {
     let start = Instant::now();
-    let out = Command::new(PANTO)
+    let out = Command::new(GEOSETTA)
         .arg(input)
         .arg(output)
         .args(extra)
         .output()
-        .expect("spawn panto");
+        .expect("spawn geosetta");
     let elapsed = start.elapsed();
     assert!(
         out.status.success(),
-        "panto {input:?} -> {output:?} failed:\n{}",
+        "geosetta {input:?} -> {output:?} failed:\n{}",
         String::from_utf8_lossy(&out.stderr)
     );
     let size = std::fs::metadata(output).map(|m| m.len()).unwrap_or(0);
@@ -174,7 +175,7 @@ fn setup(n: usize) -> (PathBuf, u64) {
 fn throughput() {
     let n = feature_count();
     let (dir, geo_bytes) = setup(n);
-    println!("\n=== panto throughput: {n} features, geojson {} bytes ===", geo_bytes);
+    println!("\n=== geosetta throughput: {n} features, geojson {} bytes ===", geo_bytes);
 
     let g = |f: &str| dir.join(f);
     let sz = |p: PathBuf| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
@@ -206,7 +207,7 @@ fn throughput() {
 /// side this stresses `schema::infer_columns` (currently O(rows × cols²)); on
 /// the read side, the per-row rebuild of each feature's properties (one key
 /// `String` allocation and one value clone per cell). Watch how the reported
-/// feat/s degrades as `PANTO_BENCH_COLS` grows — a linear-in-cols schema pass
+/// feat/s degrades as `GEOSETTA_BENCH_COLS` grows — a linear-in-cols schema pass
 /// should keep it roughly flat per cell.
 #[test]
 #[ignore = "benchmark; run with --release --ignored --nocapture"]
@@ -219,7 +220,7 @@ fn wide_table() {
     std::fs::write(&geojson, &text).unwrap();
     let geo_bytes = text.len() as u64;
     println!(
-        "\n=== panto wide-table: {n} features x {cols} props, geojson {geo_bytes} bytes ===",
+        "\n=== geosetta wide-table: {n} features x {cols} props, geojson {geo_bytes} bytes ===",
     );
 
     // Write path: schema inference + columnar materialization dominate.

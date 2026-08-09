@@ -1,6 +1,6 @@
 //! Read GeoParquet back into features.
 //!
-//! Handles the shape Pantograph writes and the common shape other tools
+//! Handles the shape Geosetta writes and the common shape other tools
 //! (DuckDB, Arrow, GDAL) emit: multiple row groups, one dictionary page plus
 //! one or more data pages per column chunk, PLAIN and dictionary
 //! (`PLAIN_DICTIONARY` / `RLE_DICTIONARY`) value encodings, RLE/bit-pack
@@ -340,7 +340,7 @@ enum Dict {
 
 /// Which rows of a data page carry a value.
 ///
-/// The overwhelmingly common case — a column with no nulls, which Pantograph
+/// The overwhelmingly common case — a column with no nulls, which Geosetta
 /// always writes as a single RLE run — is [`Present::All`], so no per-row mask
 /// is allocated or scanned. Only a page that actually contains nulls falls back
 /// to a one-byte-per-row [`Present::Mask`] (was a `Vec<u64>`, eight bytes each).

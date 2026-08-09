@@ -1,31 +1,15 @@
-//! Pantograph — convert between open vector geospatial formats.
+//! Geosetta — the `geosetta` command-line front end.
 //!
-//! First conversion: GeoJSON → GeoParquet, implemented with the standard
-//! library only (no third-party crates).
+//! All conversion logic lives in the library crate ([`geosetta`]); this
+//! binary is a thin CLI wrapper that parses arguments, reads/writes files, and
+//! reports `--progress`.
 
-mod cli;
-mod compress;
-mod convert;
-mod csv;
-mod error;
-mod feature;
-mod flatbuffers;
-mod flatgeobuf;
-mod geojson;
-mod geometry;
-mod geopackage;
-mod json;
-mod parquet;
-mod schema;
-mod spatial;
-mod sqlite;
-
-use cli::Format;
-use error::{Error, Result};
+use geosetta::{cli, convert, geopackage};
+use geosetta::{Error, Format, Result};
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("panto: {e}");
+        eprintln!("geosetta: {e}");
         std::process::exit(1);
     }
 }

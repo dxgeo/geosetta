@@ -1,9 +1,9 @@
-//! Error type for Pantograph. No external crates: a plain enum implementing
+//! Error type for Geosetta. No external crates: a plain enum implementing
 //! `std::error::Error` plus a crate-wide `Result` alias.
 
 use std::fmt;
 
-/// The one error type used throughout Pantograph.
+/// The one error type used throughout Geosetta.
 #[derive(Debug)]
 pub enum Error {
     /// An I/O failure reading input or writing output.

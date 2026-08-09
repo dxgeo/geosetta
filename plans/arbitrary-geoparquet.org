@@ -6,7 +6,7 @@
 
 ** GOAL
 Extend the round-trip reader (see
-[[file:reverse-roundtrip.org][reverse-roundtrip.org]]) so Pantograph can read
+[[file:reverse-roundtrip.org][reverse-roundtrip.org]]) so Geosetta can read
 GeoParquet produced by other tools, not just its own output. This is where the
 Parquet format's real surface area lives; the round-trip reader is the skeleton
 we hang these features on.
@@ -47,7 +47,7 @@ Local tooling note: only =duckdb= is installed here (no =pyarrow=, =geopandas=,
 pyarrow/GDAL fixtures needs those tools added to the dev environment.
 
 ** MILESTONE 1 — dictionary encoding + multiple pages/row groups — *DONE*
-Implemented in =src/parquet/reader.rs=. Pantograph now reads DuckDB's default
+Implemented in =src/parquet/reader.rs=. Geosetta now reads DuckDB's default
 GeoParquet: a 200k-row, 2-row-group file with =PLAIN_DICTIONARY= on the string,
 INT64, and geometry columns decodes to all 200k features with values matching
 DuckDB (verified across the row-group boundary). =UNCOMPRESSED= files read too;

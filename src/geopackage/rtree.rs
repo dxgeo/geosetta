@@ -381,7 +381,7 @@ mod tests {
 
     #[test]
     fn empty_layer_still_has_a_root_node() {
-        let fc = FeatureCollection { features: vec![] };
+        let fc = FeatureCollection::new(vec![]);
         let rt = build("empty", &fc);
         let node = rt.tables.iter().find(|t| t.name == "rtree_empty_geom_node").unwrap();
         assert_eq!(node.rows.len(), 1); // the (empty) root
@@ -390,9 +390,9 @@ mod tests {
 
     #[test]
     fn single_leaf_holds_every_feature() {
-        let fc = FeatureCollection {
-            features: (0..10).map(|i| point_feat(i as f64, i as f64)).collect(),
-        };
+        let fc = FeatureCollection::new(
+            (0..10).map(|i| point_feat(i as f64, i as f64)).collect(),
+        );
         let rt = build("pts", &fc);
         let node = rt.tables.iter().find(|t| t.name == "rtree_pts_geom_node").unwrap();
         let rowid = rt.tables.iter().find(|t| t.name == "rtree_pts_geom_rowid").unwrap();
@@ -409,9 +409,9 @@ mod tests {
     fn many_features_build_interior_levels() {
         // More than one node's worth forces a root over multiple leaves.
         let n = MAX_CELLS * 3 + 5;
-        let fc = FeatureCollection {
-            features: (0..n).map(|i| point_feat(i as f64, (i * 7 % 13) as f64)).collect(),
-        };
+        let fc = FeatureCollection::new(
+            (0..n).map(|i| point_feat(i as f64, (i * 7 % 13) as f64)).collect(),
+        );
         let rt = build("big", &fc);
         let node = rt.tables.iter().find(|t| t.name == "rtree_big_geom_node").unwrap();
         let parent = rt.tables.iter().find(|t| t.name == "rtree_big_geom_parent").unwrap();

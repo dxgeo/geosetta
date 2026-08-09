@@ -21,7 +21,7 @@ pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
         .map_err(|_| Error::Convert("csv: input is not valid utf-8".into()))?;
     let rows = parse(text);
     let Some(header) = rows.first() else {
-        return Ok(FeatureCollection { features: Vec::new() });
+        return Ok(FeatureCollection::new(Vec::new()));
     };
 
     let geom_col = header
@@ -54,7 +54,7 @@ pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
             properties,
         });
     }
-    Ok(FeatureCollection { features })
+    Ok(FeatureCollection::new(features))
 }
 
 /// Serialize a feature collection to CSV bytes.
@@ -204,8 +204,7 @@ mod tests {
 
     #[test]
     fn round_trips_through_csv() {
-        let fc = FeatureCollection {
-            features: vec![
+        let fc = FeatureCollection::new(vec![
                 Feature {
                     geometry: Some(Geometry::Point([-73.9, 40.7])),
                     properties: vec![
@@ -225,8 +224,7 @@ mod tests {
                         ("n".into(), JsonValue::Null),
                     ],
                 },
-            ],
-        };
+            ]);
         let bytes = write(&fc);
         let back = read(&bytes).unwrap();
         assert_eq!(back.features.len(), 2);

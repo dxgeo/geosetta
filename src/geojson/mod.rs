@@ -48,18 +48,27 @@ pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
                 .iter()
                 .map(|f| parse_feature(f, &mut keys))
                 .collect::<Result<_>>()?;
-            Ok(FeatureCollection { features })
+            Ok(wgs84(features))
         }
-        "Feature" => Ok(FeatureCollection {
-            features: vec![parse_feature(value, &mut KeyInterner::default())?],
-        }),
+        "Feature" => Ok(wgs84(vec![parse_feature(
+            value,
+            &mut KeyInterner::default(),
+        )?])),
         // A bare geometry object.
-        _ => Ok(FeatureCollection {
-            features: vec![Feature {
-                geometry: Some(parse_geometry(value)?),
-                properties: Vec::new(),
-            }],
-        }),
+        _ => Ok(wgs84(vec![Feature {
+            geometry: Some(parse_geometry(value)?),
+            properties: Vec::new(),
+        }])),
+    }
+}
+
+/// Wrap features as a collection in WGS 84 (OGC:CRS84). GeoJSON coordinates are
+/// always WGS 84 longitude/latitude per RFC 7946; a file carries no other CRS,
+/// so reading one always yields the spec default.
+fn wgs84(features: Vec<Feature>) -> FeatureCollection {
+    FeatureCollection {
+        features,
+        crs: Some(crate::crs::Crs::Wgs84),
     }
 }
 
@@ -122,7 +131,7 @@ fn stream_collection(p: &mut Parser) -> Result<Option<FeatureCollection>> {
             if !p.at_end() {
                 return Err(p.err("unexpected trailing characters"));
             }
-            Ok(Some(FeatureCollection { features: f }))
+            Ok(Some(wgs84(f)))
         }
         None => Ok(None),
     }

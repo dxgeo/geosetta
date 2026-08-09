@@ -25,7 +25,7 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.18.0*.
+Current version: *0.19.0*.
 
 Six formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -72,6 +72,9 @@ specification rather than pulled from a crate:
 - =feature.rs= :: the shared, format-neutral feature model (=Feature= /
   =FeatureCollection=) — the intermediate representation every format converts
   to and from; all spokes depend on it, not on each other
+- =crs.rs= :: the format-neutral coordinate-reference-system identity carried on
+  a =FeatureCollection= (=Crs= / =NamedCrs=), passed through opaquely from reader
+  to writer — Geosetta labels, but never reprojects
 - =json/= :: standard-library JSON parser and value model
 - =geojson/= :: GeoJSON parsing and serialization (both directions)
 - =schema.rs= :: property-column inference (type lattice, per-row cells) shared
@@ -160,8 +163,10 @@ Apache Arrow (C++ or the =arrow= and =parquet= crates). Geosetta's distinguishin
 constraint is exactly that: pure standard-library Rust, every wire format
 implemented from its specification. The payoff is a small, embeddable,
 audit-friendly, no-supply-chain build (WASM, constrained environments); the cost
-is reimplementing — from scratch — codecs, encodings, CRS handling, and the long
-tail of formats that GDAL and Arrow already handle robustly.
+is reimplementing — from scratch — codecs, encodings, and the long tail of
+formats that GDAL and Arrow already handle robustly. (Reprojection is not among
+those costs: Geosetta passes the source CRS through untouched rather than
+transforming coordinates — see the roadmap.)
 
 ** ROADMAP
 The GeoParquet reader now covers essentially every file DuckDB / Arrow / GDAL
@@ -186,7 +191,29 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
   - =DATA_PAGE_V2= — DuckDB doesn't emit it; a test fixture needs pyarrow.
   - Brotli — a full from-scratch codec on the scale of ZSTD, rarely used here.
   - =DECIMAL= / =INT96= / =FIXED_LEN_BYTE_ARRAY=, and 3D (Z/M) geometry — niche.
-- *CRS handling* beyond the CRS84 default, once a second CRS-bearing format lands.
+*CRS pass-through (implemented), not reprojection.* Geosetta deliberately does
+*not* transform coordinates between coordinate reference systems. It is a format
+translator, not a projection engine: whatever CRS the input carries is preserved
+and written through to the output unchanged, and data with no CRS stays
+CRS-less. This keeps the dependency-free constraint honest — no PROJ-equivalent
+to reimplement — and keeps conversions lossless and predictable.
+
+The IR carries the CRS as an opaque =Option<Crs>= on the =FeatureCollection=
+(=src/crs.rs=): readers recover whatever identity a format records (GeoPackage's
+=srs_id= + =gpkg_spatial_ref_sys= definition, FlatGeobuf's header =Crs= table,
+GeoParquet's =crs= PROJJSON) and writers re-emit the representation their format
+speaks — an authority+code where the format wants one, the verbatim WKT/PROJJSON
+where it wants that — falling back to "unspecified" rather than guessing. The
+well-known WGS 84 spellings collapse to a single =Crs::Wgs84= default, so a
+GeoJSON input (RFC 7946 is always WGS 84) or a =crs=-less GeoParquet becomes the
+correct idiomatic default in every other format. Geosetta never parses these
+strings; cross-encoding that would require *interpreting* a CRS (e.g. turning a
+GeoPackage WKT into GeoParquet PROJJSON) is intentionally left as "unspecified".
+
+This is also the seam for a future, separate *reprojection* utility: because the
+CRS is a public value on the IR and geometry is stored apart from it, such a tool
+slots in as a stage between read and write — transforming coordinates and
+updating =Crs=— without Geosetta itself ever learning projection math.
 
 Detailed design notes live in [[file:plans/README.org][plans/]].
 

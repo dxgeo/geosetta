@@ -83,7 +83,8 @@ fn read_wkt_lines(input: &[u8]) -> Result<FeatureCollection> {
             });
         }
     }
-    Ok(FeatureCollection { features })
+    // A .wkt file is bare geometry with no coordinate-reference metadata.
+    Ok(FeatureCollection::new(features))
 }
 
 /// Write one WKT geometry per line (properties are dropped).
@@ -119,7 +120,7 @@ fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
     }
 
     let type_names: Vec<String> = types.into_iter().map(String::from).collect();
-    let geo = parquet::geo_metadata(&type_names, &bbox);
+    let geo = parquet::geo_metadata(&type_names, &bbox, fc.crs.as_ref());
     parquet::write_geoparquet(&columns, &geometry, &geo)
 }
 
@@ -150,7 +151,10 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
             feature.properties.push((Rc::clone(&key), value));
         }
     }
-    Ok(FeatureCollection { features })
+    Ok(FeatureCollection {
+        features,
+        crs: parsed.crs,
+    })
 }
 
 // Thin named wrappers used by the tests below.
@@ -465,18 +469,75 @@ mod tests {
     #[test]
     fn hilbert_reorder_preserves_the_feature_set() {
         use crate::geometry::Geometry::Point;
-        let mut fc = FeatureCollection {
-            features: vec![
-                Feature { geometry: Some(Point([100.0, 100.0])), properties: vec![] },
-                Feature { geometry: Some(Point([0.0, 0.0])), properties: vec![] },
-                Feature { geometry: Some(Point([1.0, 1.0])), properties: vec![] },
-            ],
-        };
+        let mut fc = FeatureCollection::new(vec![
+            Feature { geometry: Some(Point([100.0, 100.0])), properties: vec![] },
+            Feature { geometry: Some(Point([0.0, 0.0])), properties: vec![] },
+            Feature { geometry: Some(Point([1.0, 1.0])), properties: vec![] },
+        ]);
         let before = sorted_geoms(&fc);
         reorder_hilbert(&mut fc);
         assert_eq!(sorted_geoms(&fc), before); // same set, reordered
         // The far point ends up last; the origin cluster is first.
         assert_eq!(fc.features.last().unwrap().geometry, Some(Point([100.0, 100.0])));
+    }
+
+    #[test]
+    fn geojson_to_parquet_uses_the_spec_default_crs() {
+        // GeoJSON carries no CRS of its own (always WGS 84), so the GeoParquet
+        // it becomes is the CRS84 default — the reader recovers Wgs84.
+        let pq = geojson_to_geoparquet(SAMPLE).unwrap();
+        let fc = parquet_to_features(&pq).unwrap();
+        assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
+    }
+
+    #[test]
+    fn parquet_crs_passes_through_the_hub() {
+        use crate::crs::{Crs, NamedCrs};
+        // A collection tagged with a non-default CRS carrying PROJJSON: it must
+        // survive Feature IR -> GeoParquet -> Feature IR unchanged.
+        let mut fc = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
+        let projjson = "{\"type\":\"ProjectedCRS\",\"id\":{\"authority\":\"EPSG\",\"code\":3857}}";
+        fc.crs = Some(Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some(3857),
+            wkt: None,
+            projjson: Some(projjson.into()),
+        }));
+        let pq = features_to_parquet(&fc);
+        let back = parquet_to_features(&pq).unwrap();
+        match back.crs {
+            Some(Crs::Named(n)) => {
+                assert_eq!(n.code, Some(3857));
+                assert!(n.projjson.is_some());
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geopackage_crs_composes_to_flatgeobuf() {
+        use crate::crs::{Crs, NamedCrs};
+        // GeoPackage -> FlatGeobuf (via the IR) preserves an EPSG code even
+        // though neither format is the source: authority+code is the portable
+        // token both speak.
+        let mut src = FeatureCollection::new(vec![Feature {
+            geometry: Some(crate::geometry::Geometry::Point([1.0, 2.0])),
+            properties: vec![],
+        }]);
+        src.crs = Some(Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some(3857),
+            wkt: Some("PROJCS[\"Web Mercator\"]".into()),
+            projjson: None,
+        }));
+        let gpkg = crate::geopackage::write_layers(None, &[("l".into(), src)], false).unwrap();
+        let layers = crate::geopackage::read_layers(&gpkg).unwrap();
+        let fgb = flatgeobuf::write(&layers[0].1);
+        let back = flatgeobuf::read(&fgb).unwrap();
+        match back.crs {
+            Some(Crs::Named(n)) => assert_eq!(n.code, Some(3857)),
+            other => panic!("expected Named EPSG:3857, got {other:?}"),
+        }
     }
 
     #[test]

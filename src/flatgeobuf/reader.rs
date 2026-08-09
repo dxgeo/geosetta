@@ -1,5 +1,6 @@
 //! Decode a FlatGeobuf byte buffer into a [`FeatureCollection`].
 
+use crate::crs::Crs;
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::flatbuffers::{Table, Vector};
@@ -46,6 +47,12 @@ mod header {
     pub const COLUMNS: usize = 7;
     pub const FEATURES_COUNT: usize = 8;
     pub const INDEX_NODE_SIZE: usize = 9;
+    pub const CRS: usize = 10;
+}
+mod crs {
+    pub const ORG: usize = 0;
+    pub const CODE: usize = 1;
+    pub const WKT: usize = 4;
 }
 mod column {
     pub const NAME: usize = 0;
@@ -84,6 +91,7 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
     let default_geom_type = header.read_u8(header::GEOMETRY_TYPE, 0)?;
     let features_count = header.read_u64(header::FEATURES_COUNT, 0)?;
     let index_node_size = header.read_u16(header::INDEX_NODE_SIZE, 16)?;
+    let crs = read_crs(&header)?;
     let columns = read_columns(&header)?;
     // Intern each column's key once so every feature shares one `Rc`.
     let keys: Vec<Rc<str>> = columns.iter().map(|c| Rc::from(c.name.as_str())).collect();
@@ -116,7 +124,25 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
         });
     }
 
-    Ok(FeatureCollection { features })
+    Ok(FeatureCollection { features, crs })
+}
+
+/// Read the header's `Crs` sub-table into a [`Crs`], carrying the org/code/WKT
+/// through unchanged. Absent (or empty) means the file recorded no CRS.
+fn read_crs(header: &Table) -> Result<Option<Crs>> {
+    let Some(t) = header.read_table(header::CRS)? else {
+        return Ok(None);
+    };
+    let org = t.read_str(crs::ORG)?.map(str::to_string);
+    let code = match t.read_i32(crs::CODE, 0)? {
+        0 => None,
+        c => Some(c as i64),
+    };
+    let wkt = t.read_str(crs::WKT)?.filter(|s| !s.is_empty()).map(str::to_string);
+    if org.is_none() && code.is_none() && wkt.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(Crs::from_authority_code(org, code, wkt, None)))
 }
 
 fn read_columns(header: &Table) -> Result<Vec<Column>> {

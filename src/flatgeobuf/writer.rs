@@ -43,7 +43,14 @@ mod header {
     pub const COLUMNS: usize = 7;
     pub const FEATURES_COUNT: usize = 8;
     pub const INDEX_NODE_SIZE: usize = 9;
-    pub const NUM_FIELDS: usize = 10;
+    pub const CRS: usize = 10;
+    pub const NUM_FIELDS: usize = 11;
+}
+mod crs {
+    pub const ORG: usize = 0;
+    pub const CODE: usize = 1;
+    pub const WKT: usize = 4;
+    pub const NUM_FIELDS: usize = 6;
 }
 mod column {
     pub const NAME: usize = 0;
@@ -110,7 +117,14 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
 
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    let header = build_header(&columns, &bbox, header_type, fc.features.len() as u64, node_size);
+    let header = build_header(
+        &columns,
+        &bbox,
+        header_type,
+        fc.features.len() as u64,
+        node_size,
+        fc.crs.as_ref(),
+    );
     out.extend_from_slice(&(header.len() as u32).to_le_bytes());
     out.extend_from_slice(&header);
     if indexed {
@@ -131,6 +145,7 @@ fn build_header(
     header_type: u8,
     features_count: u64,
     node_size: u16,
+    crs: Option<&crate::crs::Crs>,
 ) -> Vec<u8> {
     let mut b = Builder::new();
 
@@ -147,6 +162,9 @@ fn build_header(
     let name = b.create_string("geosetta");
     let envelope = (!bbox.is_empty())
         .then(|| b.create_f64_vector(&[bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y]));
+    // The CRS sub-table (built before the header that references it), carrying
+    // whatever the source recorded through unchanged.
+    let crs_off = build_crs(&mut b, crs);
 
     b.start_table(header::NUM_FIELDS);
     b.add_offset(header::NAME, name);
@@ -159,8 +177,39 @@ fn build_header(
     // Default index_node_size is 16, so an indexed file (16) omits the field and
     // an index-less one writes 0.
     b.add_u16(header::INDEX_NODE_SIZE, node_size, 16);
+    if let Some(off) = crs_off {
+        b.add_offset(header::CRS, off);
+    }
     let root = b.end_table();
     b.finish(root)
+}
+
+/// Build the FlatGeobuf `Crs` sub-table, returning its offset, or `None` when
+/// the collection has no CRS (so the header omits the field). WGS 84 is written
+/// as EPSG:4326, the spelling GDAL uses.
+fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>) -> Option<usize> {
+    use crate::crs::Crs;
+    let (org, code, wkt) = match crs? {
+        Crs::Wgs84 => (Some("EPSG".to_string()), Some(4326), None),
+        Crs::Named(n) => (n.authority.clone(), n.code, n.wkt.clone()),
+    };
+    // Nothing worth recording.
+    if org.is_none() && code.is_none() && wkt.is_none() {
+        return None;
+    }
+    let org_off = org.as_deref().map(|s| b.create_string(s));
+    let wkt_off = wkt.as_deref().map(|s| b.create_string(s));
+    b.start_table(crs::NUM_FIELDS);
+    if let Some(o) = org_off {
+        b.add_offset(crs::ORG, o);
+    }
+    // 0 is FlatGeobuf's default/"unset" code, so a real code of 0 would be
+    // dropped; codes are positive in practice, so this is fine.
+    b.add_i32(crs::CODE, code.unwrap_or(0) as i32, 0);
+    if let Some(w) = wkt_off {
+        b.add_offset(crs::WKT, w);
+    }
+    Some(b.end_table())
 }
 
 fn build_feature(geom: Option<&Geometry>, columns: &[crate::schema::Column], row: usize) -> Vec<u8> {
@@ -430,7 +479,7 @@ mod tests {
                 )],
             })
             .collect();
-        let bytes = write(&FeatureCollection { features });
+        let bytes = write(&FeatureCollection::new(features));
 
         let back = crate::flatgeobuf::read(&bytes).unwrap();
         assert_eq!(back.features.len(), 50);
@@ -442,5 +491,47 @@ mod tests {
             .collect();
         ids.sort_unstable();
         assert_eq!(ids, (0..50).collect::<Vec<_>>());
+    }
+
+    fn one_point(crs: Option<crate::crs::Crs>) -> FeatureCollection {
+        let mut fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point([1.0, 2.0])),
+            properties: vec![],
+        }]);
+        fc.crs = crs;
+        fc
+    }
+
+    #[test]
+    fn wgs84_crs_round_trips() {
+        use crate::crs::Crs;
+        let bytes = write(&one_point(Some(Crs::Wgs84)));
+        assert_eq!(crate::flatgeobuf::read(&bytes).unwrap().crs, Some(Crs::Wgs84));
+    }
+
+    #[test]
+    fn named_crs_round_trips() {
+        use crate::crs::{Crs, NamedCrs};
+        let crs = Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some(3857),
+            wkt: Some("PROJCS[\"Web Mercator\"]".into()),
+            projjson: None,
+        });
+        let bytes = write(&one_point(Some(crs)));
+        match crate::flatgeobuf::read(&bytes).unwrap().crs {
+            Some(Crs::Named(n)) => {
+                assert_eq!(n.authority.as_deref(), Some("EPSG"));
+                assert_eq!(n.code, Some(3857));
+                assert_eq!(n.wkt.as_deref(), Some("PROJCS[\"Web Mercator\"]"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn no_crs_stays_none() {
+        let bytes = write(&one_point(None));
+        assert_eq!(crate::flatgeobuf::read(&bytes).unwrap().crs, None);
     }
 }

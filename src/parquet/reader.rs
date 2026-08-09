@@ -31,6 +31,8 @@ pub struct GeoParquet {
     pub properties: Vec<PropertyColumn>,
     /// One WKB blob per row (or `None` where the geometry was null).
     pub geometry: Vec<Option<Vec<u8>>>,
+    /// The CRS recovered from the `geo` metadata, carried through unchanged.
+    pub crs: Option<crate::crs::Crs>,
 }
 
 /// Parse a GeoParquet byte buffer.
@@ -91,6 +93,7 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
         num_rows,
         properties,
         geometry,
+        crs: meta.crs,
     })
 }
 
@@ -100,6 +103,7 @@ struct Meta {
     num_rows: i64,
     row_groups: Vec<RowGroup>,
     geometry_column: String,
+    crs: Option<crate::crs::Crs>,
 }
 
 struct RowGroup {
@@ -124,6 +128,7 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     let mut num_rows = 0i64;
     let mut row_groups: Vec<RowGroup> = Vec::new();
     let mut geometry_column = GEOMETRY_COLUMN.to_string();
+    let mut crs: Option<crate::crs::Crs> = None;
     // Leaf name -> (repetition_type, converted_type), used to derive each
     // column's definition level and any date/timestamp interpretation.
     let mut reps: Vec<(String, i32, Option<i32>)> = Vec::new();
@@ -153,9 +158,12 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
                     for _ in 0..len {
                         let (k, v) = parse_key_value(&mut r)?;
                         if k == "geo"
-                            && let Some(pc) = v.as_deref().and_then(primary_column)
+                            && let Some(geo) = v.as_deref()
                         {
-                            geometry_column = pc;
+                            if let Some(pc) = primary_column(geo) {
+                                geometry_column = pc;
+                            }
+                            crs = super::geo::parse_crs(geo);
                         }
                     }
                 }
@@ -179,6 +187,7 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
         num_rows,
         row_groups,
         geometry_column,
+        crs,
     })
 }
 

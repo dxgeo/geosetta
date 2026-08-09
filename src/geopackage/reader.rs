@@ -1,5 +1,6 @@
 //! Decode a GeoPackage into its layers.
 
+use crate::crs::Crs;
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::from_wkb;
@@ -14,23 +15,97 @@ pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
 
     // gpkg_contents lists every dataset; keep the ones with data_type='features'.
     let feature_tables = feature_layer_names(&db, &tables)?;
-    // gpkg_geometry_columns says which column holds geometry per table.
+    // gpkg_geometry_columns says which column holds geometry (and its SRS) per
+    // table; gpkg_spatial_ref_sys defines each SRS.
     let geom_columns = geometry_columns(&db, &tables)?;
+    let srs = spatial_ref_systems(&db, &tables)?;
 
     let mut layers = Vec::new();
     for name in feature_tables {
         let Some(table) = tables.iter().find(|t| t.name == name) else {
             continue;
         };
-        let geom_idx = geom_columns
-            .iter()
-            .find(|(t, _)| *t == name)
-            .and_then(|(_, col)| table.columns.iter().position(|c| c == col));
+        let geom = geom_columns.iter().find(|g| g.table == name);
+        let geom_idx =
+            geom.and_then(|g| table.columns.iter().position(|c| *c == g.column));
 
-        let fc = read_layer(&db, table, geom_idx)?;
+        let mut fc = read_layer(&db, table, geom_idx)?;
+        // Carry the layer's coordinate reference system through unchanged.
+        fc.crs = geom.and_then(|g| resolve_crs(g.srs_id, &srs));
         layers.push((name, fc));
     }
     Ok(layers)
+}
+
+/// A row of `gpkg_geometry_columns`: which column holds geometry, in which SRS.
+struct GeomColumn {
+    table: String,
+    column: String,
+    srs_id: i64,
+}
+
+/// A row of `gpkg_spatial_ref_sys`.
+struct SrsRow {
+    srs_id: i64,
+    organization: String,
+    organization_coordsys_id: i64,
+    definition: String,
+}
+
+/// Turn a layer's `srs_id` into a [`Crs`], looking its definition up in
+/// `gpkg_spatial_ref_sys`. The two GeoPackage "undefined" SRSes (`0`, `-1`) and
+/// an unknown `srs_id` mean no CRS; EPSG:4326 collapses to [`Crs::Wgs84`]; every
+/// other row is carried through as a [`Crs::Named`] with its WKT `definition`.
+fn resolve_crs(srs_id: i64, srs: &[SrsRow]) -> Option<Crs> {
+    if srs_id == 0 || srs_id == -1 {
+        return None;
+    }
+    let row = srs.iter().find(|s| s.srs_id == srs_id)?;
+    let wkt = (row.definition != "undefined" && !row.definition.is_empty())
+        .then(|| row.definition.clone());
+    Some(Crs::from_authority_code(
+        Some(row.organization.clone()),
+        Some(row.organization_coordsys_id),
+        wkt,
+        None,
+    ))
+}
+
+/// Read `gpkg_spatial_ref_sys` into rows. Absent (a malformed GeoPackage) is
+/// treated as no known SRS definitions.
+fn spatial_ref_systems(db: &Database, tables: &[Table]) -> Result<Vec<SrsRow>> {
+    let Some(t) = tables.iter().find(|t| t.name == "gpkg_spatial_ref_sys") else {
+        return Ok(Vec::new());
+    };
+    let id_col = column_index(t, "srs_id")?;
+    let org_col = column_index(t, "organization")?;
+    let org_id_col = column_index(t, "organization_coordsys_id")?;
+    let def_col = column_index(t, "definition")?;
+
+    let mut out = Vec::new();
+    for row in db.read_rows(t)? {
+        // srs_id is an INTEGER PRIMARY KEY (rowid alias); the reader has already
+        // backfilled the rowid into that column, so it reads as a plain Int.
+        let srs_id = match row.get(id_col) {
+            Some(Value::Int(n)) => *n,
+            _ => continue,
+        };
+        let text = |i: usize| match row.get(i) {
+            Some(Value::Text(s)) => s.clone(),
+            _ => String::new(),
+        };
+        let org_id = match row.get(org_id_col) {
+            Some(Value::Int(n)) => *n,
+            _ => srs_id,
+        };
+        out.push(SrsRow {
+            srs_id,
+            organization: text(org_col),
+            organization_coordsys_id: org_id,
+            definition: text(def_col),
+        });
+    }
+    Ok(out)
 }
 
 fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<FeatureCollection> {
@@ -56,7 +131,8 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
             properties,
         });
     }
-    Ok(FeatureCollection { features })
+    // The caller fills in `crs` from the layer's srs_id.
+    Ok(FeatureCollection::new(features))
 }
 
 /// Names of tables whose `gpkg_contents.data_type` is `features`.
@@ -80,20 +156,29 @@ fn feature_layer_names(db: &Database, tables: &[Table]) -> Result<Vec<String>> {
     Ok(names)
 }
 
-/// `(table_name, geometry_column_name)` pairs from `gpkg_geometry_columns`.
-fn geometry_columns(db: &Database, tables: &[Table]) -> Result<Vec<(String, String)>> {
+/// Geometry column + SRS per table, from `gpkg_geometry_columns`.
+fn geometry_columns(db: &Database, tables: &[Table]) -> Result<Vec<GeomColumn>> {
     let Some(gc) = tables.iter().find(|t| t.name == "gpkg_geometry_columns") else {
         return Ok(Vec::new());
     };
     let table_col = column_index(gc, "table_name")?;
     let column_col = column_index(gc, "column_name")?;
+    let srs_col = column_index(gc, "srs_id")?;
 
     let mut out = Vec::new();
     for row in db.read_rows(gc)? {
         if let (Some(Value::Text(t)), Some(Value::Text(c))) =
             (row.get(table_col), row.get(column_col))
         {
-            out.push((t.clone(), c.clone()));
+            let srs_id = match row.get(srs_col) {
+                Some(Value::Int(n)) => *n,
+                _ => 0,
+            };
+            out.push(GeomColumn {
+                table: t.clone(),
+                column: c.clone(),
+                srs_id,
+            });
         }
     }
     Ok(out)

@@ -100,6 +100,14 @@ impl<'a> Table<'a> {
         }
     }
 
+    /// Read a signed 32-bit scalar field.
+    pub fn read_i32(&self, i: usize, default: i32) -> Result<i32> {
+        match self.field(i)? {
+            Some(p) => read_u32(self.buf, p).map(|v| v as i32),
+            None => Ok(default),
+        }
+    }
+
     pub fn read_u64(&self, i: usize, default: u64) -> Result<u64> {
         match self.field(i)? {
             Some(p) => read_u64(self.buf, p),
@@ -367,6 +375,12 @@ impl Builder {
     pub fn add_u64(&mut self, field: usize, v: u64, default: u64) {
         if v != default {
             self.push_u64(v);
+            self.slot(field);
+        }
+    }
+    pub fn add_i32(&mut self, field: usize, v: i32, default: i32) {
+        if v != default {
+            self.push_i32(v);
             self.slot(field);
         }
     }

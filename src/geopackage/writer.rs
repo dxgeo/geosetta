@@ -3,6 +3,7 @@
 //! [`crate::sqlite`] writer. Append is read-modify-write — read the existing
 //! layers, upsert, and rewrite the complete file (see `plans/geopackage.org`).
 
+use crate::crs::Crs;
 use crate::error::Result;
 use crate::feature::FeatureCollection;
 use crate::geometry::{to_wkb, Bbox, Geometry};
@@ -14,7 +15,13 @@ use super::rtree;
 
 const APPLICATION_ID: u32 = 0x4750_4B47; // "GPKG"
 const USER_VERSION: u32 = 10200; // 1.2.0
-const SRS_ID: i64 = 4326;
+/// srs_id of the WGS 84 default row (the well-known GeoPackage value).
+const WGS84_SRS_ID: i64 = 4326;
+/// srs_id of the "undefined geographic" row, used for layers whose source
+/// recorded no CRS at all (e.g. from CSV or WKT input).
+const UNDEFINED_SRS_ID: i64 = 0;
+/// First srs_id handed out to a CRS that carries no usable authority code.
+const SYNTHETIC_SRS_BASE: i64 = 100_000;
 const LAST_CHANGE: &str = "1970-01-01T00:00:00.000Z";
 
 const WGS84_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563,AUTHORITY[\"EPSG\",\"7030\"]],AUTHORITY[\"EPSG\",\"6326\"]],PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AUTHORITY[\"EPSG\",\"4326\"]]";
@@ -40,13 +47,21 @@ pub fn write_layers(
 }
 
 fn build(layers: &[(String, FeatureCollection)], rtree: bool) -> Result<Vec<u8>> {
-    let mut specs = vec![spatial_ref_sys(), gpkg_contents(layers), geometry_columns(layers)];
+    // Resolve every layer's srs_id up front (registering any non-default SRS),
+    // so gpkg_contents, gpkg_geometry_columns, and each geometry blob all agree.
+    let srs = resolve_srs(layers);
+
+    let mut specs = vec![
+        spatial_ref_sys(&srs.registrations),
+        gpkg_contents(layers, &srs.per_layer),
+        geometry_columns(layers, &srs.per_layer),
+    ];
     if rtree {
         let names: Vec<String> = layers.iter().map(|(n, _)| n.clone()).collect();
         specs.push(rtree::extensions_table(&names));
     }
-    for (name, fc) in layers {
-        specs.push(feature_table(name, fc));
+    for ((name, fc), &srs_id) in layers.iter().zip(&srs.per_layer) {
+        specs.push(feature_table(name, fc, srs_id));
     }
 
     // The spatial indexes (shadow tables) and their virtual-table + trigger
@@ -64,9 +79,88 @@ fn build(layers: &[(String, FeatureCollection)], rtree: bool) -> Result<Vec<u8>>
     write_database(&specs, &master, APPLICATION_ID, USER_VERSION)
 }
 
-fn spatial_ref_sys() -> TableSpec {
+/// A `gpkg_spatial_ref_sys` row for a CRS beyond the three mandatory defaults.
+struct SrsReg {
+    srs_id: i64,
+    name: String,
+    organization: String,
+    organization_coordsys_id: i64,
+    definition: String,
+}
+
+/// The srs_id chosen for each layer (aligned with `layers`), plus the extra
+/// `gpkg_spatial_ref_sys` rows those choices require.
+struct ResolvedSrs {
+    per_layer: Vec<i64>,
+    registrations: Vec<SrsReg>,
+}
+
+/// Map every layer's [`Crs`] to a GeoPackage srs_id, registering a
+/// `gpkg_spatial_ref_sys` row for any non-default system. Geosetta never
+/// reprojects, so this only *labels* each layer with the CRS it arrived in:
+/// `None` → undefined, WGS 84 → 4326, and any other CRS → its authority code
+/// (or a synthetic id when it has none), carrying the WKT definition through.
+fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
+    let mut per_layer = Vec::with_capacity(layers.len());
+    let mut registrations: Vec<SrsReg> = Vec::new();
+    let mut next_synthetic = SYNTHETIC_SRS_BASE;
+
+    for (_, fc) in layers {
+        let (srs_id, reg) = match &fc.crs {
+            None => (UNDEFINED_SRS_ID, None),
+            Some(Crs::Wgs84) => (WGS84_SRS_ID, None),
+            Some(Crs::Named(n)) => {
+                let definition = n.wkt.clone().unwrap_or_else(|| "undefined".into());
+                match n.code {
+                    // EPSG:4326 is exactly the default row.
+                    Some(4326) => (WGS84_SRS_ID, None),
+                    // A usable authority code becomes the srs_id directly.
+                    Some(code) if code > 0 => {
+                        let organization =
+                            n.authority.clone().unwrap_or_else(|| "EPSG".into());
+                        (
+                            code,
+                            Some(SrsReg {
+                                srs_id: code,
+                                name: format!("{organization}:{code}"),
+                                organization,
+                                organization_coordsys_id: code,
+                                definition,
+                            }),
+                        )
+                    }
+                    // No usable code: hand out a synthetic id and record whatever
+                    // definition we have (WKT, or "undefined").
+                    _ => {
+                        let srs_id = next_synthetic;
+                        next_synthetic += 1;
+                        (
+                            srs_id,
+                            Some(SrsReg {
+                                srs_id,
+                                name: format!("srs {srs_id}"),
+                                organization: n.authority.clone().unwrap_or_else(|| "NONE".into()),
+                                organization_coordsys_id: n.code.unwrap_or(srs_id),
+                                definition,
+                            }),
+                        )
+                    }
+                }
+            }
+        };
+        if let Some(reg) = reg
+            && !registrations.iter().any(|r| r.srs_id == reg.srs_id)
+        {
+            registrations.push(reg);
+        }
+        per_layer.push(srs_id);
+    }
+    ResolvedSrs { per_layer, registrations }
+}
+
+fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
     // srs_id is INTEGER PRIMARY KEY, so its column value is Null and the rowid
-    // carries it; rows must be rowid-ordered (-1, 0, 4326).
+    // carries it; rows must be rowid-ordered.
     let row = |srs_id: i64, name: &str, org: &str, org_id: i64, def: &str, desc: &str| {
         (
             srs_id,
@@ -80,22 +174,36 @@ fn spatial_ref_sys() -> TableSpec {
             ],
         )
     };
+    let mut rows = vec![
+        row(-1, "Undefined cartesian SRS", "NONE", -1, "undefined", "undefined cartesian"),
+        row(0, "Undefined geographic SRS", "NONE", 0, "undefined", "undefined geographic"),
+        row(WGS84_SRS_ID, "WGS 84 geodetic", "EPSG", 4326, WGS84_WKT, "WGS 84"),
+    ];
+    for reg in registrations {
+        rows.push(row(
+            reg.srs_id,
+            &reg.name,
+            &reg.organization,
+            reg.organization_coordsys_id,
+            &reg.definition,
+            "",
+        ));
+    }
+    // Rows must be rowid- (srs_id-) ordered for the b-tree writer.
+    rows.sort_by_key(|(srs_id, _)| *srs_id);
     TableSpec {
         name: "gpkg_spatial_ref_sys".into(),
         sql: "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER NOT NULL PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT)".into(),
-        rows: vec![
-            row(-1, "Undefined cartesian SRS", "NONE", -1, "undefined", "undefined cartesian"),
-            row(0, "Undefined geographic SRS", "NONE", 0, "undefined", "undefined geographic"),
-            row(SRS_ID, "WGS 84 geodetic", "EPSG", 4326, WGS84_WKT, "WGS 84"),
-        ],
+        rows,
     }
 }
 
-fn gpkg_contents(layers: &[(String, FeatureCollection)]) -> TableSpec {
+fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) -> TableSpec {
     let rows = layers
         .iter()
+        .zip(per_layer_srs)
         .enumerate()
-        .map(|(i, (name, fc))| {
+        .map(|(i, ((name, fc), &srs_id))| {
             let (minx, miny, maxx, maxy) = bbox(fc);
             (
                 (i + 1) as i64,
@@ -109,7 +217,7 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)]) -> TableSpec {
                     miny,
                     maxx,
                     maxy,
-                    Value::Int(SRS_ID),
+                    Value::Int(srs_id),
                 ],
             )
         })
@@ -123,18 +231,19 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)]) -> TableSpec {
     }
 }
 
-fn geometry_columns(layers: &[(String, FeatureCollection)]) -> TableSpec {
+fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) -> TableSpec {
     let rows = layers
         .iter()
+        .zip(per_layer_srs)
         .enumerate()
-        .map(|(i, (name, _))| {
+        .map(|(i, ((name, _), &srs_id))| {
             (
                 (i + 1) as i64,
                 vec![
                     Value::Text(name.clone()),
                     Value::Text("geom".into()),
                     Value::Text("GEOMETRY".into()),
-                    Value::Int(SRS_ID),
+                    Value::Int(srs_id),
                     Value::Int(0),
                     Value::Int(0),
                 ],
@@ -148,7 +257,7 @@ fn geometry_columns(layers: &[(String, FeatureCollection)]) -> TableSpec {
     }
 }
 
-fn feature_table(name: &str, fc: &FeatureCollection) -> TableSpec {
+fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64) -> TableSpec {
     let columns = infer_columns(&fc.features);
 
     // DDL: fid (rowid), geom, then one column per property.
@@ -166,7 +275,7 @@ fn feature_table(name: &str, fc: &FeatureCollection) -> TableSpec {
             let mut values = Vec::with_capacity(columns.len() + 2);
             values.push(Value::Null); // fid, carried by the rowid
             values.push(match &feat.geometry {
-                Some(g) => Value::Blob(gpkg_geometry(g)),
+                Some(g) => Value::Blob(gpkg_geometry(g, srs_id)),
                 None => Value::Null,
             });
             for col in &columns {
@@ -185,13 +294,13 @@ fn feature_table(name: &str, fc: &FeatureCollection) -> TableSpec {
 
 /// GeoPackage Binary: an 8-byte header ("GP", version, flags, LE srs_id, no
 /// envelope) wrapping standard WKB.
-fn gpkg_geometry(g: &Geometry) -> Vec<u8> {
+fn gpkg_geometry(g: &Geometry, srs_id: i64) -> Vec<u8> {
     let wkb = to_wkb(g);
     let mut out = Vec::with_capacity(8 + wkb.len());
     out.extend_from_slice(b"GP");
     out.push(0); // version
     out.push(0x01); // flags: little-endian header ints, no envelope
-    out.extend_from_slice(&(SRS_ID as i32).to_le_bytes());
+    out.extend_from_slice(&(srs_id as i32).to_le_bytes());
     out.extend_from_slice(&wkb);
     out
 }
@@ -249,7 +358,7 @@ mod tests {
         Some(Geometry::Point([x, y]))
     }
     fn fc(features: Vec<Feature>) -> FeatureCollection {
-        FeatureCollection { features }
+        FeatureCollection::new(features)
     }
 
     #[test]
@@ -307,6 +416,62 @@ mod tests {
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, "grid");
         assert_eq!(back[0].1.features.len(), 120);
+    }
+
+    #[test]
+    fn wgs84_layer_round_trips_as_wgs84() {
+        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        layer.crs = Some(Crs::Wgs84);
+        let bytes = write_layers(None, &[("p".into(), layer)], false).unwrap();
+        let back = read_layers(&bytes).unwrap();
+        assert_eq!(back[0].1.crs, Some(Crs::Wgs84));
+    }
+
+    #[test]
+    fn no_crs_layer_round_trips_as_none() {
+        // CSV/WKT-style input with no CRS lands on the "undefined" SRS and reads
+        // back as no CRS, not a mislabeled 4326.
+        let layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        let bytes = write_layers(None, &[("p".into(), layer)], false).unwrap();
+        let back = read_layers(&bytes).unwrap();
+        assert_eq!(back[0].1.crs, None);
+    }
+
+    #[test]
+    fn named_crs_is_registered_and_round_trips() {
+        use crate::crs::NamedCrs;
+        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        layer.crs = Some(Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some(3857),
+            wkt: Some("PROJCS[\"WGS 84 / Pseudo-Mercator\"]".into()),
+            projjson: None,
+        }));
+        let bytes = write_layers(None, &[("web".into(), layer)], false).unwrap();
+
+        // A valid, integrity-checkable GeoPackage that DuckDB/GDAL can open.
+        use crate::sqlite::Database;
+        assert!(Database::open(&bytes).is_ok());
+
+        let back = read_layers(&bytes).unwrap();
+        match &back[0].1.crs {
+            Some(Crs::Named(n)) => {
+                assert_eq!(n.authority.as_deref(), Some("EPSG"));
+                assert_eq!(n.code, Some(3857));
+                assert!(n.wkt.is_some());
+            }
+            other => panic!("expected Named EPSG:3857, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn real_fixture_reads_its_declared_srs() {
+        // This DuckDB-written fixture declares srs_id 0 ("undefined geographic")
+        // on the layer, so faithful pass-through reports no CRS rather than
+        // inventing one.
+        let bytes = include_bytes!("../../tests/fixtures/points.gpkg");
+        let layers = read_layers(bytes).unwrap();
+        assert_eq!(layers[0].1.crs, None);
     }
 
     #[test]

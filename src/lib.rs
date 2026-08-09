@@ -28,6 +28,7 @@
 // Public API surface. Formats are selected via `Format`, and the conversion
 // functions plus the IR types are re-exported at the crate root below.
 pub mod convert;
+pub mod crs;
 pub mod error;
 pub mod feature;
 pub mod format;
@@ -54,6 +55,7 @@ pub(crate) mod sqlite;
 
 // The curated entry points most callers want, hoisted to the crate root.
 pub use convert::{convert, read_features, reorder_hilbert, write_features};
+pub use crs::{Crs, NamedCrs};
 pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection};
 pub use format::Format;

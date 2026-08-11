@@ -4,6 +4,8 @@ version = "0.20.0"
 edition = "2024"
 description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, CSV, WKT), dependency-free."
 license = "MIT"
+# Dev-only tooling kept in the repo but out of the published crate.
+exclude = ["bench/"]
 
 [lib]
 name = "geosetta"

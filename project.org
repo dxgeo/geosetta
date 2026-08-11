@@ -77,7 +77,8 @@ specification rather than pulled from a crate:
   to writer — Geosetta labels, but never reprojects. Includes lexical id lifting
   from a WKT/PROJJSON definition and the =Crs::downgrade_warning= CRS-loss
   warnings. =crs/wkt_projjson.rs= structurally translates a WKT CRS definition
-  into resolvable GeoParquet PROJJSON (geographic CRSes)
+  into resolvable GeoParquet PROJJSON (geographic, WKT2 projected, and the common
+  WKT1 projected methods via the crosswalk tables in =crs/wkt1_tables.rs=)
 - =json/= :: standard-library JSON parser and value model
 - =geojson/= :: GeoJSON parsing and serialization (both directions)
 - =schema.rs= :: property-column inference (type lattice, per-row cells) shared
@@ -219,16 +220,24 @@ authority+code rendered as an id-only reference
 (=crs":{"id":{"authority":"EPSG","code":7844}}=) is **not** valid, resolvable
 PROJJSON — PROJ/GDAL/QGIS read it as unknown. So when a GeoPackage or FlatGeobuf
 source carries a WKT definition (they usually do), Geosetta *translates that WKT
-into a complete PROJJSON object* (=src/crs/wkt_projjson.rs=, geographic CRSes) so
-the GeoParquet output resolves correctly — a GeoPackage's =EPSG:7844= (GDA2020)
-reaches GeoParquet as a full =GeographicCRS= PROJJSON, emitted in the
-authoritative latitude,longitude axis order so GDAL/QGIS *identify it as
-EPSG:7844* at 100% confidence (a longitude-first order would identify at only
-~25% and show a bare name). GeoParquet's fixed x,y coordinate storage is honored
-by readers independently of the CRS axis order, so geometry is not flipped. When there is *no* WKT to translate (only a bare code) or the WKT is a
-kind not yet translated (projected CRSes), Geosetta writes the id-only reference
-as a last resort — it preserves the identity for Geosetta's own round trip but
-is unresolvable downstream, so the CLI *warns*. Geosetta still never parses these
+into a complete PROJJSON object* (=src/crs/wkt_projjson.rs=) so the GeoParquet
+output resolves correctly. This covers *geographic* CRSes (WKT1 =GEOGCS= / WKT2
+=GEOGCRS=, including datum ensembles, non-Greenwich prime meridians, and grad
+units), *WKT2 projected* (=PROJCRS=, read straight from its inline EPSG ids), and
+*WKT1 projected* (=PROJCS=) for the common unambiguous projection methods, resolved
+through crosswalk tables generated from PROJ's own registry (=crs/wkt1_tables.rs=).
+A GeoPackage's =EPSG:7844= (GDA2020) reaches GeoParquet as a full =GeographicCRS=
+PROJJSON, emitted in the authoritative latitude,longitude axis order so GDAL/QGIS
+*identify it as EPSG:7844* at 100% confidence (a longitude-first order would
+identify at only ~25% and show a bare name); the whole translator is gated by bulk
+oracles that check every output against =projinfo --identify= at 100%. GeoParquet's
+fixed x,y coordinate storage is honored by readers independently of the CRS axis
+order, so geometry is not flipped. When there is *no* WKT to translate (only a bare
+code), or the WKT is an *ambiguous WKT1 projection* (a name mapping to several EPSG
+methods) or a *south/west-oriented grid whose WKT1 omits its axes*, Geosetta writes
+the id-only reference as a last resort — it preserves the identity for Geosetta's
+own round trip but is unresolvable downstream, so the CLI *warns* (never a wrong
+guess). Geosetta still never parses these
 strings for *meaning* (no projection math); the WKT→PROJJSON step is a purely
 structural transcription of the fields the source already recorded.
 

@@ -39,5 +39,8 @@ they are ordered by dependency.
 - [[file:crs.org][crs.org]] :: CRS pass-through across all formats — warnings when
   a CRS-degrading target (GeoJSON/CSV/WKT) can't express the source CRS (those
   formats stay as-is), making authority+code universal among the rich formats,
-  and the dependency-free limits (WKT↔PROJJSON translation, EPSG-registry
-  synthesis). GeoParquet =id= emission is *done*; the rest is *planned*.
+  and structural WKT→PROJJSON translation for GeoParquet. Milestones A (CRS-loss
+  warnings), B (WKT id lifting), and C (WKT→PROJJSON: geographic, WKT2 projected,
+  and common WKT1 projected, gated by =projinfo= bulk oracles) are *DONE*.
+  *Remaining:* ambiguous/rare WKT1 projections, the PROJJSON→WKT reverse, and
+  EPSG-registry synthesis from a bare code (the dependency-free limit).

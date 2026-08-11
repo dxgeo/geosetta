@@ -26,7 +26,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.18.0**.
+Current version: **0.20.0**.
 
 Six formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
@@ -49,6 +49,16 @@ every other automatically — no per-pair code:
 
 Any input converts to any output: e.g. CSV→GeoParquet, FlatGeobuf→GeoJSON,
 GeoPackage→GeoParquet, GeoJSON→GeoPackage all work. Validated against DuckDB / GDAL.
+
+Each format's **coordinate reference system** is carried through the IR and
+re-emitted in the target's own representation (authority+code, WKT, or PROJJSON) —
+Geosetta *labels* CRS, it never reprojects. GeoParquet's PROJJSON-only channel is
+handled by structurally translating a source WKT definition into a complete,
+resolvable PROJJSON object — geographic and the common projected CRSes (WKT2, and
+WKT1 for the unambiguous methods) — verified against PROJ's `projinfo` at 100%
+identification. When a target can't express the source CRS (GeoJSON forces WGS 84;
+CSV/WKT record none) or a CRS falls outside the translatable set, the CLI *warns*
+rather than silently mislabeling; `--quiet` suppresses.
 
 The **GeoParquet** path is the most exercised. Write output is Snappy-compressed
 and validated by DuckDB's spatial engine as genuine, queryable GeoParquet; the
@@ -193,7 +203,12 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
     -   `DATA_PAGE_V2` — DuckDB doesn't emit it; a test fixture needs pyarrow.
     -   Brotli — a full from-scratch codec on the scale of ZSTD, rarely used here.
     -   `DECIMAL` / `INT96` / `FIXED_LEN_BYTE_ARRAY`, and 3D (Z/M) geometry — niche.
--   **CRS handling** beyond the CRS84 default, once a second CRS-bearing format lands.
+-   **CRS handling** — implemented: pass-through across all formats, CRS-loss
+    warnings, and structural WKT↔PROJJSON translation for geographic and common
+    projected CRSes (scoped in [plans/crs.org](plans/crs.org)). Remaining, and
+    deliberately bounded by the dependency-free constraint: ambiguous/rare WKT1
+    projections, the PROJJSON→WKT reverse direction, and full EPSG-registry
+    synthesis from a bare code.
 
 Detailed design notes live in [plans/](plans/README.org).
 

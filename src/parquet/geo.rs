@@ -19,10 +19,17 @@ const GEOPARQUET_VERSION: &str = "1.1.0";
 /// present; `bbox` is included only when non-empty. `crs` is written as the
 /// GeoParquet `crs` member (a PROJJSON object): it is *omitted* for the default
 /// (`Crs::Wgs84`/`None`), which GeoParquet reads as OGC:CRS84, and emitted
-/// verbatim when the source carried PROJJSON. A non-default CRS with no PROJJSON
-/// (e.g. one that arrived from GeoPackage as WKT) is omitted rather than
-/// guessed — faithfully re-encoding it would require interpreting the CRS, which
-/// Geosetta deliberately does not do.
+/// verbatim when the source carried PROJJSON.
+///
+/// A non-default CRS that arrived without PROJJSON (e.g. from GeoPackage or
+/// FlatGeobuf, which record an authority + code) is emitted as a minimal
+/// PROJJSON object carrying just that authority/code `id`, e.g.
+/// `{"id":{"authority":"EPSG","code":7844}}`. That preserves the CRS *identity*
+/// through the hub without Geosetta ever interpreting it — the same
+/// authority+code the other spokes pass through — and PROJ-backed readers
+/// (DuckDB, GDAL) resolve the code to the full definition. Only when there is no
+/// authority+code *and* no PROJJSON is the CRS omitted, since there is then
+/// nothing GeoParquet can express.
 pub fn metadata(geometry_types: &[String], bbox: &Bbox, crs: Option<&Crs>) -> String {
     let mut s = String::new();
     s.push_str("{\"version\":\"");
@@ -53,13 +60,41 @@ pub fn metadata(geometry_types: &[String], bbox: &Bbox, crs: Option<&Crs>) -> St
         s.push(']');
     }
     if let Some(Crs::Named(named)) = crs
-        && let Some(projjson) = &named.projjson
+        && let Some(crs_json) = crs_projjson(named)
     {
         s.push_str(",\"crs\":");
-        s.push_str(projjson);
+        s.push_str(&crs_json);
     }
     s.push_str("}}}");
     s
+}
+
+/// The PROJJSON to write for a non-default CRS, or `None` when GeoParquet has no
+/// way to express it. In priority order:
+///
+/// 1. A source that carried verbatim PROJJSON is re-emitted unchanged.
+/// 2. A WKT definition is translated to PROJJSON when Geosetta can
+///    ([`crate::crs::wkt_to_projjson`], geographic CRSes) — a *resolvable*
+///    definition that PROJ/GDAL/QGIS read back correctly.
+/// 3. Failing both, an authority + code is rendered as a minimal PROJJSON `id`
+///    reference (`{"id":{"authority":"EPSG","code":7844}}`), the inverse of the
+///    `id` lifting in [`parse_crs`]. This preserves the identity for Geosetta's
+///    own round trip but is *not* resolvable by PROJ-backed readers — the CLI
+///    warns (see [`crate::crs::Crs::downgrade_warning`]) when it comes to this.
+fn crs_projjson(named: &crate::crs::NamedCrs) -> Option<String> {
+    if let Some(projjson) = &named.projjson {
+        return Some(projjson.clone());
+    }
+    if let Some(wkt) = &named.wkt
+        && let Some(projjson) = crate::crs::wkt_to_projjson(wkt)
+    {
+        return Some(projjson);
+    }
+    let (authority, code) = (named.authority.clone()?, named.code?);
+    Some(format!(
+        "{{\"id\":{{\"authority\":{},\"code\":{code}}}}}",
+        JsonValue::String(authority).to_json_string()
+    ))
 }
 
 /// Recover the CRS from a `geo` metadata JSON string (the inverse of the `crs`
@@ -153,5 +188,44 @@ mod tests {
     fn absent_crs_parses_as_wgs84() {
         let json = metadata(&[], &Bbox::empty(), None);
         assert_eq!(parse_crs(&json), Some(Crs::Wgs84));
+    }
+
+    #[test]
+    fn authority_code_without_projjson_is_emitted_as_id_reference() {
+        use crate::crs::NamedCrs;
+        // What GeoPackage / FlatGeobuf hand us: an authority + code (here
+        // EPSG:7844, GDA2020) and maybe WKT, but no PROJJSON. Must not be
+        // dropped — an omitted `crs` would read back as the WGS 84 default.
+        let crs = Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some(7844),
+            wkt: Some("GEOGCRS[\"GDA2020\"]".into()),
+            projjson: None,
+        });
+        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        assert!(json.contains("\"crs\":{\"id\":{\"authority\":\"EPSG\",\"code\":7844}}"));
+
+        match parse_crs(&json).unwrap() {
+            Crs::Named(n) => {
+                assert_eq!(n.authority.as_deref(), Some("EPSG"));
+                assert_eq!(n.code, Some(7844));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn crs_with_neither_code_nor_projjson_is_omitted() {
+        use crate::crs::NamedCrs;
+        // WKT only, no authority/code and no PROJJSON: GeoParquet cannot express
+        // it, so it is omitted rather than guessed.
+        let crs = Crs::Named(NamedCrs {
+            authority: None,
+            code: None,
+            wkt: Some("GEOGCRS[\"something\"]".into()),
+            projjson: None,
+        });
+        let json = metadata(&[], &Bbox::empty(), Some(&crs));
+        assert!(!json.contains("crs"));
     }
 }

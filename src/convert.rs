@@ -541,6 +541,74 @@ mod tests {
     }
 
     #[test]
+    fn projjson_only_parquet_warns_when_written_to_a_wkt_target() {
+        use crate::crs::{Crs, NamedCrs};
+        // A hand-authored GeoParquet whose PROJJSON carries no `id` (no authority
+        // code to lift): it round-trips as a code-less, PROJJSON-only CRS…
+        let mut fc = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
+        fc.crs = Some(Crs::Named(NamedCrs {
+            authority: None,
+            code: None,
+            wkt: None,
+            projjson: Some("{\"type\":\"GeographicCRS\",\"name\":\"Custom Grid\"}".into()),
+        }));
+        let pq = features_to_parquet(&fc);
+        let recovered = parquet_to_features(&pq).unwrap();
+        match recovered.crs {
+            Some(Crs::Named(ref n)) => {
+                assert!(n.code.is_none() && n.authority.is_none());
+                assert!(n.projjson.is_some());
+            }
+            other => panic!("expected code-less PROJJSON CRS, got {other:?}"),
+        }
+
+        // …so GeoParquet (same dialect) stays silent, but a WKT-dialect target
+        // (FlatGeobuf/GeoPackage) announces that the CRS will be dropped.
+        let crs = recovered.crs.as_ref().unwrap();
+        assert_eq!(crs.downgrade_warning(Format::Parquet), None);
+        assert!(crs.downgrade_warning(Format::FlatGeobuf).unwrap().contains("dropped"));
+    }
+
+    #[test]
+    fn flatgeobuf_wkt_only_crs_recovers_authority_code() {
+        use crate::crs::{Crs, NamedCrs};
+        // Simulate a rich-format source that recorded only a WKT *definition*
+        // with no separate authority+code (org/code absent on the wire). The
+        // reader must lift the CRS's own id out of the WKT so the identity
+        // survives to every authority+code target — here FlatGeobuf -> Parquet.
+        let wkt = "GEOGCRS[\"GDA2020\",DATUM[\"GDA2020\",ELLIPSOID[\"GRS 1980\",6378137,298.257222101,ID[\"EPSG\",7019]]],CS[ellipsoidal,2],ID[\"EPSG\",7844]]";
+        let mut fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(crate::geometry::Geometry::Point([1.0, 2.0])),
+            properties: vec![],
+        }]);
+        fc.crs = Some(Crs::Named(NamedCrs {
+            authority: None,
+            code: None,
+            wkt: Some(wkt.into()),
+            projjson: None,
+        }));
+
+        // FlatGeobuf writes the WKT only; reading it back recovers EPSG:7844.
+        let fgb = flatgeobuf::write(&fc);
+        match flatgeobuf::read(&fgb).unwrap().crs {
+            Some(Crs::Named(ref n)) => {
+                assert_eq!(n.authority.as_deref(), Some("EPSG"));
+                assert_eq!(n.code, Some(7844));
+            }
+            other => panic!("expected recovered EPSG:7844, got {other:?}"),
+        }
+
+        // …and that recovered code reaches GeoParquet as a minimal id reference
+        // instead of dropping to the WGS 84 default.
+        let recovered = flatgeobuf::read(&fgb).unwrap();
+        let pq = features_to_parquet(&recovered);
+        match parquet_to_features(&pq).unwrap().crs {
+            Some(Crs::Named(n)) => assert_eq!(n.code, Some(7844)),
+            other => panic!("expected EPSG:7844 through Parquet, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn wkt_lines_round_trip() {
         // GeoJSON -> .wkt (geometry only) -> GeoJSON keeps the geometries.
         let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();

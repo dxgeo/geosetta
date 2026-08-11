@@ -5,7 +5,7 @@
 //! reports `--progress`.
 
 use geosetta::{cli, convert, geopackage};
-use geosetta::{Error, Format, Result};
+use geosetta::{Crs, Error, FeatureCollection, Format, Result};
 
 fn main() {
     if let Err(e) = run() {
@@ -50,6 +50,7 @@ fn run() -> Result<()> {
             eprintln!("sorted {} features by Hilbert locality", fc.features.len());
         }
     }
+    warn_crs_loss(&args, fc.crs.as_ref());
     if args.progress {
         eprintln!("writing {}...", args.to.extension());
     }
@@ -90,6 +91,7 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
             convert::reorder_hilbert(fc);
         }
     }
+    warn_crs_loss_layers(args, &layers);
 
     let as_dir = args.output.ends_with('/') || std::path::Path::new(&args.output).is_dir();
     if layers.len() == 1 && !as_dir {
@@ -152,6 +154,7 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
             convert::reorder_hilbert(fc);
         }
     }
+    warn_crs_loss_layers(args, &new_layers);
 
     // Append into the existing GeoPackage if the output already exists.
     let existing = std::fs::read(&args.output).ok();
@@ -164,6 +167,35 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
     std::fs::write(&args.output, &bytes)?;
     eprintln!("wrote {} ({} bytes)", args.output, bytes.len());
     Ok(())
+}
+
+/// Warn on stderr when the target format cannot record `crs` (unless `--quiet`).
+/// A correctness warning — the conversion still proceeds and succeeds; see
+/// [`Crs::downgrade_warning`].
+fn warn_crs_loss(args: &cli::Args, crs: Option<&Crs>) {
+    if args.quiet {
+        return;
+    }
+    if let Some(w) = crs.and_then(|c| c.downgrade_warning(args.to)) {
+        eprintln!("{w}");
+    }
+}
+
+/// [`warn_crs_loss`] across a GeoPackage's layers, de-duplicating identical
+/// messages so a single-CRS `.gpkg` (the usual case) warns just once even when
+/// it fans out to many output files.
+fn warn_crs_loss_layers(args: &cli::Args, layers: &[(String, FeatureCollection)]) {
+    if args.quiet {
+        return;
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for (_, fc) in layers {
+        if let Some(w) = fc.crs.as_ref().and_then(|c| c.downgrade_warning(args.to))
+            && seen.insert(w.clone())
+        {
+            eprintln!("{w}");
+        }
+    }
 }
 
 /// The file stem of `path`, used as a default layer name.

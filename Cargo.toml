@@ -1,6 +1,6 @@
 [package]
 name = "geosetta"
-version = "0.19.0"
+version = "0.20.0"
 edition = "2024"
 description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, CSV, WKT), dependency-free."
 license = "MIT"

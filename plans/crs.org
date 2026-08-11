@@ -1,0 +1,435 @@
+#+TITLE: Plan: CRS Pass-Through Across All Formats
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* CRS Pass-Through: Closing the Gaps
+
+** WHY — the goal and the two hard boundaries
+Geosetta carries a coordinate reference system through the IR as an opaque
+=Option<Crs>= (=src/crs.rs=). "Fully plugging" CRS means: *the identity a source
+records is never silently changed or lost* on the way to any target that is
+capable of expressing it. Two boundaries frame the whole effort, and neither is
+a bug to fix — both are deliberate:
+
+- *Reprojection stays out of scope.* This is about *labeling* fidelity, not
+  transforming coordinates. Geosetta is a format translator, not a projection
+  engine (see =project.org=). "Full CRS support" here never means learning
+  projection math; it means the label is faithful or the loss is announced.
+- *The CRS-less formats stay CRS-less.* GeoJSON is *always* WGS 84 in both
+  directions (RFC 7946), and CSV / WKT carry no CRS at all. This plan does *not*
+  change that — no legacy =crs= member, no EWKT =SRID=, no =.prj= sidecar. When
+  one of these formats is the target of a non-WGS 84 dataset the loss is real and
+  unavoidable, so the response is a *loud warning* (milestone A), not a new
+  encoding.
+
+** CURRENT STATE — what each spoke does on the wire
+| Format     | Native CRS repr          | Reader recovers                   | Writer emits                                |
+|------------+--------------------------+-----------------------------------+---------------------------------------------|
+| GeoJSON    | none (RFC 7946 ⇒ WGS 84) | *always* =Wgs84=                  | nothing (WGS 84 only)                       |
+| GeoParquet | PROJJSON                 | PROJJSON + lifts =id=→auth+code   | PROJJSON verbatim, else =id= from auth+code |
+| FlatGeobuf | auth+code (+WKT1)        | auth+code+WKT                     | auth+code+WKT                               |
+| GeoPackage | auth+code+WKT1           | auth+code+WKT                     | auth+code+WKT (srs registration)            |
+| CSV        | none                     | nothing                           | nothing                                     |
+| WKT        | none                     | nothing                           | nothing                                     |
+
+The IR's =NamedCrs { authority, code, wkt, projjson }= is the union of these. A
+CRS survives a conversion *only when source and target share a representation*.
+The one representation every *rich* format (GeoParquet / FlatGeobuf / GeoPackage)
+can speak is *authority + code*, so the plan splits cleanly in two. (As of
+milestone B the "Reader recovers" column is also backfilled: when a rich source
+carries a WKT/PROJJSON definition but no separate auth+code, the id embedded in
+that string is lifted out, so auth+code is recovered wherever the source recorded
+one at all.)
+
+1. The CRS-less formats (GeoJSON / CSV / WKT) — keep their behavior exactly as it
+   is and only *warn* when they discard a CRS (milestone A).
+2. The rich formats — make authority+code truly universal, then optionally
+   translate between the string blobs and synthesize definitions from a bare code
+   (milestones B–D).
+
+*Already done:* the pass-through infrastructure (=crs.rs=, =NamedCrs=, the
+WGS 84 collapse in =Crs::from_authority_code=) shipped in 0.19.0, and the
+GeoParquet writer now emits a minimal PROJJSON =id= reference from an
+authority+code when it has no verbatim PROJJSON (=src/parquet/geo.rs=), so
+GeoPackage/FlatGeobuf → GeoParquet no longer drops to WGS 84.
+
+*Milestones A (CRS-loss warnings) and B (WKT id extraction) are done*, and
+*milestone C is done for the entire WKT→PROJJSON direction* — geographic
+(WKT1/WKT2), WKT2 `PROJCRS`, *and* WKT1 `PROJCS` for the common unambiguous
+projection methods — is now structurally translated into resolvable GeoParquet
+PROJJSON. Two *crosswalk oracles* (C.1) run the translator over a broad slice of
+the real EPSG registry and check every output identifies at 100% via `projinfo`:
+*WKT2 268/268 across 43 methods*, *WKT1 437/437 across 22 methods*. Verified
+end-to-end too: a projected (EPSG:7855) GeoPackage → GeoParquet is read back by
+GDAL as EPSG:7855. Still parked and *warned* (never mislabeled): ambiguous WKT1
+projections (a WKT1 name mapping to several EPSG methods — Polar Stereographic
+variants, Azimuthal Equidistant, Krovak, LAEA), south/west-oriented grids whose
+WKT1 omits its axes, and the PROJJSON→WKT reverse. See the marked headings below.
+
+** MILESTONES (ordered)
+
+*** A. CRS-loss warnings for CRS-degrading targets — *DONE (S, high value, the immediate ask)*
+When the *target format cannot express the source CRS*, Geosetta must say so on
+=stderr= rather than silently emit mislabeled or CRS-less data. Behavior of the
+CRS-less formats is unchanged — this milestone *only adds warnings*. Example:
+converting the Australian GeoPackage (EPSG:7844, GDA2020) to GeoJSON should warn
+that the output will be interpreted as WGS 84 and should be reprojected first.
+
+*As shipped:* a pure =Crs::downgrade_warning(&self, target: Format) ->
+Option<String>= in =src/crs.rs= (with a private =NamedCrs::label= for the
+=EPSG:7844= / =code 3857= / generic fallback rendering), called from the CLI
+(=src/main.rs=) on the write side for both the generic pipeline and the
+GeoPackage fan-out (=warn_crs_loss= / =warn_crs_loss_layers=, the latter
+de-duplicating so a single-CRS =.gpkg= warns once across many output files).
+Warnings are *on by default* and suppressed with =--quiet= (alias =--no-warn=).
+Verified against =examples/G01_AUST_GDA2020.gpkg= (EPSG:7844): GeoJSON gets the
+strong "will be mislabeled — reproject" message, CSV/WKT the weaker "cannot
+record a CRS; … will be dropped", rich targets and WGS 84/None stay silent.
+
+Design (as built):
+- A pure helper, e.g. =fn crs_downgrade_warning(target: Format, crs: Option<&Crs>)
+  -> Option<String>=, called from the conversion pipeline where both the
+  resolved =fc.crs= and the target =Format= are known (=convert.rs= / =main.rs=,
+  alongside the existing =--progress= stderr path).
+- The warning is *write-side*: it fires when a non-WGS 84 =Crs::Named= meets a
+  target that cannot record it. (The read side is a no-op by design — reading
+  GeoJSON always yields =Wgs84= and reading CSV/WKT yields no CRS, so nothing is
+  ever silently lost on the way *in*.)
+- *CRS-degrading targets* and the message each warrants when =crs= is
+  =Some(Crs::Named(..))= that is not WGS 84:
+  - *GeoJSON* (forces WGS 84): the strong warning — the coordinates will be
+    *interpreted as WGS 84 longitude/latitude*, which is wrong for a non-WGS 84
+    source; reproject first. Name the source CRS, e.g. =warning: source CRS is
+    EPSG:7844; GeoJSON is always WGS 84 — output coordinates will be mislabeled.
+    Reproject to EPSG:4326 before converting.=
+  - *CSV* / *WKT* (no CRS slot): the CRS *label is dropped*; the coordinates are
+    unchanged but the file no longer records what system they are in. Weaker but
+    still worth stating: =warning: <fmt> cannot record a CRS; EPSG:7844 will be
+    dropped from the output.=
+- *WGS 84 and =None= never warn* — those are faithfully representable (or absent)
+  in every target. Only a genuine non-WGS 84 identity meeting a can't-express-it
+  target triggers a warning.
+- Suppressible via a =--quiet= / =--no-warn= flag (open question below), but *on
+  by default* — it is a correctness warning, not chatter.
+
+*** B. Lexical id extraction from WKT (rich formats) — *DONE (S, dependency-free)*
+The =AUTHORITY["EPSG","7844"]= (WKT1) / =ID["EPSG",7844]= (WKT2) node in a WKT
+string, and the =id= in PROJJSON, are *names*, not projection math — extracting
+them is the same lexical move =from_authority_code= already makes. PROJJSON
+id-lifting exists (=parquet::geo::parse_crs=); the gap is WKT.
+
+*As shipped* (=src/crs.rs=):
+- A lenient WKT tokenizer (=tokenize_wkt=) and =wkt_authority_code(&str) ->
+  Option<(String, i64)>= that returns the CRS's *own* id — the shallowest
+  =AUTHORITY=/=ID= node (a direct child of the outermost keyword), and the last
+  when several share that depth (bound/compound CRS) — ignoring the nested ids on
+  the datum, ellipsoid, prime meridian, axes, and units. Handles both the WKT1
+  quoted-code and WKT2 bare-code spellings; a non-integer code (e.g. =OGC:CRS84=)
+  is skipped since the IR carries a numeric code.
+- Folded into =Crs::from_authority_code=: when *neither* authority nor code is
+  supplied but a WKT is, the lifted id fills the pair (and then feeds the
+  existing WGS 84 collapse — a WKT-only =EPSG:4326= still becomes =Wgs84=). A
+  caller that already knows either field is left untouched.
+- Because every rich reader (=flatgeobuf/reader.rs=, =geopackage/reader.rs=)
+  already funnels through =from_authority_code=, all of them benefit with no
+  per-format change. Verified end-to-end: a WKT-only FlatGeobuf source now
+  reaches GeoParquet as =EPSG:7844= instead of dropping to WGS 84.
+- Scope note: this concerns the CRS *definition string* the rich formats record,
+  not the WKT *geometry* format (=src/geometry/wkt.rs=), which stays CRS-less.
+
+*** C. WKT ↔ PROJJSON structural translation (rich formats) — *WKT→PROJJSON DONE (geographic, WKT2 projected, common WKT1 projected); PROJJSON→WKT deferred*
+
+*The finding that forced this.* The old scheme rendered a bare authority+code
+into GeoParquet as a minimal =id= reference
+(=crs":{"id":{"authority":"EPSG","code":7844}}=), and =project.org= claimed
+"PROJ-backed readers resolve" it. *They do not.* An id-only object is **invalid
+PROJJSON** — =projinfo '{"id":{"authority":"EPSG","code":7844}}'= fails with
+=Missing "type" key=, and even adding =type=/=name= fails wanting
+=datum_ensemble=. PROJ needs a *complete* CRS object and *trusts the payload it
+is given* (it does not re-derive the definition from the id). So gpkg→parquet was
+silently producing files GDAL/QGIS/DuckDB read as =(unknown)=, even though the
+GeoPackage handed us a full WKT definition we were discarding.
+
+*As shipped (=src/crs/wkt_projjson.rs=).* When a source carries a WKT definition,
+the GeoParquet writer now *translates it into a complete PROJJSON object* instead
+of the id reference. A lenient recursive WKT parser (reusing =crs.rs='s
+=tokenize_wkt=) builds a node tree; =wkt_to_projjson= renders a =GeographicCRS=
+(WKT1 =GEOGCS= / WKT2 =GEOGCRS=) carrying the source's own name, datum name,
+ellipsoid (=semi_major_axis= + =inverse_flattening=), and the lifted authority
+=id=. The coordinate system is emitted in the *authoritative* geographic axis
+order — latitude, longitude — matching how EPSG/PROJ define geographic 2D CRSes.
+This is identity-critical: a longitude-first order drops PROJ's identification
+confidence to ~25%, so GDAL/QGIS show a bare CRS *name* rather than recognizing
+the EPSG code; latitude-first identifies at *100%*. GeoParquet's fixed x,y
+coordinate storage is unaffected — readers honor that convention independently of
+the CRS axis order (GDAL maps data→CRS axes =2,1= and does not flip the
+geometry). Verified end-to-end: the real EPSG:7844 GeoPackage → GeoParquet now
+identifies in GDAL/QGIS/projinfo as EPSG:7844 (GDA2020) at 100% with the extent
+unchanged over Australia. =parquet::geo::crs_projjson= tries verbatim PROJJSON →
+WKT translation → id reference, in that order.
+
+*Deliberately still partial.* Only geographic CRSes are translated. A *projected*
+CRS (=PROJCS=/=PROJCRS=: base geographic + conversion method + parameter-name
+mapping) returns =None= and falls back to the id reference — because PROJ trusts
+the payload, a *wrong* projected translation is worse than none. A bare code with
+no WKT likewise can't be made resolvable (that is milestone D). Both cases now
+*warn*: =parquet_expressible= means "verbatim PROJJSON, or a WKT we can
+translate," so =Crs::downgrade_warning= fires for GeoParquet on a code-only or
+untranslatable-WKT source, telling the user the output records only an
+unresolvable id reference. The reverse direction (*PROJJSON→WKT* for
+FlatGeobuf/GeoPackage targets) is not built; a code-less PROJJSON-only source to
+those targets still just warns (it is dropped).
+
+*Remaining lift:* projected-CRS translation (the parameter mapping is the hard,
+error-prone part), datum ensembles, and the PROJJSON→WKT reverse. Each is its own
+effort and stays parked; the reported gpkg→parquet loss is fixed.
+
+**Why projected-CRS translation is hard (scoping the remaining lift).**
+Geographic was one block (datum + ellipsoid + axes). A projected CRS nests three
+things, and the middle one is where the work is:
+
+: ProjectedCRS
+:  ├─ base_crs           → a GeographicCRS  (already translated — reuse it)
+:  ├─ conversion
+:  │   ├─ method         → name + EPSG method code
+:  │   └─ parameters[]   → each: name + value + unit + EPSG param code
+:  └─ coordinate_system  → Cartesian: easting/northing, metre
+
+The =base_crs= and the Cartesian CS are easy. The =conversion= is the hard part,
+in four pieces:
+
+1. *Method-name mapping.* WKT1 writes =PROJECTION["Transverse_Mercator"]=; PROJJSON
+   needs ="Transverse Mercator"= plus method code =EPSG:9807=. Different string,
+   plus an EPSG code you must *know*. A table of ~10–30 methods (TM, LCC 1SP/2SP,
+   Mercator, Web Mercator, Albers, Polar Stereographic, LAEA, Oblique Mercator…).
+
+2. *Method-**dependent** parameter mapping — the real trap.* The WKT1 parameter
+   names are nearly identical across methods but mean *different* EPSG parameters
+   depending on the method (verified with =projinfo=):
+   | WKT1 name           | under Transverse Mercator          | under Lambert Conic Conformal (2SP)  |
+   |---------------------+------------------------------------+--------------------------------------|
+   | =latitude_of_origin=  | Latitude of *natural* origin (8801)  | Latitude of *false* origin (8821)      |
+   | =central_meridian=    | Longitude of *natural* origin (8802) | Longitude of *false* origin (8822)     |
+   | =false_easting=       | False easting (8806)               | *Easting at false origin* (8826)       |
+   | =false_northing=      | False northing (8807)              | *Northing at false origin* (8827)      |
+   So there is no flat =param-name → EPSG= table; it must be keyed by *(method,
+   WKT1 name)*. Get it wrong and you produce a confidently-*wrong* CRS, not merely
+   an unrecognized one.
+
+3. *Units per parameter.* Within one conversion, lat/long params are =degree=,
+   scale factor is =unity=, and false easting/northing are =metre= — or a
+   non-metre linear unit (US survey foot = 0.3048006096…), which then needs an
+   explicit unit-conversion object. Each parameter must carry the right unit.
+
+4. *Identity discipline (the axis-order lesson, ×7).* A single wrong axis order
+   dropped geographic identification from 100% to 25%, so QGIS showed a bare name.
+   A projected CRS has ~5–7 numeric parameters *plus* method *plus* units *plus*
+   Cartesian axis order — *every one* must match authoritative or the same failure
+   recurs. Each supported method needs a =projinfo --identify= 100%-confidence gate
+   during development.
+
+*The leverage point — WKT1 vs WKT2.* WKT2 (=PROJCRS=) already embeds the canonical
+method/parameter names *and their EPSG IDs inline* (=METHOD["Transverse
+Mercator",ID["EPSG",9807]]=, =PARAMETER["Latitude of natural origin",…,ID["EPSG",
+8801]]=), so WKT2-projected is almost as cheap as geographic — read the names/IDs
+straight out, no mapping tables. *WKT1 is the hard path* because it uses GDAL's own
+names with no IDs, forcing the (method, name) tables above. The reported
+GeoPackage stores *WKT1* (=GEOGCS[…]=), so its projected cousins would be WKT1 too.
+
+*What the ecosystem actually emits (verified 2026-08).* The WKT2 fast path helps
+far less than it looks, because the tools that produce our rich inputs default to
+*WKT1*:
+- *GDAL* reads every flavor transparently (WKT1_GDAL/ESRI, WKT2:2015, WKT2:2019),
+  but =exportToWkt()= *defaults to WKT1_GDAL* (=WKT1= is an alias for it) and has
+  since GDAL 3.0. WKT2 is emitted only when explicitly requested
+  (=OSR_WKT_FORMAT= / =FORMAT=WKT2=); the long-standing proposal to flip the
+  default (GDAL issue #4681) has not landed.
+- *GeoPackage* writes *WKT1* into the base =gpkg_spatial_ref_sys.definition=
+  column. WKT2 appears *only* as an add-on: with the CRS WKT extension (OGC
+  21-057) GDAL *also* fills =definition_12_063= with WKT2:2015 (or WKT2:2019 for
+  dynamic CRS / coordinate epochs), and readers are told to prefer that column
+  when present. So a =.gpkg= may carry both, but WKT1 is the guaranteed one — and
+  our =examples/G01_AUST_GDA2020.gpkg= carries WKT1 only (=GEOGCS["GDA2020",…]=,
+  srs_id 7844).
+- *FlatGeobuf* likewise gets GDAL-written WKT, i.e. WKT1 by default.
+- *DuckDB* spatial links GDAL+PROJ, so =ST_Read=/=ST_Write= inherit the same
+  WKT1-by-default emission. (For GeoParquet it reads/writes *PROJJSON* in the
+  column metadata — no WKT — and its =ST_AsText=/=ST_GeomFromText= are *geometry*
+  WKT, unrelated to CRS-definition WKT.)
+
+*Consequence for the projected lift.* The files that motivate C are WKT1, so the
+cheap WKT2 fast path cannot cover them — it only helps inputs whose producer opted
+into WKT2 (or a =.gpkg= with the CRS-WKT extension, read from =definition_12_063=).
+A pragmatic sequencing wrinkle: reading =definition_12_063= when present would let
+the GeoPackage reader hand us *WKT2* for free, sidestepping the WKT1 (method,
+name) tables for extension-enabled files — worth doing before the WKT1 mapping
+work, though it does nothing for plain WKT1-only =.gpkg= like our example.
+
+*The scale of the problem, and why it is smaller than it looks.* PROJ's registry
+(=proj.db=, the same EPSG dataset GDAL/DuckDB resolve against) holds *~10,316
+projected CRSes* — but that is a *combinatorial* count (one method × many zones ×
+many datums), and the translator implements *methods*, not CRSes. Only *53 distinct
+projection methods* are used across all of them, and they are extremely top-heavy:
+Transverse Mercator alone covers 5,598 (~55%; UTM's 120 zones × datums plus national
+TM grids), Lambert Conic Conformal (2SP) another 1,822. *The top 5 methods cover
+~82% of every projected CRS; the top 10 cover ~94%.* So "comprehensive" is ~53
+mappings, and the *common set* the scope decision names buys the overwhelming
+majority of real files. (Counts verified 2026-08 against Homebrew =proj.db=.)
+
+*What a build would need:* extend the translator to detect =PROJCS=/=PROJCRS=,
+recurse the base =GEOGCS= (done), read method + params + linear unit, and emit the
+=conversion= + Cartesian CS; a *WKT2 fast path* first (cheap, low-risk); then WKT1
+methods driven by *crosswalk-generated* mapping tables (see *C.1*), each behind a
+100%-confidence gate (a bulk assertion over the crosswalk oracle), starting with the
+common set (UTM/TM, LCC 1SP & 2SP, Web Mercator/3857, Mercator, Albers, Polar
+Stereographic); a *strict fallback* — unknown method or any missing/ambiguous
+parameter returns =None= → id reference + warning, never a guess; and fixture-based
+end-to-end verification (WKT → expected EPSG code) as done for GDA2020.
+
+*Effort.* Geographic was ~1 file, ~200 lines, one gotcha. Projected is mostly
+*mapping data + per-method verification* — and the crosswalk (*C.1*) turns the
+*mapping data* half from hand-authoring into a generator + bulk oracle. A first
+useful increment (WKT2 projected + ~6–8 WKT1 methods) is several hundred lines plus
+the build-time generator; comprehensive coverage of the projection long tail is
+open-ended but bounded by the ~53 methods (top 10 ⇒ ~94% of CRSes). The scope
+decision is *common projected CRSes* (UTM / Web Mercator / national grids — a
+bounded, high-value set) vs *comprehensive* (drifts toward re-implementing part of
+PROJ's registry).
+
+**Historical framing (pre-fix), retained for context:**
+Only bites when a rich-format source carries a full CRS *string with no embedded
+id* — e.g. hand-authored PROJJSON with no =id= → FlatGeobuf/GeoPackage (which
+want WKT), or a WKT-only definition → GeoParquet (which wants PROJJSON). Closing
+it *for real* means a WKT2/WKT1 parser + PROJJSON (de)serializer over an
+in-memory CRS model: datums, ellipsoids, prime meridians, axes, units, projection
+parameters, compound/bound CRS. *Biggest pure-code lift and the item most in
+tension with "lightweight."*
+
+**** C.1 Build tooling: the GDAL-generated crosswalk — *both sides built and consumed*
+
+*As shipped (WKT2 oracle).* =tests/fixtures/gen_projected_wkt2.sh= samples up to N
+non-deprecated projected CRSes per method from =proj.db= (all 53 methods) and emits
+=code<TAB>WKT2:2019= into =tests/fixtures/projected_wkt2.tsv=; the ignored in-crate
+test =crs::wkt_projjson::bulk_oracle_wkt2_projected_identifies= translates each with
+=wkt_to_projjson= and gates the output through =projinfo --identify= at
+100%-confidence — the milestone-C "100% gate per method", in bulk (*268/268 across
+43 methods*). It drove out *seven* structural bugs a hand fixture would have missed,
+each a silent drop to 25% identification: Cartesian axis *order* (LAEA is
+northing-first), per-axis non-metre *units* (US-survey-foot state planes), polar
+*meridian* qualifiers, five *non-Greenwich prime meridians* nested inside the datum,
+*grad* angular units (in both the prime meridian and the geographic axes),
+*non-metre ellipsoid* axes (Clarke's foot), and *3D projected* bases. The WKT2
+render is mechanical *once you honor these* — which is why the bulk oracle, not
+eyeballing, is the right gate.
+
+*As shipped (WKT1 tables + oracle).* =tests/fixtures/gen_wkt1_crosswalk.py= is the
+generator: for each sampled CRS it reads *PROJJSON* (canonical method/param names +
+EPSG codes + unit *kinds*, already structured — no WKT2 parse needed) and
+*WKT1_GDAL* (the id-less GDAL names), aligns the two parameter lists positionally
+with a *value check*, and emits =src/crs/wkt1_tables.rs= (the =METHODS= and =PARAMS=
+static tables) plus =tests/fixtures/projected_wkt1.tsv=. =wkt_to_projjson= consumes
+the tables (=render_projected_wkt1=); the ignored test
+=bulk_oracle_wkt1_projected_identifies= gates it (*437/437 across 22 methods*). The
+generator's *conflict detection* turned the plan's scariest trap into build-time QA
+and forced two exclusion rules, both honoring strict-fallback (a wrong CRS is worse
+than none):
+- *Ambiguous methods* — a WKT1 =PROJECTION= name that maps to *more than one* EPSG
+  method (Polar_Stereographic → variant A 9810 *or* B 9829; Azimuthal_Equidistant →
+  1125 *or* Modified 9832; also Krovak, LAEA). WKT1 can't disambiguate from the name,
+  so these are excluded entirely and fall back + warn.
+- *Coordinate-system reconstructability* — GDAL WKT1 often *omits* =AXIS= even for
+  south/west-oriented grids, silently dropping the orientation. A method is kept but
+  flagged =en_default_safe = false= when it has a no-=AXIS= non-EN member; the
+  runtime then resolves only its =AXIS=-bearing CRSes (the common case — RD New,
+  UTM, state planes all carry axes) and falls back on the rest. This recovered
+  Oblique Stereographic, Cassini, Mercator (2SP), etc. that a blunt whole-method
+  exclusion would have dropped.
+The tables are regenerable (pin/record the PROJ version — the generator prints it)
+and cover 22 unambiguous methods including the volume leaders (Transverse Mercator,
+LCC 1SP/2SP, Albers). WKT1_ESRI flavor and a wider per-method cap are open follow-ups.
+
+*The original pitch (realized above):* the scariest part of the
+projected lift is the hand-keyed =(method, WKT1 name) →
+EPSG code= + unit tables, where a *wrong* entry yields a confidently-*wrong* CRS
+(§C, trap #2). That table can be *generated instead of authored*, because WKT2 and
+PROJJSON already carry the EPSG method/parameter IDs *inline* while WKT1 does not.
+Run GDAL/=projinfo= *once at build time* over the EPSG projected set, emitting each
+CRS three ways — =WKT1_GDAL= (and =WKT1_ESRI=), =WKT2:2019=, =PROJJSON= — then walk
+the WKT1 and WKT2 parameter lists in parallel to *read off* the mapping. Example
+(=EPSG:32755=, UTM 55S), the two lists in identical order:
+
+: WKT1                               WKT2:2019
+: PROJECTION["Transverse_Mercator"]  METHOD["Transverse Mercator", ID["EPSG",9807]]
+: latitude_of_origin            ↔    ID["EPSG",8801]
+: central_meridian              ↔    ID["EPSG",8802]
+: scale_factor                  ↔    ID["EPSG",8805]
+: false_easting                 ↔    ID["EPSG",8806]
+: false_northing                ↔    ID["EPSG",8807]
+
+This reframes GDAL as a *build-time codegen tool*, never a runtime/link dependency
+— the derived tables ship as static data, so the dependency-free identity is
+intact. It yields *two* artifacts:
+1. *The mapping tables*, generated and internally consistent across thousands of
+   CRSes rather than typed by hand.
+2. *A ~10k-CRS labeled oracle for free* — each projected CRS as GDAL's WKT1 (input)
+   paired with its authoritative PROJJSON (expected output). This *is* the
+   "100%-confidence =projinfo= gate per method" §C demands, delivered in bulk as
+   =translate(wkt1) == gdal_projjson= over the whole registry. Arguably the bigger
+   prize than the tables.
+
+*Crosswalk gotchas (design the generator around these):*
+- *Align by per-method position, not by value.* =latitude_of_origin=,
+  =false_easting=, etc. are =0= in many CRSes, so value-matching is ambiguous;
+  GDAL's parameter *order* is stable within a method (WKT1 and WKT2 above match
+  positionally). Belt-and-suspenders: also generate a few *synthetic* CRSes per
+  method with unique sentinel parameter values so alignment is provably unambiguous.
+- *Datum ensembles fall out for free.* WKT1's flat =DATUM["WGS_1984"]= corresponds
+  to WKT2/PROJJSON's =ENSEMBLE[…]=; the crosswalk teaches that mapping too (one of
+  the parked "datum ensemble" items).
+- *Cover more than one WKT1 flavor.* Real files carry Esri and old-GDAL spellings
+  too, so emit =WKT1_ESRI= alongside =WKT1_GDAL= and *union* the vocabularies, or
+  the table misses non-GDAL inputs. *Pin and record the GDAL/PROJ version* — the
+  tables are only as current as the registry they were generated from.
+- *It does not write the defensive parser.* The generator hands you correct tables
+  and a great test set; the runtime still needs the *strict fallback* (unknown
+  method or any missing/ambiguous parameter ⇒ =None= → id reference + warning,
+  never a guess). The crosswalk shrinks the risky *data* work, not the parsing
+  discipline.
+
+*** D. Definition synthesis from a bare code (rich formats) — *L + data + licensing; likely declined*
+Turning =EPSG:7844= *alone* into a full WKT/PROJJSON (so a target that demands a
+complete definition gets one, and so GDAL resolves the plain-parquet =id= case
+that currently shows =(unknown)=) requires the EPSG registry — PROJ ships ~9 MB
+of it. Options: (a) embed a *curated* table of the few hundred common CRSes
+(partial coverage, modest size); (b) embed the full dataset (breaks
+"lightweight," plus EPSG attribution terms); (c) don't — keep code→definition
+"unspecified." *Recommendation: (c)*, with (a) as an optional stretch. This is
+where "fully" genuinely collides with the dependency-free / lightweight identity.
+
+** RECOMMENDED SEQUENCING
+1. *A* (warnings) — *done.* The immediate ask; cheap, stops silent mislabeling
+   today, independent of everything else.
+2. *B* (WKT id extraction) — *done.* Best value/effort among the rich formats;
+   makes auth+code universal.
+3. *C* — WKT→PROJJSON (geographic) *done* (fixes gpkg→parquet in GDAL/QGIS);
+   projected CRSes, ensembles, and the PROJJSON→WKT reverse remain, each its own
+   effort.
+4. *D* — probably decline; document as the deliberate dependency-free limit.
+
+** OPEN QUESTIONS / DECISIONS
+- *Warning suppression* — *resolved for now:* shipped =--quiet= (alias
+  =--no-warn=), on-by-default warnings to =stderr= only; conversion still
+  succeeds (exit 0). No env var / exit-code policy yet — revisit only if asked.
+- *Warning granularity* — *resolved:* per-layer for a multi-layer GeoPackage,
+  but de-duplicated by message so the usual single-CRS =.gpkg= warns exactly
+  once even across a directory fan-out.
+- *Milestone C worth it?* — how often do real rich-format inputs carry a full CRS
+  string with *no* embedded id? If rare, C stays parked behind A/B indefinitely.
+
+** NON-GOALS
+- Reprojecting / transforming coordinates between CRSes (a separate future
+  utility that slots between read and write; see =project.org=).
+- Adding any CRS encoding to GeoJSON / CSV / WKT — GeoJSON stays always-WGS 84
+  both directions, CSV/WKT stay CRS-less; the only change for them is warnings.
+- Embedding the full EPSG registry (milestone D, option b).
+- Interpreting projection math from any CRS string.

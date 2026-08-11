@@ -36,3 +36,8 @@ they are ordered by dependency.
   =tests/perf.rs= benchmark harness, the GeoJSON writer's JsonValue-tree bypass
   (*done*, ~2× on =* → geojson=), and the symmetric streaming GeoJSON reader
   (*done*, ~1.35× on GeoJSON read).
+- [[file:crs.org][crs.org]] :: CRS pass-through across all formats — warnings when
+  a CRS-degrading target (GeoJSON/CSV/WKT) can't express the source CRS (those
+  formats stay as-is), making authority+code universal among the rich formats,
+  and the dependency-free limits (WKT↔PROJJSON translation, EPSG-registry
+  synthesis). GeoParquet =id= emission is *done*; the rest is *planned*.

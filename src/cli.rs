@@ -27,10 +27,14 @@ pub struct Args {
     /// Report each conversion stage (bytes read, features parsed, bytes
     /// written) to stderr, so long conversions visibly advance.
     pub progress: bool,
+    /// Suppress CRS-loss warnings (on by default). They fire on stderr when the
+    /// target format cannot record the source CRS (e.g. a non-WGS 84 dataset to
+    /// GeoJSON/CSV/WKT); conversion still succeeds either way.
+    pub quiet: bool,
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert] [--rtree] [--progress]";
+pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert] [--rtree] [--progress] [--quiet]";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -45,6 +49,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let mut sort_hilbert = false;
     let mut rtree = false;
     let mut progress = false;
+    let mut quiet = false;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -52,6 +57,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
             "--sort-hilbert" => sort_hilbert = true,
             "--rtree" => rtree = true,
             "--progress" => progress = true,
+            "--quiet" | "--no-warn" => quiet = true,
             "--from" => {
                 let v = iter
                     .next()
@@ -99,6 +105,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         sort_hilbert,
         rtree,
         progress,
+        quiet,
     })
 }
 
@@ -140,6 +147,15 @@ mod tests {
         assert!(a.progress);
         let b = args(&["geosetta", "in.geojson", "out.parquet"]).unwrap();
         assert!(!b.progress);
+    }
+
+    #[test]
+    fn parses_quiet_flag() {
+        // On by default warnings are suppressed only when asked; --no-warn is an
+        // accepted alias.
+        assert!(!args(&["geosetta", "in.gpkg", "out.geojson"]).unwrap().quiet);
+        assert!(args(&["geosetta", "in.gpkg", "out.geojson", "--quiet"]).unwrap().quiet);
+        assert!(args(&["geosetta", "in.gpkg", "out.geojson", "--no-warn"]).unwrap().quiet);
     }
 
     #[test]

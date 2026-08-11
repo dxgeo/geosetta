@@ -25,7 +25,7 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.19.0*.
+Current version: *0.20.0*.
 
 Six formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -74,7 +74,10 @@ specification rather than pulled from a crate:
   to and from; all spokes depend on it, not on each other
 - =crs.rs= :: the format-neutral coordinate-reference-system identity carried on
   a =FeatureCollection= (=Crs= / =NamedCrs=), passed through opaquely from reader
-  to writer — Geosetta labels, but never reprojects
+  to writer — Geosetta labels, but never reprojects. Includes lexical id lifting
+  from a WKT/PROJJSON definition and the =Crs::downgrade_warning= CRS-loss
+  warnings. =crs/wkt_projjson.rs= structurally translates a WKT CRS definition
+  into resolvable GeoParquet PROJJSON (geographic CRSes)
 - =json/= :: standard-library JSON parser and value model
 - =geojson/= :: GeoJSON parsing and serialization (both directions)
 - =schema.rs= :: property-column inference (type lattice, per-row cells) shared
@@ -133,6 +136,7 @@ geosetta rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
 geosetta roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
 geosetta big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
 geosetta big.geojson   big.parquet --progress      # report each stage on stderr
+geosetta aus.gpkg      aus.geojson --quiet          # silence the CRS-loss warning (on by default)
 # formats may also be given explicitly:
 geosetta in.txt out.bin --from geojson --to parquet
 #+end_src
@@ -206,9 +210,27 @@ speaks — an authority+code where the format wants one, the verbatim WKT/PROJJS
 where it wants that — falling back to "unspecified" rather than guessing. The
 well-known WGS 84 spellings collapse to a single =Crs::Wgs84= default, so a
 GeoJSON input (RFC 7946 is always WGS 84) or a =crs=-less GeoParquet becomes the
-correct idiomatic default in every other format. Geosetta never parses these
-strings; cross-encoding that would require *interpreting* a CRS (e.g. turning a
-GeoPackage WKT into GeoParquet PROJJSON) is intentionally left as "unspecified".
+correct idiomatic default in every other format. An authority+code is the
+neutral identity every format can speak, so it carries all the way through
+between the formats that store one (GeoPackage ⇄ FlatGeobuf).
+
+GeoParquet is different: its *only* CRS channel is PROJJSON, and a bare
+authority+code rendered as an id-only reference
+(=crs":{"id":{"authority":"EPSG","code":7844}}=) is **not** valid, resolvable
+PROJJSON — PROJ/GDAL/QGIS read it as unknown. So when a GeoPackage or FlatGeobuf
+source carries a WKT definition (they usually do), Geosetta *translates that WKT
+into a complete PROJJSON object* (=src/crs/wkt_projjson.rs=, geographic CRSes) so
+the GeoParquet output resolves correctly — a GeoPackage's =EPSG:7844= (GDA2020)
+reaches GeoParquet as a full =GeographicCRS= PROJJSON, emitted in the
+authoritative latitude,longitude axis order so GDAL/QGIS *identify it as
+EPSG:7844* at 100% confidence (a longitude-first order would identify at only
+~25% and show a bare name). GeoParquet's fixed x,y coordinate storage is honored
+by readers independently of the CRS axis order, so geometry is not flipped. When there is *no* WKT to translate (only a bare code) or the WKT is a
+kind not yet translated (projected CRSes), Geosetta writes the id-only reference
+as a last resort — it preserves the identity for Geosetta's own round trip but
+is unresolvable downstream, so the CLI *warns*. Geosetta still never parses these
+strings for *meaning* (no projection math); the WKT→PROJJSON step is a purely
+structural transcription of the fields the source already recorded.
 
 This is also the seam for a future, separate *reprojection* utility: because the
 CRS is a public value on the IR and geometry is stored apart from it, such a tool

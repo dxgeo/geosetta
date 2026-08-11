@@ -5,3 +5,5 @@
 *.parquet
 # ...except committed test fixtures the build embeds via include_bytes!.
 !tests/fixtures/*.parquet
+# Local sample datasets (multi-GB gpkg/shapefiles) — not for version control.
+/examples/

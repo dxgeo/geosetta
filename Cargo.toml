@@ -19,7 +19,7 @@ path = "src/main.rs"
 # Optional embedded CRS registry data (PROJ/EPSG/Esri/IGN/IAU/NKG-derived). Kept
 # in a sibling crate so its third-party dataset terms are isolated and the default
 # build stays dependency-free. Enabled by the `crs-registry` feature.
-geosetta-crs-data = { path = "../geosetta-crs-data", version = "0.1.0", optional = true }
+geosetta-crs-data = { path = "../geosetta-crs-data", version = "0.1.1", optional = true }
 
 [features]
 # CRS registry: resolve a source's (authority, code) to an authoritative CRS

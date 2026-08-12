@@ -26,9 +26,9 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.20.0**.
+Current version: **0.21.0**.
 
-Six formats are supported, all routed through a shared feature IR
+Seven formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
 every other automatically — no per-pair code:
 
@@ -46,19 +46,38 @@ every other automatically — no per-pair code:
     also writes the GeoPackage RTree extension (SQLite's R\*Tree virtual table,
     built from scratch); the index passes `rtreecheck()` and answers GDAL/DuckDB
     bbox queries.
+-   **Shapefile** (read + write) — the first multi-file spoke, sibling
+    `.shp`/`.shx`/`.dbf`/`.prj`(/`.cpg`) files sharing a basename. A from-scratch
+    mixed-endian `.shp`/`.shx` geometry codec (with real ring-classification
+    geometry — shoelace winding + appearance-order grouping — for the
+    Polygon/MultiPolygon disambiguation) and a dBase III/IV `.dbf` attribute codec.
+    Composes with GeoPackage's multi-layer fan-out for free (one `layer.shp`
+    sibling set per `.gpkg` layer, in either direction). Validated against real
+    DuckDB-generated fixtures and GDAL/DuckDB's own readers.
 
 Any input converts to any output: e.g. CSV→GeoParquet, FlatGeobuf→GeoJSON,
-GeoPackage→GeoParquet, GeoJSON→GeoPackage all work. Validated against DuckDB / GDAL.
+GeoPackage→GeoParquet, GeoJSON→GeoPackage, GeoPackage↔Shapefile all work.
+Validated against DuckDB / GDAL.
 
 Each format's **coordinate reference system** is carried through the IR and
-re-emitted in the target's own representation (authority+code, WKT, or PROJJSON) —
-Geosetta *labels* CRS, it never reprojects. GeoParquet's PROJJSON-only channel is
-handled by structurally translating a source WKT definition into a complete,
-resolvable PROJJSON object — geographic and the common projected CRSes (WKT2, and
-WKT1 for the unambiguous methods) — verified against PROJ's `projinfo` at 100%
-identification. When a target can't express the source CRS (GeoJSON forces WGS 84;
-CSV/WKT record none) or a CRS falls outside the translatable set, the CLI *warns*
-rather than silently mislabeling; `--quiet` suppresses.
+re-emitted in the target's own representation (authority+code, WKT, WKT2, or
+PROJJSON) — Geosetta *labels* CRS, it never reprojects. A source CRS resolves in
+up to three ways, tried in order: (1) an opt-in **embedded CRS registry** —
+PROJ's `proj.db`, re-encoded as a ~1 MB `(authority, code) → {PROJJSON, WKT1,
+WKT2}` blob covering all 13,790 CRSes across every authority, gated behind the
+`crs-registry` Cargo feature and shipped in a sibling crate
+([`geosetta-crs-data`](https://github.com/dxgeo/geosetta-crs-data)) so the
+default build stays dependency-free; it also recovers a code from an id-less
+WKT's name (e.g. Esri-flavor Shapefile `.prj` text, which carries no authority
+id), validated against the CRS's own ellipsoid before ever trusting a match; (2)
+**structural translation** of a source WKT definition into a complete, resolvable
+PROJJSON object — geographic and the common projected CRSes (WKT2, and WKT1 for
+the unambiguous methods), compiled in by default; (3) an *id-reference +
+warning* fallback. Every resolution path is verified against PROJ's `projinfo`
+at 100% identification (or, for name recovery, zero wrong matches — see
+`geosetta-crs-data`'s design doc for the bulk-oracle methodology). When a target
+can't express the source CRS at all (GeoJSON forces WGS 84; CSV/WKT record none),
+the CLI *warns* rather than silently mislabeling; `--quiet` suppresses.
 
 The **GeoParquet** path is the most exercised. Write output is Snappy-compressed
 and validated by DuckDB's spatial engine as genuine, queryable GeoParquet; the
@@ -118,6 +137,17 @@ specification rather than pulled from a crate:
 -   **`parquet/reader.rs`:** the inverse — footer/schema parsing, page iteration
     (dictionary + data pages), decompression via `compress/`, RLE/bit-pack levels,
     PLAIN and dictionary value decoding, across multiple row groups
+-   **`shapefile/`:** the Shapefile spoke — `geometry.rs` (mixed-endian
+    `.shp`/`.shx` codec plus ring classification), `dbf.rs` (dBase III/IV
+    attribute codec), `reader.rs`/`writer.rs` (assembling/splitting the
+    sibling-file set); `.prj` CRS goes straight through `crs.rs` with no
+    format-specific code
+-   **`crs.rs` / `crs/`:** the CRS intermediate representation and its
+    resolution paths — `crs/wkt_projjson.rs` (structural WKT→PROJJSON
+    translation, default-compiled) and, behind the opt-in `crs-registry`
+    feature, `crs/registry.rs` (the embedded-registry reader and id-less-WKT
+    name recovery, backed by the sibling
+    [`geosetta-crs-data`](https://github.com/dxgeo/geosetta-crs-data) crate)
 -   **`cli.rs` / `convert.rs`:** argument parsing and the hub-and-spoke conversion
     pipeline (`read(from) → FeatureCollection → write(to)`)
 
@@ -144,8 +174,14 @@ features (heterogeneous or nested values fall back to a JSON string).
     geosetta roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
     geosetta big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
     geosetta big.geojson   big.parquet --progress      # report each stage on stderr
+    geosetta parcels.shp   parcels.geojson  # Shapefile  -> GeoJSON (reads sibling .shx/.dbf/.prj)
+    geosetta roads.geojson roads.shp        # GeoJSON    -> Shapefile
+    geosetta data.gpkg     out/ --to shp    # multi-layer GeoPackage -> one .shp set per layer
     # formats may also be given explicitly:
     geosetta in.txt out.bin --from geojson --to parquet
+    # the embedded CRS registry (name recovery for id-less WKT1, WKT2 emission, …)
+    # is opt-in — build/run with:
+    cargo run --features crs-registry -- parcels.shp parcels.parquet
 
 A runnable example lives in [examples/sample.geojson](examples/sample.geojson).
 
@@ -191,7 +227,8 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
     clustering, and now the opt-in `--rtree` GeoPackage R\*Tree extension (scoped in
     [plans/spatial-index.org](plans/spatial-index.org)). Whether to make `--rtree` the default is the one
     remaining open question there.
--   **More format spokes** — Shapefile is another classic (multi-file .shp/.dbf/.shx).
+-   **More format spokes** — Shapefile is done (see above); the next classic
+    candidate is a further-out consideration, not yet scoped.
 -   **Raster formats** (larger effort, planned) — a genuinely new axis. Raster data
     is a grid of cells, not a set of features, so it needs a second intermediate
     representation (a coverage/grid model) beside the feature IR, with its own
@@ -204,11 +241,16 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
     -   Brotli — a full from-scratch codec on the scale of ZSTD, rarely used here.
     -   `DECIMAL` / `INT96` / `FIXED_LEN_BYTE_ARRAY`, and 3D (Z/M) geometry — niche.
 -   **CRS handling** — implemented: pass-through across all formats, CRS-loss
-    warnings, and structural WKT↔PROJJSON translation for geographic and common
-    projected CRSes (scoped in [plans/crs.org](plans/crs.org)). Remaining, and
-    deliberately bounded by the dependency-free constraint: ambiguous/rare WKT1
-    projections, the PROJJSON→WKT reverse direction, and full EPSG-registry
-    synthesis from a bare code.
+    warnings, structural WKT↔PROJJSON translation for geographic and common
+    projected CRSes (scoped in [plans/crs.org](plans/crs.org)), and — opt-in via
+    `--features crs-registry` — a full embedded `proj.db` registry
+    ([`geosetta-crs-data`](https://github.com/dxgeo/geosetta-crs-data), plan in
+    that repo's `crs-registry.org`) resolving any `(authority, code)`, recovering
+    codes from id-less WKT names (geographic and projected, ellipsoid-validated),
+    and emitting WKT2:2019. Remaining: re-scoping whether the registry's own
+    resolution makes any of the structural crosswalk's hand-maintained tables
+    redundant in the default (`crs-registry`-off) build without regressing it,
+    and whether/when `crs-registry` should become a default-on feature.
 
 Detailed design notes live in [plans/](plans/README.org).
 

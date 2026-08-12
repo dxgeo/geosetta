@@ -5,8 +5,8 @@
 //! any input format converts to any output format the writers support.
 //!
 //! The whole crate is standard-library only — every wire format (GeoJSON,
-//! GeoParquet, FlatGeobuf, CSV, WKT, GeoPackage) is implemented from its
-//! specification, with no third-party dependencies.
+//! GeoParquet, FlatGeobuf, CSV, WKT, GeoPackage, Shapefile) is implemented from
+//! its specification, with no third-party dependencies.
 //!
 //! # Example
 //!
@@ -23,7 +23,10 @@
 //! Conversions are byte-in / byte-out; file I/O is left to the caller (the
 //! `geosetta` binary wraps this API with a CLI). GeoPackage is a multi-layer
 //! container, so it has its own [`geopackage::read_layers`] /
-//! [`geopackage::write_layers`] entry points.
+//! [`geopackage::write_layers`] entry points. Shapefile is the opposite shape —
+//! one logical layer split across sibling files (`.shp`/`.shx`/`.dbf`/`.prj`) —
+//! so it has its own [`shapefile::read`] / [`shapefile::write`] entry points,
+//! taking each sibling's bytes explicitly rather than a single buffer.
 
 // Public API surface. Formats are selected via `Format`, and the conversion
 // functions plus the IR types are re-exported at the crate root below.
@@ -34,6 +37,7 @@ pub mod feature;
 pub mod format;
 pub mod geometry;
 pub mod geopackage;
+pub mod shapefile;
 
 // The CLI argument parser, used by the `geosetta` binary. Exposed so downstream
 // tooling can reuse the same parsing if desired.

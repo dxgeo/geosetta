@@ -136,7 +136,7 @@ fn read_crs(header: &Table) -> Result<Option<Crs>> {
     let org = t.read_str(crs::ORG)?.map(str::to_string);
     let code = match t.read_i32(crs::CODE, 0)? {
         0 => None,
-        c => Some(c as i64),
+        c => Some(c.to_string()),
     };
     let wkt = t.read_str(crs::WKT)?.filter(|s| !s.is_empty()).map(str::to_string);
     if org.is_none() && code.is_none() && wkt.is_none() {

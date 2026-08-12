@@ -1,0 +1,271 @@
+#+TITLE: Plan: Shapefile Format Spoke
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Adding Shapefile as a Format Spoke
+
+** STATUS — DONE (read+write, both directions)
+Read and write full Esri Shapefile — geometry, attributes, and CRS — routed
+through the shared =Feature= IR, the same shape as every prior spoke. One
+reader + one writer yields Shapefile↔GeoJSON, Shapefile↔GeoParquet,
+Shapefile↔FlatGeobuf, Shapefile↔GeoPackage, Shapefile↔CSV/WKT for free via the
+hub. Test oracle: GDAL/OGR, via DuckDB's spatial extension
+(=COPY ... TO 'x.shp' WITH (FORMAT GDAL, DRIVER 'ESRI Shapefile')= and
+=ST_Read=), the same oracle already used for FlatGeobuf and GeoPackage.
+
+Implemented: =src/shapefile/{geometry,dbf,reader,writer,mod}.rs= (mixed-endian
+=.shp=/=.shx= codec incl. shoelace-winding + appearance-order ring
+classification; =.dbf= codec incl. =.cpg=/Latin-1 fallback; =.prj= reuses
+=Crs::from_authority_code= verbatim, no new CRS code); =Format::Shapefile= in
+=format.rs=, =crs.rs= (=downgrade_warning= arm + =NamedCrs::shapefile_expressible=/
+=registry_wkt=, R1's =def_wkt='s first consumer), =convert.rs= (opts out of the
+single-buffer path, like GeoPackage); =main.rs='s =read_input=/=write_collection=
+special-case Shapefile's multi-file I/O (sibling lookup, case-insensitive
+=.dbf=/=.DBF=), reused by GeoPackage's read/write paths so GeoPackage↔Shapefile
+(including multi-layer fan-out to one =.shp= set per layer) composes for free.
+Committed fixtures: =tests/fixtures/duckdb_{point,line,multiline,multipoint,
+poly_hole,multipoly,crs_pt}.{shp,shx,dbf,prj}=, real DuckDB-spatial output,
+hand-verified against =duckdb='s own =ST_Read=/=ST_AsText= before committing;
+exercised by =convert.rs='s =reads_shapefile_*=/=shapefile_composes_to_parquet_via_hub=/
+=shapefile_write_round_trips_all_geometry_types=/=geojson_to_shapefile_preserves_features=.
+Also manually verified end-to-end via the CLI against real DuckDB/GDAL-read
+output for every geometry type, GeoPackage↔Shapefile (single-layer and
+multi-layer fan-out), CRS pass-through, the mixed-shape-family write error, and
+case-insensitive sibling lookup — see the session that implemented this for the
+transcript.
+
+Deferred / out of scope, matching the plan below: Z/M/MultiPatch shape types,
+=.dbf= memo (=M=) fields, and *projected* Esri =.prj= structural recovery (R2
+stays scoped to geographic CRSes, per crs-registry.org's own deferral — real
+=.shp= fixtures now exist to measure this against if it's picked up later, per
+§ CRS INTEGRATION below). The two § OPEN QUESTIONS resolved during
+implementation: DBF field width overflow *truncates* (string columns, at a
+char boundary) rather than erroring or warning; ring containment uses the
+appearance-order heuristic (shell immediately followed by its holes), not full
+point-in-polygon, and no real fixture has yet been found that needs the
+fallback.
+
+This plan is also =geosetta-crs-data/crs-registry.org='s named *R4* — the
+original driver for the whole CRS-registry pivot. See § CRS INTEGRATION.
+
+** WHAT MAKES SHAPEFILE DIFFERENT: it's not one file
+Every spoke so far is either single-file/single-layer (GeoJSON, CSV, WKT,
+GeoParquet, FlatGeobuf) or single-file/multi-layer (GeoPackage — one =.gpkg=
+fans out to many layers). A "shapefile" is the opposite shape: *one logical
+layer split across several sibling files sharing a basename*:
+- =.shp= — geometry (required).
+- =.shx= — geometry index (conventionally required; not read-critical, see below).
+- =.dbf= — attribute table (required for properties).
+- =.prj= — CRS as WKT1 text (optional; absent means no CRS).
+- =.cpg= — DBF text-encoding declaration (optional; absent means guess).
+This breaks =main.rs='s current =std::fs::read(&args.input)= single-file model
+the same way GeoPackage did, but inverted: GPKG special-cased main.rs because
+*one file* holds *many layers*; Shapefile special-cases it because *one layer*
+is *many files*.
+
+** THE FORMAT
+
+*** =.shp= — mixed-endian geometry (ESRI Shapefile Technical Description)
+The signature gotcha: the *file header* and each *record header* are
+big-endian; the *shape-record content* (coordinates, part/point counts) is
+little-endian. Every reader/writer helper must be explicit about which half it
+is touching — no blanket "read as LE."
+- Fixed 100-byte header: file code (=9994=, BE i32), file length in *16-bit
+  words* (BE i32, includes the header itself — an easy off-by-2× bug if
+  treated as bytes), version (=1000=, LE i32), shape type (LE i32), bounding
+  box (8 LE f64: xmin,ymin,xmax,ymax,zmin,zmax,mmin,mmax).
+- Records: =[record # BE i32][content length BE i32, 16-bit words][shape record]=.
+- Shape record: =[shape type LE i32]= then a type-specific body:
+  - =0= Null — nothing else.
+  - =1= Point — 2× LE f64.
+  - =3= PolyLine / =5= Polygon — bbox(4×f64) + numParts(i32) + numPoints(i32)
+    + parts[i32×numParts] (each part's start index into the flat points array)
+    + points[2×f64×numPoints].
+  - =8= MultiPoint — bbox + numPoints + points[2×f64×numPoints].
+  - Z/M variants (=11/13/15/18=, =21/23/25/28=) and =31= MultiPatch — *out of
+    scope*, matching the 2D-only stance already taken for GeoParquet/FlatGeobuf.
+- *The one real algorithm in this spoke:* Shapefile has no distinct
+  "MultiPolygon" shape type — type =5= covers both =Polygon= and
+  =MultiPolygon=. Disambiguation is by ring *winding* (shoelace-formula signed
+  area: clockwise = shell, counter-clockwise = hole — GeoJSON's right-hand
+  rule is the opposite convention) and *containment* (which shell a hole
+  nests under; multiple shells = MultiPolygon). Every other shape type is a
+  direct structural copy; this one needs real geometry code.
+  PolyLine's =numParts==1= vs. =>1= similarly maps to LineString vs.
+  MultiLineString — no ambiguity there, just a count check.
+
+*** =.dbf= — dBase III/IV attribute table
+- 32-byte header: version byte, last-update date (3 bytes), record count (LE
+  u32), header size (LE u16, bytes), record size (LE u16, bytes), reserved
+  fields, a language-driver/codepage byte at offset 29 (unreliable in
+  practice — =.cpg=, when present, is the trustworthy source).
+- Field descriptors: 32 bytes each, terminated by =0x0D=: name (11 bytes,
+  NUL-padded), type (1 byte — =C= char, =N= numeric, =F= float, =L= logical,
+  =D= date, =M= memo), length, decimal count.
+- Records: a 1-byte deletion flag (=' '= active, =*= deleted — skip deleted
+  records on read) + fixed-width, space-padded fields.
+- Type → =schema::Cell= mapping: =C= → =Str= (trim trailing spaces); =N=/=F=
+  with =decimals=0= → =Int=, else =Double=; =L= → =Bool= (=T/t/Y/y= true,
+  =F/f/N/n= false, =?= unset → =Null=); =D= → =Str= (ISO-8601 text — matches
+  the date-as-formatted-string convention =parquet/reader.rs= already
+  established); =M= (memo, needs a companion =.dbt=) — out of scope, rare.
+- Encoding: read =.cpg= when present (one line naming the codepage, e.g.
+  ="UTF-8"=, ="ISO-8859-1"=); absent it, attempt UTF-8 and fall back — see §
+  OPEN QUESTIONS for how far that fallback should go under the dependency-free
+  constraint (no full codepage library).
+
+*** =.prj= — CRS, and nothing new to build for it
+Plain WKT1 text, typically *Esri-flavor*: no =AUTHORITY= node, non-standard
+datum spelling (=GCS_WGS_1984=, =D_North_American_1983=) — exactly the shape
+=crs-registry.org='s R2 (geographic name-recovery) was purpose-built for.
+Reading a =.prj= is just =Crs::from_authority_code(None, None, Some(wkt), None)=
+— the existing milestone-B id-lift and R2 name-recovery paths already handle
+it, no new CRS code needed. See § CRS INTEGRATION.
+
+*** =.shx= — an index Geosetta doesn't need to read, but must write
+Same 100-byte header as =.shp=, then one 8-byte record per shape:
+=[offset][content length]= (both BE i32, 16-bit words). Purely a random-access
+index — a full sequential read (all Geosetta ever does) can walk =.shp=
+directly via each record's own header, so =.shx= is *read-optional*. It is
+*write-required* in practice: real-world readers (ArcGIS, QGIS, GDAL) expect
+it to exist alongside a valid =.shp= even though its content is redundant with
+=.shp='s own record headers.
+
+** COMPONENTS (mirrors flatgeobuf.org / geopackage.org's shape)
+
+*** 1. =.shp=/=.shx= geometry codec — =src/shapefile/geometry.rs=
+Reader: parse + validate the 100-byte header, iterate records to EOF by each
+record's own content-length (no =.shx= dependency), decode shape type + body
+into =Geometry=. Ring classification (shoelace winding + containment nesting)
+is the one nontrivial piece — implement and unit-test it standalone (see §
+TESTING) before wiring it to file parsing. Writer: mirror structure, flatten
+=Polygon=/=MultiPolygon= back to parts[]+points[] (enforcing CW shell / CCW
+hole on write, since Geosetta controls what it emits even if it can't
+guarantee winding on arbitrary input), emit =.shx= from the same
+record-offset bookkeeping. Reuses the existing =geometry::Bbox= type (already
+shared by GeoParquet/FlatGeobuf/GeoPackage) for the header and per-record bbox.
+
+*** 2. =.dbf= codec — =src/shapefile/dbf.rs=
+Reader: header + field descriptors, iterate fixed-width records (skip
+deleted), decode per the type mapping above into
+=Vec<(Rc<str>, JsonValue)>=, respecting =.cpg= encoding. Writer: reuse
+=schema::infer_columns= (already shared by Parquet/FlatGeobuf/GeoPackage) to
+get typed columns from the source features; map =ColumnType= → a DBF field
+type + width (=Bool→L=, =Int64→N=, =Double→N= with a fixed decimal count,
+=String→C= sized to the longest observed value, capped at DBF's 255-byte
+field-width limit — see § OPEN QUESTIONS for the truncation policy); write
+header + descriptors + fixed-width records.
+
+*** 3. =.prj= codec — thin, reuses existing CRS machinery
+Read: =std::fs::read_to_string= → =Crs::from_authority_code(None, None,
+Some(wkt), None)=. Write: prefer =named.wkt= verbatim if the source carried
+one; else, with =crs-registry= on, a bare-code =NamedCrs= can now write a
+=.prj= via =registry::def_wkt(authority, code)= — R1's =def_wkt= exists today
+with *no consumer yet*; this is its first one. Without a WKT or a registry
+hit, omit =.prj= (no CRS on write), matching the project's never-guess
+convention, surfaced via a new =Format::Shapefile= arm in
+=Crs::downgrade_warning= (grouped with the existing =FlatGeobuf | Gpkg= "speaks
+WKT" arm, since a Shapefile-target warning is the same shape: PROJJSON-only or
+bare-code-without-registry can't cross the gap).
+
+*** 4. =src/shapefile/{reader.rs,writer.rs}= — assemble into =FeatureCollection=
+Reader: given a =.shp= path, locate sibling =.dbf=/=.prj=/=.cpg= by swapping
+the extension (case-insensitively — real-world shapefiles mix =.DBF=/=.dbf=),
+zip geometry + attributes by record position (a count mismatch is a malformed
+input — error, don't guess), attach the =.prj= CRS if present. Writer: given
+an output base path, write =.shp=+=.shx=+=.dbf=, and =.prj= when there's a CRS
+to express.
+
+*** 5. Multi-file I/O special-casing — =main.rs=
+Parallels GeoPackage's =main.rs= special-case (=run_geopackage_read=/=_write=)
+but inverted: GPKG is "1 file → N layers," Shapefile is "N files → 1 layer."
+- Read: given =roads.shp=, locate and read the sibling set as one unit.
+- Write: given an output path =out.shp= (or a bare stem — see § OPEN
+  QUESTIONS), write the full sibling set with that stem.
+- Add =Format::Shapefile= + the =.shp= extension to =format.rs=; =main.rs=
+  gets a =(Format::Shapefile, _)=/=(_, Format::Shapefile)= match arm parallel
+  to the existing GPKG one.
+- Reading a *multi-layer* GPKG to Shapefile output should reuse GPKG's
+  existing directory-fan-out naming rule (one =layer.shp= set per layer) —
+  don't reinvent it; a shapefile has no multi-layer concept of its own, so
+  "many layers in, one shapefile-set per layer out" is exactly GPKG's already-
+  decided read-side behavior, just targeting a multi-file format instead of a
+  single file per layer.
+- =Format= is matched exhaustively in several places beyond =format.rs=
+  itself (=crs.rs='s =downgrade_warning=/=rich_format_name=, =cli.rs=) — adding
+  the variant means updating all of them; the compiler will find every site.
+
+** CRS INTEGRATION — this *is* =crs-registry.org='s R4
+Once this reader exists:
+- R2's geographic name-recovery (already shipped, validated at 327/431 = 76%
+  resolved / *zero wrong* on a 431-fixture bulk oracle of real ESRI geographic
+  CRSes) works on real =.prj= text with *zero new CRS code* — it activates the
+  moment =.prj= bytes reach =Crs::from_authority_code=.
+- *Projected* Esri =.prj= (deliberately deferred when R2 was scoped, because it
+  needs Esri method/parameter-spelling coverage that couldn't be measured
+  without real fixtures) becomes measurable for the first time here. Natural
+  follow-on: a =tests/fixtures/esri_projected_wkt1.tsv=-style bulk-oracle
+  fixture set (mirroring =esri_geographic_wkt1.tsv=), sourced from real
+  shapefiles or =projinfo -o WKT1_ESRI= projected exports, to extend R2's
+  validated recovery to projected CRSes instead of guessing at coverage.
+- =.prj= *writing* is a new consumer of R1's =registry::def_wkt=, which has
+  existed since R1 but had no caller until this spoke.
+
+** SUGGESTED ORDER (read-first, mirrors every prior spoke)
+1. =.dbf= reader (simplest — no endianness gotchas; testable in isolation
+   against =ogr2ogr -f CSV= on a real shapefile's attribute table).
+2. =.shp= reader for Point/MultiPoint/LineString/MultiLineString (no ring
+   classification needed yet).
+3. =.shp= reader Polygon/MultiPolygon ring classification — the one hard
+   algorithm; validate against GDAL's own Polygon/MultiPolygon reads.
+4. =.prj= reader (trivial — reuses existing =Crs::from_authority_code=).
+5. Assemble the reader + hub routing (=Format::Shapefile=, =format.rs=,
+   =convert.rs=) + =main.rs= multi-file read special-case → Shapefile→(anything)
+   lights up; validate against GDAL/DuckDB reads of real shapefiles.
+6. =.dbf= writer, =.shp=/=.shx= writer, =.prj= writer → the write path;
+   validate by having GDAL/DuckDB read Geosetta's output back.
+7. =main.rs= multi-file write special-case + the GPKG-fan-out reuse for
+   multi-layer-source → Shapefile conversions.
+
+** TESTING
+- Oracle: GDAL/OGR via DuckDB's spatial extension — same oracle already
+  established for FlatGeobuf and GeoPackage.
+- Fixtures: a small real =.shp=+=.shx=+=.dbf=(+=.prj=) set per geometry type
+  (Point, LineString, Polygon-with-hole, MultiPolygon, MultiPoint), committed
+  under =tests/fixtures/=, generated via DuckDB
+  =COPY ... TO 'x.shp' WITH (FORMAT GDAL, DRIVER 'ESRI Shapefile')= from an
+  existing GeoJSON/GeoParquet fixture — the same sourcing method already used
+  for the FlatGeobuf/GeoPackage fixtures.
+- Read: assert Shapefile→GeoJSON matches DuckDB's =ST_Read= of the same files.
+- Write: have DuckDB =ST_Read= Geosetta's output and compare; round-trip
+  shapefile→IR→shapefile and geojson→shapefile→geojson.
+- Ring-classification unit tests, independent of file I/O: a polygon with a
+  hole, two disjoint shells (MultiPolygon), a shell containing another
+  shell's hole (nested case) — pin the geometry algorithm down before wiring
+  it to parsing.
+- =.dbf= field-type unit tests: each of C/N/F/L/D against hand-built records;
+  a =.cpg=-less file with non-ASCII text, to pin down the encoding-fallback
+  behavior.
+- CRS: once real projected =.prj= fixtures exist via this spoke, extend the
+  =esri_geographic_wkt1.tsv= bulk-oracle pattern to a projected counterpart —
+  the natural next step for R2/R4's CRS half.
+
+** OPEN QUESTIONS
+- *DBF field-width policy* for a string property over 255 bytes: silently
+  truncate, truncate with a warning, or something else? No existing precedent
+  elsewhere in the crate (CSV/Parquet/etc. have no per-field width cap).
+- *Encoding fallback depth*: UTF-8 attempt → ISO-8859-1 (Latin-1) fallback is
+  the minimal dependency-free option when =.cpg= is absent. Is a small
+  hand-built Windows-1252 table (a common real-world shapefile encoding,
+  distinct from Latin-1 in the =0x80-0x9F= range) worth adding, or an
+  documented gap?
+- *Bare-stem input* (=roads= with no extension, a convention some Shapefile
+  tooling accepts) vs. requiring the explicit =.shp= extension — affects
+  =Format::from_path='s contract, which currently assumes every input has one.
+- *Degenerate records*: a PolyLine/Polygon part with a single point. Validate
+  against GDAL's own tolerance rather than guessing a policy up front.
+- *Ring-containment cost*: start with the cheap heuristic real-world writers'
+  output usually satisfies (shells in point/appearance order, holes
+  immediately following their shell) rather than a full point-in-polygon
+  containment test; fall back to full containment only if oracle validation
+  against GDAL finds real files it gets wrong.

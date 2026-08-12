@@ -25,6 +25,12 @@ mod wkt1_tables;
 mod wkt_projjson;
 pub(crate) use wkt_projjson::wkt_to_projjson;
 
+// Embedded CRS registry (code -> authoritative definition). Feature-gated so the
+// default build stays dependency-free; the data lives in the sibling
+// `geosetta-crs-data` crate. Skeleton — see `../../geosetta-crs-data/crs-registry.org`.
+#[cfg(feature = "crs-registry")]
+mod registry;
+
 /// The coordinate reference system a [`crate::feature::FeatureCollection`] is
 /// expressed in.
 ///
@@ -54,12 +60,28 @@ pub enum Crs {
 pub struct NamedCrs {
     /// Authority / organization name, e.g. `"EPSG"`.
     pub authority: Option<String>,
-    /// Authority code within `authority`, e.g. `3857`.
-    pub code: Option<i64>,
+    /// Authority code within `authority`, e.g. `"3857"`. A string rather than a
+    /// number: most authorities (EPSG, ESRI, IAU_2015) use numeric codes, but
+    /// IGNF/OGC/PROJ/NKG use alphanumeric ones (`"LAMB93"`, `"CRS84"`), and one
+    /// code type has to serve every authority.
+    pub code: Option<String>,
     /// Verbatim WKT (WKT1 or WKT2) definition, if the source recorded one.
     pub wkt: Option<String>,
     /// Verbatim PROJJSON definition, if the source recorded one.
     pub projjson: Option<String>,
+}
+
+/// The registry's WKT2:2019 for `EPSG:4326` — for [`Crs::Wgs84`] sources,
+/// which (unlike [`Crs::Named`]) have no [`NamedCrs`] to call
+/// [`NamedCrs::registry_wkt2`] on. `None` without `crs-registry`.
+#[cfg(feature = "crs-registry")]
+pub(crate) fn wgs84_registry_wkt2() -> Option<&'static str> {
+    registry::def_wkt2("EPSG", "4326")
+}
+
+#[cfg(not(feature = "crs-registry"))]
+pub(crate) fn wgs84_registry_wkt2() -> Option<&'static str> {
+    None
 }
 
 impl Crs {
@@ -79,7 +101,7 @@ impl Crs {
     /// untouched — the recovery only fills a total blank.
     pub fn from_authority_code(
         authority: Option<String>,
-        code: Option<i64>,
+        code: Option<String>,
         wkt: Option<String>,
         projjson: Option<String>,
     ) -> Crs {
@@ -93,8 +115,8 @@ impl Crs {
 
         let auth = authority.as_deref().map(str::to_ascii_uppercase);
         let is_wgs84 = matches!(
-            (auth.as_deref(), code),
-            (Some("EPSG"), Some(4326)) | (Some("OGC"), Some(4326))
+            (auth.as_deref(), code.as_deref()),
+            (Some("EPSG"), Some("4326")) | (Some("OGC"), Some("CRS84"))
         );
         if is_wgs84 {
             Crs::Wgs84
@@ -158,9 +180,17 @@ impl Crs {
                 } else {
                     "Geosetta has only an authority code, not a full definition to translate"
                 };
+                // Only truthful without the registry: with it on, an
+                // authority+code that reaches this branch already failed
+                // `registry_projjson` too (not just missing), so rebuilding
+                // would not change the outcome.
+                #[cfg(not(feature = "crs-registry"))]
+                let hint = " Rebuild with `--features crs-registry` for full CRS resolution.";
+                #[cfg(feature = "crs-registry")]
+                let hint = "";
                 Some(format!(
                     "warning: source CRS {label} will not be resolvable in the GeoParquet output — \
-                     {detail}, so it is written only as an id reference that PROJ/GDAL/QGIS read as unknown."
+                     {detail}, so it is written only as an id reference that PROJ/GDAL/QGIS read as unknown.{hint}"
                 ))
             }
             // FlatGeobuf/GeoPackage speak WKT: faithful with a WKT definition or
@@ -172,7 +202,25 @@ impl Crs {
                 named.definition_dialect(),
                 rich_format_name(target),
             )),
-            Format::Parquet | Format::FlatGeobuf | Format::Gpkg => None,
+            // Shapefile's .prj is pure WKT text with no separate code slot (unlike
+            // FlatGeobuf/GeoPackage), so a bare authority code is only expressible
+            // via the registry's def_wkt, not natively as it is for those two.
+            Format::Shapefile if !named.shapefile_expressible() => {
+                let detail = if named.wkt.is_some() {
+                    "Geosetta has only a non-WKT (PROJJSON) definition, and .prj records CRS as WKT text"
+                } else {
+                    "Geosetta has only an authority code, not a WKT definition to write"
+                };
+                #[cfg(not(feature = "crs-registry"))]
+                let hint = " Rebuild with `--features crs-registry` for full CRS resolution.";
+                #[cfg(feature = "crs-registry")]
+                let hint = "";
+                Some(format!(
+                    "warning: source CRS {label} will not be recorded in the Shapefile output — \
+                     {detail}, so no .prj will be written.{hint}"
+                ))
+            }
+            Format::Parquet | Format::FlatGeobuf | Format::Gpkg | Format::Shapefile => None,
         }
     }
 }
@@ -183,6 +231,7 @@ fn rich_format_name(target: Format) -> &'static str {
         Format::Parquet => "GeoParquet",
         Format::FlatGeobuf => "FlatGeobuf",
         Format::Gpkg => "GeoPackage",
+        Format::Shapefile => "Shapefile",
         // The CRS-less formats never reach this helper.
         Format::GeoJson | Format::Csv | Format::Wkt => target.extension(),
     }
@@ -193,7 +242,7 @@ impl NamedCrs {
     /// and code are known, else whichever single field is present, else a
     /// generic fallback for a CRS carried only as a WKT/PROJJSON string.
     fn label(&self) -> String {
-        match (self.authority.as_deref(), self.code) {
+        match (self.authority.as_deref(), self.code.as_deref()) {
             (Some(a), Some(c)) => format!("{a}:{c}"),
             (None, Some(c)) => format!("code {c}"),
             (Some(a), None) => format!("authority {a}"),
@@ -202,12 +251,48 @@ impl NamedCrs {
     }
 
     /// Whether GeoParquet can record this CRS *resolvably*. It speaks PROJJSON,
-    /// so it needs verbatim PROJJSON, or a WKT definition Geosetta can translate
-    /// into PROJJSON (see [`wkt_to_projjson`]). A bare authority+code is *not*
-    /// enough: an id-only reference is invalid PROJJSON that PROJ/GDAL/QGIS read
-    /// as unknown. Mirrors [`crate::parquet::geo`]'s `crs_projjson`.
+    /// so it needs verbatim PROJJSON, a WKT definition Geosetta can translate
+    /// into PROJJSON (see [`wkt_to_projjson`]), or — with the `crs-registry`
+    /// feature — an authority+code the embedded registry resolves (see
+    /// [`Self::registry_projjson`]). Without the feature a bare authority+code
+    /// is *not* enough: an id-only reference is invalid PROJJSON that
+    /// PROJ/GDAL/QGIS read as unknown. Mirrors [`crate::parquet::geo`]'s
+    /// `crs_projjson`.
     fn parquet_expressible(&self) -> bool {
-        self.projjson.is_some() || self.wkt.as_deref().is_some_and(|w| wkt_to_projjson(w).is_some())
+        self.projjson.is_some()
+            || self.wkt.as_deref().is_some_and(|w| wkt_to_projjson(w).is_some())
+            || self.registry_projjson().is_some()
+    }
+
+    /// The authoritative PROJJSON for this CRS, from the embedded registry.
+    /// Two paths, mutually exclusive:
+    ///
+    /// 1. *Trusted inline id* (R1): an authority+code the source already
+    ///    declared is looked up directly — no structural validation, since an
+    ///    authority code *is* the declared identity. If the registry doesn't
+    ///    have that exact pair, this does *not* fall through to name-based
+    ///    recovery below: guessing a different code than the one the source
+    ///    declared would be a mislabel, not a recovery.
+    /// 2. *Name → code recovery* (R2), only when the source declared *neither*
+    ///    an authority nor a code: the WKT's outer name is looked up and
+    ///    validated against its own ellipsoid before snapping (see
+    ///    [`registry::resolve_geographic_by_name`]). Scoped to geographic
+    ///    CRSes for now — see that function's doc comment.
+    ///
+    /// `None` when the `crs-registry` feature is off, or neither path resolves
+    /// (a genuinely custom/non-catalog CRS, or a projected id-less WKT — not
+    /// yet handled).
+    #[cfg(feature = "crs-registry")]
+    pub(crate) fn registry_projjson(&self) -> Option<&'static str> {
+        if let (Some(auth), Some(code)) = (self.authority.as_deref(), self.code.as_deref()) {
+            return registry::def_projjson(auth, code);
+        }
+        self.wkt.as_deref().and_then(registry::resolve_geographic_by_name)
+    }
+
+    #[cfg(not(feature = "crs-registry"))]
+    pub(crate) fn registry_projjson(&self) -> Option<&'static str> {
+        None
     }
 
     /// Whether the WKT-dialect targets (FlatGeobuf, GeoPackage) can record this
@@ -217,6 +302,48 @@ impl NamedCrs {
     /// `resolve_srs`.
     fn wkt_expressible(&self) -> bool {
         self.wkt.is_some() || self.code.is_some()
+    }
+
+    /// Whether Shapefile's `.prj` (pure WKT text, no separate code slot) can
+    /// record this CRS: a WKT definition, or — with the `crs-registry` feature —
+    /// an authority+code the embedded registry can render as WKT (see
+    /// [`Self::registry_wkt`]). Unlike [`Self::wkt_expressible`], a bare code is
+    /// *not* enough on its own, since `.prj` has nowhere to put a code without a
+    /// WKT wrapper. Mirrors `shapefile::writer`'s `.prj` writer.
+    fn shapefile_expressible(&self) -> bool {
+        self.wkt.is_some() || self.registry_wkt().is_some()
+    }
+
+    /// The authoritative WKT for this CRS from the embedded registry, keyed by
+    /// authority+code (R1's `def_wkt`). `None` when the `crs-registry` feature is
+    /// off, either field is missing, or the registry has no WKT for that code
+    /// (`has_wkt=0`, R1's ~3.3% PROJJSON-only slice).
+    #[cfg(feature = "crs-registry")]
+    pub(crate) fn registry_wkt(&self) -> Option<&'static str> {
+        let (auth, code) = (self.authority.as_deref()?, self.code.as_deref()?);
+        registry::def_wkt(auth, code)
+    }
+
+    #[cfg(not(feature = "crs-registry"))]
+    pub(crate) fn registry_wkt(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The authoritative WKT2:2019 for this CRS from the embedded registry,
+    /// keyed by authority+code (R5's `def_wkt2`). `None` when the
+    /// `crs-registry` feature is off or either field is missing — but
+    /// essentially never `None` for a pair that *does* resolve, since
+    /// WKT2:2019 is present for effectively every entry (R5), including all
+    /// of `registry_wkt`'s `has_wkt=0` gap.
+    #[cfg(feature = "crs-registry")]
+    pub(crate) fn registry_wkt2(&self) -> Option<&'static str> {
+        let (auth, code) = (self.authority.as_deref()?, self.code.as_deref()?);
+        registry::def_wkt2(auth, code)
+    }
+
+    #[cfg(not(feature = "crs-registry"))]
+    pub(crate) fn registry_wkt2(&self) -> Option<&'static str> {
+        None
     }
 
     /// The dialect of the definition string this CRS carries, for warning
@@ -297,15 +424,15 @@ fn tokenize_wkt(s: &str) -> Vec<WktTok> {
 /// axes, and units; the CRS's *own* id is the shallowest one — a direct child of
 /// the outermost keyword — and, when several sit at that depth (a bound/compound
 /// CRS), the last one. This is a purely lexical extraction: Geosetta never
-/// interprets the projection the WKT describes. A non-integer authority code
-/// (rare, e.g. `OGC:CRS84`) is skipped, since the IR carries a numeric code —
-/// and CRS84 is WGS 84, which the default already covers.
-fn wkt_authority_code(wkt: &str) -> Option<(String, i64)> {
+/// interprets the projection the WKT describes. The code is captured verbatim
+/// (the IR's code is a string), so an alphanumeric authority code (e.g.
+/// `OGC:CRS84`) round-trips just as well as a numeric one.
+fn wkt_authority_code(wkt: &str) -> Option<(String, String)> {
     let toks = tokenize_wkt(wkt);
     let mut depth: i32 = 0;
     // (depth, authority, code) of the shallowest id seen; ties resolve to the
     // later one, so `<=` replaces on equal depth.
-    let mut best: Option<(i32, String, i64)> = None;
+    let mut best: Option<(i32, String, String)> = None;
     for i in 0..toks.len() {
         match &toks[i] {
             WktTok::Open => depth += 1,
@@ -318,7 +445,7 @@ fn wkt_authority_code(wkt: &str) -> Option<(String, i64)> {
                 {
                     let code = match toks.get(i + 4) {
                         // WKT1 quotes the code (`"7844"`); WKT2 leaves it bare.
-                        Some(WktTok::Str(c)) | Some(WktTok::Word(c)) => c.parse::<i64>().ok(),
+                        Some(WktTok::Str(c)) | Some(WktTok::Word(c)) => Some(c.clone()),
                         _ => None,
                     };
                     if let Some(code) = code
@@ -341,7 +468,7 @@ mod tests {
     fn gda2020() -> Crs {
         Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
-            code: Some(7844),
+            code: Some("7844".into()),
             wkt: None,
             projjson: None,
         })
@@ -371,13 +498,63 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "crs-registry"))]
     fn parquet_warns_for_a_code_only_crs() {
-        // GeoParquet has no verbatim PROJJSON and no WKT to translate, so a bare
-        // code can only be written as an unresolvable id reference — warn.
+        // Without the registry, GeoParquet has no verbatim PROJJSON and no WKT
+        // to translate, so a bare code can only be written as an unresolvable id
+        // reference — warn, with the rebuild hint.
         let w = gda2020().downgrade_warning(Format::Parquet).unwrap();
         assert!(w.contains("EPSG:7844"), "{w}");
         assert!(w.contains("resolv"), "{w}");
         assert!(w.contains("id reference"), "{w}");
+        assert!(w.contains("--features crs-registry"), "{w}");
+    }
+
+    #[test]
+    #[cfg(feature = "crs-registry")]
+    fn parquet_resolves_a_code_only_crs_via_registry() {
+        // With the registry on, the same bare EPSG:7844 (a real registry entry)
+        // now resolves to the authoritative PROJJSON — no warning, no hint. This
+        // is R1's headline behavior change (crs-registry.org, "the hint stops
+        // firing").
+        assert_eq!(gda2020().downgrade_warning(Format::Parquet), None);
+    }
+
+    #[test]
+    #[cfg(feature = "crs-registry")]
+    fn parquet_still_warns_for_a_code_the_registry_does_not_have() {
+        // A code genuinely absent from the registry (custom/non-catalog) still
+        // warns — the registry only resolves what's actually in proj.db, and the
+        // hint is correctly absent (rebuilding would not help).
+        let custom = Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some("999999999".into()),
+            wkt: None,
+            projjson: None,
+        });
+        let w = custom.downgrade_warning(Format::Parquet).unwrap();
+        assert!(w.contains("id reference"), "{w}");
+        assert!(!w.contains("--features crs-registry"), "{w}");
+    }
+
+    #[test]
+    #[cfg(feature = "crs-registry")]
+    fn parquet_resolves_an_id_less_esri_geographic_wkt_via_name_recovery() {
+        // R2: a shapefile-.prj-shaped source — Esri WKT1, no AUTHORITY node at
+        // all, non-standard datum spelling — carries no authority/code
+        // (from_authority_code's id-lift finds nothing, since there's no id to
+        // lift). Structural translation alone would decline or mis-identify
+        // this (crs-registry.org measured NAD83 -> wrong EPSG:9309); name
+        // recovery gets the real code and resolves it, no warning.
+        let esri_nad83 = "GEOGCS[\"GCS_North_American_1983\",DATUM[\"D_North_American_1983\",\
+             SPHEROID[\"GRS_1980\",6378137.0,298.257222101]],PRIMEM[\"Greenwich\",0.0],\
+             UNIT[\"Degree\",0.0174532925199433]]";
+        let crs = Crs::from_authority_code(None, None, Some(esri_nad83.into()), None);
+        match &crs {
+            Crs::Named(n) => assert_eq!((n.authority.as_deref(), n.code.as_deref()), (None, None)),
+            other => panic!("expected an id-less Named CRS (nothing to lift), got {other:?}"),
+        }
+        assert_eq!(crs.downgrade_warning(Format::Parquet), None);
     }
 
     #[test]
@@ -452,7 +629,8 @@ mod tests {
 
     #[test]
     fn label_falls_back_when_fields_are_missing() {
-        let code_only = Crs::Named(NamedCrs { authority: None, code: Some(3857), ..Default::default() });
+        let code_only =
+            Crs::Named(NamedCrs { authority: None, code: Some("3857".into()), ..Default::default() });
         assert!(code_only.downgrade_warning(Format::GeoJson).unwrap().contains("code 3857"));
 
         let wkt_only = Crs::Named(NamedCrs {
@@ -484,13 +662,13 @@ mod tests {
 
     #[test]
     fn extracts_root_id_from_wkt2() {
-        assert_eq!(wkt_authority_code(GDA2020_WKT2), Some(("EPSG".into(), 7844)));
+        assert_eq!(wkt_authority_code(GDA2020_WKT2), Some(("EPSG".into(), "7844".into())));
     }
 
     #[test]
     fn extracts_root_authority_from_wkt1() {
         // Not the spheroid's 7019, the datum's 6283, or the unit's 9122.
-        assert_eq!(wkt_authority_code(GDA2020_WKT1), Some(("EPSG".into(), 7844)));
+        assert_eq!(wkt_authority_code(GDA2020_WKT1), Some(("EPSG".into(), "7844".into())));
     }
 
     #[test]
@@ -500,9 +678,14 @@ mod tests {
     }
 
     #[test]
-    fn non_integer_code_is_skipped() {
-        // A non-numeric code can't fit the IR's i64 code; the node is ignored.
-        assert_eq!(wkt_authority_code("GEOGCRS[\"x\",ID[\"OGC\",\"CRS84\"]]"), None);
+    fn alphanumeric_code_is_captured() {
+        // The code is a string, so a non-numeric authority code (e.g. OGC:CRS84,
+        // or an IGNF-flavored id) round-trips just like a numeric one — it is no
+        // longer dropped.
+        assert_eq!(
+            wkt_authority_code("GEOGCRS[\"x\",ID[\"OGC\",\"CRS84\"]]"),
+            Some(("OGC".into(), "CRS84".into()))
+        );
     }
 
     #[test]
@@ -512,7 +695,7 @@ mod tests {
         match Crs::from_authority_code(None, None, Some(GDA2020_WKT2.into()), None) {
             Crs::Named(n) => {
                 assert_eq!(n.authority.as_deref(), Some("EPSG"));
-                assert_eq!(n.code, Some(7844));
+                assert_eq!(n.code.as_deref(), Some("7844"));
                 assert!(n.wkt.is_some()); // the definition is still carried through
             }
             other => panic!("expected Named EPSG:7844, got {other:?}"),
@@ -528,11 +711,25 @@ mod tests {
     }
 
     #[test]
+    fn wkt_only_ogc_crs84_collapses_to_the_default() {
+        // The OGC spelling of WGS 84 lon/lat is the alphanumeric code CRS84, not
+        // a numeric 4326 — this only collapses correctly now that the code is a
+        // string the WGS 84 check can compare against "CRS84" directly.
+        let wkt = "GEOGCRS[\"WGS 84 (CRS84)\",DATUM[\"World Geodetic System 1984\",ELLIPSOID[\"WGS 84\",6378137,298.257223563]],ID[\"OGC\",\"CRS84\"]]";
+        assert_eq!(Crs::from_authority_code(None, None, Some(wkt.into()), None), Crs::Wgs84);
+    }
+
+    #[test]
     fn supplied_authority_code_is_not_overridden_by_wkt() {
         // When the caller already knows the code, the WKT is left as-is (even a
         // mismatched embedded id does not override the explicit pair).
-        match Crs::from_authority_code(Some("EPSG".into()), Some(3857), Some(GDA2020_WKT2.into()), None) {
-            Crs::Named(n) => assert_eq!(n.code, Some(3857)),
+        match Crs::from_authority_code(
+            Some("EPSG".into()),
+            Some("3857".into()),
+            Some(GDA2020_WKT2.into()),
+            None,
+        ) {
+            Crs::Named(n) => assert_eq!(n.code.as_deref(), Some("3857")),
             other => panic!("expected Named EPSG:3857, got {other:?}"),
         }
     }

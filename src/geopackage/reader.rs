@@ -65,7 +65,7 @@ fn resolve_crs(srs_id: i64, srs: &[SrsRow]) -> Option<Crs> {
         .then(|| row.definition.clone());
     Some(Crs::from_authority_code(
         Some(row.organization.clone()),
-        Some(row.organization_coordsys_id),
+        Some(row.organization_coordsys_id.to_string()),
         wkt,
         None,
     ))

@@ -1,6 +1,6 @@
 [package]
 name = "geosetta"
-version = "0.20.0"
+version = "0.21.0"
 edition = "2024"
 description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, CSV, WKT), dependency-free."
 license = "MIT"
@@ -16,6 +16,17 @@ name = "geosetta"
 path = "src/main.rs"
 
 [dependencies]
+# Optional embedded CRS registry data (PROJ/EPSG/Esri/IGN/IAU/NKG-derived). Kept
+# in a sibling crate so its third-party dataset terms are isolated and the default
+# build stays dependency-free. Enabled by the `crs-registry` feature.
+geosetta-crs-data = { path = "../geosetta-crs-data", version = "0.1.0", optional = true }
+
+[features]
+# CRS registry: resolve a source's (authority, code) to an authoritative CRS
+# definition via the embedded proj.db-derived table (see geosetta-crs-data/NOTICE
+# for data terms). OFF by default: the default build stays pure-MIT and
+# dependency-free; opt in with --features crs-registry.
+crs-registry = ["dep:geosetta-crs-data"]
 
 [profile.release]
 lto = true

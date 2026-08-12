@@ -73,28 +73,49 @@ pub fn metadata(geometry_types: &[String], bbox: &Bbox, crs: Option<&Crs>) -> St
 /// way to express it. In priority order:
 ///
 /// 1. A source that carried verbatim PROJJSON is re-emitted unchanged.
-/// 2. A WKT definition is translated to PROJJSON when Geosetta can
+/// 2. With the `crs-registry` feature, an authority + code resolves to the
+///    embedded registry's authoritative PROJJSON for that code (the R1
+///    trusted-id path — see [`crate::crs::NamedCrs::registry_projjson`]). A
+///    no-op (always `None`) without the feature.
+/// 3. A WKT definition is translated to PROJJSON when Geosetta can
 ///    ([`crate::crs::wkt_to_projjson`], geographic CRSes) — a *resolvable*
 ///    definition that PROJ/GDAL/QGIS read back correctly.
-/// 3. Failing both, an authority + code is rendered as a minimal PROJJSON `id`
-///    reference (`{"id":{"authority":"EPSG","code":7844}}`), the inverse of the
-///    `id` lifting in [`parse_crs`]. This preserves the identity for Geosetta's
-///    own round trip but is *not* resolvable by PROJ-backed readers — the CLI
-///    warns (see [`crate::crs::Crs::downgrade_warning`]) when it comes to this.
+/// 4. Failing all of the above, an authority + code is rendered as a minimal
+///    PROJJSON `id` reference (`{"id":{"authority":"EPSG","code":7844}}`), the
+///    inverse of the `id` lifting in [`parse_crs`]. This preserves the identity
+///    for Geosetta's own round trip but is *not* resolvable by PROJ-backed
+///    readers — the CLI warns (see [`crate::crs::Crs::downgrade_warning`]) when
+///    it comes to this.
 fn crs_projjson(named: &crate::crs::NamedCrs) -> Option<String> {
     if let Some(projjson) = &named.projjson {
         return Some(projjson.clone());
+    }
+    if let Some(projjson) = named.registry_projjson() {
+        return Some(projjson.to_string());
     }
     if let Some(wkt) = &named.wkt
         && let Some(projjson) = crate::crs::wkt_to_projjson(wkt)
     {
         return Some(projjson);
     }
-    let (authority, code) = (named.authority.clone()?, named.code?);
+    let (authority, code) = (named.authority.clone()?, named.code.clone()?);
     Some(format!(
-        "{{\"id\":{{\"authority\":{},\"code\":{code}}}}}",
-        JsonValue::String(authority).to_json_string()
+        "{{\"id\":{{\"authority\":{},\"code\":{}}}}}",
+        JsonValue::String(authority).to_json_string(),
+        code_json_literal(&code),
     ))
+}
+
+/// PROJJSON's `id.code` is spec'd as an integer *or* a string; emit whichever
+/// the code actually is — bare for a purely-numeric code (the common
+/// EPSG/ESRI/IAU_2015 case, and what real PROJJSON emits), quoted for anything
+/// else (IGNF/OGC/PROJ/NKG's alphanumeric codes, e.g. `"LAMB93"`).
+fn code_json_literal(code: &str) -> String {
+    if !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()) {
+        code.to_string()
+    } else {
+        JsonValue::String(code.to_string()).to_json_string()
+    }
 }
 
 /// Recover the CRS from a `geo` metadata JSON string (the inverse of the `crs`
@@ -115,7 +136,7 @@ pub fn parse_crs(geo: &str) -> Option<Crs> {
                 .and_then(|i| i.get("authority"))
                 .and_then(JsonValue::as_str)
                 .map(String::from);
-            let code = id.and_then(|i| i.get("code")).and_then(JsonValue::as_f64).map(|c| c as i64);
+            let code = id.and_then(|i| i.get("code")).and_then(json_code_as_string);
             Some(Crs::from_authority_code(
                 authority,
                 code,
@@ -126,7 +147,20 @@ pub fn parse_crs(geo: &str) -> Option<Crs> {
     }
 }
 
-/// Format a coordinate as a JSON number (finite values only reach here).
+/// A PROJJSON `id.code` value read back as a string, whichever JSON type it
+/// arrived as (the inverse of [`code_json_literal`]): a JSON string is used
+/// verbatim (IGNF/OGC/PROJ/NKG-style alphanumeric codes), a JSON number is
+/// formatted without a spurious fractional part (authority codes are always
+/// integers).
+fn json_code_as_string(v: &JsonValue) -> Option<String> {
+    match v.as_str() {
+        Some(s) => Some(s.to_string()),
+        None => v.as_f64().map(fmt_num),
+    }
+}
+
+/// Format a coordinate — or, via [`json_code_as_string`], a numeric authority
+/// code — as a JSON number (finite values only reach here).
 fn fmt_num(v: f64) -> String {
     if v == v.trunc() && v.abs() < 1e15 {
         format!("{}", v as i64)
@@ -166,7 +200,7 @@ mod tests {
         let projjson = "{\"type\":\"ProjectedCRS\",\"id\":{\"authority\":\"EPSG\",\"code\":3857}}";
         let crs = Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
-            code: Some(3857),
+            code: Some("3857".into()),
             wkt: None,
             projjson: Some(projjson.into()),
         });
@@ -177,7 +211,7 @@ mod tests {
         match parse_crs(&json).unwrap() {
             Crs::Named(n) => {
                 assert_eq!(n.authority.as_deref(), Some("EPSG"));
-                assert_eq!(n.code, Some(3857));
+                assert_eq!(n.code.as_deref(), Some("3857"));
                 assert!(n.projjson.is_some());
             }
             other => panic!("expected Named, got {other:?}"),
@@ -191,14 +225,41 @@ mod tests {
     }
 
     #[test]
+    fn alphanumeric_code_round_trips_as_a_json_string() {
+        use crate::crs::NamedCrs;
+        // IGNF/OGC/PROJ/NKG-style codes are alphanumeric; PROJJSON's id.code
+        // must be quoted for these (unlike EPSG's bare-number codes), or the
+        // value comes back malformed. A made-up authority keeps this
+        // independent of whether the registry happens to resolve it.
+        let crs = Crs::Named(NamedCrs {
+            authority: Some("CUSTOM".into()),
+            code: Some("GRID-1".into()),
+            wkt: None,
+            projjson: None,
+        });
+        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        assert!(json.contains("\"crs\":{\"id\":{\"authority\":\"CUSTOM\",\"code\":\"GRID-1\"}}"), "{json}");
+
+        match parse_crs(&json).unwrap() {
+            Crs::Named(n) => {
+                assert_eq!(n.authority.as_deref(), Some("CUSTOM"));
+                assert_eq!(n.code.as_deref(), Some("GRID-1"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(not(feature = "crs-registry"))]
     fn authority_code_without_projjson_is_emitted_as_id_reference() {
         use crate::crs::NamedCrs;
         // What GeoPackage / FlatGeobuf hand us: an authority + code (here
         // EPSG:7844, GDA2020) and maybe WKT, but no PROJJSON. Must not be
         // dropped — an omitted `crs` would read back as the WGS 84 default.
+        // Without the registry, this is the best GeoParquet can do.
         let crs = Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
-            code: Some(7844),
+            code: Some("7844".into()),
             wkt: Some("GEOGCRS[\"GDA2020\"]".into()),
             projjson: None,
         });
@@ -208,7 +269,37 @@ mod tests {
         match parse_crs(&json).unwrap() {
             Crs::Named(n) => {
                 assert_eq!(n.authority.as_deref(), Some("EPSG"));
-                assert_eq!(n.code, Some(7844));
+                assert_eq!(n.code.as_deref(), Some("7844"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "crs-registry")]
+    fn authority_code_without_projjson_resolves_via_registry() {
+        use crate::crs::NamedCrs;
+        // Same input as the non-registry case, but with the feature on: the
+        // registry resolves EPSG:7844 to its authoritative PROJJSON rather than
+        // a minimal id reference — R1 step 2.
+        let crs = Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some("7844".into()),
+            wkt: Some("GEOGCRS[\"GDA2020\"]".into()),
+            projjson: None,
+        });
+        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        // Not the minimal id-only form the non-registry path would emit...
+        assert!(!json.contains("\"crs\":{\"id\":{\"authority\":\"EPSG\",\"code\":7844}}"), "{json}");
+        // ...but the full authoritative definition, id included.
+        assert!(json.contains("\"id\":{\"authority\":\"EPSG\",\"code\":7844}"), "{json}");
+        assert!(json.contains("\"type\":\"GeographicCRS\""), "{json}");
+
+        match parse_crs(&json).unwrap() {
+            Crs::Named(n) => {
+                assert_eq!(n.authority.as_deref(), Some("EPSG"));
+                assert_eq!(n.code.as_deref(), Some("7844"));
+                assert!(n.projjson.is_some());
             }
             other => panic!("expected Named, got {other:?}"),
         }

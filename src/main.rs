@@ -4,7 +4,7 @@
 //! binary is a thin CLI wrapper that parses arguments, reads/writes files, and
 //! reports `--progress`.
 
-use geosetta::{cli, convert, geopackage};
+use geosetta::{cli, convert, geopackage, shapefile};
 use geosetta::{Crs, Error, FeatureCollection, Format, Result};
 
 fn main() {
@@ -35,12 +35,10 @@ fn run() -> Result<()> {
     // Everything else routes through the shared feature IR, so any input format
     // converts to any output format the writers support. The stages are made
     // visible under --progress (the pipeline is batch, so this is per-stage, not
-    // sub-stage).
-    let input = std::fs::read(&args.input)?;
-    if args.progress {
-        eprintln!("read {} ({} bytes)", args.input, input.len());
-    }
-    let mut fc = convert::read_features(args.from, &input)?;
+    // sub-stage). Shapefile is multi-file (read_input/write_collection handle
+    // locating/writing its .shp/.shx/.dbf/.prj siblings) but otherwise composes
+    // through the IR exactly like every other format.
+    let mut fc = read_input(&args)?;
     if args.progress {
         eprintln!("parsed {} features from {}", fc.features.len(), args.from.extension());
     }
@@ -54,10 +52,109 @@ fn run() -> Result<()> {
     if args.progress {
         eprintln!("writing {}...", args.to.extension());
     }
-    let output = convert::write_features(args.to, &fc)?;
-    std::fs::write(&args.output, &output)?;
-    eprintln!("wrote {} ({} bytes)", args.output, output.len());
+    write_collection(args.to, &args.output, &fc)
+}
+
+/// Read the input into the Feature IR. Shapefile is multi-file, so its
+/// sibling files (`.dbf` required, `.prj`/`.cpg` optional) are located next to
+/// `args.input` and read explicitly; every other format reads a single buffer
+/// through [`convert::read_features`].
+fn read_input(args: &cli::Args) -> Result<FeatureCollection> {
+    if args.from == Format::Shapefile {
+        return read_shapefile_from_path(&args.input, args.progress);
+    }
+    let input = std::fs::read(&args.input)?;
+    if args.progress {
+        eprintln!("read {} ({} bytes)", args.input, input.len());
+    }
+    convert::read_features(args.from, &input)
+}
+
+/// Write the Feature IR to `output_path`. Shapefile is multi-file, so its
+/// sibling files are written explicitly under `output_path`'s stem; every
+/// other format writes a single buffer through [`convert::write_features`].
+/// Shared by the plain single-collection path and GeoPackage's per-layer
+/// fan-out (`run_geopackage_read`), so a multi-layer `.gpkg` → Shapefile
+/// conversion gets one `layer.shp` sibling set per layer for free.
+fn write_collection(to: Format, output_path: &str, fc: &FeatureCollection) -> Result<()> {
+    if to == Format::Shapefile {
+        return write_shapefile_to_path(output_path, fc);
+    }
+    let bytes = convert::write_features(to, fc)?;
+    std::fs::write(output_path, &bytes)?;
+    eprintln!("wrote {output_path} ({} bytes)", bytes.len());
     Ok(())
+}
+
+/// Read a Shapefile given its `.shp` path, locating `.dbf` (required),
+/// `.prj`, and `.cpg` (both optional) alongside it.
+fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<FeatureCollection> {
+    let shp = std::fs::read(shp_path)?;
+    let dbf_path = sibling_path(shp_path, "dbf")
+        .ok_or_else(|| Error::Usage(format!("shapefile: no .dbf found alongside {shp_path}")))?;
+    let dbf_bytes = std::fs::read(&dbf_path)?;
+    let prj = sibling_path(shp_path, "prj").map(std::fs::read_to_string).transpose()?;
+    let cpg = sibling_path(shp_path, "cpg").map(std::fs::read_to_string).transpose()?;
+    if progress {
+        eprintln!(
+            "read {shp_path} ({} bytes) + {dbf_path} ({} bytes){}",
+            shp.len(),
+            dbf_bytes.len(),
+            if prj.is_some() { " + .prj" } else { "" },
+        );
+    }
+    shapefile::read(&shp, &dbf_bytes, prj.as_deref(), cpg.as_deref())
+}
+
+/// Write a Shapefile's sibling files under `output_path`'s stem (a trailing
+/// `.shp`/`.SHP`, if present, is stripped so `roads.shp` and `roads` both name
+/// the same `roads.{shp,shx,dbf,prj}` set).
+fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection) -> Result<()> {
+    let encoded = shapefile::write(fc)?;
+    let stem = strip_shp_extension(output_path);
+    std::fs::write(format!("{stem}.shp"), &encoded.shp)?;
+    std::fs::write(format!("{stem}.shx"), &encoded.shx)?;
+    std::fs::write(format!("{stem}.dbf"), &encoded.dbf)?;
+    if let Some(prj) = &encoded.prj {
+        std::fs::write(format!("{stem}.prj"), prj)?;
+    }
+    eprintln!(
+        "wrote {stem}.shp + .shx + .dbf{} ({} features)",
+        if encoded.prj.is_some() { " + .prj" } else { "" },
+        fc.features.len(),
+    );
+    Ok(())
+}
+
+fn strip_shp_extension(path: &str) -> String {
+    let p = std::path::Path::new(path);
+    match p.extension().and_then(|e| e.to_str()) {
+        Some(ext) if ext.eq_ignore_ascii_case("shp") => p.with_extension("").to_string_lossy().into_owned(),
+        _ => path.to_string(),
+    }
+}
+
+/// Find a sibling file next to `shp_path` with extension `ext`, trying the
+/// `.shp` path's own case first and its opposite second — real-world
+/// shapefiles mix `.DBF`/`.dbf` casing. `None` when neither casing exists.
+fn sibling_path(shp_path: &str, ext: &str) -> Option<String> {
+    let path = std::path::Path::new(shp_path);
+    let stem = path.file_stem()?.to_string_lossy().into_owned();
+    let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let shp_ext_is_upper = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.chars().next().is_some_and(|c| c.is_ascii_uppercase()));
+    let candidates =
+        if shp_ext_is_upper { [ext.to_ascii_uppercase(), ext.to_string()] } else { [ext.to_string(), ext.to_ascii_uppercase()] };
+    candidates.into_iter().find_map(|e| {
+        let name = format!("{stem}.{e}");
+        let p = match dir {
+            Some(d) => d.join(&name),
+            None => std::path::PathBuf::from(&name),
+        };
+        p.exists().then(|| p.to_string_lossy().into_owned())
+    })
 }
 
 /// Read a GeoPackage (all layers) and fan out to the target format. Output
@@ -96,10 +193,7 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
     let as_dir = args.output.ends_with('/') || std::path::Path::new(&args.output).is_dir();
     if layers.len() == 1 && !as_dir {
         let (_, fc) = &layers[0];
-        let bytes = convert::write_features(args.to, fc)?;
-        std::fs::write(&args.output, &bytes)?;
-        eprintln!("wrote {} ({} bytes)", args.output, bytes.len());
-        return Ok(());
+        return write_collection(args.to, &args.output, fc);
     }
     if !as_dir {
         return Err(Error::Usage(
@@ -110,10 +204,8 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
     std::fs::create_dir_all(&args.output)?;
     let dir = std::path::Path::new(&args.output);
     for (name, fc) in &layers {
-        let bytes = convert::write_features(args.to, fc)?;
         let path = dir.join(format!("{name}.{}", args.to.extension()));
-        std::fs::write(&path, &bytes)?;
-        eprintln!("wrote {} ({} bytes)", path.display(), bytes.len());
+        write_collection(args.to, &path.to_string_lossy(), fc)?;
     }
     Ok(())
 }
@@ -121,13 +213,12 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
 /// Write a layer into a GeoPackage, creating it or appending (upserting the
 /// layer if it already exists). The layer name defaults to the input file stem.
 fn run_geopackage_write(args: &cli::Args) -> Result<()> {
-    let input = std::fs::read(&args.input)?;
-    if args.progress {
-        eprintln!("read {} ({} bytes)", args.input, input.len());
-    }
-
     let mut new_layers = if args.from == Format::Gpkg {
         // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
+        let input = std::fs::read(&args.input)?;
+        if args.progress {
+            eprintln!("read {} ({} bytes)", args.input, input.len());
+        }
         let mut ls = geopackage::read_layers(&input)?;
         if let Some(name) = &args.layer {
             ls.retain(|(n, _)| n == name);
@@ -137,7 +228,9 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
         }
         ls
     } else {
-        let fc = convert::read_features(args.from, &input)?;
+        // Shapefile input's siblings are located via read_input; every other
+        // format reads a single buffer the same way it always has.
+        let fc = read_input(args)?;
         let name = args
             .layer
             .clone()

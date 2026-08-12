@@ -16,6 +16,7 @@ pub enum Format {
     Csv,
     Wkt,
     Gpkg,
+    Shapefile,
 }
 
 impl Format {
@@ -28,6 +29,7 @@ impl Format {
             "csv" => Ok(Format::Csv),
             "wkt" => Ok(Format::Wkt),
             "gpkg" | "geopackage" => Ok(Format::Gpkg),
+            "shapefile" | "shp" | "esri shapefile" => Ok(Format::Shapefile),
             other => Err(Error::Usage(format!("unknown format \"{other}\""))),
         }
     }
@@ -42,6 +44,7 @@ impl Format {
             "csv" => Some(Format::Csv),
             "wkt" => Some(Format::Wkt),
             "gpkg" => Some(Format::Gpkg),
+            "shp" => Some(Format::Shapefile),
             _ => None,
         }
     }
@@ -55,6 +58,7 @@ impl Format {
             Format::Csv => "csv",
             Format::Wkt => "wkt",
             Format::Gpkg => "gpkg",
+            Format::Shapefile => "shp",
         }
     }
 }

@@ -54,6 +54,12 @@ pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> 
         Format::Gpkg => Err(Error::Usage(
             "GeoPackage input is handled per-layer; this path should not be reached".into(),
         )),
+        // Shapefile is multi-file (.shp/.dbf/.prj), so it's read via
+        // shapefile::read in main.rs, which locates the sibling files, rather
+        // than through this single-buffer path.
+        Format::Shapefile => Err(Error::Usage(
+            "Shapefile input is handled via its sibling files; this path should not be reached".into(),
+        )),
     }
 }
 
@@ -65,7 +71,13 @@ pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>>
         Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
         Format::Csv => Ok(csv::write(fc)),
         Format::Wkt => Ok(write_wkt_lines(fc)),
+        // GeoPackage and Shapefile are handled outside this single-buffer path
+        // (see read_features above) — GeoPackage via geopackage::write_layers,
+        // Shapefile via shapefile::write, both called from main.rs.
         Format::Gpkg => Err(Error::Usage("writing GeoPackage is not supported yet".into())),
+        Format::Shapefile => Err(Error::Usage(
+            "Shapefile output is handled via its sibling files; this path should not be reached".into(),
+        )),
     }
 }
 
@@ -499,7 +511,7 @@ mod tests {
         let projjson = "{\"type\":\"ProjectedCRS\",\"id\":{\"authority\":\"EPSG\",\"code\":3857}}";
         fc.crs = Some(Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
-            code: Some(3857),
+            code: Some("3857".into()),
             wkt: None,
             projjson: Some(projjson.into()),
         }));
@@ -507,7 +519,7 @@ mod tests {
         let back = parquet_to_features(&pq).unwrap();
         match back.crs {
             Some(Crs::Named(n)) => {
-                assert_eq!(n.code, Some(3857));
+                assert_eq!(n.code.as_deref(), Some("3857"));
                 assert!(n.projjson.is_some());
             }
             other => panic!("expected Named, got {other:?}"),
@@ -526,7 +538,7 @@ mod tests {
         }]);
         src.crs = Some(Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
-            code: Some(3857),
+            code: Some("3857".into()),
             wkt: Some("PROJCS[\"Web Mercator\"]".into()),
             projjson: None,
         }));
@@ -535,7 +547,7 @@ mod tests {
         let fgb = flatgeobuf::write(&layers[0].1);
         let back = flatgeobuf::read(&fgb).unwrap();
         match back.crs {
-            Some(Crs::Named(n)) => assert_eq!(n.code, Some(3857)),
+            Some(Crs::Named(n)) => assert_eq!(n.code.as_deref(), Some("3857")),
             other => panic!("expected Named EPSG:3857, got {other:?}"),
         }
     }
@@ -593,7 +605,7 @@ mod tests {
         match flatgeobuf::read(&fgb).unwrap().crs {
             Some(Crs::Named(ref n)) => {
                 assert_eq!(n.authority.as_deref(), Some("EPSG"));
-                assert_eq!(n.code, Some(7844));
+                assert_eq!(n.code.as_deref(), Some("7844"));
             }
             other => panic!("expected recovered EPSG:7844, got {other:?}"),
         }
@@ -603,9 +615,199 @@ mod tests {
         let recovered = flatgeobuf::read(&fgb).unwrap();
         let pq = features_to_parquet(&recovered);
         match parquet_to_features(&pq).unwrap().crs {
-            Some(Crs::Named(n)) => assert_eq!(n.code, Some(7844)),
+            Some(Crs::Named(n)) => assert_eq!(n.code.as_deref(), Some("7844")),
             other => panic!("expected EPSG:7844 through Parquet, got {other:?}"),
         }
+    }
+
+    // --- Shapefile ---------------------------------------------------------
+    // Real DuckDB-spatial-generated fixtures (`COPY ... TO 'x.shp' WITH
+    // (FORMAT GDAL, DRIVER 'ESRI Shapefile')`, the same sourcing method used
+    // for the FlatGeobuf/GeoPackage fixtures above), one per geometry family,
+    // oracle-checked by hand against `duckdb`'s own `ST_Read`/`ST_AsText`
+    // before being committed. Shapefile isn't routed through
+    // `convert::read_features` (it's multi-file — see that match arm), so
+    // these call `shapefile::read` directly, mirroring `fgb_to_fc` above.
+
+    #[test]
+    fn reads_shapefile_point() {
+        use crate::geometry::Geometry::Point;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/duckdb_point.shp"),
+            include_bytes!("../tests/fixtures/duckdb_point.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fc.features.len(), 1);
+        assert_eq!(fc.features[0].geometry, Some(Point([1.5, 2.5])));
+        let prop = |k: &str| {
+            fc.features[0].properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        assert_eq!(prop("id").as_f64(), Some(1.0));
+        assert_eq!(prop("name").as_str(), Some("alpha"));
+    }
+
+    #[test]
+    fn reads_shapefile_multilinestring() {
+        use crate::geometry::Geometry::MultiLineString;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/duckdb_multiline.shp"),
+            include_bytes!("../tests/fixtures/duckdb_multiline.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(MultiLineString(vec![
+                vec![[0.0, 0.0], [1.0, 0.0]],
+                vec![[5.0, 5.0], [6.0, 6.0], [7.0, 5.0]],
+            ]))
+        );
+    }
+
+    #[test]
+    fn reads_shapefile_multipoint() {
+        use crate::geometry::Geometry::MultiPoint;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/duckdb_multipoint.shp"),
+            include_bytes!("../tests/fixtures/duckdb_multipoint.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]])));
+    }
+
+    #[test]
+    fn reads_shapefile_polygon_with_hole() {
+        use crate::geometry::Geometry::Polygon;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/duckdb_poly_hole.shp"),
+            include_bytes!("../tests/fixtures/duckdb_poly_hole.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(Polygon(vec![
+                vec![[0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0], [0.0, 0.0]],
+                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+            ]))
+        );
+    }
+
+    #[test]
+    fn reads_shapefile_multipolygon() {
+        use crate::geometry::Geometry::MultiPolygon;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/duckdb_multipoly.shp"),
+            include_bytes!("../tests/fixtures/duckdb_multipoly.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(MultiPolygon(vec![
+                vec![vec![[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]],
+                vec![vec![[5.0, 5.0], [5.0, 6.0], [6.0, 6.0], [6.0, 5.0], [5.0, 5.0]]],
+            ]))
+        );
+    }
+
+    #[test]
+    fn reads_shapefile_prj_as_id_less_named_crs() {
+        // DuckDB/GDAL's WGS 84 .prj carries no AUTHORITY node (real-world Esri
+        // shape — the case crs-registry.org's R2 targets), so it recovers as a
+        // Named CRS with no lifted id, not the Wgs84 default; see KEY FINDINGS
+        // in handoff.org for why this is expected without the registry feature.
+        let prj = std::str::from_utf8(include_bytes!("../tests/fixtures/duckdb_crs_pt.prj")).unwrap();
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/duckdb_crs_pt.shp"),
+            include_bytes!("../tests/fixtures/duckdb_crs_pt.dbf"),
+            Some(prj),
+            None,
+        )
+        .unwrap();
+        match fc.crs {
+            Some(crate::crs::Crs::Named(n)) => {
+                assert_eq!((n.authority, n.code), (None, None));
+                assert!(n.wkt.as_deref().unwrap().contains("GCS_WGS_1984"));
+            }
+            other => panic!("expected an id-less Named CRS, got {other:?}"),
+        }
+    }
+
+    fn shp_to_fc(shp: &[u8], dbf: &[u8]) -> FeatureCollection {
+        crate::shapefile::read(shp, dbf, None, None).unwrap()
+    }
+
+    #[test]
+    fn shapefile_composes_to_parquet_via_hub() {
+        // The hub payoff, mirroring flatgeobuf_composes_to_parquet_via_hub:
+        // Shapefile -> Parquet (a path never written explicitly) then Parquet
+        // -> GeoJSON must reproduce the same features as reading the shapefile
+        // directly.
+        let shp = include_bytes!("../tests/fixtures/duckdb_multipoly.shp");
+        let dbf = include_bytes!("../tests/fixtures/duckdb_multipoly.dbf");
+        let direct = shp_to_fc(shp, dbf);
+        let pq = features_to_parquet(&direct);
+        let via_parquet = parquet_to_features(&pq).unwrap();
+        assert_eq!(sorted_geoms(&direct), sorted_geoms(&via_parquet));
+    }
+
+    #[test]
+    fn shapefile_write_round_trips_all_geometry_types() {
+        // Read each real DuckDB fixture, rewrite it with our writer, read
+        // again — geometry survives (mirrors
+        // flatgeobuf_write_round_trips_all_geometry_types).
+        for (shp, dbf) in [
+            (
+                &include_bytes!("../tests/fixtures/duckdb_point.shp")[..],
+                &include_bytes!("../tests/fixtures/duckdb_point.dbf")[..],
+            ),
+            (
+                &include_bytes!("../tests/fixtures/duckdb_multiline.shp")[..],
+                &include_bytes!("../tests/fixtures/duckdb_multiline.dbf")[..],
+            ),
+            (
+                &include_bytes!("../tests/fixtures/duckdb_poly_hole.shp")[..],
+                &include_bytes!("../tests/fixtures/duckdb_poly_hole.dbf")[..],
+            ),
+            (
+                &include_bytes!("../tests/fixtures/duckdb_multipoly.shp")[..],
+                &include_bytes!("../tests/fixtures/duckdb_multipoly.dbf")[..],
+            ),
+            (
+                &include_bytes!("../tests/fixtures/duckdb_multipoint.shp")[..],
+                &include_bytes!("../tests/fixtures/duckdb_multipoint.dbf")[..],
+            ),
+        ] {
+            let original = shp_to_fc(shp, dbf);
+            let encoded = crate::shapefile::write(&original).unwrap();
+            let reread = crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None).unwrap();
+            assert_eq!(sorted_geoms(&original), sorted_geoms(&reread));
+        }
+    }
+
+    #[test]
+    fn geojson_to_shapefile_preserves_features() {
+        // GeoJSON -> Shapefile (our writer) -> back, via shapefile::read
+        // directly (Shapefile isn't in the hub's single-buffer path).
+        let geojson_fc = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
+        // SAMPLE mixes Point/LineString/Polygon, which a single .shp can't
+        // represent (one shape family per file) — isolate the Point features,
+        // matching the real-world constraint this spoke's writer enforces.
+        let points_only = FeatureCollection::new(
+            geojson_fc.features.iter().filter(|f| matches!(f.geometry, Some(crate::geometry::Geometry::Point(_)))).cloned().collect(),
+        );
+        let encoded = crate::shapefile::write(&points_only).unwrap();
+        let back = crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None).unwrap();
+        assert_eq!(back.features.len(), points_only.features.len());
+        assert_eq!(sorted_geoms(&back), sorted_geoms(&points_only));
     }
 
     #[test]

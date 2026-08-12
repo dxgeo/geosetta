@@ -189,9 +189,18 @@ fn build_header(
 /// as EPSG:4326, the spelling GDAL uses.
 fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>) -> Option<usize> {
     use crate::crs::Crs;
+    // FlatGeobuf's Crs.code is int32 on the wire — genuinely numeric, unlike the
+    // IR's string code (which also holds IGNF/OGC/PROJ/NKG's alphanumeric
+    // codes). A non-numeric code can't be represented here; it falls back to
+    // the same "no code" 0/unset sentinel as below, same as GeoPackage's
+    // synthetic-id fallback — org and wkt still carry through.
     let (org, code, wkt) = match crs? {
         Crs::Wgs84 => (Some("EPSG".to_string()), Some(4326), None),
-        Crs::Named(n) => (n.authority.clone(), n.code, n.wkt.clone()),
+        Crs::Named(n) => (
+            n.authority.clone(),
+            n.code.as_deref().and_then(|c| c.parse::<i64>().ok()),
+            n.wkt.clone(),
+        ),
     };
     // Nothing worth recording.
     if org.is_none() && code.is_none() && wkt.is_none() {
@@ -514,7 +523,7 @@ mod tests {
         use crate::crs::{Crs, NamedCrs};
         let crs = Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
-            code: Some(3857),
+            code: Some("3857".into()),
             wkt: Some("PROJCS[\"Web Mercator\"]".into()),
             projjson: None,
         });
@@ -522,7 +531,7 @@ mod tests {
         match crate::flatgeobuf::read(&bytes).unwrap().crs {
             Some(Crs::Named(n)) => {
                 assert_eq!(n.authority.as_deref(), Some("EPSG"));
-                assert_eq!(n.code, Some(3857));
+                assert_eq!(n.code.as_deref(), Some("3857"));
                 assert_eq!(n.wkt.as_deref(), Some("PROJCS[\"Web Mercator\"]"));
             }
             other => panic!("expected Named, got {other:?}"),
@@ -533,5 +542,29 @@ mod tests {
     fn no_crs_stays_none() {
         let bytes = write(&one_point(None));
         assert_eq!(crate::flatgeobuf::read(&bytes).unwrap().crs, None);
+    }
+
+    #[test]
+    fn alphanumeric_code_is_dropped_but_org_and_wkt_survive() {
+        use crate::crs::{Crs, NamedCrs};
+        // FlatGeobuf's Crs.code is int32 on the wire; a non-numeric code
+        // (IGNF/OGC/PROJ/NKG-style) can't fit, so it's dropped rather than
+        // mangled — but the authority and WKT, which *can* be represented,
+        // still round-trip.
+        let crs = Crs::Named(NamedCrs {
+            authority: Some("IGNF".into()),
+            code: Some("LAMB93".into()),
+            wkt: Some("PROJCS[\"RGF93 Lambert 93\"]".into()),
+            projjson: None,
+        });
+        let bytes = write(&one_point(Some(crs)));
+        match crate::flatgeobuf::read(&bytes).unwrap().crs {
+            Some(Crs::Named(n)) => {
+                assert_eq!(n.authority.as_deref(), Some("IGNF"));
+                assert_eq!(n.code, None);
+                assert_eq!(n.wkt.as_deref(), Some("PROJCS[\"RGF93 Lambert 93\"]"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
     }
 }

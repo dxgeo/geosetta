@@ -301,30 +301,22 @@ fn triggers(table: &str, rtree: &str) -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The `gpkg_extensions` DDL and one registration row per indexed layer,
-/// declaring the RTree extension.
-pub fn extensions_table(layers: &[String]) -> TableSpec {
-    let rows = layers
+/// One `gpkg_extensions` registration row per indexed layer, declaring the
+/// RTree extension. Combined with any other extensions' rows (e.g. R5's
+/// CRS-WKT one) into a single `gpkg_extensions` table by the caller — a
+/// GeoPackage has only one such table regardless of how many extensions are
+/// in use.
+pub fn extension_rows(layers: &[String]) -> Vec<super::writer::ExtensionRow> {
+    layers
         .iter()
-        .enumerate()
-        .map(|(i, name)| {
-            (
-                (i + 1) as i64,
-                vec![
-                    Value::Text(name.clone()),
-                    Value::Text("geom".into()),
-                    Value::Text("gpkg_rtree_index".into()),
-                    Value::Text("http://www.geopackage.org/spec120/#extension_rtree".into()),
-                    Value::Text("write-only".into()),
-                ],
-            )
+        .map(|name| super::writer::ExtensionRow {
+            table_name: name.clone(),
+            column_name: "geom".into(),
+            extension_name: "gpkg_rtree_index".into(),
+            definition: "http://www.geopackage.org/spec120/#extension_rtree".into(),
+            scope: "write-only".into(),
         })
-        .collect();
-    TableSpec {
-        name: "gpkg_extensions".into(),
-        sql: "CREATE TABLE gpkg_extensions (table_name TEXT, column_name TEXT, extension_name TEXT NOT NULL, definition TEXT NOT NULL, scope TEXT NOT NULL)".into(),
-        rows,
-    }
+        .collect()
 }
 
 // --- coordinate rounding ---------------------------------------------------

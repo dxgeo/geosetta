@@ -11,7 +11,7 @@
 # Usage: tests/fixtures/gen_projected_wkt2.sh [per_method_cap]
 set -euo pipefail
 
-cap="${1:-15}"
+cap="${1:-50}"
 here="$(cd "$(dirname "$0")" && pwd)"
 out="$here/projected_wkt2.tsv"
 
@@ -52,4 +52,4 @@ while IFS= read -r crs; do
   n=$((n + 1))
 done <<< "$codes"
 
-echo "wrote $n fixtures to $out (per-method cap $cap; $(projinfo --version 2>&1 | head -1))"
+echo "wrote $n fixtures to $out (per-method cap $cap; $(projinfo 2>&1 1>/dev/null | grep -iE '^Rel' | head -1 || true))"

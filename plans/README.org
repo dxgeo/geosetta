@@ -44,3 +44,29 @@ they are ordered by dependency.
   and common WKT1 projected, gated by =projinfo= bulk oracles) are *DONE*.
   *Remaining:* ambiguous/rare WKT1 projections, the PROJJSON→WKT reverse, and
   EPSG-registry synthesis from a bare code (the dependency-free limit).
+- *CRS registry* (moved out of this repo) :: Embedded CRS registry — *resolve a
+  source's (authority, code) (inline id, name→code, or structural match), then
+  emit the authoritative definition* in the target's dialect, instead of
+  translating the CRS string. A build-time-generated, zstd-compressed
+  =(auth,code)→{PROJJSON,WKT1}= blob covering *all 13 790 CRSes in proj.db* —
+  every authority (EPSG, ESRI, IGNF, OGC, IAU_2015 planetary, …) and type — in
+  *~2.3 MB*, decoded by =geosetta='s own =compress/zstd.rs=. Supersedes =crs.org=
+  milestone D and reframes C. Because it embeds third-party dataset data (with its
+  own terms), it lives in a *sibling crate*, =geosetta-crs-data=, pulled in behind
+  a =crs-registry= feature so the core stays pure-MIT and dependency-free. Plan and
+  =NOTICE= live there (=../../geosetta-crs-data/crs-registry.org=). *Depends on
+  =crs.org=.*
+- [[file:shapefile.org][shapefile.org]] :: Add Shapefile — the first *multi-file*
+  spoke (=.shp=+=.shx=+=.dbf=+=.prj=+=.cpg= sharing a basename, the inverse
+  shape of GeoPackage's one-file-many-layers), a from-scratch mixed-endian
+  =.shp= geometry codec (with real ring-classification geometry for the
+  Polygon/MultiPolygon disambiguation) and dBase =.dbf= attribute codec, plus
+  =main.rs= multi-file I/O special-casing. *DONE* (read+write, both directions,
+  including GeoPackage↔Shapefile fan-out) — see the file's STATUS section for
+  what's deliberately deferred (Z/M/MultiPatch, memo fields, projected-Esri
+  =.prj= structural recovery). This is also the CRS registry plan's named *R4*
+  — the shapefile =.prj='s id-less, Esri-flavor WKT1 is the original driver for
+  the whole registry pivot; R2's geographic name-recovery already applies to it
+  with no new CRS code, and =.prj= writing is the first consumer of R1's
+  =registry::def_wkt=. *Depends on the CRS registry* (for full =.prj= fidelity;
+  geometry/attributes have no dependency on it).

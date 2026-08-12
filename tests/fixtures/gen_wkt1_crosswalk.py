@@ -31,7 +31,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-CAP = int(sys.argv[1]) if len(sys.argv) > 1 else 60
+CAP = int(sys.argv[1]) if len(sys.argv) > 1 else 200
 
 PROJ_DB = os.environ.get("PROJ_DB") or next(
     (p for p in (

@@ -26,7 +26,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.21.0**.
+Current version: **0.21.1**.
 
 Seven formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with

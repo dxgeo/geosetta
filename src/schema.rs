@@ -85,29 +85,31 @@ impl Infer {
 
 /// Scan all features and build the property columns.
 ///
-/// Single pass in `O(rows × cols)`: a `HashMap` assigns each property key a
-/// stable first-seen column index (no linear scan over known columns per
-/// property), each key's type is merged as values are seen, and every row's
-/// value is recorded per column with absent cells back-filled as `None`. A
-/// second pass then resolves each column's type and materializes its cells.
+/// Two passes, neither doing per-row work proportional to the *total* column
+/// count (unlike a design that back-fills every known column on every row):
+///
+/// 1. Discover the column set (a `HashMap` assigns each property key a stable
+///    first-seen index) and merge each column's type, without materializing
+///    any per-row values yet.
+/// 2. Append each column's cells in row order as they're encountered. A
+///    column not touched by the current row is left alone rather than
+///    eagerly padded — the gap is back-filled with `Null` only when (a) that
+///    column is touched again later, or (b) the pass ends and it never is.
+///    So a fully dense table (every row has every key, the common case) costs
+///    one push per cell and never touches a column it isn't writing to; only
+///    genuinely sparse data pays for back-filling, proportional to the gaps
+///    it actually has.
 pub fn infer_columns(features: &[Feature]) -> Vec<Column> {
     let mut index: HashMap<&str, usize> = HashMap::new();
     let mut order: Vec<&str> = Vec::new();
     let mut types: Vec<Option<Infer>> = Vec::new();
-    // Per column, the value at each row (borrowed from `features`); `None` marks
-    // a row that omitted the key. Kept row-aligned as the pass proceeds.
-    let mut raw: Vec<Vec<Option<&JsonValue>>> = Vec::new();
 
-    for (row, feature) in features.iter().enumerate() {
+    for feature in features {
         for (key, value) in &feature.properties {
             let idx = *index.entry(&**key).or_insert_with(|| {
                 let i = order.len();
                 order.push(&**key);
                 types.push(None);
-                // Back-fill the rows before this key first appeared.
-                let mut col = Vec::with_capacity(features.len());
-                col.resize(row, None);
-                raw.push(col);
                 i
             });
             if let Some(inf) = Infer::of(value) {
@@ -116,35 +118,47 @@ pub fn infer_columns(features: &[Feature]) -> Vec<Column> {
                     None => inf,
                 });
             }
-            // Record this row's value; on a duplicate key within the row the
-            // first occurrence wins (matching the old `find`-based lookup).
-            if raw[idx].len() == row {
-                raw[idx].push(Some(value));
-            }
-        }
-        // Any column not touched this row gets a Null cell for it.
-        for col in raw.iter_mut() {
-            if col.len() == row {
-                col.push(None);
-            }
         }
     }
 
-    // Materialize each column, filling missing/null cells with Null.
+    // Columns whose values were all null default to String.
+    let resolved: Vec<ColumnType> =
+        types.iter().map(|t| t.map(Infer::resolve).unwrap_or(ColumnType::String)).collect();
+
+    let n = features.len();
+    let mut columns: Vec<Vec<Cell>> = resolved.iter().map(|_| Vec::with_capacity(n)).collect();
+
+    for (row, feature) in features.iter().enumerate() {
+        for (key, value) in &feature.properties {
+            let idx = *index.get(&**key).expect("every key was indexed in the first pass");
+            let col = &mut columns[idx];
+            match col.len().cmp(&row) {
+                // Common case: this column was written last row too, so it's
+                // exactly caught up — just append.
+                std::cmp::Ordering::Equal => col.push(materialize(resolved[idx], Some(value))),
+                // This column skipped one or more rows since its last
+                // appearance: back-fill the gap, then append.
+                std::cmp::Ordering::Less => {
+                    col.resize(row, Cell::Null);
+                    col.push(materialize(resolved[idx], Some(value)));
+                }
+                // Already written this row: a duplicate key within one row's
+                // properties, where the first occurrence wins (matching the
+                // old `find`-based lookup).
+                std::cmp::Ordering::Greater => {}
+            }
+        }
+    }
+    // Any column whose last appearance wasn't the final row is still short.
+    for col in columns.iter_mut() {
+        col.resize(n, Cell::Null);
+    }
+
     order
         .into_iter()
-        .zip(types)
-        .zip(raw)
-        .map(|((name, ty), col)| {
-            // Columns whose values were all null default to String.
-            let ty = ty.map(Infer::resolve).unwrap_or(ColumnType::String);
-            let values = col.into_iter().map(|v| materialize(ty, v)).collect();
-            Column {
-                name: name.to_string(),
-                ty,
-                values,
-            }
-        })
+        .zip(resolved)
+        .zip(columns)
+        .map(|((name, ty), values)| Column { name: name.to_string(), ty, values })
         .collect()
 }
 
@@ -223,5 +237,15 @@ mod tests {
         let a = cols.iter().find(|c| c.name == "a").unwrap();
         assert_eq!(a.values[0], Cell::Int(1));
         assert_eq!(a.values[1], Cell::Null);
+    }
+
+    #[test]
+    fn duplicate_key_in_one_row_keeps_the_first_value() {
+        // The JSON object model preserves duplicate keys as separate members
+        // (it's a Vec, not a map), so a row can legitimately carry the same
+        // property twice; the first occurrence should win.
+        let f = features(&[r#"{"a":1,"a":2}"#]);
+        let cols = infer_columns(&f);
+        assert_eq!(cols[0].values[0], Cell::Int(1));
     }
 }

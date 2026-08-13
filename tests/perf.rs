@@ -77,10 +77,34 @@ fn gen_geojson(n: usize) -> String {
     s
 }
 
+/// Generate a GeoJSON FeatureCollection of `n` points with the same
+/// properties as [`gen_geojson`]. Shapefile's `.shp` can only hold one
+/// geometry type per file, so the mixed-geometry fixture doesn't work there.
+fn gen_points_geojson(n: usize) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(n * 120);
+    s.push_str("{\"type\":\"FeatureCollection\",\"features\":[");
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        let x = -180.0 + (i as f64 * 0.001) % 360.0;
+        let y = -90.0 + (i as f64 * 0.0007) % 180.0;
+        let _ = write!(
+            s,
+            "{{\"type\":\"Feature\",\"geometry\":{{\"type\":\"Point\",\"coordinates\":[{x:.6},{y:.6}]}},\"properties\":{{\"id\":{i},\"name\":\"f{i}\",\"val\":{:.3},\"flag\":{}}}}}",
+            (i as f64) * 1.5,
+            i % 2 == 0
+        );
+    }
+    s.push_str("]}");
+    s
+}
+
 /// Generate a FeatureCollection of `n` points, each carrying `cols` typed
 /// properties (int / float / string / bool, cycling by column). Geometry is a
 /// trivial point, so property handling dominates: this isolates the cost of
-/// `schema::infer_columns` (which scales with the *square* of the column count)
+/// `schema::infer_columns` (a HashMap-keyed single pass, `O(rows × cols)`)
 /// and the per-row property key/value (de)construction — neither of which the
 /// narrow four-property `gen_geojson` exercises.
 fn gen_wide_geojson(n: usize, cols: usize) -> String {
@@ -154,8 +178,8 @@ fn bench(label: &str, input: &Path, in_bytes: u64, n: usize, output: &Path, extr
     size
 }
 
-/// Build the shared source fixtures (geojson + the binary formats derived from
-/// it) once, returning the scratch dir and the geojson byte size.
+/// Build the shared source fixtures (geojson + the formats derived from it)
+/// once, returning the scratch dir and the geojson byte size.
 fn setup(n: usize) -> (PathBuf, u64) {
     let dir = scratch();
     let geojson = dir.join("bench.geojson");
@@ -163,10 +187,19 @@ fn setup(n: usize) -> (PathBuf, u64) {
     std::fs::write(&geojson, &text).unwrap();
     let bytes = text.len() as u64;
 
-    // Derive the binary inputs used by the read benchmarks.
+    // Derive the inputs used by the read benchmarks (one per format).
     run(&geojson, &dir.join("bench.parquet"), &[]);
     run(&geojson, &dir.join("bench.fgb"), &[]);
     run(&geojson, &dir.join("bench.csv"), &[]);
+    run(&geojson, &dir.join("bench.wkt"), &[]);
+    run(&geojson, &dir.join("bench.gpkg"), &[]);
+
+    // Shapefile is single-geometry-type per file, so it gets its own
+    // points-only source (see `gen_points_geojson`).
+    let points_geojson = dir.join("bench_points.geojson");
+    std::fs::write(&points_geojson, gen_points_geojson(n)).unwrap();
+    run(&points_geojson, &dir.join("bench.shp"), &[]);
+
     (dir, bytes)
 }
 
@@ -182,21 +215,45 @@ fn throughput() {
     let pq = sz(g("bench.parquet"));
     let fgb = sz(g("bench.fgb"));
     let csv = sz(g("bench.csv"));
+    let wkt = sz(g("bench.wkt"));
+    let shp = sz(g("bench.shp"));
+    let gpkg = sz(g("bench.gpkg"));
 
-    // Reads (input format is what we're stressing; output is cheap-ish).
-    bench("geojson->wkt (read gj)", &g("bench.geojson"), geo_bytes, n, &g("out.wkt"), &[]);
-    bench("parquet->geojson", &g("bench.parquet"), pq, n, &g("out1.geojson"), &[]);
-    bench("fgb->geojson", &g("bench.fgb"), fgb, n, &g("out2.geojson"), &[]);
-    bench("csv->geojson", &g("bench.csv"), csv, n, &g("out3.geojson"), &[]);
+    // Reads: one per format (input format is what we're stressing; output is
+    // cheap-ish geojson).
+    bench("parquet->geojson", &g("bench.parquet"), pq, n, &g("r_pq.geojson"), &[]);
+    bench("fgb->geojson", &g("bench.fgb"), fgb, n, &g("r_fgb.geojson"), &[]);
+    bench("csv->geojson", &g("bench.csv"), csv, n, &g("r_csv.geojson"), &[]);
+    bench("wkt->geojson", &g("bench.wkt"), wkt, n, &g("r_wkt.geojson"), &[]);
+    bench("shp->geojson", &g("bench.shp"), shp, n, &g("r_shp.geojson"), &[]);
+    bench("gpkg->geojson", &g("bench.gpkg"), gpkg, n, &g("r_gpkg.geojson"), &[]);
 
-    // Writes (output format is what we're stressing).
-    bench("geojson->parquet", &g("bench.geojson"), geo_bytes, n, &g("out.parquet"), &[]);
-    bench("geojson->fgb", &g("bench.geojson"), geo_bytes, n, &g("out.fgb"), &[]);
-    bench("geojson->gpkg", &g("bench.geojson"), geo_bytes, n, &g("out.gpkg"), &[]);
-    bench("gpkg->geojson", &g("out.gpkg"), sz(g("out.gpkg")), n, &g("out4.geojson"), &[]);
+    // Writes: one per format (source is always geojson, cheap-ish to read;
+    // output format is what we're stressing).
+    bench("geojson->parquet", &g("bench.geojson"), geo_bytes, n, &g("w.parquet"), &[]);
+    bench("geojson->fgb", &g("bench.geojson"), geo_bytes, n, &g("w.fgb"), &[]);
+    bench("geojson->gpkg", &g("bench.geojson"), geo_bytes, n, &g("w.gpkg"), &[]);
+    bench("geojson->csv", &g("bench.geojson"), geo_bytes, n, &g("w.csv"), &[]);
+    bench("geojson->wkt", &g("bench.geojson"), geo_bytes, n, &g("w.wkt"), &[]);
+    // Shapefile can't hold mixed geometry types, so this stresses the
+    // points-only source built in `setup` rather than `bench.geojson`.
+    let points_bytes = sz(g("bench_points.geojson"));
+    bench("geojson->shp", &g("bench_points.geojson"), points_bytes, n, &g("w.shp"), &[]);
+
+    // A few non-geojson-anchored pairs: these chain two formats that both
+    // carry a materialized CRS (GeoPackage srs_id + WKT, FlatGeobuf's Crs
+    // table, Shapefile's .prj text) straight into each other, which a
+    // geojson-anchored read or write never exercises — geojson has no CRS
+    // channel at all, so it never touches the WKT/PROJJSON translation path
+    // in crs.rs. (The fixtures here are WGS 84, so this hits the well-known
+    // fast path rather than the general structural translator, but it still
+    // covers the pair-specific CRS carry-through code.)
+    bench("gpkg->parquet", &g("bench.gpkg"), gpkg, n, &g("p_gpkg.parquet"), &[]);
+    bench("shp->parquet", &g("bench.shp"), shp, n, &g("p_shp.parquet"), &[]);
+    bench("fgb->gpkg", &g("bench.fgb"), fgb, n, &g("p_fgb.gpkg"), &[]);
 
     // Sanity: a full round trip preserves the feature count.
-    let back = std::fs::read_to_string(g("out1.geojson")).unwrap();
+    let back = std::fs::read_to_string(g("r_pq.geojson")).unwrap();
     assert_eq!(back.matches("\"Feature\"").count(), n, "feature count preserved");
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -204,7 +261,7 @@ fn throughput() {
 
 /// Wide-table benchmark: the same feature count, but many property columns, to
 /// expose the per-column costs the narrow `throughput` run hides. On the write
-/// side this stresses `schema::infer_columns` (currently O(rows × cols²)); on
+/// side this stresses `schema::infer_columns` (linear, `O(rows × cols)`); on
 /// the read side, the per-row rebuild of each feature's properties (one key
 /// `String` allocation and one value clone per cell). Watch how the reported
 /// feat/s degrades as `GEOSETTA_BENCH_COLS` grows — a linear-in-cols schema pass

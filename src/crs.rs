@@ -160,7 +160,7 @@ impl Crs {
         let label = named.label();
         match target {
             Format::GeoJson => Some(format!(
-                "warning: source CRS is {label}; GeoJSON is always WGS 84 — output \
+                "warning: {label} is not WGS 84; GeoJSON is always WGS 84 — output \
                  coordinates will be mislabeled. Reproject to EPSG:4326 before converting."
             )),
             Format::Csv | Format::Wkt => Some(format!(
@@ -189,7 +189,7 @@ impl Crs {
                 #[cfg(feature = "crs-registry")]
                 let hint = "";
                 Some(format!(
-                    "warning: source CRS {label} will not be resolvable in the GeoParquet output — \
+                    "warning: {label} will not be resolvable in the GeoParquet output — \
                      {detail}, so it is written only as an id reference that PROJ/GDAL/QGIS read as unknown.{hint}"
                 ))
             }
@@ -216,7 +216,7 @@ impl Crs {
                 #[cfg(feature = "crs-registry")]
                 let hint = "";
                 Some(format!(
-                    "warning: source CRS {label} will not be recorded in the Shapefile output — \
+                    "warning: {label} will not be recorded in the Shapefile output — \
                      {detail}, so no .prj will be written.{hint}"
                 ))
             }

@@ -108,6 +108,9 @@ for columns a row omits; a second pass resolves each column type and
 materializes. Duplicate keys within a row keep the first occurrence, matching the
 old =find=-based lookup. All 107 tests pass.
 
+(Superseded by item 7 below — that back-filling-every-row design was still
+paying a real per-row constant factor even though the asymptotics were fixed.)
+
 Result (=wide_table=, N=40k, best-of-3, release, with item 2 below):
 | conversion             | 30 cols (before→after) | 60 cols (before→after) | col-doubling |
 |------------------------+------------------------+------------------------+--------------|
@@ -217,6 +220,51 @@ the 4-property common case (no regression) and improved key-heavy reads.
   for a throughput-only gain — deliberately left for later, if ever. Note this is
   *not* a dependency question: the current formatter is =std=, so there is no
   crate to remove; the only question is speed vs. maintenance/correctness risk.
+
+*** DONE 7. =schema::infer_columns=: cut the per-row column sweep and the double =Null= write  [write path]
+Item 1 fixed the asymptotics but item 1's own pass still had a real per-row
+constant factor: after each row's properties, a =for col in raw.iter_mut()=
+loop swept *every known column so far* to back-fill a =None= for the ones that
+row didn't touch — =O(cols)= work every row regardless of how many properties
+that row actually has. Profiling a 3M-row, 4-column =geojson→parquet= with
+=sample= (macOS's built-in, no-sudo stack sampler — =dtrace=/=cargo flamegraph=
+need root here) showed this single function eating ~19% of total wall time,
+~47% of the write phase.
+
+Rewrote as two passes, neither doing per-row work proportional to the *total*
+column count:
+1. Discover the column set + merge each column's type — no per-row value
+   materialization.
+2. Append each column's cells in row order as encountered; a column skipped by
+   the current row is left alone, not eagerly padded. The gap is back-filled
+   with =Null= lazily — only when that column is touched again, or once at the
+   end if it never is. A fully dense table (every row has every key, the
+   common case) costs exactly one push per cell and never touches a column
+   it isn't writing to.
+
+First attempt pre-sized every column to =vec![Cell::Null; n]= up front instead
+of the lazy back-fill above — *wrong*: for dense data (no rows ever omit a
+key) every cell then gets written *twice* (the eager =Null=, then the real
+value), and =Cell= is ~4× the size of the =Option<&JsonValue>= item 1's raw
+buffer held. Caught this because a wide-column benchmark (200 cols) got
+measurably *slower*, not faster — the narrow 4-column case alone didn't reveal
+it. The lazy version fixed it in both regimes. Added a duplicate-key-within-one-row
+test (item 1's =find=-first-wins rule had no dedicated test).
+
+Result: whole-process wall-clock at these scales was too noisy to trust (even
+interleaved A/B, the machine was under load this session) — from-scratch/new
+binaries, =sample=-based time-share (immune to absolute-clock drift, since it's
+a ratio within one run) gave the reliable signal instead:
+| fixture                | before (sample-ms) | after | total Δ | =infer_columns= Δ |
+|-------------------------+--------------------+-------+---------+--------------------|
+| 4 cols, 3M rows         | 2819               | 2660  | -5.6%   | -32.6%             |
+| 30 cols, 200k rows      | 486                | 456   | -6.2%   | ~flat (noisy)      |
+| 200 cols, 50k rows      | 868                | 744   | -14.3%  | -44.2%             |
+Win grows with column count, as expected — the eliminated sweep was =O(cols)=
+per row. =bench/compare.py=, which only ever used a 4-property fixture, was
+extended with a =WIDE_N=/=WIDE_COLS= wide-column case to actually exercise this;
+at 200 cols geosetta's margin over ogr2ogr/duckdb *widens* to 8–10× (vs 5–9× on
+the narrow cases) — both external tools scale worse with column count too.
 
 *** Deferred / profile-first
 - =get()= on JSON objects is a linear scan; fine for small feature/geometry

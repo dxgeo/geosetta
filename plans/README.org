@@ -33,9 +33,25 @@ they are ordered by dependency.
   =--progress= can show a live percentage on large files (the current flag only
   reports per-stage). *Enhancement, not yet implemented.*
 - [[file:performance.org][performance.org]] :: Read/write throughput — the
-  =tests/perf.rs= benchmark harness, the GeoJSON writer's JsonValue-tree bypass
-  (*done*, ~2× on =* → geojson=), and the symmetric streaming GeoJSON reader
-  (*done*, ~1.35× on GeoJSON read).
+  =tests/perf.rs= harness (=throughput= + =wide_table= benchmarks) and
+  =bench/compare.py= (vs ogr2ogr/duckdb). *DONE*: the GeoJSON writer's
+  JsonValue-tree bypass (~2× on =* → geojson=) and the symmetric streaming
+  reader (~1.35× on GeoJSON read); =schema::infer_columns= fixed from
+  O(rows×cols²) to O(rows×cols) via a =HashMap=-keyed pass, then further to a
+  lazy-backfill single pass that skips the per-row sweep over every known
+  column entirely (measured via =sample= time-share, since whole-process
+  wall-clock was too noisy at these scales) — the win widens with column
+  count, and now shows up in =compare.py='s dedicated wide-column case as an
+  8–10× margin over ogr2ogr/duckdb, vs 5–9× on the narrow, 4-property cases;
+  Parquet read de-duplication (dropped the second per-cell copy) and
+  reader-internal column fusion; bulk-copy string writing instead of
+  char-by-char; =Rc<str>= property-key sharing/interning to cut per-row key
+  allocation; a Parquet all-present level-decoding fast path and WKB =Vec=
+  pre-sizing to avoid reallocs. *Remaining:* a hand-rolled float formatter
+  (dtoa/Ryū) is parked — correctness-risk and effort not worth it yet against
+  =std='s formatter; the compression codecs are untuned but unlikely to be the
+  bottleneck; full streaming (vs. whole-file-in-RAM) is tracked separately in
+  [[file:streaming-progress.org][streaming-progress.org]].
 - [[file:crs.org][crs.org]] :: CRS pass-through across all formats — warnings when
   a CRS-degrading target (GeoJSON/CSV/WKT) can't express the source CRS (those
   formats stay as-is), making authority+code universal among the rich formats,

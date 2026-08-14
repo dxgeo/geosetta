@@ -26,9 +26,9 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.21.1**.
+Current version: **0.22.0**.
 
-Seven formats are supported, all routed through a shared feature IR
+Eight formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
 every other automatically — no per-pair code:
 
@@ -54,6 +54,17 @@ every other automatically — no per-pair code:
     Composes with GeoPackage's multi-layer fan-out for free (one `layer.shp`
     sibling set per `.gpkg` layer, in either direction). Validated against real
     DuckDB-generated fixtures and GDAL/DuckDB's own readers.
+-   **KML** and **KMZ** (read + write) on a from-scratch XML reader/writer
+    (`src/xml.rs`) and a minimal ZIP container codec (`src/zip.rs`). CRS is
+    always WGS 84 (KML has no other CRS concept). `.kmz` reading flattens
+    every internal `*.kml` entry rather than trusting just the first, since a
+    real multi-layer producer's root `doc.kml` can be nothing but a
+    `<NetworkLink>` pointing at the actual data; writing packs the `.kml`
+    bytes as one stored (uncompressed) zip entry — no DEFLATE encoder in the
+    crate yet, so `.kmz` output is bigger than a compressed one but
+    universally readable. Validated against real GDAL (`ogrinfo`,
+    `ogr2ogr -f LIBKML`) and DuckDB-generated fixtures, plus a real Info-ZIP
+    archive for the deflate read path.
 
 Any input converts to any output: e.g. CSV→GeoParquet, FlatGeobuf→GeoJSON,
 GeoPackage→GeoParquet, GeoJSON→GeoPackage, GeoPackage↔Shapefile all work.
@@ -86,13 +97,19 @@ and the geojson→parquet→geojson→parquet round trip is byte-for-byte stable
 
 The reader also handles common **foreign** GeoParquet: DuckDB's default output
 (dictionary-encoded columns, multiple row groups) reads back correctly,
-geometry included, under SNAPPY, GZIP, ZSTD, LZ4<sub>RAW</sub>, or no compression — the
+geometry included, under SNAPPY, GZIP, ZSTD, LZ4_RAW, or no compression — the
 ZSTD, GZIP/DEFLATE, and LZ4 decoders are implemented from scratch in
 `compress/zstd.rs`, `compress/gzip.rs`, and `compress/lz4.rs`. Property columns may
-be `BOOLEAN`, `INT32=/=INT64`, `FLOAT=/=DOUBLE`, or `BYTE_ARRAY` strings, with
-`DATE` and `TIMESTAMP` columns rendered as ISO 8601 strings. Remaining gaps —
-`DATA_PAGE_V2`, `DECIMAL=/=INT96`, nested columns, 3D geometry, Brotli — are
-reported as clear errors and tracked in
+be `BOOLEAN`, `INT32`/`INT64`, `FLOAT`/`DOUBLE`, or `BYTE_ARRAY` strings, with
+`DATE` and `TIMESTAMP` columns rendered as ISO 8601 strings. The schema parser
+walks the file's actual schema *tree* (not just each leaf's own repetition
+type), so a column nested under an OPTIONAL group decodes correctly too — the
+case that matters in practice is GDAL/OGR's GeoParquet 1.1 `geometry_bbox`
+"covering" column, which it writes by default; Geosetta recognizes it via the
+`geo` metadata and excludes it from `properties` rather than surfacing it as a
+fake column (fixture: `tests/fixtures/gdal_covering_bbox.parquet`). Remaining
+gaps — `DATA_PAGE_V2`, `DECIMAL`/`INT96`, genuinely nested/repeated (list-valued)
+columns, 3D geometry, Brotli — are reported as clear errors and tracked in
 [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
 
 
@@ -177,11 +194,24 @@ features (heterogeneous or nested values fall back to a JSON string).
     geosetta parcels.shp   parcels.geojson  # Shapefile  -> GeoJSON (reads sibling .shx/.dbf/.prj)
     geosetta roads.geojson roads.shp        # GeoJSON    -> Shapefile
     geosetta data.gpkg     out/ --to shp    # multi-layer GeoPackage -> one .shp set per layer
+    geosetta places.kml    places.geojson   # KML        -> GeoJSON
+    geosetta places.kmz    places.parquet   # KMZ        -> GeoParquet (reads every internal .kml)
+    geosetta places.geojson places.kml      # GeoJSON    -> KML
+    geosetta places.geojson places.kmz      # GeoJSON    -> KMZ (stored, uncompressed)
     # formats may also be given explicitly:
     geosetta in.txt out.bin --from geojson --to parquet
     # the embedded CRS registry (name recovery for id-less WKT1, WKT2 emission, …)
     # is opt-in — build/run with:
     cargo run --features crs-registry -- parcels.shp parcels.parquet
+    # or, when installing the published crate:
+    cargo install geosetta --features crs-registry
+    # "-" means stdin/stdout (needs --from/--to, since there's no path to infer
+    # a format from) — pipe any external tool in between read and write, e.g. a
+    # reprojection step, since Geosetta itself never reprojects:
+    reproject-tool --to EPSG:3857 < in.geojson | geosetta --from geojson --to fgb - out.fgb
+    # not supported for Shapefile (sibling .shp/.shx/.dbf/.prj files, no single
+    # byte stream to pipe) — route it through a single-buffer format instead:
+    geosetta in.shp - --to fgb | reproject-tool --to EPSG:3857 | geosetta - out.shp --from fgb
 
 A runnable example lives in [examples/sample.geojson](examples/sample.geojson).
 
@@ -219,7 +249,7 @@ tail of formats that GDAL and Arrow already handle robustly.
 
 The GeoParquet reader now covers essentially every file DuckDB / Arrow / GDAL
 produce in practice: dictionary encoding, multiple row groups, the
-SNAPPY/GZIP/ZSTD/LZ4 codecs, =BOOLEAN=/=INT32=/=INT64=/=FLOAT=/=DOUBLE=/string
+SNAPPY/GZIP/ZSTD/LZ4 codecs, `BOOLEAN`/`INT32`/`INT64`/`FLOAT`/`DOUBLE`/string
 columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
 
 -   **Spatial indexing** — done across all three formats: the shared Hilbert
@@ -227,8 +257,9 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
     clustering, and now the opt-in `--rtree` GeoPackage R\*Tree extension (scoped in
     [plans/spatial-index.org](plans/spatial-index.org)). Whether to make `--rtree` the default is the one
     remaining open question there.
--   **More format spokes** — Shapefile is done (see above); the next classic
-    candidate is a further-out consideration, not yet scoped.
+-   **More format spokes** — Shapefile and KML/KMZ are both done (see above),
+    scoped in [plans/kml.org](plans/kml.org). The next classic candidate is a
+    further-out consideration, not yet scoped.
 -   **Raster formats** (larger effort, planned) — a genuinely new axis. Raster data
     is a grid of cells, not a set of features, so it needs a second intermediate
     representation (a coverage/grid model) beside the feature IR, with its own
@@ -251,6 +282,19 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
     resolution makes any of the structural crosswalk's hand-maintained tables
     redundant in the default (`crs-registry`-off) build without regressing it,
     and whether/when `crs-registry` should become a default-on feature.
+-   **Reprojection composability** — implemented (scoped in
+    [plans/reproject-composability.org](plans/reproject-composability.org)).
+    Geosetta still never reprojects itself, but two seams now let an external
+    tool do it as a stage between read and write: `-` as `<input>`/`<output>`
+    pipes any external CLI through stdin/stdout (not supported for Shapefile,
+    which is multi-file — route it through a single-buffer format instead), and
+    `FeatureCollection::for_each_position_mut`/`for_each_position_run_mut`
+    (`src/feature.rs`, `src/geometry/mod.rs`) let a linked-in Rust reprojection
+    *library* rewrite coordinates in place, the latter yielding whole
+    contiguous coordinate runs for backends that batch. Verified against three
+    independent, real tools — GDAL (`ogr2ogr`), PROJ (`cs2cs`), and the
+    [`wbprojection`](https://crates.io/crates/wbprojection) crate — in
+    `tests/reproject_pipe.rs`.
 
 Detailed design notes live in [plans/](plans/README.org).
 

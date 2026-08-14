@@ -3,9 +3,59 @@
 //! All conversion logic lives in the library crate ([`geosetta`]); this
 //! binary is a thin CLI wrapper that parses arguments, reads/writes files, and
 //! reports `--progress`.
+//!
+//! `-` as `<input>` or `<output>` means stdin/stdout (the standard Unix
+//! convention), so any external tool composes with geosetta through an
+//! ordinary pipe — including a reprojection step, since geosetta itself never
+//! reprojects (see [`geosetta::crs`]):
+//! ```text
+//! reproject-tool --to EPSG:3857 < in.geojson | geosetta --from geojson --to fgb - out.fgb
+//! ```
+//! Shapefile is excluded: it's sibling files (`.shp`/`.shx`/`.dbf`/`.prj`),
+//! not a single byte stream, so there's nothing to pipe. Route it through a
+//! single-buffer format instead (FlatGeobuf and GeoParquet both carry the CRS
+//! faithfully): `geosetta in.shp - --to fgb | ... | geosetta - out.shp --from fgb`.
+
+use std::io::{Read, Write};
 
 use geosetta::{cli, convert, geopackage, shapefile};
 use geosetta::{Crs, Error, FeatureCollection, Format, Result};
+
+/// Read `path`'s bytes, or all of stdin when `path` is `"-"`.
+fn read_bytes(path: &str) -> Result<Vec<u8>> {
+    if path == "-" {
+        let mut buf = Vec::new();
+        std::io::stdin().lock().read_to_end(&mut buf)?;
+        Ok(buf)
+    } else {
+        Ok(std::fs::read(path)?)
+    }
+}
+
+/// Write `bytes` to `path`, or to stdout when `path` is `"-"`.
+fn write_bytes(path: &str, bytes: &[u8]) -> Result<()> {
+    if path == "-" {
+        std::io::stdout().lock().write_all(bytes)
+    } else {
+        std::fs::write(path, bytes)
+    }
+    .map_err(Error::from)
+}
+
+/// A human label for `--progress`/status messages: `path` verbatim, or
+/// `"stdin"`/`"stdout"` for `"-"` (which direction depends on the caller).
+fn io_label<'a>(path: &'a str, when_dash: &'a str) -> &'a str {
+    if path == "-" { when_dash } else { path }
+}
+
+/// An error for a multi-file format (Shapefile) asked to read/write `"-"` —
+/// there's no single byte stream to pipe; see the module doc comment.
+fn no_stdio_for_multifile(format_name: &str) -> Error {
+    Error::Usage(format!(
+        "{format_name} is multi-file; piping it through stdin/stdout (\"-\") isn't supported — \
+         convert through a single-buffer format instead (e.g. FlatGeobuf or GeoParquet)"
+    ))
+}
 
 fn main() {
     if let Err(e) = run() {
@@ -57,32 +107,41 @@ fn run() -> Result<()> {
 
 /// Read the input into the Feature IR. Shapefile is multi-file, so its
 /// sibling files (`.dbf` required, `.prj`/`.cpg` optional) are located next to
-/// `args.input` and read explicitly; every other format reads a single buffer
-/// through [`convert::read_features`].
+/// `args.input` and read explicitly (and can't be `"-"` — see the module doc
+/// comment); every other format reads a single buffer — `args.input`'s bytes,
+/// or all of stdin when it's `"-"` — through [`convert::read_features`].
 fn read_input(args: &cli::Args) -> Result<FeatureCollection> {
     if args.from == Format::Shapefile {
+        if args.input == "-" {
+            return Err(no_stdio_for_multifile("Shapefile"));
+        }
         return read_shapefile_from_path(&args.input, args.progress);
     }
-    let input = std::fs::read(&args.input)?;
+    let input = read_bytes(&args.input)?;
     if args.progress {
-        eprintln!("read {} ({} bytes)", args.input, input.len());
+        eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
     }
     convert::read_features(args.from, &input)
 }
 
 /// Write the Feature IR to `output_path`. Shapefile is multi-file, so its
-/// sibling files are written explicitly under `output_path`'s stem; every
-/// other format writes a single buffer through [`convert::write_features`].
-/// Shared by the plain single-collection path and GeoPackage's per-layer
-/// fan-out (`run_geopackage_read`), so a multi-layer `.gpkg` → Shapefile
-/// conversion gets one `layer.shp` sibling set per layer for free.
+/// sibling files are written explicitly under `output_path`'s stem (and
+/// `output_path` can't be `"-"` — see the module doc comment); every other
+/// format writes a single buffer — to `output_path`, or to stdout when it's
+/// `"-"` — through [`convert::write_features`]. Shared by the plain
+/// single-collection path and GeoPackage's per-layer fan-out
+/// (`run_geopackage_read`), so a multi-layer `.gpkg` → Shapefile conversion
+/// gets one `layer.shp` sibling set per layer for free.
 fn write_collection(to: Format, output_path: &str, fc: &FeatureCollection) -> Result<()> {
     if to == Format::Shapefile {
+        if output_path == "-" {
+            return Err(no_stdio_for_multifile("Shapefile"));
+        }
         return write_shapefile_to_path(output_path, fc);
     }
     let bytes = convert::write_features(to, fc)?;
-    std::fs::write(output_path, &bytes)?;
-    eprintln!("wrote {output_path} ({} bytes)", bytes.len());
+    write_bytes(output_path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", io_label(output_path, "stdout"), bytes.len());
     Ok(())
 }
 
@@ -162,9 +221,9 @@ fn sibling_path(shp_path: &str, ext: &str) -> Option<String> {
 /// each; a single layer goes to the plain output path; multiple layers to a
 /// plain path is an error unless `--layer` selects one.
 fn run_geopackage_read(args: &cli::Args) -> Result<()> {
-    let input = std::fs::read(&args.input)?;
+    let input = read_bytes(&args.input)?;
     if args.progress {
-        eprintln!("read {} ({} bytes)", args.input, input.len());
+        eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
     }
     let mut layers = geopackage::read_layers(&input)?;
     if args.progress {
@@ -190,7 +249,12 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
     }
     warn_crs_loss_layers(args, &layers);
 
-    let as_dir = args.output.ends_with('/') || std::path::Path::new(&args.output).is_dir();
+    // "-" (stdout) is never a directory, regardless of what happens to exist
+    // in the current directory — a multi-layer .gpkg piped out is rejected
+    // below by the same "give a directory or --layer" error a plain file path
+    // gets, since a single stream can't fan out to more than one layer.
+    let as_dir = args.output != "-"
+        && (args.output.ends_with('/') || std::path::Path::new(&args.output).is_dir());
     if layers.len() == 1 && !as_dir {
         let (_, fc) = &layers[0];
         return write_collection(args.to, &args.output, fc);
@@ -215,9 +279,9 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
 fn run_geopackage_write(args: &cli::Args) -> Result<()> {
     let mut new_layers = if args.from == Format::Gpkg {
         // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
-        let input = std::fs::read(&args.input)?;
+        let input = read_bytes(&args.input)?;
         if args.progress {
-            eprintln!("read {} ({} bytes)", args.input, input.len());
+            eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
         }
         let mut ls = geopackage::read_layers(&input)?;
         if let Some(name) = &args.layer {
@@ -249,16 +313,18 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
     }
     warn_crs_loss_layers(args, &new_layers);
 
-    // Append into the existing GeoPackage if the output already exists.
-    let existing = std::fs::read(&args.output).ok();
+    // Append into the existing GeoPackage if the output already exists. "-"
+    // (stdout) is never "existing" — there's nothing to read back from a pipe
+    // you're about to write to, so piping to a .gpkg always starts fresh.
+    let existing = if args.output == "-" { None } else { std::fs::read(&args.output).ok() };
     if args.progress {
         let verb = if existing.is_some() { "appending to" } else { "writing" };
         let idx = if args.rtree { " (+rtree index)" } else { "" };
-        eprintln!("{verb} {}{idx}...", args.output);
+        eprintln!("{verb} {}{idx}...", io_label(&args.output, "stdout"));
     }
     let bytes = geopackage::write_layers(existing.as_deref(), &new_layers, args.rtree)?;
-    std::fs::write(&args.output, &bytes)?;
-    eprintln!("wrote {} ({} bytes)", args.output, bytes.len());
+    write_bytes(&args.output, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", io_label(&args.output, "stdout"), bytes.len());
     Ok(())
 }
 
@@ -291,8 +357,13 @@ fn warn_crs_loss_layers(args: &cli::Args, layers: &[(String, FeatureCollection)]
     }
 }
 
-/// The file stem of `path`, used as a default layer name.
+/// The file stem of `path`, used as a default layer name. `"-"` (stdin) has
+/// no filename to draw one from, so it falls back to `"layer"` same as an
+/// extension-less/empty path does.
 fn layer_stem(path: &str) -> String {
+    if path == "-" {
+        return "layer".into();
+    }
     std::path::Path::new(path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())

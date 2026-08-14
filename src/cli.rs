@@ -4,7 +4,11 @@
 //! ```text
 //! geosetta <input> <output> [--from FMT] [--to FMT]
 //! ```
-//! Formats are inferred from file extensions when not given explicitly.
+//! Formats are inferred from file extensions when not given explicitly. `-` as
+//! `<input>`/`<output>` means stdin/stdout — see `main.rs`'s module doc
+//! comment for why (piping an external tool, e.g. a reprojection step, in
+//! between) — and requires the corresponding `--from`/`--to`, since there's no
+//! extension to infer from. Not accepted for Shapefile, which is multi-file.
 
 use crate::error::{Error, Result};
 use crate::format::Format;
@@ -34,7 +38,7 @@ pub struct Args {
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert] [--rtree] [--progress] [--quiet]";
+pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--sort-hilbert] [--rtree] [--progress] [--quiet]\n  \"-\" for <input>/<output> means stdin/stdout (needs --from/--to; not for Shapefile)";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -76,7 +80,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
                         .ok_or_else(|| Error::Usage("--layer needs a value".into()))?,
                 );
             }
-            other if other.starts_with('-') => {
+            // Bare "-" is the stdin/stdout placeholder, not an option flag —
+            // it falls through to the positional bucket like any path.
+            other if other.starts_with('-') && other != "-" => {
                 return Err(Error::Usage(format!("unknown option \"{other}\"")));
             }
             _ => positional.push(arg),
@@ -89,12 +95,20 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let input = positional[0].clone();
     let output = positional[1].clone();
 
-    let from = from
-        .or_else(|| Format::from_path(&input))
-        .ok_or_else(|| Error::Usage(format!("cannot infer input format from \"{input}\"")))?;
-    let to = to
-        .or_else(|| Format::from_path(&output))
-        .ok_or_else(|| Error::Usage(format!("cannot infer output format from \"{output}\"")))?;
+    let from = from.or_else(|| Format::from_path(&input)).ok_or_else(|| {
+        if input == "-" {
+            Error::Usage("--from is required when reading from stdin (\"-\")".into())
+        } else {
+            Error::Usage(format!("cannot infer input format from \"{input}\""))
+        }
+    })?;
+    let to = to.or_else(|| Format::from_path(&output)).ok_or_else(|| {
+        if output == "-" {
+            Error::Usage("--to is required when writing to stdout (\"-\")".into())
+        } else {
+            Error::Usage(format!("cannot infer output format from \"{output}\""))
+        }
+    })?;
 
     Ok(Args {
         input,
@@ -163,5 +177,35 @@ mod tests {
         assert!(args(&["geosetta", "only-one.geojson"]).is_err());
         assert!(args(&["geosetta", "a.xyz", "b.parquet"]).is_err()); // unknown input ext
         assert!(args(&["geosetta", "--help"]).is_err());
+    }
+
+    #[test]
+    fn bare_dash_is_a_positional_not_an_unknown_option() {
+        // "-" starts with '-' like every flag, but it's the stdin/stdout
+        // placeholder, not an option — it must reach the positional bucket
+        // rather than tripping the "unknown option" branch.
+        let a = args(&["geosetta", "-", "-", "--from", "geojson", "--to", "wkt"]).unwrap();
+        assert_eq!(a.input, "-");
+        assert_eq!(a.output, "-");
+        assert_eq!(a.from, Format::GeoJson);
+        assert_eq!(a.to, Format::Wkt);
+    }
+
+    #[test]
+    fn dash_input_requires_explicit_from() {
+        let err = args(&["geosetta", "-", "out.geojson"]).unwrap_err();
+        assert!(matches!(err, Error::Usage(m) if m.contains("--from") && m.contains("stdin")));
+        // Supplying --from clears it (--to is still inferred from the extension).
+        let a = args(&["geosetta", "-", "out.geojson", "--from", "wkt"]).unwrap();
+        assert_eq!(a.from, Format::Wkt);
+        assert_eq!(a.to, Format::GeoJson);
+    }
+
+    #[test]
+    fn dash_output_requires_explicit_to() {
+        let err = args(&["geosetta", "in.geojson", "-"]).unwrap_err();
+        assert!(matches!(err, Error::Usage(m) if m.contains("--to") && m.contains("stdout")));
+        let a = args(&["geosetta", "in.geojson", "-", "--to", "wkt"]).unwrap();
+        assert_eq!(a.to, Format::Wkt);
     }
 }

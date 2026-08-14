@@ -52,10 +52,13 @@ pub(crate) mod flatbuffers;
 pub(crate) mod flatgeobuf;
 pub(crate) mod geojson;
 pub(crate) mod json;
+pub(crate) mod kml;
 pub(crate) mod parquet;
 pub(crate) mod schema;
 pub(crate) mod spatial;
 pub(crate) mod sqlite;
+pub(crate) mod xml;
+pub(crate) mod zip;
 
 // The curated entry points most callers want, hoisted to the crate root.
 pub use convert::{convert, read_features, reorder_hilbert, write_features};

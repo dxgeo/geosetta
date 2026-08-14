@@ -4,10 +4,23 @@
 //! (DuckDB, Arrow, GDAL) emit: multiple row groups, one dictionary page plus
 //! one or more data pages per column chunk, PLAIN and dictionary
 //! (`PLAIN_DICTIONARY` / `RLE_DICTIONARY`) value encodings, RLE/bit-pack
-//! definition levels, SNAPPY or no compression, flat (non-nested) 2D WKB
-//! geometry. Anything outside that — other codecs (ZSTD/GZIP), `DATA_PAGE_V2`,
-//! nested/repeated columns — is reported as a specific error rather than
-//! misread. See `plans/arbitrary-geoparquet.org` for what remains.
+//! definition levels, SNAPPY/GZIP/ZSTD/LZ4_RAW or no compression, and flat 2D
+//! WKB geometry.
+//!
+//! The schema itself doesn't have to be flat: `flatten_schema` walks the
+//! file's schema tree (not just each leaf's own repetition type) so a leaf
+//! nested under OPTIONAL groups still gets the right definition level — the
+//! case that matters in practice is GDAL/OGR's GeoParquet 1.1
+//! `geometry_bbox` "covering" column, a per-row bbox struct it writes
+//! alongside the geometry by default (recognized via the `geo` metadata's
+//! `covering` key and excluded from `properties`, not surfaced as a fake
+//! column — see `tests/fixtures/gdal_covering_bbox.parquet`'s test). A
+//! REPEATED ancestor (a genuinely list-valued column) is a different,
+//! harder problem — decoding one needs repetition levels this reader
+//! doesn't parse — so that's still reported as a specific error rather than
+//! misread, along with the remaining codecs (LZO, BROTLI, Hadoop-framed
+//! LZ4) and `DATA_PAGE_V2`. See `plans/arbitrary-geoparquet.org` for what
+//! remains.
 
 use super::geo::GEOMETRY_COLUMN;
 use super::thrift::{CompactReader, Field};
@@ -61,6 +74,20 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
         let rg_rows = rg.num_rows as usize;
         let mut prop_idx = 0;
         for col in &rg.columns {
+            // A GeoParquet "covering" bbox index column (see
+            // `Meta::covering_paths`) — a spatial-pruning optimization, not a
+            // real feature property, so it's skipped entirely rather than
+            // decoded. Checked consistently across every row group, so
+            // `prop_idx` still lines up with `properties`.
+            if meta.covering_paths.iter().any(|p| p == &col.path) {
+                continue;
+            }
+            if col.unsupported_repeated {
+                return Err(Error::Parquet(format!(
+                    "column \"{}\" is a nested/repeated (list-valued) column, which is not supported yet",
+                    col.path.join(".")
+                )));
+            }
             let is_geometry = col.name == meta.geometry_column;
             match decode_column(bytes, col, rg_rows, is_geometry)? {
                 ColumnSink::Wkb(v) => {
@@ -104,6 +131,13 @@ struct Meta {
     row_groups: Vec<RowGroup>,
     geometry_column: String,
     crs: Option<crate::crs::Crs>,
+    /// Full schema paths of GeoParquet 1.1 "covering" bbox index columns (e.g.
+    /// `["geometry_bbox", "xmin"]`) — a spatial-pruning optimization some
+    /// writers (GDAL/OGR) emit alongside the geometry column, not a real
+    /// feature property. Read as ordinary columns (their definition levels
+    /// still need the schema-tree walk below to decode correctly) but
+    /// excluded from `properties` in `read_geoparquet`.
+    covering_paths: Vec<Vec<String>>,
 }
 
 struct RowGroup {
@@ -112,13 +146,29 @@ struct RowGroup {
 }
 
 struct ColumnMeta {
+    /// The leaf's own name — `path`'s last segment. Used for property JSON
+    /// keys and the (always top-level) geometry-column match; schema lookups
+    /// use the full `path` instead, since a bare name isn't unique once
+    /// nested columns are in play (two different structs could each have an
+    /// "xmin" leaf).
     name: String,
+    /// Full dotted path from the schema root (`path_in_schema`), e.g.
+    /// `["geometry_bbox", "xmin"]` for a nested leaf or `["height"]` for a
+    /// top-level one.
+    path: Vec<String>,
     physical: i32,
     codec: i32,
     data_page_offset: i64,
     dictionary_page_offset: Option<i64>,
-    /// 0 for a REQUIRED leaf (no definition levels), 1 for an OPTIONAL one.
+    /// The number of OPTIONAL/REPEATED ancestors (including the leaf itself)
+    /// from the schema root, computed by walking the schema tree — *not*
+    /// just the leaf's own repetition type, which is only correct for
+    /// top-level columns (see `flatten_schema`).
     max_def_level: u32,
+    /// Set when the leaf or any ancestor group is REPEATED (a list-valued
+    /// column) — decoding one needs repetition levels this reader doesn't
+    /// parse, so it's reported as a clear error rather than misread.
+    unsupported_repeated: bool,
     /// The schema's converted_type, if any (e.g. DATE, TIMESTAMP_*).
     converted_type: Option<i32>,
 }
@@ -129,9 +179,10 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     let mut row_groups: Vec<RowGroup> = Vec::new();
     let mut geometry_column = GEOMETRY_COLUMN.to_string();
     let mut crs: Option<crate::crs::Crs> = None;
-    // Leaf name -> (repetition_type, converted_type), used to derive each
-    // column's definition level and any date/timestamp interpretation.
-    let mut reps: Vec<(String, i32, Option<i32>)> = Vec::new();
+    let mut covering_paths: Vec<Vec<String>> = Vec::new();
+    // The flat, pre-order SchemaElement list — a tree in disguise (see
+    // `flatten_schema`), not one entry per column.
+    let mut schema: Vec<SchemaNode> = Vec::new();
 
     r.struct_begin();
     loop {
@@ -142,7 +193,7 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
                     // schema: list<SchemaElement>
                     let (_elem, len) = r.read_list_header()?;
                     for _ in 0..len {
-                        reps.push(parse_schema_element(&mut r)?);
+                        schema.push(parse_schema_element(&mut r)?);
                     }
                 }
                 3 => num_rows = r.read_i64()?,
@@ -153,7 +204,7 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
                     }
                 }
                 5 => {
-                    // key_value_metadata: pull primary_column from "geo".
+                    // key_value_metadata: pull primary_column/covering from "geo".
                     let (_elem, len) = r.read_list_header()?;
                     for _ in 0..len {
                         let (k, v) = parse_key_value(&mut r)?;
@@ -164,6 +215,7 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
                                 geometry_column = pc;
                             }
                             crs = super::geo::parse_crs(geo);
+                            covering_paths = covering_bbox_paths(geo);
                         }
                     }
                 }
@@ -173,13 +225,23 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     }
     r.struct_end();
 
-    // Attach schema info (definition level, converted type) to every column.
+    // Attach schema info (definition level, converted type) to every column,
+    // matched by full path — a bare leaf name isn't unique once nested
+    // columns are in play (see `ColumnMeta::path`'s doc comment).
+    let leaves = flatten_schema(&schema);
     for rg in &mut row_groups {
         for col in &mut rg.columns {
-            let leaf = reps.iter().find(|(name, ..)| *name == col.name);
-            let rep = leaf.map(|(_, r, _)| *r).unwrap_or(repetition::OPTIONAL);
-            col.max_def_level = if rep == repetition::REQUIRED { 0 } else { 1 };
-            col.converted_type = leaf.and_then(|(.., c)| *c);
+            match leaves.iter().find(|l| l.path == col.path) {
+                Some(leaf) => {
+                    col.max_def_level = leaf.max_def_level;
+                    col.unsupported_repeated = leaf.has_repeated;
+                    col.converted_type = leaf.converted_type;
+                }
+                // No schema entry for this path (shouldn't happen in a
+                // well-formed file) — fall back to the old conservative
+                // default rather than fail outright.
+                None => col.max_def_level = 1,
+            }
         }
     }
 
@@ -188,15 +250,27 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
         row_groups,
         geometry_column,
         crs,
+        covering_paths,
     })
 }
 
-/// A schema element reduced to `(name, repetition_type, converted_type)`. The
-/// root and non-leaf elements carry names too but never match a column path, so
-/// we keep them all and look up leaves by name.
-fn parse_schema_element(r: &mut CompactReader) -> Result<(String, i32, Option<i32>)> {
+/// One entry from the file's flat, pre-order `list<SchemaElement>` — the root
+/// "message" element, an intermediate group, or a leaf. `num_children` is what
+/// makes the list a *tree*: a leaf omits it (decoded as 0), a group gives the
+/// count of elements immediately following it in the list that are its
+/// children (recursively, so a child that's itself a group is followed by
+/// its own children before the next sibling).
+struct SchemaNode {
+    name: String,
+    repetition: i32,
+    num_children: i32,
+    converted_type: Option<i32>,
+}
+
+fn parse_schema_element(r: &mut CompactReader) -> Result<SchemaNode> {
     let mut name = String::new();
     let mut rep = repetition::REQUIRED;
+    let mut num_children = 0i32;
     let mut converted = None;
     r.struct_begin();
     loop {
@@ -205,13 +279,105 @@ fn parse_schema_element(r: &mut CompactReader) -> Result<(String, i32, Option<i3
             Field::Begin { id, ty } => match id {
                 3 => rep = r.read_i32()?,
                 4 => name = r.read_string()?,
+                5 => num_children = r.read_i32()?,
                 6 => converted = Some(r.read_i32()?),
                 _ => r.skip(ty)?,
             },
         }
     }
     r.struct_end();
-    Ok((name, rep, converted))
+    Ok(SchemaNode { name, repetition: rep, num_children, converted_type: converted })
+}
+
+/// A leaf's identity and decoding-relevant facts, recovered by walking the
+/// schema tree (see [`flatten_schema`]) rather than reading one
+/// [`SchemaNode`] in isolation.
+struct LeafInfo {
+    /// Full dotted path from the schema root, matching a column chunk's
+    /// `path_in_schema` (see `ColumnMeta::path`).
+    path: Vec<String>,
+    /// Count of OPTIONAL/REPEATED elements from the root down to and
+    /// including this leaf — the definition level a present, non-null value
+    /// at this leaf is written with. Parquet's schema root itself never
+    /// contributes (its own repetition type is not meaningful).
+    max_def_level: u32,
+    /// Whether this leaf or any ancestor group is REPEATED.
+    has_repeated: bool,
+    converted_type: Option<i32>,
+}
+
+/// Reconstruct the schema tree from the file's flat pre-order `SchemaNode`
+/// list (root first, each group immediately followed by its `num_children`
+/// descendants) and flatten it back out into one [`LeafInfo`] per leaf, with
+/// the definition level and repeated-ness accumulated through every ancestor
+/// — not just the leaf's own repetition type, which alone is only correct
+/// when nothing is nested. `nodes[0]` is the root message and is consumed
+/// without contributing to any leaf's definition level, matching the Parquet
+/// spec's definition-level algorithm.
+fn flatten_schema(nodes: &[SchemaNode]) -> Vec<LeafInfo> {
+    fn walk(
+        nodes: &[SchemaNode],
+        idx: &mut usize,
+        path: &mut Vec<String>,
+        parent_def: u32,
+        parent_repeated: bool,
+        leaves: &mut Vec<LeafInfo>,
+    ) {
+        let Some(node) = nodes.get(*idx) else { return };
+        *idx += 1;
+        let is_repeated = node.repetition == repetition::REPEATED;
+        let def = parent_def + u32::from(node.repetition != repetition::REQUIRED);
+        let has_repeated = parent_repeated || is_repeated;
+
+        path.push(node.name.clone());
+        if node.num_children <= 0 {
+            leaves.push(LeafInfo {
+                path: path.clone(),
+                max_def_level: def,
+                has_repeated,
+                converted_type: node.converted_type,
+            });
+        } else {
+            for _ in 0..node.num_children {
+                walk(nodes, idx, path, def, has_repeated, leaves);
+            }
+        }
+        path.pop();
+    }
+
+    let mut leaves = Vec::new();
+    let Some(root) = nodes.first() else { return leaves };
+    let mut idx = 1usize;
+    let mut path = Vec::new();
+    for _ in 0..root.num_children {
+        walk(nodes, &mut idx, &mut path, 0, false, &mut leaves);
+    }
+    leaves
+}
+
+/// Column paths (full `path_in_schema` segments, e.g. `["geometry_bbox",
+/// "xmin"]`) that a GeoParquet "covering" bbox index references — see
+/// [`Meta::covering_paths`].
+fn covering_bbox_paths(geo: &str) -> Vec<Vec<String>> {
+    let Ok(root) = json::parse(geo) else { return Vec::new() };
+    let Some(columns) = root.get("columns").and_then(JsonValue::as_object) else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for (_, col) in columns {
+        let Some(bbox) = col.get("covering").and_then(|c| c.get("bbox")).and_then(JsonValue::as_object) else {
+            continue;
+        };
+        for (_, path) in bbox {
+            if let Some(segments) = path.as_array() {
+                let segments: Vec<String> = segments.iter().filter_map(JsonValue::as_str).map(String::from).collect();
+                if !segments.is_empty() {
+                    paths.push(segments);
+                }
+            }
+        }
+    }
+    paths
 }
 
 fn parse_row_group(r: &mut CompactReader) -> Result<RowGroup> {
@@ -286,13 +452,15 @@ fn parse_column_meta(r: &mut CompactReader) -> Result<ColumnMeta> {
         return Err(Error::Parquet("column missing data_page_offset".into()));
     }
     Ok(ColumnMeta {
-        name: path.pop().unwrap_or_default(),
+        name: path.last().cloned().unwrap_or_default(),
+        path,
         physical,
         codec,
         data_page_offset,
         dictionary_page_offset,
-        max_def_level: 1, // set from the schema in parse_file_metadata
-        converted_type: None, // set from the schema in parse_file_metadata
+        max_def_level: 1,          // set from the schema in parse_file_metadata
+        unsupported_repeated: false, // set from the schema in parse_file_metadata
+        converted_type: None,      // set from the schema in parse_file_metadata
     })
 }
 
@@ -1121,5 +1289,134 @@ mod tests {
             ),
             _ => panic!("wrong variant"),
         }
+    }
+
+    // --- flatten_schema / nested-group definition levels -------------------
+
+    fn node(name: &str, rep: i32, num_children: i32) -> SchemaNode {
+        SchemaNode { name: name.into(), repetition: rep, num_children, converted_type: None }
+    }
+
+    #[test]
+    fn flat_schema_uses_each_leafs_own_repetition() {
+        // root -> [name (OPTIONAL), height (REQUIRED)] — the shape every
+        // fixture before GDAL's covering-bbox column exercised.
+        let schema = vec![
+            node("schema", repetition::REQUIRED, 2),
+            node("name", repetition::OPTIONAL, 0),
+            node("height", repetition::REQUIRED, 0),
+        ];
+        let leaves = flatten_schema(&schema);
+        let by_path = |p: &[&str]| leaves.iter().find(|l| l.path == p).unwrap();
+        assert_eq!(by_path(&["name"]).max_def_level, 1);
+        assert_eq!(by_path(&["height"]).max_def_level, 0);
+        assert!(leaves.iter().all(|l| !l.has_repeated));
+    }
+
+    #[test]
+    fn nested_leaf_inherits_its_optional_groups_definition_level() {
+        // The real shape from `tests/fixtures/gdal_covering_bbox.parquet`:
+        // root -> [name, height, geometry (all OPTIONAL),
+        //          geometry_bbox (OPTIONAL group) -> [xmin, ymin, xmax, ymax (REQUIRED)]].
+        // xmin etc. are REQUIRED *within* the group, but the group itself is
+        // OPTIONAL, so their true max_def_level is 1 — not 0, which is what
+        // reading only the leaf's own repetition_type (the pre-fix behavior)
+        // would give, and what caused the original "zero-length level run"
+        // misparse against this exact file.
+        let schema = vec![
+            node("schema", repetition::REQUIRED, 4),
+            node("name", repetition::OPTIONAL, 0),
+            node("height", repetition::OPTIONAL, 0),
+            node("geometry", repetition::OPTIONAL, 0),
+            node("geometry_bbox", repetition::OPTIONAL, 4),
+            node("xmin", repetition::REQUIRED, 0),
+            node("ymin", repetition::REQUIRED, 0),
+            node("xmax", repetition::REQUIRED, 0),
+            node("ymax", repetition::REQUIRED, 0),
+        ];
+        let leaves = flatten_schema(&schema);
+        assert_eq!(leaves.len(), 7);
+        let by_path = |p: &[&str]| leaves.iter().find(|l| l.path == p).unwrap();
+        for top in ["name", "height", "geometry"] {
+            assert_eq!(by_path(&[top]).max_def_level, 1, "{top}");
+        }
+        for leaf in ["xmin", "ymin", "xmax", "ymax"] {
+            let l = by_path(&["geometry_bbox", leaf]);
+            assert_eq!(l.max_def_level, 1, "{leaf}: own repetition is REQUIRED, but the enclosing group is OPTIONAL");
+            assert!(!l.has_repeated);
+        }
+    }
+
+    #[test]
+    fn repeated_ancestor_marks_the_leaf_unsupported() {
+        // root -> tags (REPEATED group, e.g. a list<string>) -> list -> item
+        let schema = vec![
+            node("schema", repetition::REQUIRED, 1),
+            node("tags", repetition::REPEATED, 1),
+            node("item", repetition::OPTIONAL, 0),
+        ];
+        let leaves = flatten_schema(&schema);
+        assert_eq!(leaves.len(), 1);
+        assert!(leaves[0].has_repeated);
+        // A REPEATED ancestor also counts toward the definition level, same
+        // as OPTIONAL — tags(REPEATED)=1 + item(OPTIONAL)=1.
+        assert_eq!(leaves[0].max_def_level, 2);
+    }
+
+    #[test]
+    fn covering_bbox_paths_reads_the_geo_metadata_covering_key() {
+        let geo = r#"{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{
+            "encoding":"WKB",
+            "covering":{"bbox":{
+                "xmin":["geometry_bbox","xmin"],"ymin":["geometry_bbox","ymin"],
+                "xmax":["geometry_bbox","xmax"],"ymax":["geometry_bbox","ymax"]
+            }}
+        }}}"#;
+        let mut paths = covering_bbox_paths(geo);
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                vec!["geometry_bbox".to_string(), "xmax".to_string()],
+                vec!["geometry_bbox".to_string(), "xmin".to_string()],
+                vec!["geometry_bbox".to_string(), "ymax".to_string()],
+                vec!["geometry_bbox".to_string(), "ymin".to_string()],
+            ]
+        );
+    }
+
+    #[test]
+    fn covering_bbox_paths_is_empty_without_a_covering_key() {
+        let geo = r#"{"version":"1.0.0","primary_column":"geometry","columns":{"geometry":{"encoding":"WKB"}}}"#;
+        assert!(covering_bbox_paths(geo).is_empty());
+    }
+
+    #[test]
+    fn reads_a_real_gdal_fixture_with_a_covering_bbox_column() {
+        // `ogr2ogr -f Parquet` output for a 3-point GeoJSON (name/height
+        // properties) — GDAL 3.13 / Arrow 25 writes a GeoParquet 1.1
+        // "geometry_bbox" covering-bbox struct alongside the WKB geometry by
+        // default. Before the schema-tree walk above, this file's xmin/ymin/
+        // xmax/ymax columns were misread as REQUIRED (def_level 0) instead of
+        // 1, causing the reader to misparse their data pages entirely
+        // ("invalid parquet: zero-length level run").
+        let bytes = include_bytes!("../../tests/fixtures/gdal_covering_bbox.parquet");
+        let parsed = read_geoparquet(bytes).expect("reads the GDAL fixture");
+        assert_eq!(parsed.num_rows, 3);
+
+        // The covering-bbox columns are excluded, not surfaced as properties.
+        let names: Vec<&str> = parsed.properties.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["name", "height"]);
+
+        let prop = |col: &str, row: usize| {
+            parsed.properties.iter().find(|c| c.name == col).unwrap().values[row].clone()
+        };
+        assert_eq!(prop("name", 0).as_str(), Some("Empire State"));
+        assert_eq!(prop("height", 0).as_f64(), Some(381.0));
+        assert_eq!(prop("name", 2).as_str(), Some("Tokyo"));
+        assert_eq!(prop("height", 2).as_f64(), Some(40.0));
+
+        assert_eq!(parsed.geometry.len(), 3);
+        assert!(parsed.geometry.iter().all(Option::is_some));
     }
 }

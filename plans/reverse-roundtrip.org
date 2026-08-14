@@ -30,7 +30,7 @@ safe later.
 Each encoder in the write stack gets a matching decoder.
 
 *** 1. Un-gate the Snappy decoder
-=parquet/snappy.rs::decompress= (and its =copy_match= / =read_uvarint= helpers)
+=compress/snappy.rs::decompress= (and its =copy_match= / =read_uvarint= helpers)
 already exist under =#[cfg(test)]=. Promote to normal =pub(crate)= code and keep
 the round-trip tests. Essentially free.
 

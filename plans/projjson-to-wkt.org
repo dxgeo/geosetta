@@ -1,0 +1,272 @@
+#+TITLE: Plan: PROJJSON → WKT (id-less GeoParquet CRS sources)
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Translating PROJJSON to WKT
+
+** STATUS — DONE (geographic and projected)
+=src/crs/wkt_projjson.rs= now has =projjson_to_wkt=, the reverse of
+=wkt_to_projjson= ([[file:crs.org][crs.org]] milestone C), covering both
+=GeographicCRS= and =ProjectedCRS=. =NamedCrs::structural_wkt= wires it into
+=wkt_expressible=/=shapefile_expressible= and the actual WKT emitted by
+FlatGeobuf/GeoPackage/Shapefile's =.prj=.
+
+- *Geographic* (§ SUGGESTED ORDER steps 1–2): verified against real
+  =projinfo --identify= (a round-tripped GDA2020 PROJJSON still identifies as
+  EPSG:7844 at 100%) and by end-to-end tests in each of the three writers.
+- *Projected* (§ SUGGESTED ORDER steps 3–4): =wkt1_tables.rs='s crosswalk
+  reversed (=method_name_by_code=/=param_by_code=, exact — no new generated
+  data), a WKT1 =PROJCS= renderer built on the geographic renderer for its
+  base CRS, and — found only while implementing, not anticipated in the
+  original design — explicit =AXIS= emission is now unconditional (see the
+  resolved =en_default_safe= open question below). Verified against real
+  =projinfo --identify= for both an all-metre case (GDA2020 / MGA zone 55,
+  EPSG:7855) and a non-metre case (NAD83 / California zone 1, US survey feet,
+  EPSG:2225), both at 100%. The actual target scenario — a real =ogr2ogr=-
+  produced id-less custom-datum-plus-standard-projection GeoParquet file (see
+  the resolved "how common" open question) — was run through the actual
+  =geosetta= CLI end to end (GeoParquet → Shapefile) and the resulting
+  =.prj= read back correctly by real =ogrinfo=, not just by Geosetta's own
+  round trip.
+
+** THE GAP THIS CLOSES
+GeoParquet's only CRS channel is PROJJSON. Reading a GeoParquet source today
+(=parquet::geo::parse_crs=) already lifts an embedded =id= (authority+code)
+into the IR when the PROJJSON has one — that CRS then round-trips to
+FlatGeobuf/GeoPackage (via authority+code, or the registry's =def_wkt= when
+=crs-registry= is on) and to Shapefile's =.prj= the same way. *That case is
+already handled, not this gap.*
+
+The gap is a PROJJSON object with *no =id= at all* — a custom or
+authority-stripped definition, which real producers do emit. Today that CRS
+has no authority code and no WKT, so =NamedCrs::wkt_expressible= /
+=shapefile_expressible= (=src/crs.rs:210-234=) both fail, and converting to
+FlatGeobuf, GeoPackage, or Shapefile silently drops the CRS with a warning:
+#+begin_src text
+warning: source CRS is a PROJJSON definition with no authority code, and
+GeoPackage records CRS as WKT; Geosetta does not translate between the two,
+so the CRS will be dropped from the output.
+#+end_src
+The registry cannot help here even when enabled — its lookups are keyed by
+=(authority, code)=, and an id-less PROJJSON has nothing to key on. The only
+fix is a structural translator, the direct mirror of =wkt_to_projjson=.
+
+** DESIGN
+
+*** Parsing side: no new parser needed
+=crate::json= (=src/json/=) already has a full JSON parser, already used to
+read PROJJSON fields in =crs/registry.rs= (=crate::json::parse=,
+=JsonValue::get=/=as_str=/=as_f64=). =projjson_to_wkt= reuses it directly —
+unlike the forward direction, which had to build its own WKT tokenizer
+(=tokenize_wkt=) because no WKT parser existed anywhere in the crate.
+
+*** Output dialect: WKT1 (GDAL/ESRI flavor), matching what consumers already take
+=NamedCrs.wkt= is a single =Option<String>= slot, and all three WKT-dialect
+writers already expect WKT1-flavor text in it — =flatgeobuf/writer.rs= and
+=geopackage/writer.rs= pass =n.wkt= straight through (fixtures use
+=PROJCS["...]=/=GEOGCS["...]= WKT1 syntax), and =shapefile/writer.rs='s
+=prj_wkt= does the same for =.prj=. Emitting WKT1 needs no schema change and
+lands directly in the slot every existing consumer already reads.
+
+WKT2 output was considered and rejected for v1: PROJJSON's method/parameter
+=id= transfers into a WKT2 =PROJCRS= without needing the name crosswalk below
+(simpler to generate), but it would put WKT2-flavor text into a slot every
+current consumer treats as WKT1/ESRI text (=.prj= in particular is
+conventionally WKT1 and read by tools with no WKT2 support). Not worth the
+compatibility risk for the id-less-PROJJSON case this plan targets. GeoPackage
+already has a dedicated WKT2 path for a different purpose (the registry's
+=def_wkt2= into =definition_12_063=); this plan doesn't touch that.
+
+*** Geographic CRSes (=GeographicCRS= → =GEOGCS=) — the simple case
+Structurally the mirror of =render_geographic=: read =name=, =datum.name=,
+=datum.ellipsoid.semi_major_axis=/=inverse_flattening=,
+=datum.prime_meridian= (only when non-Greenwich), the coordinate system's
+angular unit, and =id= (when present — this is the id-less case, so usually
+absent; the translator should still emit an =AUTHORITY= node when a caller
+happens to pass a PROJJSON that *does* have one, so this function alone is
+usable in isolation and testable against the forward direction's own fixtures
+for the round-trip check). No method/parameter crosswalk needed — this is the
+bulk of the value here, since geographic is also the more common id-less case
+in practice (a custom datum/ellipsoid with no registered code).
+
+Axis order: PROJJSON's geographic =coordinate_system= is latitude,longitude
+(the forward direction's own doc comment explains why — PROJ identification
+confidence). WKT1 =GEOGCS= conventionally carries no explicit =AXIS= nodes and
+tools read it as the traditional lon,lat *display* order regardless — this
+only affects how external tools label the CRS definition, never Geosetta's
+own stored coordinate order (the IR's geometry coordinates are untouched by
+this translation either direction, same as the forward path's note that
+"GeoParquet's fixed x,y coordinate storage is honored... independently of the
+CRS axis order"). Worth confirming empirically (see § TESTING) rather than
+assuming.
+
+*** Projected CRSes (=ProjectedCRS= → =PROJCS=) — needs the method-name crosswalk reversed
+WKT1 =PROJCS= has no id slot on its =PROJECTION= node — just GDAL's own method
+*name* string (=Lambert_Conformal_Conic_2SP=, etc.). PROJJSON's
+=conversion.method= instead carries a canonical name *and* an EPSG code. To
+emit valid WKT1, the translator needs to go from that EPSG method code back to
+GDAL's WKT1 name — exactly the crosswalk =wkt1_tables.rs= already has, just
+walked in the other direction.
+
+*This reversal is cheap and exact, not new data.* =wkt1_tables::METHODS= is
+=&[(wkt1_name, projjson_name, epsg_code, en_default_safe)]=, already filtered
+down to the common/unambiguous subset the forward direction supports (per
+=crs.org=, ambiguous WKT1 method names — one name, several possible EPSG
+codes — are the *forward* direction's unresolved case, tracked separately).
+Within that filtered subset each code has exactly one WKT1 name, so
+=code → name= is a straight linear scan (or a small reverse index if profiling
+ever cares) over the *existing* static table — no new crosswalk generation,
+no new Python/=projinfo= oracle run. Same story for =PARAMS=:
+=(epsg_method_code, projjson_param_name) → wkt1_param_name= reverses cleanly
+within the table's existing entries.
+
+*The one real gap this reversal doesn't close*: a PROJJSON projected CRS whose
+method *code* isn't in =METHODS= at all — a method the forward direction never
+needed to support because no WKT1 source ever exercised it. That's an honest
+=None= (falls back to today's drop + warning, no regression), not a bug to
+fix here; extending it means adding rows to the generated table, which is
+=arbitrary-geoparquet.org='s/=crs.org='s established path (rerun
+=tests/fixtures/gen_wkt1_crosswalk.py=), not new design.
+
+Everything else mirrors =render_projected='s WKT2 path structurally: base
+geographic CRS (via the geographic renderer above), conversion name,
+parameters (name via the reversed =PARAMS= table, value, unit rendered as a
+WKT1 =PARAMETER[name, value]= — no per-parameter =UNIT= node in WKT1, since
+the projected CRS's own linear =UNIT= node covers all its parameters, unlike
+PROJJSON where each parameter carries its own explicit unit), Cartesian
+coordinate system / linear unit, and =AUTHORITY= only when the projected
+CRS's own =id= happens to be present.
+
+*** Out of scope (mirrors the forward direction's own exclusions)
+- Geocentric CRSes (PROJJSON =GeodeticCRS= with a Cartesian, not ellipsoidal,
+  CS) — =wkt_to_projjson= excludes the WKT-side equivalent already; no reverse
+  case to handle without also adding forward support first.
+- Datum *ensembles* — WKT1 has no ensemble concept at all (only a single
+  =DATUM=); a PROJJSON =datum_ensemble= has no faithful WKT1 rendering. Return
+  =None= rather than picking an arbitrary member.
+- Compound / bound CRSes — not handled by the forward direction, so no round
+  trip to test the reverse against.
+
+** COMPONENTS
+*** 1. =src/crs/wkt_projjson.rs= — add =pub(crate) fn projjson_to_wkt(json: &str) -> Option<String>=
+Lives in the same file as =wkt_to_projjson= (not a new module) — the two
+directions share the =UnitKind= enum, the not-yet-existing but derivable unit
+name/conversion-factor tables, and conceptually the same field mapping, just
+walked in opposite directions. New code: a JSON-input geographic renderer and
+a JSON-input projected renderer, each emitting WKT1 text via plain
+=format!=/=String= building (no output-side helper reuse from the forward
+direction — that side builds JSON strings, not WKT text, so quoting/escaping
+rules differ; =q()='s JSON-string escaping isn't reusable, WKT's own quoted-string
+escaping is simpler — doubled double-quotes, no backslash escapes — and needs
+its own small helper).
+*** 2. =src/crs/wkt1_tables.rs= — add reverse lookups
+=method_name_by_code(code: i64) -> Option<&'static str>= and
+=param_name_by_code(method_code: i64, epsg_param_code: i64) -> Option<&'static str>=
+(or equivalent), scanning the existing =METHODS=/=PARAMS= statics — no
+changes to the generated data itself.
+*** 3. =src/crs.rs= — wire the new path into expressibility + emission
+=NamedCrs::wkt_expressible=/=shapefile_expressible= currently require
+=self.wkt.is_some()= or a usable code; extend the id-less-PROJJSON branch to
+try =projjson_to_wkt(&self.projjson)= before giving up, mirroring how
+=parquet_expressible= already tries =wkt_to_projjson= before falling back.
+Wherever the actual WKT string is produced for FlatGeobuf/GeoPackage/Shapefile
+output (today just =n.wkt.clone()=, per =shapefile/writer.rs:47='s
+=prj_wkt=), add the same fallback. =downgrade_warning='s PROJJSON-only branch
+(=src/crs.rs:210-216=) stops firing for CRSes this closes.
+
+** SUGGESTED ORDER
+1. =projjson_to_wkt= for geographic CRSes only — no crosswalk dependency,
+   closes the more common id-less case, small and independently testable.
+2. Wire the geographic case into =crs.rs='s expressibility/emission (§
+   COMPONENTS 3) and validate end-to-end: a hand-built id-less geographic
+   PROJJSON (custom datum + ellipsoid, no =id=) through GeoParquet →
+   GeoPackage/FlatGeobuf/Shapefile, confirm the =.gpkg=/=.fgb=/=.prj= now
+   carries a real =GEOGCS= instead of dropping the CRS.
+3. Add the =wkt1_tables.rs= reverse lookups (§ COMPONENTS 2) and the projected
+   renderer, reusing the geographic renderer for the base CRS.
+4. Update =crs.org=/=README.org='s "PROJJSON→WKT reverse deferred" note once
+   this ships — same housekeeping step =compression-encoders.org= calls out
+   for its own status doc. *Done* — see § STATUS above and both files' updated
+   entries.
+
+** TESTING
+- Round trip against the forward direction: for a WKT1/WKT2 fixture already
+  covered by =wkt_to_projjson='s existing tests, confirm
+  =projjson_to_wkt(&wkt_to_projjson(wkt).unwrap())= reproduces an
+  *equivalent* CRS (not necessarily byte-identical text — field order/
+  formatting may differ — so compare via =projinfo --identify= agreement on
+  both strings, the same oracle discipline every other CRS milestone here
+  uses, not a string diff).
+- External oracle: =projinfo --identify= against the *emitted* WKT1 directly,
+  for both a geographic and a projected case with a known EPSG code baked
+  into the input PROJJSON (even though the target scenario is id-less, the
+  identification bulk-oracle needs a knowable-good CRS to check the emitted
+  text represents faithfully).
+- The actual target case (no =id= anywhere): confirm the emitted WKT1 is at
+  least *syntactically* valid and datum/ellipsoid-faithful — =projinfo= can't
+  identify an unregistered custom CRS by definition, so the check here is
+  "GDAL/=ogrinfo= reads the =.prj=/=.gpkg=/=.fgb= without error and reports
+  the same ellipsoid parameters," not an identification-confidence number.
+- End-to-end: GeoParquet (hand-built id-less PROJJSON fixture) → GeoPackage,
+  → FlatGeobuf, → Shapefile, each opened by GDAL and confirmed to carry a
+  real CRS definition instead of "unknown."
+
+** RESOLVED QUESTIONS
+- *Axis-order round trip for =GEOGCS=* — RESOLVED, no effect. Confirmed
+  empirically: the emitted WKT1 =GEOGCS= (no explicit =AXIS=) round-trips
+  through real =projinfo --identify= at 100% (GDA2020, EPSG:7844) and through
+  real =ogrinfo= reading a Geosetta-written =.prj=/=.shp= pair, with geometry
+  coordinates unaffected either way — confirms the forward direction's own
+  reasoning applies symmetrically in reverse.
+- *=en_default_safe = false= methods* — RESOLVED: emit =AXIS= unconditionally
+  rather than deciding per-method. This was found necessary during
+  implementation, not just a caution worth deciding on paper — the first
+  version of =render_wkt1_projected= omitted =AXIS= entirely, and its own
+  output for Transverse Mercator (an =en_default_safe = false= method) failed
+  to round-trip back through =wkt_to_projjson=, since the forward direction
+  refuses to trust the implicit easting/northing order for exactly that
+  method class. Always emitting explicit =AXIS[name,DIRECTION]= nodes (read
+  from the PROJJSON's own =coordinate_system.axis=) sidesteps the question
+  per-method and matches what real GDAL WKT1 export does anyway (every real
+  fixture in this file's tests, e.g. =CALIF1_WKT1=, already carries them).
+- *How common is the id-less-PROJJSON case in practice?* — RESOLVED, real
+  producer output confirmed via real =ogr2ogr=/GDAL runs (5 catalog EPSG
+  codes, one catalog ESRI code, a fully custom geographic =.prj=, and a fully
+  custom projected =.prj=, each converted to GeoParquet and inspected via
+  =duckdb='s =parquet_kv_metadata=):
+  - Every *catalog* CRS (EPSG or ESRI, geographic or projected) carries a
+    top-level =id= — already handled by the existing id-lifting path, not this
+    gap.
+  - A *custom geographic* =.prj= (a locally-defined datum, no registry entry)
+    produces a =GeographicCRS= with *no* =id= anywhere — exactly the case §
+    SUGGESTED ORDER steps 1–2 now close.
+  - A *custom projected* =.prj= (a locally-defined base datum + the standard
+    =Transverse_Mercator= method) produces a =ProjectedCRS= with no top-level
+    =id=, but its =conversion.method= and every =parameter= *do* carry EPSG
+    ids (PROJ recognizes the projection method independent of the
+    unrecognized base datum) — =9807=/Transverse Mercator, already present in
+    =wkt1_tables.rs='s crosswalk. This is a realistic scenario, not a
+    hypothetical: any organization on a local/regional datum with a standard
+    projection method hits it. *Confirmed step 3 (the crosswalk reversal) was
+    worth doing*, not just theoretically complete.
+
+** OPEN QUESTIONS
+Not resolved by this plan — future work, not follow-ups it depends on.
+
+- *A structural WKT2 path for GeoPackage's =definition_12_063=?* This plan
+  defaults to WKT1 output (§ DESIGN, "Output dialect") because
+  =gpkg_spatial_ref_sys.definition= is spec-mandated WKT1, =.prj= is
+  conventionally WKT1/ESRI-flavor, and =NamedCrs.wkt= is one slot every
+  existing consumer already reads as WKT1 — so WKT2 text would be correct data
+  in the wrong field for two of the three targets. But GeoPackage separately
+  has a *real* WKT2 slot, =definition_12_063= (the R5 CRS-WKT extension
+  column, =src/geopackage/writer.rs:126-152=), populated today only by the
+  registry's =registry_wkt2()= when =crs-registry= is on. A structural
+  =projjson_to_wkt2= (arguably *simpler* than the WKT1 projected renderer here
+  — PROJJSON's method/parameter =id= transfers straight into WKT2
+  =METHOD[...,ID[...]]=, no crosswalk reversal needed) could fill that column
+  for an id-less PROJJSON source even without the registry feature. Not folded
+  into this plan — it's a narrower, GeoPackage-only need with a different
+  consumer and no current driver forcing it; worth its own short plan if/when
+  someone wants =definition_12_063= populated from structural translation
+  instead of only the registry.

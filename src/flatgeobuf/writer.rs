@@ -199,7 +199,7 @@ fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>) -> Option<usize> {
         Crs::Named(n) => (
             n.authority.clone(),
             n.code.as_deref().and_then(|c| c.parse::<i64>().ok()),
-            n.wkt.clone(),
+            n.wkt.clone().or_else(|| n.structural_wkt()),
         ),
     };
     // Nothing worth recording.
@@ -563,6 +563,30 @@ mod tests {
                 assert_eq!(n.authority.as_deref(), Some("IGNF"));
                 assert_eq!(n.code, None);
                 assert_eq!(n.wkt.as_deref(), Some("PROJCS[\"RGF93 Lambert 93\"]"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_less_projjson_round_trips_via_structural_translation() {
+        use crate::crs::{Crs, NamedCrs};
+        // The gap `plans/projjson-to-wkt.org` closes: a GeoParquet source
+        // whose PROJJSON carries no authority code at all still reaches
+        // FlatGeobuf's WKT slot via `NamedCrs::structural_wkt`.
+        let pj = r#"{"type":"GeographicCRS","name":"custom","datum":{"type":"GeodeticReferenceFrame","name":"custom datum","ellipsoid":{"name":"custom ellipsoid","semi_major_axis":6378137,"inverse_flattening":298.257223563}}}"#;
+        let crs = Crs::Named(NamedCrs {
+            authority: None,
+            code: None,
+            wkt: None,
+            projjson: Some(pj.into()),
+        });
+        let bytes = write(&one_point(Some(crs)));
+        match crate::flatgeobuf::read(&bytes).unwrap().crs {
+            Some(Crs::Named(n)) => {
+                let wkt = n.wkt.expect("structural translation produced a WKT string");
+                assert!(wkt.starts_with("GEOGCS[\"custom\""), "{wkt}");
+                assert!(wkt.contains("SPHEROID[\"custom ellipsoid\",6378137,298.257223563]"), "{wkt}");
             }
             other => panic!("expected Named, got {other:?}"),
         }

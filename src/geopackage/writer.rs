@@ -182,7 +182,8 @@ fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
             None => (UNDEFINED_SRS_ID, None),
             Some(Crs::Wgs84) => (WGS84_SRS_ID, None),
             Some(Crs::Named(n)) => {
-                let definition = n.wkt.clone().unwrap_or_else(|| "undefined".into());
+                let definition =
+                    n.wkt.clone().or_else(|| n.structural_wkt()).unwrap_or_else(|| "undefined".into());
                 let definition_12_063 =
                     n.registry_wkt2().map(str::to_string).unwrap_or_else(|| "undefined".into());
                 let numeric_code = n.code.as_deref().and_then(|c| c.parse::<i64>().ok());
@@ -628,6 +629,38 @@ mod tests {
                 assert!(n.code.as_deref().is_some_and(|c| c.parse::<i64>().is_ok()));
             }
             other => panic!("expected Named IGNF, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn id_less_projjson_writes_definition_via_structural_translation() {
+        use crate::crs::NamedCrs;
+        // The gap `plans/projjson-to-wkt.org` closes: a GeoParquet source
+        // whose PROJJSON carries no authority code at all — the registry
+        // can't help (nothing to key a lookup on) — still reaches
+        // `gpkg_spatial_ref_sys.definition` via `NamedCrs::structural_wkt`,
+        // instead of falling to a bare "undefined".
+        let pj = r#"{"type":"GeographicCRS","name":"custom","datum":{"type":"GeodeticReferenceFrame","name":"custom datum","ellipsoid":{"name":"custom ellipsoid","semi_major_axis":6378137,"inverse_flattening":298.257223563}}}"#;
+        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        layer.crs = Some(Crs::Named(NamedCrs {
+            authority: None,
+            code: None,
+            wkt: None,
+            projjson: Some(pj.into()),
+        }));
+        let bytes = write_layers(None, &[("custom".into(), layer)], false).unwrap();
+
+        use crate::sqlite::Database;
+        assert!(Database::open(&bytes).is_ok());
+
+        let back = read_layers(&bytes).unwrap();
+        match &back[0].1.crs {
+            Some(Crs::Named(n)) => {
+                let wkt = n.wkt.as_deref().expect("structural translation produced a WKT string");
+                assert!(wkt.starts_with("GEOGCS[\"custom\""), "{wkt}");
+                assert!(wkt.contains("SPHEROID[\"custom ellipsoid\",6378137,298.257223563]"), "{wkt}");
+            }
+            other => panic!("expected Named, got {other:?}"),
         }
     }
 

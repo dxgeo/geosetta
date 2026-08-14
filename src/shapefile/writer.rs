@@ -40,11 +40,17 @@ pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
 /// The WKT text to write to `.prj` for this CRS, or `None` when it can't be
 /// expressed: prefer the source's own verbatim WKT, else — with the
 /// `crs-registry` feature — the registry's authoritative WKT for a known
-/// authority+code (R1's `def_wkt`, this spoke is its first consumer).
+/// authority+code (R1's `def_wkt`, this spoke is its first consumer), else a
+/// structural PROJJSON→WKT translation for an id-less PROJJSON-only source
+/// (see `NamedCrs::structural_wkt`).
 fn prj_wkt(crs: &Crs) -> Option<String> {
     match crs {
         Crs::Wgs84 => Some(WGS84_WKT1.to_string()),
-        Crs::Named(n) => n.wkt.clone().or_else(|| n.registry_wkt().map(str::to_string)),
+        Crs::Named(n) => n
+            .wkt
+            .clone()
+            .or_else(|| n.registry_wkt().map(str::to_string))
+            .or_else(|| n.structural_wkt()),
     }
 }
 
@@ -104,5 +110,19 @@ mod tests {
         // With the registry on, this now resolves via def_wkt.
         #[cfg(feature = "crs-registry")]
         assert!(encoded.prj.is_some());
+    }
+
+    #[test]
+    fn id_less_projjson_writes_prj_via_structural_translation() {
+        // The gap `plans/projjson-to-wkt.org` closes: a GeoParquet source
+        // whose PROJJSON carries no authority code at all — the registry
+        // can't help (nothing to key a lookup on) — still reaches `.prj` via
+        // `NamedCrs::structural_wkt`, independent of the registry feature.
+        let pj = r#"{"type":"GeographicCRS","name":"custom","datum":{"type":"GeodeticReferenceFrame","name":"custom datum","ellipsoid":{"name":"custom ellipsoid","semi_major_axis":6378137,"inverse_flattening":298.257223563}}}"#;
+        let crs = Crs::Named(NamedCrs { projjson: Some(pj.into()), ..Default::default() });
+        let encoded = write(&one_point_fc(Some(crs))).unwrap();
+        let prj = encoded.prj.expect(".prj written via structural translation");
+        assert!(prj.starts_with("GEOGCS[\"custom\""), "{prj}");
+        assert!(prj.contains("SPHEROID[\"custom ellipsoid\",6378137,298.257223563]"), "{prj}");
     }
 }

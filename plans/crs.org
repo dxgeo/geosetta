@@ -63,8 +63,9 @@ the real EPSG registry and check every output identifies at 100% via `projinfo`:
 end-to-end too: a projected (EPSG:7855) GeoPackage → GeoParquet is read back by
 GDAL as EPSG:7855. Still parked and *warned* (never mislabeled): ambiguous WKT1
 projections (a WKT1 name mapping to several EPSG methods — Polar Stereographic
-variants, Azimuthal Equidistant, Krovak, LAEA), south/west-oriented grids whose
-WKT1 omits its axes, and the PROJJSON→WKT reverse. See the marked headings below.
+variants, Azimuthal Equidistant, Krovak, LAEA), and south/west-oriented grids whose
+WKT1 omits its axes. See the marked headings below. The PROJJSON→WKT reverse is
+*DONE* — see [[file:projjson-to-wkt.org][projjson-to-wkt.org]], not this file.
 
 ** MILESTONES (ordered)
 
@@ -137,7 +138,7 @@ id-lifting exists (=parquet::geo::parse_crs=); the gap is WKT.
 - Scope note: this concerns the CRS *definition string* the rich formats record,
   not the WKT *geometry* format (=src/geometry/wkt.rs=), which stays CRS-less.
 
-*** C. WKT ↔ PROJJSON structural translation (rich formats) — *WKT→PROJJSON DONE (geographic, WKT2 projected, common WKT1 projected); PROJJSON→WKT deferred*
+*** C. WKT ↔ PROJJSON structural translation (rich formats) — *DONE, both directions (geographic, WKT2 projected, common WKT1 projected)*
 
 *The finding that forced this.* The old scheme rendered a bare authority+code
 into GeoParquet as a minimal =id= reference
@@ -168,21 +169,28 @@ identifies in GDAL/QGIS/projinfo as EPSG:7844 (GDA2020) at 100% with the extent
 unchanged over Australia. =parquet::geo::crs_projjson= tries verbatim PROJJSON →
 WKT translation → id reference, in that order.
 
-*Deliberately still partial.* Only geographic CRSes are translated. A *projected*
-CRS (=PROJCS=/=PROJCRS=: base geographic + conversion method + parameter-name
-mapping) returns =None= and falls back to the id reference — because PROJ trusts
-the payload, a *wrong* projected translation is worse than none. A bare code with
-no WKT likewise can't be made resolvable (that is milestone D). Both cases now
-*warn*: =parquet_expressible= means "verbatim PROJJSON, or a WKT we can
+*Deliberately still partial.* Projected CRSes translate too now (§ "Why
+projected-CRS translation is hard" below covers how) — WKT2 =PROJCRS= fully,
+WKT1 =PROJCS= for the common/unambiguous projection methods via
+=wkt1_tables.rs='s crosswalk — but two cases still fall back to the id
+reference rather than a full translation: an *ambiguous* WKT1 projection name
+(maps to several possible EPSG methods — Polar Stereographic variants,
+Azimuthal Equidistant, Krovak, LAEA) and a bare code with *no* WKT at all
+(that is milestone D). Because PROJ trusts the payload it is given, a *wrong*
+translation would be worse than none, so both cases decline rather than guess.
+Both *warn*: =parquet_expressible= means "verbatim PROJJSON, or a WKT we can
 translate," so =Crs::downgrade_warning= fires for GeoParquet on a code-only or
 untranslatable-WKT source, telling the user the output records only an
 unresolvable id reference. The reverse direction (*PROJJSON→WKT* for
-FlatGeobuf/GeoPackage targets) is not built; a code-less PROJJSON-only source to
-those targets still just warns (it is dropped).
+FlatGeobuf/GeoPackage/Shapefile targets) is now built too — see
+[[file:projjson-to-wkt.org][projjson-to-wkt.org]] — so a code-less
+PROJJSON-only source reaches those targets when it is geographic or a
+projected CRS whose method is in =wkt1_tables.rs='s crosswalk; outside that it
+still warns (dropped).
 
-*Remaining lift:* projected-CRS translation (the parameter mapping is the hard,
-error-prone part), datum ensembles, and the PROJJSON→WKT reverse. Each is its own
-effort and stays parked; the reported gpkg→parquet loss is fixed.
+*Remaining lift:* datum ensembles (no faithful rendering in either direction —
+WKT1 has no ensemble concept at all). Projected-CRS translation itself (both
+directions) and the PROJJSON→WKT reverse are done; each was its own effort.
 
 **Why projected-CRS translation is hard (scoping the remaining lift).**
 Geographic was one block (datum + ellipsoid + axes). A projected CRS nests three
@@ -396,25 +404,46 @@ intact. It yields *two* artifacts:
   never a guess). The crosswalk shrinks the risky *data* work, not the parsing
   discipline.
 
-*** D. Definition synthesis from a bare code (rich formats) — *L + data + licensing; likely declined*
+*** D. Definition synthesis from a bare code (rich formats) — *DONE, via the opt-in CRS registry*
 Turning =EPSG:7844= *alone* into a full WKT/PROJJSON (so a target that demands a
 complete definition gets one, and so GDAL resolves the plain-parquet =id= case
 that currently shows =(unknown)=) requires the EPSG registry — PROJ ships ~9 MB
-of it. Options: (a) embed a *curated* table of the few hundred common CRSes
-(partial coverage, modest size); (b) embed the full dataset (breaks
-"lightweight," plus EPSG attribution terms); (c) don't — keep code→definition
-"unspecified." *Recommendation: (c)*, with (a) as an optional stretch. This is
-where "fully" genuinely collides with the dependency-free / lightweight identity.
+of it. The three options considered here were (a) a curated table of common
+CRSes, (b) embed the full dataset, or (c) decline and document the limit; this
+plan originally recommended (c).
+
+*As shipped, instead: option (b), but kept out of the dependency-free core.*
+The *CRS registry* effort (moved out of this repo — see =plans/README.org=)
+built exactly the full-dataset option, as the sibling
+[[https://github.com/dxgeo/geosetta-crs-data][=geosetta-crs-data=]] crate: all
+13,790 =proj.db= CRSes, zstd-compressed to ~1 MB, decoded by =geosetta='s own
+=compress/zstd.rs=. It is pulled in behind the =crs-registry= Cargo feature, so
+the default build's dependency-free identity is untouched — the "collision
+with lightweight" this milestone worried about is resolved by making the
+lookup *opt-in* rather than by shrinking the dataset. =Crs::registry_projjson=
+/ =registry_wkt= / =registry_wkt2= (=src/crs.rs=) resolve a trusted
+=(authority, code)= pair directly against the embedded blob (R1, =src/crs/
+registry.rs='s =def_projjson=/=def_wkt=/=def_wkt2=) and feed
+=parquet_expressible=/=shapefile_expressible=, so a source carrying *only* a
+bare code — no WKT, no PROJJSON — now reaches GeoParquet with real, resolvable
+PROJJSON and Shapefile's =.prj= with real WKT, when the feature is on. Without
+the feature, the original limit still holds: a bare code alone cannot be
+synthesized in the dependency-free build, and the CLI still warns rather than
+guess. See =crs-registry.org= in the sibling crate for the design/oracle
+details; this file only tracks that D's gap is closed for the opt-in build.
 
 ** RECOMMENDED SEQUENCING
 1. *A* (warnings) — *done.* The immediate ask; cheap, stops silent mislabeling
    today, independent of everything else.
 2. *B* (WKT id extraction) — *done.* Best value/effort among the rich formats;
    makes auth+code universal.
-3. *C* — WKT→PROJJSON (geographic) *done* (fixes gpkg→parquet in GDAL/QGIS);
-   projected CRSes, ensembles, and the PROJJSON→WKT reverse remain, each its own
-   effort.
-4. *D* — probably decline; document as the deliberate dependency-free limit.
+3. *C* — WKT→PROJJSON (geographic, WKT2 projected, common WKT1 projected)
+   *done* (fixes gpkg→parquet in GDAL/QGIS); the PROJJSON→WKT reverse is also
+   *done* ([[file:projjson-to-wkt.org][projjson-to-wkt.org]]). Datum ensembles
+   remain (no faithful WKT1 rendering exists), each its own effort.
+4. *D* — *done*, via the opt-in =crs-registry= feature (=geosetta-crs-data='s
+   full embedded registry); the default dependency-free build still declines,
+   as originally recommended.
 
 ** OPEN QUESTIONS / DECISIONS
 - *Warning suppression* — *resolved for now:* shipped =--quiet= (alias
@@ -431,5 +460,7 @@ where "fully" genuinely collides with the dependency-free / lightweight identity
   utility that slots between read and write; see =project.org=).
 - Adding any CRS encoding to GeoJSON / CSV / WKT — GeoJSON stays always-WGS 84
   both directions, CSV/WKT stay CRS-less; the only change for them is warnings.
-- Embedding the full EPSG registry (milestone D, option b).
+- Embedding the full EPSG registry *in the default build* (milestone D, option
+  b) — done instead as the opt-in =crs-registry= feature / sibling crate, so
+  this non-goal is scoped to "not in the dependency-free core," not "never."
 - Interpreting projection math from any CRS string.

@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+<Document id="root_doc">
+<Schema name="duckdb_geoms" id="duckdb_geoms">
+	<SimpleField name="n" type="int"></SimpleField>
+</Schema>
+<Folder><name>duckdb_geoms</name>
+  <Placemark>
+	<name>alpha</name>
+	<ExtendedData><SchemaData schemaUrl="#duckdb_geoms">
+		<SimpleData name="n">1</SimpleData>
+	</SchemaData></ExtendedData>
+      <Point><coordinates>1.5,2.5</coordinates></Point>
+  </Placemark>
+  <Placemark>
+	<name>beta</name>
+	<Style><LineStyle><color>ff0000ff</color></LineStyle><PolyStyle><fill>0</fill></PolyStyle></Style>
+	<ExtendedData><SchemaData schemaUrl="#duckdb_geoms">
+		<SimpleData name="n">2</SimpleData>
+	</SchemaData></ExtendedData>
+      <LineString><coordinates>0,0 1,1 2,0</coordinates></LineString>
+  </Placemark>
+  <Placemark>
+	<name>gamma</name>
+	<Style><LineStyle><color>ff0000ff</color></LineStyle><PolyStyle><fill>0</fill></PolyStyle></Style>
+	<ExtendedData><SchemaData schemaUrl="#duckdb_geoms">
+		<SimpleData name="n">3</SimpleData>
+	</SchemaData></ExtendedData>
+      <Polygon><outerBoundaryIs><LinearRing><coordinates>0,0 4,0 4,4 0,4 0,0</coordinates></LinearRing></outerBoundaryIs><innerBoundaryIs><LinearRing><coordinates>1,1 2,1 2,2 1,2 1,1</coordinates></LinearRing></innerBoundaryIs></Polygon>
+  </Placemark>
+</Folder>
+</Document></kml>

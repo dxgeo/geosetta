@@ -1,0 +1,195 @@
+#+TITLE: Plan: Compression Encoders (DEFLATE, LZ4, ZSTD)
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Adding the Missing Compression Encoders
+
+** STATUS — SCOPING (not started)
+Not yet implemented. =compress/= currently has one real encoder — Snappy
+(=compress/snappy.rs=, both =compress= and =decompress=, and the codec the
+GeoParquet writer actually uses today) — plus three *decode-only* codecs:
+GZIP/DEFLATE (=gzip.rs=), LZ4 (=lz4.rs=), and ZSTD (=zstd.rs=). Those three
+were built for [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]
+purely to *read* foreign GeoParquet files (DuckDB/GDAL/Arrow choose their own
+page codec on write; Geosetta just has to decode whatever it finds) — nothing
+in the crate has ever needed to *write* GZIP, LZ4, or ZSTD, so no encoder was
+built. This plan covers closing that read/write asymmetry, one codec at a
+time, each independently shippable.
+
+** WHY THIS NOW: the .kmz driver
+[[file:kml.org][kml.org]]'s =.kmz= writer is stored-only (uncompressed) today
+specifically because there's no DEFLATE encoder — ZIP's only two compression
+methods are stored (=0=) and deflate (=8=), so DEFLATE is the one codec here
+with an actual, immediate consumer. LZ4 and ZSTD have *no* current consumer:
+the GeoParquet writer is hardcoded to Snappy (=parquet/writer.rs= calls
+=snappy::compress= directly, no codec choice), and nothing else in the crate
+writes compressed bytes at all. Their motivation is symmetry/completeness
+(every codec Geosetta can read, it can also write) and unlocking a future
+GeoParquet =--compression= flag, not an existing blocked feature — see §
+PRIORITY for why that changes the ordering.
+
+** DEFLATE / GZIP ENCODER (RFC 1951) — the one with a driver
+
+*** Design: fixed-Huffman only, not a full zlib-quality encoder
+DEFLATE compression has two independent pieces: LZ77 back-reference matching,
+then Huffman-coding the resulting literal/length/distance symbol stream.
+=gzip.rs='s decoder already implements *all three* DEFLATE block types
+(=Inflater::run='s =btype= match: =0= stored, =1= fixed Huffman, =2= dynamic
+Huffman) and already has the fixed Huffman code tables built (=fixed_tables()=,
+RFC 1951 §3.2.6, currently only called from the decode path). The proposal is
+an encoder that emits *only* BTYPE =1= (fixed Huffman) blocks: reuse
+=fixed_tables()= as-is for the symbol encoding (no canonical-code-length
+construction — no package-merge/JPEG-style algorithm — needed at all), paired
+with a simple LZ77 match finder (a hash-table single-candidate matcher,
+structurally the same shape as =snappy.rs='s existing =encode_block=, which
+already does exactly this for Snappy's own tag format). This produces fully
+valid, standard DEFLATE — decodable by =gzip.rs= itself, and by every real
+tool (=zlib=, Python, Google Earth, GDAL) — at a *worse compression ratio*
+than a dynamic-Huffman encoder (which adapts code lengths to the actual
+symbol frequencies of each block) would achieve. That gap is the deliberate
+trade-off: dynamic Huffman needs canonical code construction from symbol
+frequencies, which is real additional complexity with no correctness payoff
+for =.kmz= (small XML text, where "smaller than uncompressed" already beats
+today's stored-only baseline by a wide margin — see § OPEN QUESTIONS on
+whether the ratio gap ever matters enough to revisit).
+- *Incompressible-input fallback:* mirror Snappy's own literal-block
+  fallback for tiny/incompressible input — emit a BTYPE =0= (stored) block
+  instead of a fixed-Huffman block when compression would expand the data,
+  so the encoder never makes output *larger* than the input plus a small
+  fixed overhead. The decoder already supports BTYPE =0= (it has to, for
+  real-world streams), so this is free on the decode side.
+- *Container:* a raw DEFLATE stream, no gzip/zlib wrapper — exactly what ZIP
+  method =8= entries are, and what =gzip.rs='s own =strip_container=
+  already treats as the default case on decode. A gzip-container encoder
+  (magic + header + CRC/size trailer, RFC 1952) is a thin, optional
+  addition on top if a future consumer ever needs literal =.gz= output; not
+  needed for =.kmz= and out of scope here unless requested.
+
+*** Consumer: =zip.rs='s write path
+=zip::write= currently hardcodes =METHOD_STORED= for every entry
+(=write_local_header=/=write_central_header=). Wiring the encoder in means:
+compress each entry's bytes via the new DEFLATE encoder, use the *actual*
+compressed length (not =data.len()=) for the compressed-size field, and set
+the method field to =METHOD_DEFLATE= (=8=) instead of =METHOD_STORED=. CRC-32
+is computed over the *uncompressed* bytes either way (already correct, no
+change needed there). =kml::write_kmz= itself needs no change — it already
+just hands =doc.kml='s bytes to =zip::write=.
+
+** LZ4 BLOCK ENCODER — no current driver, moderate effort
+LZ4's block format (what =lz4.rs= already decodes: =tests/fixtures/duckdb_lz4.parquet=,
+the =LZ4_RAW= Parquet codec) has no entropy coding at all — just a token byte
+per sequence (literal length nibble + match length nibble), literal bytes, and
+a 2-byte little-endian match offset. An encoder is structurally the closest of
+the three to =snappy.rs='s existing hash-table match finder — same shape
+(hash chain/table over 4-byte sequences, greedy longest-match), different
+output tag encoding. Meaningfully simpler than the DEFLATE encoder above
+(no Huffman step of any kind) but has *no consumer to wire it into* until the
+GeoParquet writer gets a codec-choice flag (see § OPEN QUESTIONS) — it would
+sit unused, tested only against its own decoder and hand-built fixtures,
+until that flag exists.
+
+** ZSTD ENCODER — no current driver, highest effort, lowest priority
+A real, useful ZSTD encoder means FSE (tANS) entropy encoding of both
+literals and sequences, Huffman literal coding, and *matching* the
+decoder's frame structure end-to-end (=compress/zstd.rs='s decoder, at 1000+
+lines, is already the largest codec in the crate — encoding is harder than
+decoding for every entropy coder here, since the encoder also has to choose
+good statistics/tables, not just apply given ones). A minimally-compliant
+"encoder" that only ever emits raw/uncompressed ZSTD blocks would be a small,
+easy addition — but it would achieve *zero* compression, making it strictly
+worse than just using the Snappy encoder that already exists, so it isn't
+worth building at all on its own. A ZSTD encoder is only worth its cost
+if/when there's a real reason to prefer ZSTD's *ratio* over Snappy's *speed*
+for GeoParquet output specifically (large archival exports, e.g.) — until
+then this sits at the bottom of the list, the same diminishing-returns bar
+[[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]] used to defer
+Brotli.
+
+** PRIORITY
+1. *DEFLATE* — real, existing consumer (=.kmz= compression); ships value
+   immediately; fixed-Huffman scope keeps the lift small and reuses code
+   already in =gzip.rs=.
+2. *LZ4* — no consumer yet, but cheap (~simplest of the three) and would be
+   ready the moment a GeoParquet =--compression= flag exists.
+3. *ZSTD* — no consumer, highest cost, and a "just make it compile" version
+   would be pointless (zero compression). Do this last, and only with a
+   concrete reason.
+
+These are independent — shipping DEFLATE alone (closing the =.kmz= gap) is a
+complete, useful unit of work; LZ4 and ZSTD don't need to happen for it to be
+worth doing.
+
+** COMPONENTS
+*** 1. =compress/gzip.rs= — add =pub fn compress(input: &[u8]) -> Vec<u8>=
+Symmetric with =gzip::decompress='s signature shape. Internals: an LZ77
+match finder (new — the decoder has no matching logic to reuse, only symbol
+decoding) emitting into the existing fixed Huffman tables via a bit-level
+writer (new — the decoder's =BitReader= has no writer counterpart yet). Emits
+one final BTYPE =1= block per call (or BTYPE =0= for the incompressible-input
+fallback); a caller wanting a gzip container instead of a raw stream wraps
+the output itself (not this function's job, mirroring how =gzip::decompress=
+strips a container down to raw DEFLATE rather than the reverse).
+*** 2. =zip.rs= — wire the encoder into the write path
+=write_local_header=/=write_central_header= take the compression method and
+the already-compressed bytes' length instead of assuming stored; =zip::write=
+tries DEFLATE first, falls back to stored only if DEFLATE would expand the
+entry (the encoder's own incompressible-input fallback already handles the
+common case, but a whole-entry check is the belt-and-suspenders version at
+this layer).
+*** 3. (LZ4/ZSTD, once prioritized) =compress/lz4.rs= / =compress/zstd.rs= —
+add =compress= analogous to Snappy's, plus whatever CLI/writer plumbing a
+=--compression= flag needs (out of scope for *this* plan — see § OPEN
+QUESTIONS).
+
+** SUGGESTED ORDER
+1. =gzip::compress= (fixed-Huffman + stored fallback) as a standalone
+   =bytes -> bytes= function, unit-tested via its own round trip
+   (=gzip::decompress(gzip::compress(x)) == x=) and against real =zlib=/
+   Python =zlib.decompress= output as an external oracle, the same discipline
+   =arbitrary-geoparquet.org= used for the decoder.
+2. Wire it into =zip::write=; validate by having real =unzip=/=ogrinfo=
+   (already used for =.kmz= oracle testing) read a *compressed* Geosetta-written
+   =.kmz=, and confirm the output is smaller than today's stored baseline on a
+   real-sized =.kml= document.
+3. Update =plans/kml.org='s § OPEN QUESTIONS entry for the DEFLATE encoder
+   once step 2 lands (it currently documents the stored-only trade-off as
+   deliberate/deferred — that entry becomes stale the moment this ships).
+4. LZ4 and ZSTD encoders, if/when prioritized — each independently, each
+   needing its own consumer decision first (see § OPEN QUESTIONS).
+
+** TESTING
+- Round-trip against the crate's own decoder for each codec — cheap,
+  catches most bugs, but not sufficient alone (a decoder and encoder built
+  by the same hand can share a blind spot).
+- External oracle per codec: real =zlib=/=gzip=/Python for DEFLATE (mirrors
+  how =gzip.rs='s decoder was validated against real gzip output at every
+  compression level 1–9 per =arbitrary-geoparquet.org=); the system =zip=
+  tool or =ogr2ogr= reading a Geosetta-written compressed =.kmz= is the
+  end-to-end version of the same check.
+- Incompressible-input case: confirm the stored-block fallback actually
+  fires (e.g. already-compressed or random bytes) and that output size
+  never exceeds input size by more than the fixed per-block overhead.
+- Fuzz/property-style check worth considering: round-trip a corpus of
+  varied-size inputs (empty, 1 byte, exactly one match-length boundary,
+  highly repetitive, high-entropy) through encode→decode, matching the
+  boundary-condition style already used in =gzip.rs='s existing
+  =roundtrip_small_sizes= decoder test.
+
+** OPEN QUESTIONS
+- *Is the fixed-Huffman ratio gap ever a real problem?* The plan's bet is
+  "no, not for =.kmz='s typical size/content" — revisit with a dynamic-Huffman
+  upgrade only if someone hits an actual case where it matters (large
+  =.kmz= exports, e.g.), the same "ship the simpler correct thing, upgrade
+  on evidence" call =kml.org= already made once for stored-vs-compressed.
+- *A GeoParquet =--compression= flag* — the actual consumer LZ4/ZSTD
+  encoders would need to matter at all. Not scoped here: it touches
+  =cli.rs=, =convert.rs=, and =parquet/writer.rs='s currently-hardcoded
+  Snappy call, and raises its own question (expose all four codecs, or just
+  a curated subset?). Worth a short dedicated plan of its own if/when LZ4 or
+  ZSTD encoders are prioritized, rather than folding it into this one.
+- *Gzip-container output* (RFC 1952 wrapper: magic, header, CRC/size
+  trailer) — not needed by any current consumer (=.kmz= wants raw DEFLATE);
+  add only if something starts needing literal =.gz= files.
+- *LZ4 frame vs. block format* — =lz4.rs='s decoder handles the *block*
+  format only (=LZ4_RAW=, what Parquet uses); the encoder should match that
+  scope unless a future consumer specifically needs LZ4 frame output.

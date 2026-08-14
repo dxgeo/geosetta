@@ -25,9 +25,9 @@ The project aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.21.1*.
+Current version: *0.22.0*.
 
-Seven formats are supported, all routed through a shared feature IR
+Eight formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
 every other automatically — no per-pair code:
 
@@ -53,6 +53,16 @@ every other automatically — no per-pair code:
   Composes with GeoPackage's multi-layer fan-out for free (one =layer.shp=
   sibling set per =.gpkg= layer, in either direction). Validated against real
   DuckDB-generated fixtures and GDAL/DuckDB's own readers.
+- *KML* and *KMZ* (read + write) on a from-scratch XML reader/writer
+  (=src/xml.rs=) and a minimal ZIP container codec (=src/zip.rs=). CRS is
+  always WGS 84 (KML has no other CRS concept). =.kmz= reading flattens every
+  internal =*.kml= entry rather than trusting just the first, since a real
+  multi-layer producer's root =doc.kml= can be nothing but a =<NetworkLink>=
+  pointing at the actual data; writing packs the =.kml= bytes as one stored
+  (uncompressed) zip entry — no DEFLATE encoder in the crate yet, so =.kmz=
+  output is bigger than a compressed one but universally readable. Validated
+  against real GDAL (=ogrinfo=, =ogr2ogr -f LIBKML=) and DuckDB-generated
+  fixtures, plus a real Info-ZIP archive for the deflate read path.
 
 Any input converts to any output: e.g. CSV→GeoParquet, FlatGeobuf→GeoJSON,
 GeoPackage→GeoParquet, GeoJSON→GeoPackage, GeoPackage↔Shapefile all work.
@@ -89,10 +99,16 @@ geometry included, under SNAPPY, GZIP, ZSTD, LZ4_RAW, or no compression — the
 ZSTD, GZIP/DEFLATE, and LZ4 decoders are implemented from scratch in
 =compress/zstd.rs=, =compress/gzip.rs=, and =compress/lz4.rs=. Property columns may
 be =BOOLEAN=, =INT32=/=INT64=, =FLOAT=/=DOUBLE=, or =BYTE_ARRAY= strings, with
-=DATE= and =TIMESTAMP= columns rendered as ISO 8601 strings. Remaining gaps —
-=DATA_PAGE_V2=, =DECIMAL=/=INT96=, nested columns, 3D geometry, Brotli — are
-reported as clear errors and tracked in
-[[file:plans/arbitrary-geoparquet.org][plans/arbitrary-geoparquet.org]].
+=DATE= and =TIMESTAMP= columns rendered as ISO 8601 strings. The schema parser
+walks the file's actual schema /tree/ (not just each leaf's own repetition
+type), so a column nested under an OPTIONAL group decodes correctly too — the
+case that matters in practice is GDAL/OGR's GeoParquet 1.1 =geometry_bbox=
+"covering" column, which it writes by default; Geosetta recognizes it via the
+=geo= metadata and excludes it from =properties= rather than surfacing it as a
+fake column (fixture: =tests/fixtures/gdal_covering_bbox.parquet=). Remaining
+gaps — =DATA_PAGE_V2=, =DECIMAL=/=INT96=, genuinely nested/repeated
+(list-valued) columns, 3D geometry, Brotli — are reported as clear errors and
+tracked in [[file:plans/arbitrary-geoparquet.org][plans/arbitrary-geoparquet.org]].
 
 ** IMPLEMENTATION
 Language: Rust (edition 2024). Every wire format is implemented from its
@@ -174,11 +190,24 @@ geosetta aus.gpkg      aus.geojson --quiet          # silence the CRS-loss warni
 geosetta parcels.shp   parcels.geojson  # Shapefile  -> GeoJSON (reads sibling .shx/.dbf/.prj)
 geosetta roads.geojson roads.shp        # GeoJSON    -> Shapefile
 geosetta data.gpkg     out/ --to shp    # multi-layer GeoPackage -> one .shp set per layer
+geosetta places.kml    places.geojson   # KML        -> GeoJSON
+geosetta places.kmz    places.parquet   # KMZ        -> GeoParquet (reads every internal .kml)
+geosetta places.geojson places.kml      # GeoJSON    -> KML
+geosetta places.geojson places.kmz      # GeoJSON    -> KMZ (stored, uncompressed)
 # formats may also be given explicitly:
 geosetta in.txt out.bin --from geojson --to parquet
 # the embedded CRS registry (name recovery for id-less WKT1, WKT2 emission, …)
 # is opt-in — build/run with:
 cargo run --features crs-registry -- parcels.shp parcels.parquet
+# or, when installing the published crate:
+cargo install geosetta --features crs-registry
+# "-" means stdin/stdout (needs --from/--to, since there's no path to infer
+# a format from) — pipe any external tool in between read and write, e.g. a
+# reprojection step, since Geosetta itself never reprojects:
+reproject-tool --to EPSG:3857 < in.geojson | geosetta --from geojson --to fgb - out.fgb
+# not supported for Shapefile (sibling .shp/.shx/.dbf/.prj files, no single
+# byte stream to pipe) — route it through a single-buffer format instead:
+geosetta in.shp - --to fgb | reproject-tool --to EPSG:3857 | geosetta - out.shp --from fgb
 #+end_src
 
 A runnable example lives in [[file:examples/sample.geojson][examples/sample.geojson]].
@@ -223,8 +252,9 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
   clustering, and now the opt-in =--rtree= GeoPackage R*Tree extension (scoped in
   [[file:plans/spatial-index.org][plans/spatial-index.org]]). Whether to make =--rtree= the default is the one
   remaining open question there.
-- *More format spokes* — Shapefile is done (see above); the next classic
-  candidate is a further-out consideration, not yet scoped.
+- *More format spokes* — Shapefile and KML/KMZ are both done (see above),
+  scoped in [[file:plans/kml.org][plans/kml.org]]. The next classic candidate
+  is a further-out consideration, not yet scoped.
 - *Raster formats* (larger effort, planned) — a genuinely new axis. Raster data
   is a grid of cells, not a set of features, so it needs a second intermediate
   representation (a coverage/grid model) beside the feature IR, with its own
@@ -281,6 +311,20 @@ guess). Geosetta still never parses these
 strings for *meaning* (no projection math); the WKT→PROJJSON step is a purely
 structural transcription of the fields the source already recorded.
 
+The reverse direction — *PROJJSON→WKT*, for a GeoParquet source whose CRS
+carries no authority code reaching FlatGeobuf, GeoPackage, or Shapefile's
+=.prj= — is implemented the same way, structurally and without registry
+involvement (the registry can't help here: an id-less PROJJSON has nothing to
+key a lookup on). Geographic CRSes translate directly; projected CRSes reuse
+=wkt1_tables.rs='s crosswalk in reverse (an EPSG method/parameter code back to
+its GDAL WKT1 name), so a custom/local datum combined with a standard,
+catalogued projection method — confirmed a realistic case against real
+=ogr2ogr= output, not just hypothetical — still reaches a WKT-dialect target
+instead of dropping the CRS. Verified against real =projinfo --identify= (both
+an all-metre and a US-survey-foot projected case, each at 100%) and against
+real =ogrinfo= reading a Geosetta-written =.prj= end to end
+([[file:plans/projjson-to-wkt.org][plans/projjson-to-wkt.org]]).
+
 *Embedded CRS registry (opt-in, 0.21.0).* Structural translation alone can't
 resolve every CRS — a source may carry only a bare code, an ambiguous WKT1
 projection name, or (as with Esri-flavor Shapefile =.prj= text) no authority id
@@ -302,10 +346,36 @@ path, registry included, is checked by bulk oracles against PROJ's
 =NamedCrs='s code field is =Option<String>= (not =Option<i64>=) precisely so
 this path can round-trip alphanumeric codes like =OGC:CRS84=.
 
-This is also the seam for a future, separate *reprojection* utility: because the
-CRS is a public value on the IR and geometry is stored apart from it, such a tool
-slots in as a stage between read and write — transforming coordinates and
-updating =Crs=— without Geosetta itself ever learning projection math.
+*Reprojection composability (implemented).* Because the CRS is a public value
+on the IR and geometry is stored apart from it, a reprojection tool slots in
+as a stage between read and write — transforming coordinates and updating
+=Crs= — without Geosetta itself ever learning projection math (scoped in
+[[file:plans/reproject-composability.org][plans/reproject-composability.org]]).
+Two seams, for the two ways such a tool shows up:
+
+- *A linked-in library* uses
+  =FeatureCollection::for_each_position_mut=/=for_each_position_run_mut=
+  (=src/feature.rs=, =src/geometry/mod.rs=) to rewrite every coordinate in
+  place — the =_run_= variant yields whole contiguous coordinate runs (a ring,
+  a =LineString=, ...) rather than one point at a time, so a backend that
+  batches (PROJ's =proj_trans_array=, a SIMD kernel) gets a real batch instead
+  of a per-point callback.
+- *An external process* — including one with no Rust API to link against at
+  all — composes through =-= as =<input>=/=<output>=, the standard stdin/stdout
+  placeholder (needs =--from=/=--to= explicitly, since there's no path to infer
+  a format from): =reproject-tool --to EPSG:3857 < in.geojson | geosetta
+  --from geojson --to fgb - out.fgb=. Not accepted for Shapefile — sibling
+  =.shp=/=.shx=/=.dbf=/=.prj= files, not a single byte stream — which routes
+  through a single-buffer format instead (FlatGeobuf and GeoParquet both
+  carry the CRS faithfully) around the external step.
+
+Verified against three independent, real tools in =tests/reproject_pipe.rs=:
+GDAL (=ogr2ogr=, piped, container- and CRS-aware), PROJ (=cs2cs=, piped, a bare
+coordinate transformer with no container format of its own), and
+[[https://crates.io/crates/wbprojection][=wbprojection=]] (a reprojection
+*library* with no CLI binary, linked directly against =for_each_position_mut=
+as a dev-dependency). All three transform the same fixture to EPSG:3857 and
+are checked against the same oracle values, cross-verified by hand.
 
 Detailed design notes live in [[file:plans/README.org][plans/]].
 

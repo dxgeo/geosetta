@@ -12,7 +12,9 @@ they are ordered by dependency.
   round trip is byte-for-byte stable.
 - [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]] :: Extend that
   reader to files from DuckDB / GDAL / Arrow — dictionary encoding, the general
-  RLE/bit-pack hybrid, multiple pages/row groups, more codecs and types.
+  RLE/bit-pack hybrid, multiple pages/row groups, more codecs and types, and a
+  schema-tree walk so columns nested under OPTIONAL groups (e.g. GDAL's
+  =geometry_bbox= covering column) decode correctly instead of misparsing.
   *Depends on the round-trip reader.* Largely done (see the file for the
   remaining deferred items).
 - [[file:flatgeobuf.org][flatgeobuf.org]] :: Add FlatGeobuf as a new format
@@ -58,8 +60,12 @@ they are ordered by dependency.
   and structural WKT→PROJJSON translation for GeoParquet. Milestones A (CRS-loss
   warnings), B (WKT id lifting), and C (WKT→PROJJSON: geographic, WKT2 projected,
   and common WKT1 projected, gated by =projinfo= bulk oracles) are *DONE*.
-  *Remaining:* ambiguous/rare WKT1 projections, the PROJJSON→WKT reverse, and
-  EPSG-registry synthesis from a bare code (the dependency-free limit).
+  *Remaining in the dependency-free core:* ambiguous/rare WKT1 projections
+  (declined by design — no safe disambiguation) and bare-code definition
+  synthesis without the registry feature. Bare-code synthesis (milestone D) is
+  otherwise *DONE* when the opt-in =crs-registry= feature is on — see the *CRS
+  registry* entry below. The PROJJSON→WKT reverse is *DONE* — see
+  [[file:projjson-to-wkt.org][projjson-to-wkt.org]].
 - *CRS registry* (moved out of this repo) :: Embedded CRS registry — *resolve a
   source's (authority, code) (inline id, name→code, or structural match), then
   emit the authoritative definition* in the target's dialect, instead of
@@ -86,3 +92,41 @@ they are ordered by dependency.
   with no new CRS code, and =.prj= writing is the first consumer of R1's
   =registry::def_wkt=. *Depends on the CRS registry* (for full =.prj= fidelity;
   geometry/attributes have no dependency on it).
+- [[file:kml.org][kml.org]] :: Add KML/KMZ — a from-scratch XML reader/writer
+  (=src/xml.rs=) and a minimal ZIP container codec (=src/zip.rs=, stored +
+  the existing DEFLATE decoder for reads, stored-only for writes), with CRS
+  always =Crs::Wgs84= (KML has no other CRS concept). *DONE* (=.kml= and
+  =.kmz=, read + write, both directions, wired into the hub via
+  =Format::Kml=/=Format::Kmz=) — oracle-validated against real GDAL
+  (=ogrinfo=, =ogr2ogr -f LIBKML=) and DuckDB, including a real multi-layer
+  LIBKML =.kmz= fixture that required flattening every internal =*.kml= entry
+  rather than trusting just the first (its root =doc.kml= is only a
+  =<NetworkLink>=). No dependency on the other plans.
+- [[file:projjson-to-wkt.org][projjson-to-wkt.org]] :: The reverse of
+  =crs.org= milestone C — translate a PROJJSON CRS with no authority code
+  into WKT1, so a GeoParquet source can still express its CRS when converted
+  to FlatGeobuf/GeoPackage/Shapefile. *DONE* (geographic and projected, both
+  directions verified against real =projinfo=/=ogrinfo=) — closes
+  [[file:crs.org][crs.org]]'s "PROJJSON→WKT reverse" item. Shares
+  =crs.org='s WKT→PROJJSON translator's file, its =UnitKind= types, and —
+  for projected CRSes — its =wkt1_tables.rs= crosswalk, reversed rather than
+  rebuilt.
+- [[file:compression-encoders.org][compression-encoders.org]] :: Close the
+  read/write asymmetry in =compress/= — GZIP/DEFLATE, LZ4, and ZSTD are
+  decode-only today (built for =arbitrary-geoparquet.org='s foreign-file
+  reading; only Snappy has ever needed an encoder, for the GeoParquet
+  writer). DEFLATE is prioritized first: it has a real, immediate consumer
+  in =kml.org='s stored-only =.kmz= writer, and a fixed-Huffman-only design
+  (reusing =gzip.rs='s existing fixed tables) keeps the lift small. LZ4 and
+  ZSTD have no current consumer and are deferred accordingly — ZSTD
+  especially, since a real compressing encoder is comparable in effort to
+  its 1000+-line decoder. *Scoping only, not yet implemented.*
+- [[file:reproject-composability.org][reproject-composability.org]] :: Make
+  Geosetta composable with any *external* reprojection tool without ever
+  reprojecting itself — a coordinate-mutation seam
+  (=for_each_position_mut=/=for_each_position_run_mut=) for a linked-in Rust
+  library, and =-= stdin/stdout piping (=main.rs=/=cli.rs=) for a separate
+  process. *DONE* — verified against three independent, real tools (GDAL,
+  PROJ, and the =wbprojection= crate) in =tests/reproject_pipe.rs=. *Depends
+  on =crs.org='s opaque-CRS design* (the IR never interprets a =Crs=, so
+  swapping it out after an external transform needs no Geosetta-side code).

@@ -152,3 +152,53 @@ pub(super) static PARAMS: &[(i64, &str, &str, i64, UnitKind)] = &[
     (9830, "Longitude of origin", "Longitude of origin", 8833, UnitKind::Angular),
     (9830, "Northing at false origin", "Northing at false origin", 8827, UnitKind::Linear),
 ];
+
+/// The WKT1 GDAL projection method name for an EPSG method code — the reverse
+/// of `METHODS`' `wkt1_name -> epsg_code` direction, for `projjson_to_wkt`
+/// (`wkt_projjson.rs`, `plans/projjson-to-wkt.org`). Exact within this
+/// table's already-filtered common/unambiguous subset — no new crosswalk
+/// data, just a scan of the existing static in the other direction. A method
+/// code absent from `METHODS` (one no WKT1 source ever exercised) returns
+/// `None`, same as the forward direction's own unresolved case.
+pub(super) fn method_name_by_code(code: i64) -> Option<&'static str> {
+    METHODS.iter().find(|(_, _, c, _)| *c == code).map(|(wkt1_name, ..)| *wkt1_name)
+}
+
+/// The WKT1 GDAL parameter name and unit kind for an `(EPSG method code,
+/// EPSG parameter code)` pair — the reverse of `PARAMS`' direction, for
+/// `projjson_to_wkt`. The unit kind rides along so the caller can validate a
+/// PROJJSON parameter's own unit against what WKT1 expects (angular params
+/// carry the base CRS's angular unit, linear params the projected CRS's own
+/// linear unit, scale params are always dimensionless) without re-deriving it
+/// from the JSON.
+pub(super) fn param_by_code(method_code: i64, epsg_param_code: i64) -> Option<(&'static str, UnitKind)> {
+    PARAMS
+        .iter()
+        .find(|(mc, _, _, pc, _)| *mc == method_code && *pc == epsg_param_code)
+        .map(|(_, wkt1_name, _, _, kind)| (*wkt1_name, *kind))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_method_round_trips_through_the_reverse_lookup() {
+        for (wkt1_name, _, code, _) in METHODS {
+            assert_eq!(method_name_by_code(*code), Some(*wkt1_name), "method code {code}");
+        }
+        assert_eq!(method_name_by_code(-1), None);
+    }
+
+    #[test]
+    fn every_param_round_trips_through_the_reverse_lookup() {
+        for (method_code, wkt1_name, _, epsg_code, kind) in PARAMS {
+            assert_eq!(
+                param_by_code(*method_code, *epsg_code),
+                Some((*wkt1_name, *kind)),
+                "method {method_code}, param {epsg_code}"
+            );
+        }
+        assert_eq!(param_by_code(-1, -1), None);
+    }
+}

@@ -43,11 +43,32 @@ pub(crate) fn wkt_to_projjson(wkt: &str) -> Option<String> {
     }
 }
 
+/// Translate a PROJJSON CRS object into a WKT1 (GDAL-flavor) string — the
+/// mirror of [`wkt_to_projjson`], for the direction it needs. Needed when a
+/// GeoParquet source's PROJJSON carries no authority `id`: the registry can't
+/// help there (its lookups are keyed by `(authority, code)`, and an id-less
+/// PROJJSON has nothing to key on), so this is the only way such a CRS can
+/// still reach a WKT-dialect target (FlatGeobuf, GeoPackage, Shapefile's
+/// `.prj`). See `plans/projjson-to-wkt.org`.
+///
+/// `ProjectedCRS` goes through the `wkt1_tables.rs` crosswalk *reversed*
+/// (EPSG method/parameter code → GDAL WKT1 name); a method code the crosswalk
+/// doesn't have — one no WKT1 source ever exercised — declines rather than
+/// guessing, the same as the forward direction's own unresolved case.
+pub(crate) fn projjson_to_wkt(json: &str) -> Option<String> {
+    let pj = crate::json::parse(json).ok()?;
+    match pj.get("type").and_then(JsonValue::as_str)? {
+        "GeographicCRS" => render_wkt1_geographic(&pj),
+        "ProjectedCRS" => render_wkt1_projected(&pj),
+        _ => None,
+    }
+}
+
 /// The unit family of a projection parameter, recorded in the crosswalk tables.
 /// A WKT1 parameter carries no unit of its own; its kind selects which PROJJSON
 /// unit to attach — the base CRS's angular unit, the projected linear unit, or a
 /// dimensionless scale.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UnitKind {
     Angular,
     Linear,
@@ -702,6 +723,223 @@ fn number(v: f64) -> String {
     }
 }
 
+// ============================================================================
+// REVERSE DIRECTION: PROJJSON -> WKT1, for `projjson_to_wkt` above.
+//
+// The input side needs no new parser: `crate::json::parse` already exists and
+// is already used to read PROJJSON fields elsewhere (`crs/registry.rs`). The
+// output side is new — WKT1 syntax, quoting, and node nesting differ enough
+// from JSON's that the forward direction's `q()`/render_* functions (which
+// build JSON strings) aren't reusable here.
+// ============================================================================
+
+/// Render a PROJJSON `GeographicCRS` object as a WKT1 `GEOGCS[...]` string.
+/// Narrower than the forward direction's `render_geographic`: WKT1's
+/// `SPHEROID`/`PRIMEM` carry no unit node (unlike WKT2's `ELLIPSOID`/
+/// `PRIMEM`), so a non-metre ellipsoid axis or non-degree prime meridian has
+/// no faithful WKT1 rendering — those return `None` rather than silently
+/// mislabeling a unit. Datum *ensembles* are out of scope for the same reason
+/// WKT1 has no `ENSEMBLE` keyword at all (see `plans/projjson-to-wkt.org`).
+fn render_wkt1_geographic(pj: &JsonValue) -> Option<String> {
+    let name = pj.get("name").and_then(JsonValue::as_str)?;
+    let datum = pj.get("datum")?;
+    let datum_name = datum.get("name").and_then(JsonValue::as_str).unwrap_or("unknown");
+    let ellipsoid = wkt1_ellipsoid(datum)?;
+
+    let mut out = format!("GEOGCS[{}", wkt1_str(name));
+    out.push_str(&format!(",DATUM[{},{}]", wkt1_str(datum_name), ellipsoid));
+    out.push_str(&wkt1_prime_meridian(datum)?);
+    out.push_str(",UNIT[\"degree\",0.0174532925199433]");
+    if let Some((authority, code)) = pj_id(pj) {
+        out.push_str(&format!(",AUTHORITY[{},{}]", wkt1_str(&authority), wkt1_str(&code.to_string())));
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// `SPHEROID["name",semi_major_axis,inverse_flattening]`. See
+/// [`render_wkt1_geographic`] for why a non-metre `semi_major_axis` returns
+/// `None` rather than a wrong-unit number.
+fn wkt1_ellipsoid(datum: &JsonValue) -> Option<String> {
+    let ellipsoid = datum.get("ellipsoid")?;
+    let name = ellipsoid.get("name").and_then(JsonValue::as_str).unwrap_or("unknown");
+    let a = pj_length_metres(ellipsoid.get("semi_major_axis")?)?;
+    let rf = match ellipsoid.get("inverse_flattening").and_then(JsonValue::as_f64) {
+        Some(rf) => rf,
+        // Mirrors `registry.rs`'s `projjson_ellipsoid`: some sources (Clarke
+        // 1866, NAD27's ellipsoid) give `semi_minor_axis` instead.
+        None => {
+            let b = pj_length_metres(ellipsoid.get("semi_minor_axis")?)?;
+            a / (a - b)
+        }
+    };
+    Some(format!("SPHEROID[{},{},{}]", wkt1_str(name), number(a), number(rf)))
+}
+
+/// A PROJJSON length field's value in metres. A bare number is already
+/// metres (PROJJSON's default unit for length fields); a `{value,unit}`
+/// object is accepted only when its unit is `metre` — any other unit (US
+/// survey foot, Clarke's foot, …) has no unit node to carry it faithfully in
+/// WKT1's unit-less `SPHEROID`, so that returns `None`.
+fn pj_length_metres(v: &JsonValue) -> Option<f64> {
+    if let Some(n) = v.as_f64() {
+        return Some(n);
+    }
+    let unit = v.get("unit").and_then(JsonValue::as_str)?;
+    if unit != "metre" && unit != "meter" {
+        return None;
+    }
+    v.get("value").and_then(JsonValue::as_f64)
+}
+
+/// `,PRIMEM["name",longitude]` — `Greenwich`/`0` when the source PROJJSON
+/// omits `prime_meridian` entirely (PROJJSON's own default). Takes the
+/// *datum* object, not the CRS: PROJJSON nests `prime_meridian` inside
+/// `datum`, even though WKT1 lists `PRIMEM` as a sibling of `DATUM` (the
+/// forward direction's `render_datum` has the identical asymmetry, see its
+/// doc comment). WKT1's `PRIMEM` carries no unit node, so a longitude given
+/// via the `{value,unit}` object form in a non-degree unit (e.g. grad, for
+/// legacy French/African datums) has no faithful rendering here and returns
+/// `None` — see § OPEN QUESTIONS in `plans/projjson-to-wkt.org`.
+fn wkt1_prime_meridian(datum: &JsonValue) -> Option<String> {
+    let Some(pm) = datum.get("prime_meridian") else {
+        return Some(",PRIMEM[\"Greenwich\",0]".to_string());
+    };
+    let name = pm.get("name").and_then(JsonValue::as_str).unwrap_or("Greenwich");
+    let lon_field = pm.get("longitude")?;
+    let longitude = if let Some(n) = lon_field.as_f64() {
+        n
+    } else {
+        let unit = lon_field.get("unit").and_then(JsonValue::as_str)?;
+        if unit != "degree" {
+            return None;
+        }
+        lon_field.get("value").and_then(JsonValue::as_f64)?
+    };
+    Some(format!(",PRIMEM[{},{}]", wkt1_str(name), number(longitude)))
+}
+
+/// A PROJJSON object's own top-level `id` as `(authority, code)` — a CRS's,
+/// but equally a `conversion.method`'s or a `parameter`'s, since all three
+/// carry the same `{"id":{"authority":...,"code":...}}` shape. Nested ids
+/// further down (on a datum, an ellipsoid, ...) are not surfaced through this
+/// path — the same scope as the forward direction's `node_authority_code`,
+/// which only ever reads a node's *own* direct `AUTHORITY`/`ID` child.
+fn pj_id(pj: &JsonValue) -> Option<(String, i64)> {
+    let id = pj.get("id")?;
+    let authority = id.get("authority").and_then(JsonValue::as_str)?.to_string();
+    let code = id.get("code").and_then(JsonValue::as_f64)? as i64;
+    Some((authority, code))
+}
+
+/// A WKT1 quoted string literal. Unlike JSON, WKT has no backslash-escape
+/// convention (`tokenize_wkt`'s reader doesn't recognize one either — it
+/// reads until the next `"` verbatim); CRS names in practice never carry an
+/// embedded quote, so this does not attempt to escape one.
+fn wkt1_str(s: &str) -> String {
+    format!("\"{s}\"")
+}
+
+/// Render a PROJJSON `ProjectedCRS` object as a WKT1 `PROJCS[...]` string.
+/// The method and every parameter carry an EPSG `id` in PROJJSON but a WKT1
+/// `PROJECTION`/`PARAMETER` node only ever has a GDAL *name* — those come
+/// from `wkt1_tables::method_by_code`/`param_by_code`, the reverse of the
+/// crosswalk the forward direction (`render_projected_wkt1`) already
+/// generates from. A method code absent from that table — one no WKT1 source
+/// ever exercised — declines rather than guessing (see
+/// `plans/projjson-to-wkt.org`), same as any parameter whose own unit doesn't
+/// match what WKT1 needs (see [`wkt1_linear_unit`]).
+fn render_wkt1_projected(pj: &JsonValue) -> Option<String> {
+    let name = pj.get("name").and_then(JsonValue::as_str)?;
+    let base_wkt = render_wkt1_geographic(pj.get("base_crs")?)?;
+
+    let conversion = pj.get("conversion")?;
+    let method = conversion.get("method")?;
+    let method_code = pj_id(method)?.1;
+    let method_name = super::wkt1_tables::method_name_by_code(method_code)?;
+
+    let (unit_name, unit_factor) = wkt1_linear_unit(pj)?;
+
+    let mut param_wkt = String::new();
+    for param in conversion.get("parameters")?.as_array()? {
+        let (_, epsg_param_code) = pj_id(param)?;
+        let (wkt1_pname, kind) = super::wkt1_tables::param_by_code(method_code, epsg_param_code)?;
+        let value = param.get("value").and_then(JsonValue::as_f64)?;
+        let unit = param.get("unit")?;
+        match kind {
+            UnitKind::Angular if unit.as_str() == Some("degree") => {}
+            UnitKind::Scale if unit.as_str() == Some("unity") => {}
+            UnitKind::Linear => {
+                let (n, f) = linear_unit_name_factor(unit)?;
+                if n != unit_name || f != unit_factor {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        param_wkt.push_str(&format!(",PARAMETER[{},{}]", wkt1_str(wkt1_pname), number(value)));
+    }
+    if param_wkt.is_empty() {
+        return None;
+    }
+
+    let mut out = format!("PROJCS[{},", wkt1_str(name));
+    out.push_str(&base_wkt);
+    out.push_str(&format!(",PROJECTION[{}]", wkt1_str(method_name)));
+    out.push_str(&param_wkt);
+    out.push_str(&format!(",UNIT[{},{}]", wkt1_str(&unit_name), number(unit_factor)));
+    // Explicit AXIS nodes, always — never the WKT1 no-AXIS convention that
+    // implicitly assumes easting,northing. The forward direction
+    // (`render_projected_wkt1`) deliberately distrusts that assumption for
+    // `en_default_safe = false` methods (a source WKT1 omitting AXIS there
+    // is refused, not guessed); emitting it unconditionally here keeps this
+    // writer's own output identifiable by that same forward direction, and
+    // matches what real GDAL WKT1 export always includes (see `CALIF1_WKT1`).
+    out.push_str(&wkt1_axes(pj)?);
+    if let Some((authority, code)) = pj_id(pj) {
+        out.push_str(&format!(",AUTHORITY[{},{}]", wkt1_str(&authority), wkt1_str(&code.to_string())));
+    }
+    out.push(']');
+    Some(out)
+}
+
+/// `,AXIS["name",DIRECTION]` for each axis of the projected CRS's Cartesian
+/// coordinate system, in order — WKT1's direction token is a bare uppercase
+/// word (`EAST`, `NORTH`, ...), unlike PROJJSON's lowercase string.
+fn wkt1_axes(pj: &JsonValue) -> Option<String> {
+    let axes = pj.get("coordinate_system")?.get("axis")?.as_array()?;
+    let mut out = String::new();
+    for axis in axes {
+        let name = axis.get("name").and_then(JsonValue::as_str)?;
+        let direction = axis.get("direction").and_then(JsonValue::as_str)?;
+        out.push_str(&format!(",AXIS[{},{}]", wkt1_str(name), direction.to_ascii_uppercase()));
+    }
+    Some(out)
+}
+
+/// The projected CRS's governing linear unit — WKT1 stores every linear
+/// parameter and the coordinate system itself in one shared unit (unlike
+/// PROJJSON, where each parameter carries its own) — read from the Cartesian
+/// coordinate system's first axis, the same source `render_cartesian`/
+/// `render_axis` use going the other way.
+fn wkt1_linear_unit(pj: &JsonValue) -> Option<(String, f64)> {
+    let axis0 = pj.get("coordinate_system")?.get("axis")?.as_array()?.first()?;
+    linear_unit_name_factor(axis0.get("unit")?)
+}
+
+/// A PROJJSON unit value's `(name, conversion_factor)` when it is a *linear*
+/// unit — the bare string `"metre"` (factor `1`), or a `{type,name,
+/// conversion_factor}` object for a non-metre unit (US survey foot, …).
+/// `None` for `"degree"`/`"unity"` or anything not linear.
+fn linear_unit_name_factor(unit: &JsonValue) -> Option<(String, f64)> {
+    if let Some(s) = unit.as_str() {
+        return (s == "metre").then(|| ("metre".to_string(), 1.0));
+    }
+    let name = unit.get("name").and_then(JsonValue::as_str)?.to_string();
+    let factor = unit.get("conversion_factor").and_then(JsonValue::as_f64)?;
+    Some((name, factor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -894,5 +1132,178 @@ mod tests {
         );
         // Not WKT at all.
         assert_eq!(wkt_to_projjson("not wkt"), None);
+    }
+
+    // --- projjson_to_wkt (reverse direction) ---
+
+    #[test]
+    fn projjson_to_wkt_renders_geographic_with_id() {
+        let pj = wkt_to_projjson(GDA2020_WKT1).unwrap();
+        let wkt = projjson_to_wkt(&pj).unwrap();
+        assert!(wkt.starts_with("GEOGCS[\"GDA2020\""), "{wkt}");
+        assert!(wkt.contains("DATUM[\"Geocentric_Datum_of_Australia_2020\""), "{wkt}");
+        assert!(wkt.contains("SPHEROID[\"GRS 1980\",6378137,298.257222101]"), "{wkt}");
+        assert!(wkt.contains("PRIMEM[\"Greenwich\",0]"), "{wkt}");
+        assert!(wkt.contains("UNIT[\"degree\",0.0174532925199433]"), "{wkt}");
+        assert!(wkt.ends_with("AUTHORITY[\"EPSG\",\"7844\"]]"), "{wkt}");
+    }
+
+    #[test]
+    fn projjson_to_wkt_round_trips_id_less_geographic() {
+        // No `id` anywhere — the actual target case: a custom/authority-
+        // stripped PROJJSON with nothing a registry lookup could key on.
+        let pj = r#"{"type":"GeographicCRS","name":"custom","datum":{"type":"GeodeticReferenceFrame","name":"custom datum","ellipsoid":{"name":"custom ellipsoid","semi_major_axis":6378137,"inverse_flattening":298.257223563}},"coordinate_system":{"subtype":"ellipsoidal","axis":[]}}"#;
+        let wkt = projjson_to_wkt(pj).unwrap();
+        assert!(!wkt.contains("AUTHORITY"), "no id to round-trip: {wkt}");
+        assert!(wkt.contains("SPHEROID[\"custom ellipsoid\",6378137,298.257223563]"), "{wkt}");
+
+        // Feeding the emitted WKT1 back through the forward direction should
+        // recover the same datum/ellipsoid fields (not necessarily the same
+        // JSON text — field order may differ).
+        let pj_back = wkt_to_projjson(&wkt).unwrap();
+        assert!(pj_back.contains("\"name\":\"custom datum\""), "{pj_back}");
+        assert!(pj_back.contains("\"semi_major_axis\":6378137"), "{pj_back}");
+        assert!(pj_back.contains("\"inverse_flattening\":298.257223563"), "{pj_back}");
+    }
+
+    #[test]
+    fn projjson_to_wkt_renders_non_greenwich_prime_meridian() {
+        let pj = r#"{"type":"GeographicCRS","name":"custom Paris","datum":{"type":"GeodeticReferenceFrame","name":"custom datum","ellipsoid":{"name":"Clarke 1880 (IGN)","semi_major_axis":6378249.2,"inverse_flattening":293.4660212936269},"prime_meridian":{"name":"Paris","longitude":2.5969213}}}"#;
+        // (`prime_meridian` nests inside `datum` — see `wkt1_prime_meridian`'s doc.)
+        let wkt = projjson_to_wkt(pj).unwrap();
+        assert!(wkt.contains("PRIMEM[\"Paris\",2.5969213]"), "{wkt}");
+    }
+
+    #[test]
+    fn projjson_to_wkt_declines_ensemble_and_nonmetre_ellipsoid() {
+        // Datum ensembles have no WKT1 equivalent (no ENSEMBLE keyword).
+        let ensemble = r#"{"type":"GeographicCRS","name":"WGS 84","datum_ensemble":{"name":"World Geodetic System 1984 ensemble","members":[],"ellipsoid":{"name":"WGS 84","semi_major_axis":6378137,"inverse_flattening":298.257223563},"accuracy":"2.0"}}"#;
+        assert_eq!(projjson_to_wkt(ensemble), None);
+
+        // A non-metre semi_major_axis has no unit node to carry it in WKT1's
+        // unit-less SPHEROID — refuse rather than mislabel the ellipsoid.
+        let non_metre = r#"{"type":"GeographicCRS","name":"custom","datum":{"type":"GeodeticReferenceFrame","name":"d","ellipsoid":{"name":"e","semi_major_axis":{"type":"LinearUnit","name":"US survey foot","value":20925832.16,"conversion_factor":0.304800609601219},"inverse_flattening":294.978698214}}}"#;
+        assert_eq!(projjson_to_wkt(non_metre), None);
+
+        // A non-degree prime meridian likewise has nowhere to carry its unit
+        // (`prime_meridian` nests inside `datum` — see `wkt1_prime_meridian`).
+        let grad_pm = r#"{"type":"GeographicCRS","name":"custom","datum":{"type":"GeodeticReferenceFrame","name":"d","ellipsoid":{"name":"e","semi_major_axis":6378249.2,"inverse_flattening":293.466021293},"prime_meridian":{"name":"Paris","longitude":{"value":2.5969213,"unit":"grad"}}}}"#;
+        assert_eq!(projjson_to_wkt(grad_pm), None);
+
+        // A ProjectedCRS missing everything a render needs (no base_crs, no
+        // conversion) — incomplete input declines rather than guessing.
+        let projected = r#"{"type":"ProjectedCRS","name":"x"}"#;
+        assert_eq!(projjson_to_wkt(projected), None);
+        // Some other/unhandled PROJJSON `type` entirely.
+        assert_eq!(projjson_to_wkt(r#"{"type":"GeodeticCRS","name":"x"}"#), None);
+
+        // Not valid JSON.
+        assert_eq!(projjson_to_wkt("not json"), None);
+    }
+
+    #[test]
+    #[ignore = "manual: needs `projinfo` (PROJ) on PATH"]
+    fn projjson_to_wkt_oracle_identifies() {
+        use std::process::Command;
+        let pj = wkt_to_projjson(GDA2020_WKT1).unwrap();
+        let wkt = projjson_to_wkt(&pj).unwrap();
+        let out = Command::new("projinfo")
+            .arg("--identify")
+            .arg(&wkt)
+            .output()
+            .expect("run projinfo");
+        let text = String::from_utf8_lossy(&out.stdout);
+        assert!(text.contains("EPSG:7844: 100 %"), "{text}\nwkt: {wkt}");
+    }
+
+    #[test]
+    fn projjson_to_wkt_renders_projected_with_metre_units() {
+        // Round trip through the forward direction's own MGA55 fixture (a
+        // plain-datum base, all-metre Transverse Mercator projection).
+        let pj = wkt_to_projjson(MGA55_WKT2).unwrap();
+        let wkt = projjson_to_wkt(&pj).unwrap();
+        assert!(wkt.starts_with("PROJCS[\"GDA2020 / MGA zone 55\""), "{wkt}");
+        assert!(wkt.contains("GEOGCS[\"GDA2020\""), "{wkt}");
+        assert!(wkt.contains("PROJECTION[\"Transverse_Mercator\"]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"central_meridian\",147]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"scale_factor\",0.9996]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"false_easting\",500000]"), "{wkt}");
+        assert!(wkt.contains("UNIT[\"metre\",1]"), "{wkt}");
+        assert!(wkt.ends_with("AUTHORITY[\"EPSG\",\"7855\"]]"), "{wkt}");
+    }
+
+    #[test]
+    fn projjson_to_wkt_renders_projected_with_non_metre_units() {
+        // Round trip through the forward direction's own California-zone-1
+        // fixture — exercises the non-metre (US survey foot) governing linear
+        // unit path, not just the common metre case.
+        let pj = wkt_to_projjson(CALIF1_WKT1).unwrap();
+        let wkt = projjson_to_wkt(&pj).unwrap();
+        assert!(wkt.starts_with("PROJCS[\"NAD83 / California zone 1 (ftUS)\""), "{wkt}");
+        assert!(wkt.contains("PROJECTION[\"Lambert_Conformal_Conic_2SP\"]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"false_easting\",6561666.667]"), "{wkt}");
+        assert!(wkt.contains("UNIT[\"US survey foot\",0.304800609601219]"), "{wkt}");
+        assert!(wkt.ends_with("AUTHORITY[\"EPSG\",\"2225\"]]"), "{wkt}");
+    }
+
+    #[test]
+    fn projjson_to_wkt_round_trips_id_less_projected() {
+        // The real target case (see `plans/projjson-to-wkt.org`'s "How common
+        // is the id-less-PROJJSON case" finding): a local/custom base datum
+        // with a standard, recognized projection method — real GDAL output
+        // for exactly this shape has no top-level `id`, but the method and
+        // every parameter still carry their EPSG ids.
+        let pj = r#"{"type":"ProjectedCRS","name":"My Custom Projection","base_crs":{"type":"GeographicCRS","name":"My Custom Datum","datum":{"type":"GeodeticReferenceFrame","name":"My_Custom_Datum","ellipsoid":{"name":"My Ellipsoid","semi_major_axis":6378137,"inverse_flattening":299}}},"conversion":{"name":"UTM zone 18N","method":{"name":"Transverse Mercator","id":{"authority":"EPSG","code":9807}},"parameters":[{"name":"Latitude of natural origin","value":0,"unit":"degree","id":{"authority":"EPSG","code":8801}},{"name":"Longitude of natural origin","value":-75,"unit":"degree","id":{"authority":"EPSG","code":8802}},{"name":"Scale factor at natural origin","value":0.9996,"unit":"unity","id":{"authority":"EPSG","code":8805}},{"name":"False easting","value":500000,"unit":"metre","id":{"authority":"EPSG","code":8806}},{"name":"False northing","value":0,"unit":"metre","id":{"authority":"EPSG","code":8807}}]},"coordinate_system":{"subtype":"Cartesian","axis":[{"name":"Easting","abbreviation":"E","direction":"east","unit":"metre"},{"name":"Northing","abbreviation":"N","direction":"north","unit":"metre"}]}}"#;
+        let wkt = projjson_to_wkt(pj).unwrap();
+        assert!(!wkt.contains("AUTHORITY"), "no id anywhere to round-trip: {wkt}");
+        assert!(wkt.contains("GEOGCS[\"My Custom Datum\""), "{wkt}");
+        assert!(wkt.contains("PROJECTION[\"Transverse_Mercator\"]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"central_meridian\",-75]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"scale_factor\",0.9996]"), "{wkt}");
+
+        // GDAL/ogrinfo reads it back without error and reports the same
+        // ellipsoid and projection parameters (the target case has no
+        // registered code, so `projinfo --identify` can't confirm identity —
+        // this is a syntactic/faithfulness check instead).
+        let pj_back = wkt_to_projjson(&wkt).unwrap();
+        assert!(pj_back.contains("\"semi_major_axis\":6378137"), "{pj_back}");
+        assert!(pj_back.contains("\"method\":{\"name\":\"Transverse Mercator\""), "{pj_back}");
+        assert!(pj_back.contains("\"name\":\"Longitude of natural origin\",\"value\":-75"), "{pj_back}");
+    }
+
+    #[test]
+    fn projjson_to_wkt_declines_unresolvable_projected_cases() {
+        // A method code absent from `wkt1_tables.rs` — no WKT1 source ever
+        // exercised it, so there is no GDAL name to emit. (EPSG:1024,
+        // Pseudo Mercator, is a real method not in the crosswalk.)
+        let unknown_method = r#"{"type":"ProjectedCRS","name":"x","base_crs":{"type":"GeographicCRS","name":"WGS 84","datum":{"type":"GeodeticReferenceFrame","name":"d","ellipsoid":{"name":"e","semi_major_axis":6378137,"inverse_flattening":298.257223563}}},"conversion":{"name":"c","method":{"name":"Popular Visualisation Pseudo-Mercator","id":{"authority":"EPSG","code":1024}},"parameters":[{"name":"False easting","value":0,"unit":"metre","id":{"authority":"EPSG","code":8806}}]},"coordinate_system":{"subtype":"Cartesian","axis":[{"name":"Easting","abbreviation":"E","direction":"east","unit":"metre"}]}}"#;
+        assert_eq!(projjson_to_wkt(unknown_method), None);
+
+        // A linear parameter whose own unit doesn't match the CRS's governing
+        // linear unit (metre param under a US-survey-foot CRS) — refuse
+        // rather than silently mix units.
+        let mismatched_unit = r#"{"type":"ProjectedCRS","name":"x","base_crs":{"type":"GeographicCRS","name":"WGS 84","datum":{"type":"GeodeticReferenceFrame","name":"d","ellipsoid":{"name":"e","semi_major_axis":6378137,"inverse_flattening":298.257223563}}},"conversion":{"name":"c","method":{"name":"Transverse Mercator","id":{"authority":"EPSG","code":9807}},"parameters":[{"name":"False easting","value":500000,"unit":"metre","id":{"authority":"EPSG","code":8806}}]},"coordinate_system":{"subtype":"Cartesian","axis":[{"name":"Easting","abbreviation":"E","direction":"east","unit":{"type":"LinearUnit","name":"US survey foot","conversion_factor":0.304800609601219}}]}}"#;
+        assert_eq!(projjson_to_wkt(mismatched_unit), None);
+
+        // No parameters at all — nothing to render.
+        let no_params = r#"{"type":"ProjectedCRS","name":"x","base_crs":{"type":"GeographicCRS","name":"WGS 84","datum":{"type":"GeodeticReferenceFrame","name":"d","ellipsoid":{"name":"e","semi_major_axis":6378137,"inverse_flattening":298.257223563}}},"conversion":{"name":"c","method":{"name":"Transverse Mercator","id":{"authority":"EPSG","code":9807}},"parameters":[]},"coordinate_system":{"subtype":"Cartesian","axis":[{"name":"Easting","abbreviation":"E","direction":"east","unit":"metre"}]}}"#;
+        assert_eq!(projjson_to_wkt(no_params), None);
+    }
+
+    #[test]
+    #[ignore = "manual: needs `projinfo` (PROJ) on PATH"]
+    fn projjson_to_wkt_projected_oracle_identifies() {
+        use std::process::Command;
+        for (fixture, expect) in [(MGA55_WKT2, "EPSG:7855"), (CALIF1_WKT1, "EPSG:2225")] {
+            let pj = wkt_to_projjson(fixture).unwrap();
+            let wkt = projjson_to_wkt(&pj).unwrap();
+            let out = Command::new("projinfo")
+                .arg("--identify")
+                .arg(&wkt)
+                .output()
+                .expect("run projinfo");
+            let text = String::from_utf8_lossy(&out.stdout);
+            assert!(text.contains(&format!("{expect}: 100 %")), "{text}\nwkt: {wkt}");
+        }
     }
 }

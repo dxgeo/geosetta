@@ -17,6 +17,8 @@ pub enum Format {
     Wkt,
     Gpkg,
     Shapefile,
+    Kml,
+    Kmz,
 }
 
 impl Format {
@@ -30,6 +32,8 @@ impl Format {
             "wkt" => Ok(Format::Wkt),
             "gpkg" | "geopackage" => Ok(Format::Gpkg),
             "shapefile" | "shp" | "esri shapefile" => Ok(Format::Shapefile),
+            "kml" => Ok(Format::Kml),
+            "kmz" => Ok(Format::Kmz),
             other => Err(Error::Usage(format!("unknown format \"{other}\""))),
         }
     }
@@ -45,6 +49,8 @@ impl Format {
             "wkt" => Some(Format::Wkt),
             "gpkg" => Some(Format::Gpkg),
             "shp" => Some(Format::Shapefile),
+            "kml" => Some(Format::Kml),
+            "kmz" => Some(Format::Kmz),
             _ => None,
         }
     }
@@ -59,6 +65,8 @@ impl Format {
             Format::Wkt => "wkt",
             Format::Gpkg => "gpkg",
             Format::Shapefile => "shp",
+            Format::Kml => "kml",
+            Format::Kmz => "kmz",
         }
     }
 }

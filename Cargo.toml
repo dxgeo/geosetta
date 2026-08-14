@@ -1,6 +1,6 @@
 [package]
 name = "geosetta"
-version = "0.21.1"
+version = "0.22.0"
 edition = "2024"
 description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, CSV, WKT), dependency-free."
 license = "MIT"
@@ -19,7 +19,16 @@ path = "src/main.rs"
 # Optional embedded CRS registry data (PROJ/EPSG/Esri/IGN/IAU/NKG-derived). Kept
 # in a sibling crate so its third-party dataset terms are isolated and the default
 # build stays dependency-free. Enabled by the `crs-registry` feature.
-geosetta-crs-data = { path = "../geosetta-crs-data", version = "0.1.1", optional = true }
+geosetta-crs-data = { path = "../geosetta-crs-data", version = "0.2.0", optional = true }
+
+[dev-dependencies]
+# Used only by tests/reproject_pipe.rs, to prove the reprojection seam
+# (`FeatureCollection::for_each_position_mut`) composes with a real,
+# independently-authored reprojection crate — wbprojection has no CLI binary,
+# so unlike GDAL/PROJ (exercised via stdin/stdout piping in the same test
+# file) it's linked directly instead. `default-features = false` skips the
+# `parallel` (rayon) feature, which the tests don't need.
+wbprojection = { version = "0.3.3", default-features = false }
 
 [features]
 # CRS registry: resolve a source's (authority, code) to an authoritative CRS

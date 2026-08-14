@@ -121,8 +121,16 @@ Validated: =PRAGMA integrity_check= passes and GDAL (via DuckDB =ST_Read=) reads
 our output — points through multipolygons, with append, upsert, and multi-layer
 fan-out all working.
 
-*Deferred (optional):* the packed R-tree spatial index and the GPKG extension
-tables; our files are index-less but valid and readable.
+- *CRS/SRS.* =gpkg_spatial_ref_sys= is read (=src/geopackage/reader.rs=) and
+  written (=src/geopackage/writer.rs=, including the =definition_12_063=
+  WKT2:2019 column) in full, per the CRS IR described in =crs.org=/=project.org=
+  — not the CRS84 placeholder originally scoped below.
+
+*Also DONE (opt-in):* the packed R-tree spatial index and its GPKG extension
+tables — see =spatial-index.org= milestone D and =src/geopackage/rtree.rs= (a
+packed R*Tree in SQLite's node-blob format, shadow tables, and maintenance
+triggers, gated behind =--rtree=). Files without the flag remain index-less but
+valid and readable.
 
 ** SUGGESTED ORDER (read-first)
 1. SQLite reader (item 1) — validate by dumping tables/rows of a DuckDB-written
@@ -148,8 +156,6 @@ tables; our files are index-less but valid and readable.
 - SQLite feature scope: which serial types and page features are truly needed for
   GPKG feature tables (overflow pages yes; =WITHOUT ROWID= no; indexes can be
   ignored on read and omitted on write). Confirm as we go.
-- CRS/SRS: GPKG stores an SRS per layer (=gpkg_spatial_ref_sys=). For now assume
-  CRS84, consistent with the rest of the project; ties into the existing CRS
-  roadmap item.
+- CRS/SRS: resolved — see the Status section above.
 - Raster/tile and attribute-only tables in a GPKG: skip (only =data_type =
   'features'= tables are converted).

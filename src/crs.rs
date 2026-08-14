@@ -23,7 +23,7 @@ use crate::format::Format;
 
 mod wkt1_tables;
 mod wkt_projjson;
-pub(crate) use wkt_projjson::wkt_to_projjson;
+pub(crate) use wkt_projjson::{projjson_to_wkt, wkt_to_projjson};
 
 // Embedded CRS registry (code -> authoritative definition). Feature-gated so the
 // default build stays dependency-free; the data lives in the sibling
@@ -159,10 +159,22 @@ impl Crs {
         };
         let label = named.label();
         match target {
-            Format::GeoJson => Some(format!(
-                "warning: {label} is not WGS 84; GeoJSON is always WGS 84 — output \
-                 coordinates will be mislabeled. Reproject to EPSG:4326 before converting."
-            )),
+            // GeoJSON and KML/KMZ have no CRS channel at all — all *always*
+            // WGS 84 by spec, so a non-WGS-84 source doesn't get dropped, it
+            // gets silently relabeled: the same numbers are re-emitted as if
+            // they were already WGS 84 lon/lat.
+            Format::GeoJson | Format::Kml | Format::Kmz => {
+                let target_name = match target {
+                    Format::GeoJson => "GeoJSON",
+                    Format::Kml => "KML",
+                    Format::Kmz => "KMZ",
+                    _ => unreachable!(),
+                };
+                Some(format!(
+                    "warning: {label} is not WGS 84; {target_name} is always WGS 84 — output \
+                     coordinates will be mislabeled. Reproject to EPSG:4326 before converting."
+                ))
+            }
             Format::Csv | Format::Wkt => Some(format!(
                 "warning: {} cannot record a CRS; {label} will be dropped from the output.",
                 target.extension().to_ascii_uppercase()
@@ -193,12 +205,16 @@ impl Crs {
                      {detail}, so it is written only as an id reference that PROJ/GDAL/QGIS read as unknown.{hint}"
                 ))
             }
-            // FlatGeobuf/GeoPackage speak WKT: faithful with a WKT definition or
-            // a usable authority code; a PROJJSON-only CRS has neither.
+            // FlatGeobuf/GeoPackage speak WKT: faithful with a WKT definition, a
+            // usable authority code, or a PROJJSON-only CRS Geosetta can
+            // structurally translate (geographic, currently — see
+            // `NamedCrs::structural_wkt`). A PROJJSON-only CRS outside that
+            // scope (projected, a datum ensemble, a non-metre ellipsoid axis, …)
+            // has no way to reach a WKT-dialect target.
             Format::FlatGeobuf | Format::Gpkg if !named.wkt_expressible() => Some(format!(
                 "warning: source CRS is a {} definition with no authority code, and {} \
-                 records CRS as WKT; Geosetta does not translate between the two, so the \
-                 CRS will be dropped from the output.",
+                 records CRS as WKT; Geosetta cannot translate this particular definition, so \
+                 the CRS will be dropped from the output.",
                 named.definition_dialect(),
                 rich_format_name(target),
             )),
@@ -206,8 +222,9 @@ impl Crs {
             // FlatGeobuf/GeoPackage), so a bare authority code is only expressible
             // via the registry's def_wkt, not natively as it is for those two.
             Format::Shapefile if !named.shapefile_expressible() => {
-                let detail = if named.wkt.is_some() {
-                    "Geosetta has only a non-WKT (PROJJSON) definition, and .prj records CRS as WKT text"
+                let detail = if named.projjson.is_some() {
+                    "Geosetta has only a non-WKT (PROJJSON) definition it cannot translate for \
+                     this CRS, and .prj records CRS as WKT text"
                 } else {
                     "Geosetta has only an authority code, not a WKT definition to write"
                 };
@@ -233,7 +250,7 @@ fn rich_format_name(target: Format) -> &'static str {
         Format::Gpkg => "GeoPackage",
         Format::Shapefile => "Shapefile",
         // The CRS-less formats never reach this helper.
-        Format::GeoJson | Format::Csv | Format::Wkt => target.extension(),
+        Format::GeoJson | Format::Csv | Format::Wkt | Format::Kml | Format::Kmz => target.extension(),
     }
 }
 
@@ -297,21 +314,34 @@ impl NamedCrs {
 
     /// Whether the WKT-dialect targets (FlatGeobuf, GeoPackage) can record this
     /// CRS. They store a WKT `definition` and/or an authority code, so they need
-    /// a WKT string or a usable code; a PROJJSON-only definition has neither.
-    /// Mirrors `flatgeobuf::writer`'s `build_crs` and `geopackage::writer`'s
-    /// `resolve_srs`.
+    /// a WKT string or a usable code — or, for a PROJJSON-only definition with
+    /// neither (the case a registry lookup can't help with, since it has no
+    /// `(authority, code)` to key on), a structural PROJJSON→WKT translation
+    /// (see [`Self::structural_wkt`]). Mirrors `flatgeobuf::writer`'s
+    /// `build_crs` and `geopackage::writer`'s `resolve_srs`.
     fn wkt_expressible(&self) -> bool {
-        self.wkt.is_some() || self.code.is_some()
+        self.wkt.is_some() || self.code.is_some() || self.structural_wkt().is_some()
     }
 
     /// Whether Shapefile's `.prj` (pure WKT text, no separate code slot) can
-    /// record this CRS: a WKT definition, or — with the `crs-registry` feature —
+    /// record this CRS: a WKT definition, a structural PROJJSON→WKT translation
+    /// (see [`Self::structural_wkt`]), or — with the `crs-registry` feature —
     /// an authority+code the embedded registry can render as WKT (see
-    /// [`Self::registry_wkt`]). Unlike [`Self::wkt_expressible`], a bare code is
-    /// *not* enough on its own, since `.prj` has nowhere to put a code without a
+    /// [`Self::registry_wkt`]). Unlike [`Self::wkt_expressible`], a bare code
+    /// alone is *not* enough, since `.prj` has nowhere to put a code without a
     /// WKT wrapper. Mirrors `shapefile::writer`'s `.prj` writer.
     fn shapefile_expressible(&self) -> bool {
-        self.wkt.is_some() || self.registry_wkt().is_some()
+        self.wkt.is_some() || self.registry_wkt().is_some() || self.structural_wkt().is_some()
+    }
+
+    /// A WKT1 rendering of this CRS's verbatim PROJJSON, when it has one and no
+    /// `id` to resolve some other way — the reverse of [`wkt_to_projjson`] (see
+    /// [`projjson_to_wkt`]), for a GeoParquet source reaching a WKT-dialect
+    /// target. `None` when there is no PROJJSON, or the translation can't be
+    /// made faithfully (a projected CRS, a datum ensemble, a non-metre
+    /// ellipsoid axis, …) — see `plans/projjson-to-wkt.org`.
+    pub(crate) fn structural_wkt(&self) -> Option<String> {
+        self.projjson.as_deref().and_then(projjson_to_wkt)
     }
 
     /// The authoritative WKT for this CRS from the embedded registry, keyed by

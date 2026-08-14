@@ -1,0 +1,129 @@
+#+TITLE: Plan: Reprojection Composability
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Making Geosetta Composable With Any Reprojection Tool
+
+** STATUS — DONE (two seams, verified against three real, independent tools)
+Geosetta deliberately does not reproject (see =src/crs.rs='s module doc
+comment) — it's a format translator, not a projection engine. The goal here
+was not to add reprojection, but to make sure a *separate* reprojection
+tool — whichever one a user already trusts, GDAL/PROJ or a pure-Rust crate —
+composes cleanly with =read(from) → FeatureCollection → write(to)= without
+Geosetta needing to know anything about how that tool does its work.
+
+Two independent seams, matching the two ways such a tool shows up:
+
+1. A Rust library linked directly into the caller's own binary.
+2. A separate process, composed via a Unix pipe.
+
+Both are implemented and exercised against real tools in
+=tests/reproject_pipe.rs=, not just our own stand-ins — the point was
+explicitly to prove third-party interop, not just that the API compiles.
+
+*** IMPLEMENTED
+
+**** 1. The coordinate-mutation seam (library composition)
+- =Geometry::for_each_position_mut= / =FeatureCollection::for_each_position_mut=
+  (=src/geometry/mod.rs=, =src/feature.rs=) — visits every coordinate by
+  mutable reference, recursing through every =Geometry= variant (rings,
+  parts, nested =GeometryCollection=) the same way =extend_bbox= already did.
+  Generic over =impl FnMut(&mut Position)=, monomorphized (no =dyn=, no
+  allocation) — the compiler inlines a simple closure into a straight loop.
+  This is the seam a caller pairs with any reprojection library: mutate
+  coordinates in place, then set =FeatureCollection::crs= to the target
+  identity — Geosetta itself never calls either method.
+- =Geometry::for_each_position_run_mut= / =FeatureCollection::for_each_position_run_mut=
+  — the batch-oriented sibling. Yields whole *contiguous runs* already
+  present in the IR (a =Point= as a length-1 slice, a whole
+  =LineString=/=MultiPoint=, one slice per =Polygon=/=MultiLineString= ring,
+  one per =MultiPolygon= ring) as =&mut [Position]= instead of one coordinate
+  at a time. Exists because a per-point closure structurally prevents
+  batching: PROJ's =proj_trans_array=/=proj_trans_generic= exist specifically
+  because per-call FFI/context overhead dominates at scalar granularity, and
+  a SIMD kernel needs a contiguous slice to pack into vector registers in
+  the first place. =Position= (=[f64; 2]=) is already the interleaved xy
+  layout PROJ's array API expects, so a run hands over with no copying.
+  Both visitors coexist — =_run_= for a batch-capable backend,
+  =for_each_position_mut= for a simple pointwise one.
+
+**** 2. The stdin/stdout piping seam (process composition)
+- =-= as =<input>=/=<output>= (=src/cli.rs=, =src/main.rs=) means stdin/stdout,
+  the standard Unix convention (=cat=, =jq=, =curl=, GDAL's
+  =/vsistdin//vsistdout/=). Requires the corresponding =--from=/=--to=
+  explicitly, since there's no path extension to infer a format from —
+  =Format::from_path("-")= already returned =None=, so this fell out mostly
+  for free; the one real gap was the CLI arg parser treating any token
+  starting with =-= as an unknown option before it could reach the
+  positional bucket, fixed by special-casing the bare =-= token.
+  =read_bytes=/=write_bytes= helpers in =main.rs= branch on =path == "-"= to
+  go through =std::io::stdin()=/=stdout()= instead of =std::fs=; progress/status
+  messages already went to stderr, so they don't corrupt a piped stdout
+  stream.
+- Scoped to the single-buffer formats (GeoJSON, GeoParquet, FlatGeobuf, CSV,
+  WKT, KML, KMZ) plus GeoPackage. GeoPackage works because it's one
+  self-contained SQLite blob (unlike Shapefile's sibling files) — the two
+  wrinkles: a plain output path already required "single layer, or give a
+  directory" for multi-layer fan-out, and =-= extends that restriction
+  naturally (a pipe can't fan out to multiple files either); and the
+  create-or-append-if-exists check (=std::fs::read(&args.output).ok()=) is
+  skipped for =-=, since there's nothing to read back from a pipe you're
+  about to write to — piping to a =.gpkg= always starts fresh.
+- *Not* supported for Shapefile — =.shp=/=.shx=/=.dbf=/=.prj= sibling files,
+  not a single byte stream, and inventing a custom bundle format just for
+  the pipe would defeat the actual goal (any external tool should work,
+  and no external tool would recognize a Geosetta-specific bundle). Rejected
+  with a clear =Error::Usage= pointing at the alternative: convert through a
+  single-buffer format around the external step
+  (=geosetta in.shp - --to fgb | reproject-tool | geosetta - out.shp --from fgb=),
+  which needs no new code — FlatGeobuf/GeoParquet already carry the CRS
+  faithfully both directions.
+
+**** 3. Verification against three independent, real tools
+=tests/reproject_pipe.rs= — three tests, one per tool, transforming the same
+three-point WGS 84 fixture to EPSG:3857 and checking the result against the
+same hand-verified oracle values (GDAL and PROJ agree to 6 decimal places
+independently, so a bug specific to one integration shows up as a mismatch
+even without comparing the tools to each other):
+- *GDAL* (=ogr2ogr=) — container- and CRS-aware. =geosetta ... -= (FlatGeobuf)
+  piped into =ogr2ogr -t_srs EPSG:3857 /vsistdin/=, writing a real =.gpkg=
+  (GDAL's GeoPackage driver isn't =/vsistdout/=-streamable — an SQLite
+  constraint, not a Geosetta one), then read back through geosetta's own
+  =-= output. Checks both the reprojected numbers and that the CRS survived
+  as EPSG:3857.
+- *PROJ* (=cs2cs=) — a bare coordinate transformer with no container format
+  of its own, just "x y" per line. =geosetta ... -= (WKT) piped through a
+  thin text adapter into =cs2cs=, reconstructed, and bounced back through
+  =geosetta ... -= (via GeoJSON, since Geosetta refuses a same-format
+  WKT→WKT no-op conversion) to prove the round trip through Geosetta's own
+  reader/writer is intact, not just the external math.
+- *wbprojection* — a real, published reprojection *library* (crates.io,
+  MIT/Apache-2.0; confirmed no CLI binary against its source in
+  =github.com/jblindsay/whitebox_next_gen=), added as a dev-dependency
+  (=default-features = false=, skipping its =parallel=/rayon feature — not
+  needed for these tests). Plugs into =for_each_position_mut= directly, no
+  subprocess involved — the seam this test exists to prove.
+All three run by default under plain =cargo test= (GDAL/PROJ check
+=tool_available= at runtime and skip with a message rather than fail if
+missing, so a contributor without them still gets a clean =cargo test=).
+
+*** A discovered, unrelated bug fixed along the way
+Diagnosing the GDAL integration surfaced that Geosetta's Parquet reader
+couldn't read GDAL-written GeoParquet at all (=invalid parquet: zero-length
+level run=) — nothing to do with piping. Root cause and fix are tracked in
+[[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]] (the
+=geometry_bbox= covering-column / nested-schema milestone); the GDAL test
+here now exercises real files, not a workaround.
+
+** OPEN QUESTIONS
+- Whether =-= should extend to GeoPackage's directory-fan-out multi-layer
+  read path in some other shape (e.g. a =tar=-like bundle) — deferred; the
+  current restriction (single layer only when piping) matches what a plain
+  non-directory output path already required, so it's not a regression, just
+  not maximally general.
+- Whether a blessed Rust *trait* — a one-method =Reproject= contract taking a
+  target =Crs= and returning a =Result= — is worth adding as a documented
+  integration point for third-party crates to implement against
+  =FeatureCollection=, versus leaving =for_each_position_mut= itself as the
+  (sufficient, closure-based) contract. No concrete need surfaced yet — the
+  three real integrations above didn't want for one.

@@ -42,9 +42,10 @@ priorities below — they are facts about what real files contain, not guesses.
   can't parse it. The failure is safe but the message is unhelpful; see
   "Clean errors" below.
 
-Local tooling note: only =duckdb= is installed here (no =pyarrow=, =geopandas=,
-=ogr2ogr=/GDAL). Test fixtures will be generated with DuckDB; broadening to
-pyarrow/GDAL fixtures needs those tools added to the dev environment.
+Local tooling note (superseded): =ogr2ogr=/GDAL and =cs2cs=/PROJ are now on
+=PATH= in the dev environment (=pyarrow=/=geopandas= still aren't). GDAL
+fixtures are now generated directly — see the covering-bbox milestone below,
+which a real =ogr2ogr -f Parquet= fixture surfaced.
 
 ** MILESTONE 1 — dictionary encoding + multiple pages/row groups — *DONE*
 Implemented in =src/parquet/reader.rs=. Geosetta now reads DuckDB's default
@@ -126,7 +127,7 @@ current opaque =truncated varint= into an actionable message.
 ** LATER MILESTONES (evidence-ordered)
 
 *** 2. ZSTD codec — *DONE*
-Implemented from scratch (RFC 8878) in =src/parquet/zstd.rs=: a decoder with
+Implemented from scratch (RFC 8878) in =src/compress/zstd.rs=: a decoder with
 FSE (tANS) entropy decoding, Huffman literals (direct and FSE-compressed
 weights, 1- and 4-stream), and the sequence machine (predefined/RLE/FSE tables,
 repeat offsets). Verified against =zstd= CLI vectors (raw / RLE / Huffman /
@@ -140,7 +141,7 @@ BSD/GPLv2. The =zstd= CLI is used only as a test oracle. Documented in the
 module header.
 
 *** 3. GZIP codec — *DONE*
-Implemented from scratch in =src/parquet/gzip.rs=: RFC 1951 DEFLATE =inflate=
+Implemented from scratch in =src/compress/gzip.rs=: RFC 1951 DEFLATE =inflate=
 (stored / fixed / dynamic Huffman, canonical-code decoding, length/distance
 matches) plus the RFC 1952 gzip container (also tolerant of bare zlib or raw
 DEFLATE). Verified against Python =gzip= vectors (text / repetitive /
@@ -149,11 +150,60 @@ multi-row-group file. Committed fixture: =tests/fixtures/duckdb_gzip.parquet=.
 
 *** 3b. LZ4 codec — *DONE*
 =LZ4_RAW= (codec 7, what DuckDB/Arrow emit) implemented from the LZ4 block spec
-in =src/parquet/lz4.rs= — a small LZ77 sequence decoder (token, variable
+in =src/compress/lz4.rs= — a small LZ77 sequence decoder (token, variable
 literal/match lengths, 2-byte offsets, overlapping copies), no entropy coding.
 Verified against DuckDB LZ4 GeoParquet (200k rows) and a committed fixture
 =tests/fixtures/duckdb_lz4.parquet=. The legacy Hadoop-framed =LZ4= (codec 5)
 still errors cleanly; Brotli remains unimplemented.
+
+*** 3c. Nested-schema definition levels + the GeoParquet covering-bbox column — *DONE*
+=parse_file_metadata='s schema handling used to match a column chunk to its
+schema definition *by bare leaf name*, reading only that one element's own
+=repetition_type= — correct for a flat schema (DuckDB's default shape, which
+is all this reader had real fixtures for), silently wrong for anything
+nested: a leaf's true definition level is the count of OPTIONAL/REPEATED
+*ancestors* down to and including itself, not just its own repetition type.
+
+This was invisible until a real =ogr2ogr -f Parquet= fixture hit it: GDAL
+3.13 / Arrow 25 writes a GeoParquet 1.1 =geometry_bbox= "covering" column —
+a per-row bbox struct (=xmin=/=ymin=/=xmax=/=ymax=) alongside the WKB
+geometry, a spatial-pruning optimization. Its leaves are REQUIRED *within*
+the struct but the struct itself is OPTIONAL, so their true definition level
+is 1, not 0; reading it as 0 made the reader skip a real, present
+definition-level section entirely and start parsing dictionary indices 4
+bytes into what was still level data — surfacing as
+=invalid parquet: zero-length level run=, a confusing symptom of a schema
+bug, not page corruption.
+
+Fixed in =src/parquet/reader.rs=:
+- =SchemaNode= now reads =num_children= (thrift field 5, previously
+  unparsed), and =flatten_schema= walks the file's flat pre-order
+  =SchemaElement= list as the tree it actually encodes — root first, each
+  group immediately followed by its children — accumulating definition
+  level through every ancestor rather than reading one element in
+  isolation.
+- =ColumnMeta= now carries its full schema =path= (not just the last
+  segment), matched against =flatten_schema='s leaves by full path — a bare
+  name isn't unique once nesting is in play (two different structs could
+  each have an =xmin=).
+- A leaf under a REPEATED ancestor (a genuinely list-valued column — a
+  harder problem needing repetition levels this reader still doesn't parse)
+  is flagged =unsupported_repeated= and rejected with a clear
+  =Error::Parquet= naming the column, instead of attempting to decode and
+  misparsing the same way the bbox column did.
+- =covering_bbox_paths= reads the =geo= metadata's =columns.<col>.covering.bbox=
+  key (GeoParquet 1.1) and excludes those columns from =properties=
+  entirely — they're an index optimization, not real feature data, so they
+  shouldn't surface as fake columns even once decodable.
+
+Verified against a committed real fixture,
+=tests/fixtures/gdal_covering_bbox.parquet= (=ogr2ogr -f Parquet= on a
+3-point/2-property GeoJSON), plus unit tests for =flatten_schema= (flat
+schema, nested-OPTIONAL-group inheritance, REPEATED detection) and
+=covering_bbox_paths= in =parquet/reader.rs='s test module. Also fixed a
+stale doc comment while in there: it claimed ZSTD/GZIP were unsupported
+codecs, but =decompress= already handles them (only LZO, BROTLI, and
+Hadoop-framed =LZ4= remain genuinely unimplemented).
 
 *** 4. Additional physical / logical types — *PARTIAL*
 Done:
@@ -183,6 +233,104 @@ DuckDB default; handle or explicitly error until a real file needs it.
 - Some writers use the newer Parquet native =GEOMETRY= logical type instead of
   the GeoParquet =geo= key/value convention — detect which is present.
 
+*** 7. Nested/repeated (list-valued) columns — *SCOPING, not yet implemented*
+The §3c fix taught the reader to compute definition levels correctly for any
+column nested under an OPTIONAL group (=flatten_schema='s tree walk), and to
+detect a REPEATED ancestor and reject it with a clear
+=Error::Parquet("column \"...\" is a nested/repeated (list-valued) column,
+which is not supported yet")= rather than attempt (and silently misparse) a
+decode. This milestone is about actually *decoding* that case instead of
+just detecting it.
+
+**** Concrete example
+A property that's an array — a GeoJSON feature with
+="tags": ["park", "historic"]= — written by a tool that gives it a
+native Parquet list type instead of falling back to a JSON string (which is
+what Geosetta's own writer does for any array/object property value — see
+=schema.rs='s =infer_columns=, used by every one of Geosetta's own format
+writers). GDAL does this for its =StringList=/=IntegerList= OGR field types;
+so does pandas/geopandas via Arrow's list type. Parquet represents a list
+with its standard 3-level encoding:
+#+begin_src text
+optional group tags (LIST) {
+  repeated group list {
+    optional binary element (STRING);
+  }
+}
+#+end_src
+The middle =list= group is REPEATED: for a single row it can appear zero
+times (empty list), once, or many times. That's a fundamentally different
+shape from §3c's =geometry_bbox= (OPTIONAL — each row has *at most one*
+value at that path); decoding a REPEATED column needs *repetition levels* —
+a second value alongside each definition level saying "does this value
+start a new row, or continue the same row's list as the previous value" —
+which is how the reader would tell where one row's list ends and the next
+row's begins within Parquet's flat, columnar stream of encoded values.
+=parquet/reader.rs= doesn't parse repetition levels at all today; only
+definition levels.
+
+**** Where this connects to the write side (already solved, no new design needed)
+Once a list's elements are decoded, they don't need a new representation of
+their own — they slot into the IR's existing =JsonValue::Array= and flow
+through the *same* universal fallback every array-valued property already
+uses, regardless of format: =schema.rs='s =infer_columns= treats any
+=JsonValue::Array=/=JsonValue::Object= property as JSON text (line ~71:
+"Arrays/objects can only be represented as JSON text"), so it gets
+serialized to a JSON string and written into whichever text-shaped column
+each target format has (Shapefile =.dbf= =Character=, GeoPackage =TEXT=,
+FlatGeobuf =ColumnType::String=, a CSV cell, another GeoParquet
+=BYTE_ARRAY=). This is exactly what already happens today for a
+GeoJSON-sourced array — =convert.rs='s test fixture has a feature with
+="tags": ["a", "b"]=, and =read_recovers_geometry_and_properties= confirms
+it comes back out as the string =["a", "b"]= after a GeoParquet round trip.
+So this milestone is read-side only: decode the list into a =Vec<JsonValue>=
+(=JsonValue::Array=), hand it to the property sink as one cell the same way
+every other decoded value is, and the existing write path takes it from
+there with zero changes. No format gets special-cased, including Shapefile —
+it's already in the same "flatten to text" boat as every other format for
+array-valued properties, list-typed source column or not.
+
+**** What decoding needs (sketch, not yet designed in detail)
+- Parse the repetition-level stream the same structural way
+  =split_definition_levels=/=decode_levels= already parse definition
+  levels (same RLE/bit-pack hybrid, a second bit-width derived from the
+  schema's max *repetition* level rather than max *definition* level) —
+  =flatten_schema= already has enough tree information to compute a max
+  repetition level per leaf (count of REPEATED ancestors) alongside the
+  max definition level it already computes; it just doesn't expose that
+  number yet.
+- Group consecutive values into per-row lists using the repetition levels
+  (a repetition level of 0 marks the start of a new row's list; anything
+  higher continues the current row's).
+- Detect the standard 3-level list encoding structurally (a REPEATED group
+  with exactly one child, itself either a leaf or a nested group) rather
+  than only via the =LogicalType= annotation, since some writers only set
+  the legacy =ConvertedType= =LIST= (=converted_type= 3) — mirrors how §4
+  already prefers =converted_type= over parsing the =logicalType= union
+  where both exist.
+- Scope question: start with a list of scalars (covers the GDAL
+  =StringList=/=IntegerList= case, the one with a real driver) and
+  explicitly reject a list of structs/nested lists with a clear error,
+  rather than trying to handle arbitrary nesting depth in the first pass.
+
+**** Testing
+- A real fixture: =ogr2ogr= writing a =StringList= (or =IntegerList=)
+  OGR field to GeoParquet — same sourcing discipline as
+  =gdal_covering_bbox.parquet=, committed small and real rather than
+  hand-built. DuckDB can likely produce an equivalent list-typed column
+  too (=LIST(VARCHAR)=), giving a second independent oracle.
+- Unit tests for the repetition-level decode itself, mirroring
+  =decode_levels_single_rle_run=/=decode_levels_bit_packed=: hand-built
+  repetition-level streams for "all rows have exactly one element,"
+  "some rows empty," and "some rows with several elements," checked
+  against the expected row groupings directly (no full file needed).
+- End-to-end: decode the fixture, confirm each row's =JsonValue::Array=
+  matches the source data, then confirm the existing write path (§ "Where
+  this connects to the write side" above) already turns it into the right
+  JSON-string text in at least one non-GeoParquet format (Shapefile =.dbf=
+  or GeoPackage =TEXT=) with *no new write-side code* — that's the
+  milestone's actual completion bar, not just "the read decodes."
+
 ** ROBUSTNESS / VALIDATION
 - Bounds-check every offset and length from the footer before slicing (the
   round-trip reader already does; keep it up as new offsets like
@@ -193,9 +341,14 @@ DuckDB default; handle or explicitly error until a real file needs it.
   already handles unknown fields).
 
 ** OPEN QUESTIONS
-- Do we commit to a fully dependency-free ZSTD decoder, or draw the line and
-  document a supported-codec matrix (=SNAPPY= / =UNCOMPRESSED= / =GZIP=)?
+- *Resolved:* a fully dependency-free ZSTD decoder — implemented from scratch
+  (§2 above); SNAPPY/UNCOMPRESSED/GZIP/ZSTD/LZ4_RAW are all supported, only
+  LZO/BROTLI/Hadoop-framed-LZ4 remain.
 - How faithfully must property *types* round-trip vs. being best-effort mapped
   onto GeoJSON's JSON value model (e.g. =INT32= → number, =TIMESTAMP= → string)?
-- Fixtures: commit small binary =.parquet= files to the repo, or add
-  pyarrow/GDAL to the dev environment and generate them in a test setup step?
+- *Resolved, partially:* fixtures — GDAL is now available in the dev
+  environment, and its output is committed as a small binary fixture
+  (=tests/fixtures/gdal_covering_bbox.parquet=), matching the existing
+  DuckDB-fixture convention rather than generating files in a test setup
+  step. pyarrow still isn't available, so anything that needs it
+  specifically (=DATA_PAGE_V2=, per §5) is unaffected.

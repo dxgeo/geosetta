@@ -8,22 +8,26 @@
 //!
 //! The wire format decoded here (`GCR1`) is specified in
 //! `../../geosetta-crs-data/registry-format.org`; read that alongside this file.
-//! The image is `(authority, code) -> {PROJJSON, WKT1}`, sorted by
+//! The image is `(authority, code) -> {PROJJSON, WKT1, WKT2}`, sorted by
 //! `(auth_id, code_bytes)` so lookup is a binary search + slice — no per-entry
 //! allocation, no map build.
 //!
-//! # Status: R1 done; R2 in progress (name→code recovery, geographic + projected)
+//! # Status: R1, R2, R5 done (R3/R4 are consumers of R1 in the GeoParquet and
+//! # Shapefile spokes, not further work here)
 //! [`def_projjson`] / [`def_wkt`] resolve a trusted `(authority, code)` to its
 //! authoritative definition (R1). [`resolve_geographic_by_name`] and
 //! [`resolve_projected_by_name`] add R2's "name → code" identity recovery —
 //! an id-less WKT's outer name is looked up in [`geosetta_crs_data::NAMES`]
 //! and validated against its ellipsoid before snapping (`crs-registry.org` §
-//! Validation). Both stop at the ellipsoid check, not full structural
-//! (method/parameter) param-match — that plan's recovery step 3 — since a
-//! prior attempt at Esri method/parameter *translation* hit unproven spelling
-//! gaps (see `handoff.org` § KEY FINDINGS, "TRIED AND REVERTED"); each
-//! resolver's own bulk oracle (over real ESRI fixtures) is the empirical
-//! check on whether the ellipsoid-only bar holds at scale.
+//! Validation), for both geographic and projected CRSes. Both stop at the
+//! ellipsoid check, not full structural (method/parameter) param-match — that
+//! plan's recovery step 3 — since a prior attempt at Esri method/parameter
+//! *translation* hit unproven spelling gaps (see `handoff.org` § KEY FINDINGS,
+//! "TRIED AND REVERTED"); each resolver's own bulk oracle (over real ESRI
+//! fixtures) is the empirical check on whether the ellipsoid-only bar holds at
+//! scale. [`def_wkt2`] adds R5's WKT2:2019 emission for CRSes WKT1 can't
+//! structurally express (datum ensembles, dynamic CRSes, some compound
+//! systems).
 
 #![allow(dead_code)]
 
@@ -262,7 +266,12 @@ fn approx_eq(a: f64, b: f64) -> bool {
 /// other authority) columns carry — what the generator built `NAMES` from —
 /// so no normalization is needed before looking it up.
 fn wkt_crs_name(wkt: &str) -> Option<String> {
-    let toks = tokenize_wkt(wkt);
+    wkt_crs_name_toks(&tokenize_wkt(wkt))
+}
+
+/// [`wkt_crs_name`] over pre-tokenized input, so callers that also need
+/// [`wkt_ellipsoid_params_toks`] can tokenize the WKT once and share it.
+fn wkt_crs_name_toks(toks: &[WktTok]) -> Option<String> {
     match (toks.first(), toks.get(1), toks.get(2)) {
         (Some(WktTok::Word(_)), Some(WktTok::Open), Some(WktTok::Str(name))) => Some(name.clone()),
         _ => None,
@@ -276,7 +285,12 @@ fn wkt_crs_name(wkt: &str) -> Option<String> {
 /// is weaker evidence than a trusted id, so it is confirmed against a real
 /// geodetic constant before snapping, not just trusted outright.
 fn wkt_ellipsoid_params(wkt: &str) -> Option<(f64, f64)> {
-    let toks = tokenize_wkt(wkt);
+    wkt_ellipsoid_params_toks(&tokenize_wkt(wkt))
+}
+
+/// [`wkt_ellipsoid_params`] over pre-tokenized input — see
+/// [`wkt_crs_name_toks`].
+fn wkt_ellipsoid_params_toks(toks: &[WktTok]) -> Option<(f64, f64)> {
     for i in 0..toks.len() {
         let WktTok::Word(w) = &toks[i] else { continue };
         if !(w.eq_ignore_ascii_case("SPHEROID") || w.eq_ignore_ascii_case("ELLIPSOID")) {
@@ -329,6 +343,17 @@ fn projjson_ellipsoid(pj: &JsonValue) -> Option<(f64, f64)> {
     Some((a, rf))
 }
 
+/// The contiguous run of `geosetta_crs_data::NAMES` entries sharing `name`.
+/// `NAMES` is sorted by `(name, authority, code)`
+/// (`geosetta-crs-data/src/names.rs`), so its bounds are two binary searches
+/// instead of a full scan of all ~20k entries per resolution.
+fn names_matching(name: &str) -> &'static [(&'static str, &'static str, &'static str)] {
+    let names = geosetta_crs_data::NAMES;
+    let lo = names.partition_point(|(n, _, _)| *n < name);
+    let hi = lo + names[lo..].partition_point(|(n, _, _)| *n == name);
+    &names[lo..hi]
+}
+
 /// Resolve a geographic CRS's `(authority, code)` from the outer name of a
 /// WKT definition, validated against the WKT's own ellipsoid before snapping
 /// — R2's "name → code" recovery (`crs-registry.org` § Identity recovery,
@@ -340,11 +365,11 @@ fn projjson_ellipsoid(pj: &JsonValue) -> Option<(f64, f64)> {
 /// validated match; `None` if the WKT has no extractable name/ellipsoid, no
 /// candidate exists, or no candidate validates.
 pub(crate) fn resolve_geographic_by_name(wkt: &str) -> Option<&'static str> {
-    let name = wkt_crs_name(wkt)?;
-    let (wkt_a, wkt_rf) = wkt_ellipsoid_params(wkt)?;
-    geosetta_crs_data::NAMES
+    let toks = tokenize_wkt(wkt);
+    let name = wkt_crs_name_toks(&toks)?;
+    let (wkt_a, wkt_rf) = wkt_ellipsoid_params_toks(&toks)?;
+    names_matching(&name)
         .iter()
-        .filter(|(n, _, _)| *n == name)
         .find_map(|(_, auth, code)| {
             let pj = def_projjson(auth, code)?;
             let parsed = crate::json::parse(pj).ok()?;
@@ -373,11 +398,11 @@ pub(crate) fn resolve_geographic_by_name(wkt: &str) -> Option<&'static str> {
 /// whether that's enough — if it ever finds a wrong (not just declined)
 /// resolution, this needs a real method/parameter check added, not before.
 pub(crate) fn resolve_projected_by_name(wkt: &str) -> Option<&'static str> {
-    let name = wkt_crs_name(wkt)?;
-    let (wkt_a, wkt_rf) = wkt_ellipsoid_params(wkt)?;
-    geosetta_crs_data::NAMES
+    let toks = tokenize_wkt(wkt);
+    let name = wkt_crs_name_toks(&toks)?;
+    let (wkt_a, wkt_rf) = wkt_ellipsoid_params_toks(&toks)?;
+    names_matching(&name)
         .iter()
-        .filter(|(n, _, _)| *n == name)
         .find_map(|(_, auth, code)| {
             let pj = def_projjson(auth, code)?;
             let parsed = crate::json::parse(pj).ok()?;

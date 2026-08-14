@@ -34,11 +34,11 @@ multi-layer fan-out), CRS pass-through, the mixed-shape-family write error, and
 case-insensitive sibling lookup — see the session that implemented this for the
 transcript.
 
-Deferred / out of scope, matching the plan below: Z/M/MultiPatch shape types,
-=.dbf= memo (=M=) fields, and *projected* Esri =.prj= structural recovery (R2
-stays scoped to geographic CRSes, per crs-registry.org's own deferral — real
-=.shp= fixtures now exist to measure this against if it's picked up later, per
-§ CRS INTEGRATION below). The two § OPEN QUESTIONS resolved during
+Deferred / out of scope, matching the plan below: Z/M/MultiPatch shape types
+and =.dbf= memo (=M=) fields. *Projected* Esri =.prj= structural recovery —
+originally deferred here pending real fixtures — has since shipped as R2's
+projected half (=resolve_projected_by_name= in =crs/registry.rs=, 2026-08-12);
+see § CRS INTEGRATION below. The two § OPEN QUESTIONS resolved during
 implementation: DBF field width overflow *truncates* (string columns, at a
 char boundary) rather than erroring or warning; ring containment uses the
 appearance-order heuristic (shell immediately followed by its holes), not full
@@ -201,13 +201,12 @@ Once this reader exists:
   resolved / *zero wrong* on a 431-fixture bulk oracle of real ESRI geographic
   CRSes) works on real =.prj= text with *zero new CRS code* — it activates the
   moment =.prj= bytes reach =Crs::from_authority_code=.
-- *Projected* Esri =.prj= (deliberately deferred when R2 was scoped, because it
-  needs Esri method/parameter-spelling coverage that couldn't be measured
-  without real fixtures) becomes measurable for the first time here. Natural
-  follow-on: a =tests/fixtures/esri_projected_wkt1.tsv=-style bulk-oracle
-  fixture set (mirroring =esri_geographic_wkt1.tsv=), sourced from real
-  shapefiles or =projinfo -o WKT1_ESRI= projected exports, to extend R2's
-  validated recovery to projected CRSes instead of guessing at coverage.
+- *Projected* Esri =.prj= recovery — deferred when R2 was originally scoped,
+  pending real fixtures to measure it against — shipped 2026-08-12:
+  =resolve_projected_by_name= in =crs/registry.rs=, validated by a
+  =tests/fixtures/esri_projected_wkt1.tsv= bulk oracle (all 2,274 native ESRI
+  projected CRSes in =proj.db=) at 2185/2274 (96%) resolved, zero wrong. See
+  =crs-registry.org='s R2 for the full writeup.
 - =.prj= *writing* is a new consumer of R1's =registry::def_wkt=, which has
   existed since R1 but had no caller until this spoke.
 
@@ -246,9 +245,8 @@ Once this reader exists:
 - =.dbf= field-type unit tests: each of C/N/F/L/D against hand-built records;
   a =.cpg=-less file with non-ASCII text, to pin down the encoding-fallback
   behavior.
-- CRS: once real projected =.prj= fixtures exist via this spoke, extend the
-  =esri_geographic_wkt1.tsv= bulk-oracle pattern to a projected counterpart —
-  the natural next step for R2/R4's CRS half.
+- CRS: done — =esri_projected_wkt1.tsv= extends the =esri_geographic_wkt1.tsv=
+  bulk-oracle pattern to projected CRSes; see § CRS INTEGRATION.
 
 ** OPEN QUESTIONS
 - *DBF field-width policy* for a string property over 255 bytes: silently

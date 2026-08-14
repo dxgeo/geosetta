@@ -10,7 +10,7 @@ use crate::format::Format;
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox};
-use crate::{csv, flatgeobuf, geojson, parquet};
+use crate::{csv, flatgeobuf, geojson, kml, parquet};
 // `json` is only needed by the test helpers below (the read path streams
 // GeoJSON directly rather than through a JsonValue tree).
 #[cfg(test)]
@@ -49,6 +49,8 @@ pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> 
         Format::FlatGeobuf => flatgeobuf::read(input),
         Format::Csv => csv::read(input),
         Format::Wkt => read_wkt_lines(input),
+        Format::Kml => kml::read_kml(input),
+        Format::Kmz => kml::read_kmz(input),
         // GeoPackage is multi-layer, so it's read via geopackage::read_layers in
         // main.rs rather than through this single-collection path.
         Format::Gpkg => Err(Error::Usage(
@@ -71,6 +73,8 @@ pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>>
         Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
         Format::Csv => Ok(csv::write(fc)),
         Format::Wkt => Ok(write_wkt_lines(fc)),
+        Format::Kml => Ok(kml::write_kml(fc)),
+        Format::Kmz => Ok(kml::write_kmz(fc)),
         // GeoPackage and Shapefile are handled outside this single-buffer path
         // (see read_features above) — GeoPackage via geopackage::write_layers,
         // Shapefile via shapefile::write, both called from main.rs.
@@ -822,5 +826,154 @@ mod tests {
         let geoms: Vec<_> = orig.features.iter().map(|f| f.geometry.clone()).collect();
         let back_geoms: Vec<_> = back.features.iter().map(|f| f.geometry.clone()).collect();
         assert_eq!(geoms, back_geoms);
+    }
+
+    // --- KML ----------------------------------------------------------------
+
+    #[test]
+    fn reads_real_duckdb_kml_fixture() {
+        // Real DuckDB-spatial output (COPY ... TO 'x.kml' WITH (FORMAT GDAL,
+        // DRIVER 'KML')), the same sourcing method used for the FlatGeobuf/
+        // GeoPackage/Shapefile fixtures. Exercises real-world shapes our
+        // hand-written test fixtures don't: a <Folder>/<Schema> wrapper, the
+        // <SchemaData>/<SimpleData> ExtendedData form, and a <Style> element
+        // (LineStyle/PolyStyle) that must be ignored, not just absent.
+        use crate::geometry::Geometry::{LineString, Point, Polygon};
+        let bytes = include_bytes!("../tests/fixtures/duckdb_geoms.kml");
+        let fc = convert(Format::Kml, Format::GeoJson, bytes).unwrap();
+        let fc = geojson::from_json(&json::parse(std::str::from_utf8(&fc).unwrap()).unwrap()).unwrap();
+        assert_eq!(fc.features.len(), 3);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        let by_name = |name: &str| fc.features.iter().find(|f| prop(f, "name").as_str() == Some(name)).unwrap();
+
+        let alpha = by_name("alpha");
+        assert_eq!(prop(alpha, "n").as_str(), Some("1"));
+        assert_eq!(alpha.geometry, Some(Point([1.5, 2.5])));
+
+        let beta = by_name("beta");
+        assert_eq!(prop(beta, "n").as_str(), Some("2"));
+        assert_eq!(beta.geometry, Some(LineString(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]])));
+
+        let gamma = by_name("gamma");
+        assert_eq!(prop(gamma, "n").as_str(), Some("3"));
+        assert_eq!(
+            gamma.geometry,
+            Some(Polygon(vec![
+                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
+                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+            ]))
+        );
+    }
+
+    #[test]
+    fn kml_composes_to_parquet_via_hub() {
+        // The hub payoff, mirroring flatgeobuf_composes_to_parquet_via_hub:
+        // KML -> Parquet (a path never written explicitly) then Parquet ->
+        // GeoJSON must reproduce the same features as KML -> GeoJSON.
+        let kml = include_bytes!("../tests/fixtures/duckdb_geoms.kml");
+        let direct = geojson::from_json(
+            &json::parse(std::str::from_utf8(&convert(Format::Kml, Format::GeoJson, kml).unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let pq = convert(Format::Kml, Format::Parquet, kml).unwrap();
+        let via_parquet = geojson::from_json(&json::parse(&geoparquet_to_geojson(&pq).unwrap()).unwrap()).unwrap();
+        assert_eq!(sorted_geoms(&direct), sorted_geoms(&via_parquet));
+    }
+
+    #[test]
+    fn kml_writer_round_trips_geometry_and_properties() {
+        // GeoJSON -> KML (our writer) -> GeoJSON via the hub.
+        let kml = convert(Format::GeoJson, Format::Kml, SAMPLE.as_bytes()).unwrap();
+        let back = geojson::from_json(
+            &json::parse(std::str::from_utf8(&convert(Format::Kml, Format::GeoJson, &kml).unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
+        assert_eq!(back.features.len(), orig.features.len());
+        assert_eq!(sorted_geoms(&orig), sorted_geoms(&back));
+    }
+
+    #[test]
+    fn kml_read_produces_wgs84() {
+        // KML has no CRS channel at all — always WGS 84 by spec.
+        let bytes = include_bytes!("../tests/fixtures/duckdb_geoms.kml");
+        let fc = read_features(Format::Kml, bytes).unwrap();
+        assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
+    }
+
+    // --- KMZ ------------------------------------------------------------
+
+    #[test]
+    fn kmz_writer_round_trips_through_our_own_reader() {
+        // GeoJSON -> .kmz (our writer) -> GeoJSON via the hub.
+        let kmz = convert(Format::GeoJson, Format::Kmz, SAMPLE.as_bytes()).unwrap();
+        let back = geojson::from_json(
+            &json::parse(std::str::from_utf8(&convert(Format::Kmz, Format::GeoJson, &kmz).unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
+        assert_eq!(back.features.len(), orig.features.len());
+        assert_eq!(sorted_geoms(&orig), sorted_geoms(&back));
+    }
+
+    #[test]
+    fn reads_a_real_gdal_libkml_networklink_kmz() {
+        // Real `ogr2ogr -f LIBKML` output: a root doc.kml that is *only* a
+        // <NetworkLink> pointing at layers/geoms.kml, where the actual
+        // Placemarks live — the real-world shape that requires flattening
+        // every *.kml archive entry, not just the first (see
+        // kml::read_kmz's doc comment). Sourced from the same geometries as
+        // duckdb_geoms.kml's oracle fixture: a polygon with a hole, a mixed
+        // GeometryCollection, and a MultiPolygon.
+        use crate::geometry::Geometry::{GeometryCollection, LineString, MultiPolygon, Point, Polygon};
+        let bytes = include_bytes!("../tests/fixtures/gdal_networklink.kmz");
+        let fc = read_features(Format::Kmz, bytes).unwrap();
+        assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
+        assert_eq!(fc.features.len(), 3);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        let by_name = |name: &str| fc.features.iter().find(|f| prop(f, "name").as_str() == Some(name)).unwrap();
+
+        assert_eq!(
+            by_name("square-with-hole").geometry,
+            Some(Polygon(vec![
+                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
+                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+            ]))
+        );
+        assert_eq!(
+            by_name("mixed-collection").geometry,
+            Some(GeometryCollection(vec![
+                Point([10.0, 10.0]),
+                LineString(vec![[10.0, 10.0], [11.0, 11.0]]),
+            ]))
+        );
+        assert_eq!(
+            by_name("multipoly").geometry,
+            Some(MultiPolygon(vec![
+                vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
+                vec![vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 5.0]]],
+            ]))
+        );
+    }
+
+    #[test]
+    fn kmz_composes_to_parquet_via_hub() {
+        // The hub payoff, mirroring kml_composes_to_parquet_via_hub: KMZ ->
+        // Parquet then Parquet -> GeoJSON must reproduce the same features
+        // as KMZ -> GeoJSON directly.
+        let kmz = include_bytes!("../tests/fixtures/gdal_networklink.kmz");
+        let direct = geojson::from_json(
+            &json::parse(std::str::from_utf8(&convert(Format::Kmz, Format::GeoJson, kmz).unwrap()).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let pq = convert(Format::Kmz, Format::Parquet, kmz).unwrap();
+        let via_parquet = geojson::from_json(&json::parse(&geoparquet_to_geojson(&pq).unwrap()).unwrap()).unwrap();
+        assert_eq!(sorted_geoms(&direct), sorted_geoms(&via_parquet));
     }
 }

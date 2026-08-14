@@ -1,0 +1,378 @@
+#+TITLE: Plan: KML / KMZ Format Spoke
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Adding KML/KMZ as a Format Spoke
+
+** STATUS — DONE (.kml and .kmz, read + write, both directions)
+Both artifacts the KML name covers — plain =.kml= and zip-wrapped =.kmz= —
+read and write through the Feature IR and compose through the hub in every
+direction (KML↔GeoParquet, KMZ↔GeoJSON, GeoJSON→KML→GeoParquet, etc.). See §
+IMPLEMENTED below for what exists; § OPEN QUESTIONS still has a few
+deliberately-deferred items (a real DEFLATE encoder for compressed =.kmz=
+writes, =<gx:*>= extensions) that don't block calling this spoke done. This
+plan originally laid out the shape of the work before any code was written,
+matching how [[file:shapefile.org][shapefile.org]] and
+[[file:flatgeobuf.org][flatgeobuf.org]] were scoped ahead of their spokes; the
+design below is unchanged from that scoping except where noted.
+
+*** IMPLEMENTED
+- =src/xml.rs= — the from-scratch XML reader *and* writer described in §
+  COMPONENTS 1 below: the parser + =XmlElement= model
+  (=attr=/=child=/=children_named=/=text_trimmed= accessors, plus
+  =leaf=/=with_children=/=with_attr= builders for constructing a tree to
+  serialize), and =write()= (element tree → a complete =<?xml?>= document,
+  with text/attribute escaping — the inverse of =parse=). 22 unit tests
+  (reader: prolog/comment/doctype skipping, BOM stripping, entity + numeric
+  character-reference decoding, CDATA, namespace-prefix stripping,
+  mismatched/unterminated-tag rejection; writer: escaping, self-closing
+  elements, and a write-then-parse round trip).
+- =src/kml/reader.rs= (+ =src/kml/mod.rs=) — =.kml= bytes → =FeatureCollection=,
+  per § COMPONENTS 3 below: =Document=/=Folder= flattening to find every
+  =Placemark=; =Point=/=LineString=/=Polygon= (with =innerBoundaryIs= holes);
+  =MultiGeometry= collapsing to =Multi*= (same-type children) or
+  =GeometryCollection= (mixed); both =ExtendedData= forms (=Data=/=value= and
+  =SchemaData=/=SimpleData=) plus =name=/=description= flattened into
+  properties; CRS always =Crs::Wgs84=. Malformed coordinate tuples error hard
+  (per the resolved open question — see below). 9 unit tests.
+- =src/kml/writer.rs= — the inverse: =FeatureCollection= → =.kml= bytes.
+  =name=/=description= properties become their own elements; every other
+  property round-trips through =<ExtendedData><Data name="k"><value>v</value>=
+  (the =<SchemaData>=/=<SimpleData>= form is read but not written — it needs a
+  companion =<Schema>= this writer has no reason to generate). All geometry
+  types, including =MultiGeometry= (same-type collapse and mixed-type
+  =GeometryCollection=) and polygon holes. 6 unit tests, including a
+  GeoJSON→KML→GeoJSON round trip.
+- =src/zip.rs= — a minimal ZIP container codec (§ COMPONENTS 2), not
+  KML-specific: read via the central directory (the authoritative index —
+  entries aren't decoded by scanning local headers sequentially), stored
+  (method 0) entries pass through, deflate (method 8) entries decompress via
+  the existing =compress::gzip::decompress= (its =strip_container= already
+  treats a bare DEFLATE stream as the default case, so *zero* new
+  decompression code was needed); each entry's CRC-32 is checked against the
+  central directory's recorded value. Write is stored-only (no DEFLATE
+  encoder in the crate — a deliberate, deferred trade-off, see § OPEN
+  QUESTIONS). CRC-32 (a 256-entry table built at =const fn= compile time, per
+  the resolved open question) lives here, not in =compress/=. 5 unit tests,
+  including one against a real archive from the system =zip= tool (Info-ZIP,
+  deflate by default) — the one path our own stored-only writer can never
+  exercise on its own output.
+- =Format::Kml= (extension =kml=) and =Format::Kmz= (extension =kmz=) both
+  fully wired into =format.rs= and =convert::{read_features,write_features}=;
+  =crs.rs='s =downgrade_warning= gained a merged =GeoJson | Kml | Kmz= arm (all
+  three are unconditionally WGS 84, so a non-WGS-84 source gets the same
+  "output will be mislabeled" warning, not a "dropped" one).
+  =kml::read_kmz= unwraps the zip container and flattens *every* =*.kml=
+  entry's =Placemark=s into one collection, not just the first — a real
+  multi-layer producer (=ogr2ogr -f LIBKML=, confirmed against real output)
+  writes a root =doc.kml= that is *only* a =<NetworkLink>= pointing at the
+  actual per-layer data in =layers/*.kml=; reading only the first entry would
+  silently produce zero features for archives shaped that way. =kml::write_kmz=
+  wraps the =.kml= writer's output as one stored entry named =doc.kml=.
+- Oracle-validated against real GDAL and DuckDB, matching the discipline every
+  prior spoke used:
+  - Our =.kml= writer's output for every geometry type (Point, LineString,
+    Polygon-with-hole, MultiPoint, MultiPolygon, a mixed =GeometryCollection=)
+    round-trips correctly through =ogrinfo=/LIBKML (geometry, =name=,
+    =description=, =ExtendedData= all read back exactly).
+  - A real DuckDB-generated =.kml= fixture (=COPY ... TO 'x.kml' WITH (FORMAT
+    GDAL, DRIVER 'KML')=, covering a =<Folder>=/=<Schema>= wrapper, the
+    =<SchemaData>=/=<SimpleData>= form, and a =<Style>= block that must be
+    ignored) is committed at =tests/fixtures/duckdb_geoms.kml=, exercised by
+    =convert.rs='s =reads_real_duckdb_kml_fixture=/=kml_composes_to_parquet_via_hub=/
+    =kml_writer_round_trips_geometry_and_properties=/=kml_read_produces_wgs84=.
+  - Our =.kmz= writer's stored-uncompressed output round-trips correctly
+    through both =unzip= and =ogrinfo=/LIBKML.
+  - A real GDAL/LIBKML-generated multi-layer =.kmz= (=ogr2ogr -f LIBKML=,
+    deflate-compressed, exercising the =<NetworkLink>=-flattening case above)
+    is committed at =tests/fixtures/gdal_networklink.kmz=, exercised by
+    =convert.rs='s =reads_a_real_gdal_libkml_networklink_kmz=/
+    =kmz_composes_to_parquet_via_hub=/=kmz_writer_round_trips_through_our_own_reader=.
+
+KML is an OGC standard (OGC KML 2.3), widely produced/consumed by Google
+Earth, ArcGIS, and most GIS tooling, and — unlike GML — has a small enough
+practical surface (a handful of geometry elements plus flat attribute data)
+to be a reasonable next classic spoke. Two artifacts share the name:
+- =.kml= — a plain XML document. Read/write is "just" a new from-scratch XML
+  parser/serializer, the same shape as =json/= was for GeoJSON.
+- =.kmz= — a =.kml= (conventionally =doc.kml=) plus optional assets (icons,
+  overlays), packed in a plain ZIP container. Read/write is the =.kml= codec
+  plus a new from-scratch ZIP container reader/writer.
+
+** WHAT MAKES KML DIFFERENT: markup, not records, and a styling layer we don't model
+Every prior spoke is a binary or line-record format with an explicit
+geometry/attribute split (Shapefile's =.shp=/=.dbf=, FlatGeobuf/GeoParquet's
+typed columns, GeoPackage's SQL rows). KML is different in two ways:
+- It's *XML*, not a binary or delimited format — Geosetta has no XML
+  infrastructure yet (=json/= doesn't help directly; the grammar is different:
+  attributes, nested elements, mixed content, namespaces).
+- It conflates *data* (geometry, feature identity, arbitrary key/value pairs)
+  with *presentation* (icon styles, line/poly styling, camera views, time
+  animation, screen overlays) in one tree. Geosetta's IR
+  (=Feature=/=FeatureCollection=, see =src/feature.rs=) has no concept of
+  styling — every prior format either has none (Shapefile/FlatGeobuf/GeoPackage/
+  GeoParquet) or, where GeoJSON de facto allows a =style= property via
+  =simplestyle-spec=, we already just pass arbitrary =properties= through
+  unmodified. KML styling is scoped *out*: read drops it, write never
+  generates it. See § OPEN QUESTIONS for how far "drop" should reasonably go
+  (e.g. =<name>=/=<description>= are cheap to keep as properties; =<Style>= is
+  not worth modeling).
+
+** THE FORMAT
+
+*** =.kml= — the XML document
+Top-level shape (namespace =http://www.opengis.net/kml/2.2=, often declared
+but safe to ignore structurally — match local element names, don't require
+exact namespace URIs, mirroring how GeoParquet's PROJJSON parsing in
+=parquet/geo.rs= doesn't validate against a schema):
+- =<kml><Document>...</Document></kml>= or =<kml><Folder>...</Folder></kml>=
+  or a bare =<kml><Placemark>...</Placemark></kml>=. =Document=/=Folder=
+  nest arbitrarily and exist only for grouping/display — flatten every
+  =Placemark= found anywhere in the tree into one =FeatureCollection=,
+  discarding the folder structure (the same "flatten, don't model hierarchy"
+  choice GeoPackage's layer fan-out makes in the *other* direction — there,
+  one file explodes into many outputs; here, nested grouping collapses into
+  one).
+- =<Placemark>= is the feature unit: an optional =<name>=, optional
+  =<description>=, an optional =<ExtendedData>= block, and exactly one
+  geometry child (or =<MultiGeometry>= wrapping several).
+- Geometry elements, each a straightforward structural mapping onto
+  [[file:../src/geometry/mod.rs][=Geometry=]]:
+  - =<Point><coordinates>lon,lat[,alt]</coordinates></Point>= → =Geometry::Point=
+  - =<LineString><coordinates>lon,lat lon,lat ...</coordinates></LineString>=
+    → =Geometry::LineString=
+  - =<Polygon><outerBoundaryIs><LinearRing><coordinates>...=
+    (+ zero or more =<innerBoundaryIs><LinearRing>...=) → =Geometry::Polygon=
+  - =<MultiGeometry>= wrapping same-type children → =MultiPoint=/
+    =MultiLineString=/=MultiPolygon=; wrapping mixed types → GeoJSON's
+    =GeometryCollection= (the IR already has this variant, unused by every
+    prior spoke except GeoJSON itself — KML would be its second producer/
+    consumer).
+  - No =MultiPoint=/=MultiLineString=/=MultiPolygon= element of its own — KML
+    only has the singular forms plus =MultiGeometry=; the multi-vs-single
+    decision on *write* is "how many children would =MultiGeometry= need,"
+    same shape as Shapefile's numParts check, no ring-classification-style
+    ambiguity this time.
+- Coordinate parsing: whitespace-*or*-newline-separated tuples, each
+  comma-separated =lon,lat[,alt]=; altitude is read and dropped (matches the
+  project's existing 2D-only stance — see =geometry/mod.rs='s module doc).
+  This tolerant whitespace handling is the one real "parsing feel" gotcha:
+  real-world KML (especially Google Earth exports) is inconsistent about
+  newlines vs. spaces inside =<coordinates>=.
+- =<ExtendedData>=: either =<Data name="k"><value>v</value></Data>= pairs or
+  the schema-typed =<SchemaData><SimpleData name="k">v</SimpleData></SchemaData>=
+  form (the latter's =<Schema>= type declarations, usually at the =Document=
+  level, are read for the field *name* but the declared type is not worth
+  chasing — read every value as a =JsonValue::String=, matching how DBF's
+  loosely-typed text fields already come through as strings/inferred by
+  =schema::infer_columns= downstream). Both forms flatten into
+  =Feature::properties= the same way GeoJSON's =properties= object already
+  does. =<name>=/=<description>= become properties too (keys =name=/
+  =description=) if present — cheap, commonly-consumed fields, unlike the
+  rest of the styling/presentation tree.
+- Everything else under =Document=/=Folder=/=Placemark= (=<Style>=,
+  =<StyleMap>=, =<LookAt>=/=<Camera>=, =<TimeStamp>=/=<TimeSpan>=,
+  =<Region>=, =<NetworkLink>=, ground/screen overlays, =<Model>=) is *out of
+  scope* for both read and write — see § OPEN QUESTIONS.
+
+*** =.kmz= — a ZIP container around =.kml=
+Plain ZIP (PKWARE APPNOTE), not KML-specific:
+- End of Central Directory record (fixed, at/near EOF — locate by scanning
+  backward for the =PK\x05\x06= signature, same "trailing structure" shape as
+  GeoParquet's Thrift footer) → central directory → each entry's local file
+  header + (usually) compressed data.
+- Compression method =0= (stored, raw bytes) or =8= (deflate) per entry. KML
+  producers (Google Earth included) use deflate almost universally; the
+  read side needs a *decoder*, which the project already fully has:
+  =compress::gzip::decompress='s =strip_container= already special-cases a
+  bare DEFLATE stream (no gzip/zlib wrapper) — exactly what ZIP method 8
+  entries are. So =.kmz= reading needs *zero* new compression code, only the
+  ZIP container framing.
+- The write side is the asymmetry: there is *no* DEFLATE **encoder** in the
+  crate today (=compress/gzip.rs= is decoder-only per its own module doc;
+  =snappy.rs= and the rest are Parquet-codec decoders except Snappy, which
+  does have a from-scratch encoder). Writing a real DEFLATE encoder is a
+  ZSTD-scale undertaking, not justified just to shrink a KMZ. Recommended:
+  write =.kmz= entries *stored* (method =0=, uncompressed) — valid per spec,
+  read by every real-world consumer (Google Earth, GDAL, QGIS), just bigger
+  on disk than a "real" KMZ. Matches the project's existing "ship the
+  simpler correct thing, defer the exotic codec" calls (Brotli deferred in
+  =plans/arbitrary-geoparquet.org=). Only the single =doc.kml= entry matters
+  for us — no image/overlay assets get generated since styling is out of
+  scope.
+- Locating the KML root inside the archive: conventionally =doc.kml= at the
+  archive root, but the spec only requires *a* =.kml= file; real producers
+  vary. *Revised during implementation:* taking only the first =*.kml= entry
+  (the original plan here) turned out to be wrong for a real producer —
+  =ogr2ogr -f LIBKML='s multi-layer output writes a root =doc.kml= that is
+  *only* a =<NetworkLink>= pointing at the real data in =layers/*.kml=, so
+  reading just the first entry silently produced zero features. The
+  implemented behavior instead flattens =Placemark=s out of *every* =*.kml=
+  entry in the archive (a =<NetworkLink>= has no =Placemark= children, so it
+  contributes nothing on its own) — the same "flatten, don't model hierarchy"
+  instinct the single-file =Document=/=Folder= case above already uses, just
+  extended across files instead of within one.
+
+** COMPONENTS
+
+*** 1. =src/xml.rs= — a small from-scratch XML reader
+The new primitive this spoke needs, playing the role =json/parser.rs= played
+for GeoJSON. Scope deliberately narrow — *not* a general XML library:
+- Well-formed-document parsing only (no DTD, no external entities — a
+  deliberate non-goal, entity expansion is a known XML security footgun and
+  KML never needs it).
+- Element start/end tags, attributes, text content, self-closing tags,
+  =<?xml ...?>= prolog (skip), comments (skip), the five predefined entities
+  (=&amp; &lt; &gt; &quot; &apos;=) plus numeric character references
+  (=&#NNN;=/=&#xHHHH;=).
+- Expose either a pull/cursor API (mirroring =json::parser::Parser=, which
+  the GeoJSON reader already drives by hand instead of building a full
+  =JsonValue= tree first) or a minimal DOM (=XmlElement { name, attrs,
+  children, text }=) — a full tree is probably simpler here than a JSON-style
+  streaming cursor, since KML's =Placemark= subtrees are small and read as a
+  unit; lean DOM unless profiling says otherwise (this format is not on the
+  performance-critical path the way GeoParquet/FlatGeobuf are).
+- Namespace handling: ignore/strip prefixes, match local names only (=kml:=,
+  =gx:=, bare — all the same element).
+- A parallel *writer*: element-tree-to-bytes serialization with XML escaping
+  on text/attribute content — the encode side, thin, same shape as
+  =geojson/mod.rs='s =encode= half.
+
+*** 2. =src/zip.rs= — a minimal ZIP container codec
+Read: locate EOCD from the tail, parse the central directory, for each
+entry decompress (method 0 passthrough, method 8 via the existing
+=compress::gzip::decompress=) into an in-memory =name -> bytes= map. Write:
+local file header + stored (method 0) bytes + central directory + EOCD, CRC-32
+per entry (a new, small, standard algorithm — not currently in the crate;
+ZIP's format requires it in both the local header and central directory, so
+it can't be skipped even for stored entries). Format-agnostic like
+=compress/=, so it's a reasonable future building block if another
+ZIP-based format ever gets added.
+
+*** 3. =src/kml/{reader.rs,writer.rs,mod.rs}= — assemble into =FeatureCollection=
+Reader: =.kml= path → =xml::parse= → walk for =Placemark= elements → geometry
++ =ExtendedData=/=name=/=description= → =Feature=; =.kmz= path → =zip::read=
+→ find the =*.kml= entry → same =.kml= path from there. =CRS= is trivial and
+new code is not needed here: KML coordinates are *always* WGS 84
+longitude/latitude (the spec has no other option, no per-file CRS element at
+all) — reader always returns =Crs::Wgs84=, exactly GeoJSON's existing
+default (see =src/crs.rs='s =Crs::Wgs84= doc comment, which already names
+GeoJSON as the reference case this mirrors).
+Writer: =Feature=/=FeatureCollection= → an XML tree (=<kml><Document>=
+containing one =<Placemark>= per feature, =properties= round-tripped as
+=<ExtendedData><Data>= pairs, =name=/=description= keys special-cased back to
+their own elements if present) → =xml::write=. =.kmz= output wraps that in a
+single stored =zip= entry named =doc.kml=.
+On non-WGS-84 input (a source =Crs::Named=): this is a genuine, unavoidable
+CRS-loss case, the same shape GeoJSON/CSV/WKT already have — wire it into
+=Crs::downgrade_warning='s existing "target forces WGS 84" arm rather than
+inventing new warning logic.
+
+*** 4. =format.rs= / =main.rs= wiring
+- *Decided:* two =Format= variants, =Format::Kml= (extension =kml=) and
+  =Format::Kmz= (extension =kmz=), mirroring how =Gpkg=/=Shapefile= are
+  distinct =Format= values despite sharing a hub. They share one
+  reader/writer module (=src/kml/=) and differ only in the outer container
+  (plain bytes vs. zip-wrapped bytes), but staying as two variants lets
+  =--from kml=/=--to kmz= be selected independently — e.g. =.kml= out from a
+  =.kmz= source, or vice versa — the same way =--from=/=--to= already work
+  for every other pair.
+- Both are single-file, single-layer, like GeoJSON/CSV/WKT/GeoParquet/
+  FlatGeobuf — *no* =main.rs= multi-file special-casing needed (unlike
+  Shapefile's sibling-file set or GeoPackage's layer fan-out). This is the
+  simplest spoke to wire in on that axis.
+- =crs.rs='s =downgrade_warning=/=rich_format_name= and =cli.rs='s format
+  list need the new variant(s); the compiler finds every match site, same as
+  every prior spoke's addition.
+
+** CRS INTEGRATION
+Nothing new. KML has no CRS concept beyond "always WGS 84 lon/lat" — reading
+produces =Crs::Wgs84= unconditionally (no id-lifting, no registry lookup, no
+structural WKT translation, none of the machinery =crs/= built for the richer
+formats applies here), and writing to KML from a non-WGS-84 source is a
+CRS-loss case handled by the existing =downgrade_warning= path. This spoke
+adds a warning-arm entry, not new CRS code — the simplest CRS story of any
+spoke so far.
+
+** SUGGESTED ORDER (read-first, mirrors every prior spoke)
+1. DONE — =src/xml.rs= reader.
+2. DONE — KML reader for =Point=/=LineString=/=Polygon= +
+   =ExtendedData=/=name=/=description= → properties.
+3. DONE — =MultiGeometry= handling (same-type → Multi*, mixed-type →
+   =GeometryCollection=) + =Document=/=Folder= flattening.
+4. DONE — =Format::Kml=, =format.rs=, hub routing (=convert.rs=) wired up;
+   KML→(anything) works, verified via the CLI (GeoJSON, GeoParquet) and
+   against a real DuckDB-generated =.kml= fixture
+   (=tests/fixtures/duckdb_geoms.kml=, committed).
+5. DONE — =src/xml.rs= writer + KML writer (the inverse of step 2/3) →
+   (anything)→KML. Validated: real =ogrinfo=/LIBKML reads Geosetta's output
+   back correctly for every geometry type (Point, LineString,
+   Polygon-with-hole, MultiPoint, MultiPolygon, mixed
+   =GeometryCollection=), and geojson→kml→geojson round-trips both geometry
+   and properties (=convert.rs='s =kml_writer_round_trips_geometry_and_properties=).
+   *Not yet validated against a real Google Earth export* (only DuckDB/GDAL
+   fixtures so far) — worth doing if one becomes available, same as the
+   still-open item from step 4.
+6. DONE — =src/zip.rs= (read: stored + deflate-via-existing-gzip-decoder,
+   plus CRC-32 verification; write: stored-only) → =.kmz= read. Validated
+   against a real Info-ZIP-produced deflate archive
+   (=tests/fixtures/sample.zip=) and a real =ogr2ogr -f LIBKML= multi-layer
+   =.kmz= (=tests/fixtures/gdal_networklink.kmz=) — the latter surfaced and
+   fixed a real gap: reading only the first =*.kml= entry silently produced
+   zero features, since LIBKML's root =doc.kml= is only a =<NetworkLink>=;
+   =kml::read_kmz= now flattens every =*.kml= entry instead.
+7. DONE — =.kmz= write (wraps the =.kml= writer's bytes as one stored zip
+   entry named =doc.kml=). Validated: real =unzip= and =ogrinfo=/LIBKML both
+   read Geosetta's =.kmz= output back correctly.
+
+** TESTING
+- Oracle: GDAL/OGR via DuckDB's spatial extension (=ST_Read=/=COPY ... TO
+  'x.kml' WITH (FORMAT GDAL, DRIVER 'KML')=) — same oracle as every prior
+  spoke. Also worth hand-checking a couple of real Google-Earth-exported
+  =.kml=/=.kmz= files (different producer, catches the "everyone deviates
+  from the spec a little" cases the shapefile spoke ran into with Esri
+  =.prj= text).
+- =xml.rs= unit tests, independent of KML: malformed-but-common documents
+  (unescaped =&= is common in the wild and worth deciding a tolerance
+  policy for — see § OPEN QUESTIONS), entity/char-ref decoding, whitespace-only
+  text nodes.
+- =zip.rs= unit tests: a hand-built small archive with both stored and
+  deflate entries, CRC-32 mismatch detection, EOCD-scan on an archive with a
+  trailing comment field (legal per spec, shifts where EOCD starts).
+- KML fixtures under =tests/fixtures/=, generated via DuckDB the same way as
+  Shapefile/FlatGeobuf/GeoPackage's fixtures, per geometry type plus one
+  =ExtendedData=-bearing fixture and one =MultiGeometry=/=GeometryCollection=
+  fixture.
+- Round trips: geojson→kml→geojson (properties + geometry), kml→kmz→kml
+  (container only, content should be byte-identical after XML re-parse).
+
+** OPEN QUESTIONS
+- *How much of =<name>=/=<description>= to keep* — treating them as ordinary
+  properties (as scoped above) is cheap and matches how GeoJSON's
+  =simplestyle-spec= properties already pass through unmodified, but it does
+  mean a property literally named =name= or =description= in the source
+  round-trips ambiguously if the source *also* had a KML =<name>= element.
+  Probably a non-issue in practice; worth a test case rather than a design
+  decision up front.
+- *Malformed-XML tolerance* — real-world KML (Google Earth exports
+  especially) sometimes contains unescaped =&= in text content, technically
+  invalid XML. Default lean is error hard (matching the project's "never
+  guess" convention elsewhere — e.g. Shapefile's record-count mismatch);
+  revisit only if real fixtures show unescaped =&= common enough to be a
+  real blocker, same approach the Shapefile spoke took with its DBF
+  encoding-fallback question — decide from evidence, not up front.
+- *=<gx:*>= extensions* (Google's =gx= namespace: =<gx:Track>=,
+  =<gx:MultiTrack>=, tour elements) — out of scope for a first cut, but
+  =<gx:Track>= in particular is common enough in real GPS-export KML that it
+  may be worth a follow-up once the core spoke lands; note it here so it
+  isn't forgotten rather than silently dropped.
+- *CRC-32 implementation* — RESOLVED: =zip.rs= owns it directly (a 256-entry
+  table built at compile time via a =const fn=, not generalized into
+  =compress/=), used both to compute entries on write and verify them on
+  read. Validated against the standard CRC-32/ISO-HDLC check value and by a
+  dedicated corruption-detection test.
+- *DEFLATE encoder for real =.kmz= compression* — scoped separately in
+  [[file:compression-encoders.org][compression-encoders.org]] (a
+  fixed-Huffman-only encoder reusing =gzip.rs='s existing fixed tables); not
+  yet implemented. Revisit priority only if stored-mode =.kmz= output turns
+  out to be a real problem for someone (e.g. very large exports).

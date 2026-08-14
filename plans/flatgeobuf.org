@@ -80,8 +80,8 @@ into =read_geoparquet_features= + IR→geojson). Add =Format::FlatGeobuf= and th
 - FGB's geometry types map 1:1 onto our =Geometry= enum; 2D matches our model, so
   no enum change now. 3D (z) stays out of scope, consistent with the rest.
 - CRS: FGB stores a CRS in the header; GeoParquet stores it in =geo= metadata;
-  GeoJSON assumes CRS84. Cross-format CRS fidelity is the existing open roadmap
-  item — for now assume CRS84, matching current behavior.
+  GeoJSON assumes CRS84. Cross-format CRS pass-through is implemented — see
+  the Status section above and =crs.org=/=project.org=.
 
 ** SUGGESTED ORDER (read-first)
 1 (FlatBuffers reader + FGB types) → 2 (FGB reader) → 4 (hub routing + CLI, so
@@ -97,14 +97,18 @@ Read (items 1, 2, 4) and write (item 3) are implemented and validated:
 - =src/flatgeobuf/= — FGB reader and writer. Column inference is shared via the
   hoisted =src/schema.rs= (moved out of =parquet/=), so both writers use it.
 - Hub routing in =convert.rs=: any format → FGB and FGB → any format.
+- CRS pass-through: the header's =Crs= table is read and written in both
+  directions (=src/flatgeobuf/writer.rs='s =build_crs=/=mod crs=), consistent
+  with the CRS IR described in =crs.org=/=project.org=.
 Validated against DuckDB's GDAL FlatGeobuf driver in *both* directions —
 Point / LineString / Polygon-with-hole / MultiPolygon / MultiLineString /
 MultiPoint decode from and encode to files GDAL reads correctly. Fixtures:
 =tests/fixtures/duckdb_geoms.fgb=, =duckdb_props.fgb=.
 
-*Deferred (optional):* the packed Hilbert R-tree spatial index on write — files
-are written with =index_node_size = 0= (valid, index-less), which GDAL/DuckDB
-read fine; an index would speed up spatial queries in other tools.
+*Also DONE:* the packed Hilbert R-tree spatial index on write — see
+=spatial-index.org= milestone B (=index_node_size = 16= by default, built via
+=src/spatial.rs='s Hilbert ordering, checked in
+=src/flatgeobuf/writer.rs=). GDAL bbox queries against our output work.
 
 ** TESTING
 - Fixtures written by DuckDB (=DRIVER 'FlatGeobuf'=), committed small under
@@ -115,7 +119,6 @@ read fine; an index would speed up spatial queries in other tools.
 - Unit-test the FlatBuffers reader/writer against hand-built buffers.
 
 ** OPEN QUESTIONS
-- Do we build the packed Hilbert R-tree on write (enables spatial queries in
-  other tools), or ship index-less FGB and defer it?
-- Hoist =infer_columns= (currently in =parquet/schema.rs=) to a shared module so
-  both the Parquet and FGB writers use it?
+Both resolved — see Status above:
+- The packed Hilbert R-tree is built on write (default =index_node_size = 16=).
+- =infer_columns= was hoisted to =src/schema.rs= and is shared by both writers.

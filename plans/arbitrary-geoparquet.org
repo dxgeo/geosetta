@@ -205,7 +205,7 @@ stale doc comment while in there: it claimed ZSTD/GZIP were unsupported
 codecs, but =decompress= already handles them (only LZO, BROTLI, and
 Hadoop-framed =LZ4= remain genuinely unimplemented).
 
-*** 4. Additional physical / logical types — *PARTIAL*
+*** 4. Additional physical / logical types — *DONE*
 Done:
 - =INT32= (4-byte LE) and =FLOAT= (4-byte IEEE) widen into the i64 and f64
   columns respectively, surfacing as ordinary JSON numbers, in both PLAIN and
@@ -214,33 +214,187 @@ Done:
   as ISO 8601 strings, read from the schema's =converted_type= (DuckDB writes
   it, so no need to parse the =logicalType= union). Verified against DuckDB
   read-back including sub-second micros (fixture =tests/fixtures/duckdb_dates.parquet=).
+- =INT96= (legacy 12-byte Impala/Hive timestamp: 8-byte nanos-of-day + 4-byte
+  Julian day, both little-endian) renders as an ISO 8601 string at full
+  nanosecond precision (=format_int96=, keeping day and time-of-day arithmetic
+  separate rather than summing into one nanoseconds-since-epoch =i64=, which
+  would overflow outside ~1677-2262). No =converted_type= marks it — the
+  physical type alone means "timestamp," matching every real writer.
+- =FIXED_LEN_BYTE_ARRAY= decodes in both PLAIN and dictionary encodings, keyed
+  by the schema's =type_length= (newly parsed, =SchemaElement= field 2, threaded
+  through =SchemaNode=/=LeafInfo=/=ColumnMeta= alongside =converted_type=). A
+  plain (non-=DECIMAL=) column renders as lowercase hex text — the fallback for
+  a raw-bytes value with no more specific logical meaning, since the IR has no
+  raw-bytes value type.
+- =DECIMAL= on =INT32=, =INT64=, and =FIXED_LEN_BYTE_ARRAY= (=BYTE_ARRAY=-backed
+  decimal is implemented too, sharing the same big-endian-bytes-to-=i128= path,
+  though no real fixture exercises it — pyarrow only emits it for =INT32=/
+  =INT64=/=FLBA=). Always renders as an exact base-10 string (=format_decimal=,
+  scale read from the schema's newly-parsed =scale= field), never a JSON
+  number — =f64= can't hold 38 significant decimal digits without loss, and a
+  =DECIMAL= column exists specifically to avoid that loss.
+- =JSON= logical type: a =BYTE_ARRAY= column annotated =JSON= is parsed and
+  embedded as a real =JsonValue= rather than re-stringified into a JSON string
+  of a string, falling back to a plain string on a parse failure.
 
-Still to do: =INT96= (legacy timestamps), =FIXED_LEN_BYTE_ARRAY=, and =DECIMAL= /
-=JSON= logical types. Writers that emit *only* =logicalType= (not the legacy
-=converted_type=) would need the union parsed; DuckDB writes both.
+Verified against a real fixture generated with pyarrow (now available in the
+dev environment via =uv=), in both PLAIN and dictionary-encoded forms
+(=tests/fixtures/pyarrow_types_{plain,dict}.parquet=, generated with
+=store_decimal_as_integer=True= and =use_deprecated_int96_timestamps=True= so
+all three =DECIMAL= physical encodings and the legacy =INT96= timestamp are
+exercised end to end), plus unit tests for the pure formatters
+(=format_int96=, =format_decimal=, =be_bytes_to_i128=, =to_hex=) and the
+dispatch wiring itself. Writers that emit *only* the modern =logicalType=
+union (not the legacy =converted_type=) would still need that union parsed —
+DuckDB and pyarrow both write =converted_type=, so no real file has forced
+this yet.
 
-*** 5. DATA_PAGE_V2
-Distinct header: separate definition/repetition byte counts, an =is_compressed=
-flag, and levels that are *not* compressed even when values are. Not emitted by
-DuckDB default; handle or explicitly error until a real file needs it.
+*** 5. DATA_PAGE_V2 — *DONE*
+Not emitted by DuckDB by default, but pyarrow (now available in the dev
+environment via =uv=) writes it with =data_page_version="2.0"=, which unblocked
+this.
 
-*** 6. Geometry variation
+=DataPageHeaderV2= (=PageHeader= field 8) is parsed in
+=parse_data_page_header_v2=: =num_values=(1), =encoding=(4),
+=definition_levels_byte_length=(5), =repetition_levels_byte_length=(6), and the
+thrift-optional =is_compressed=(7, default =true=) — read directly off the
+field header's type nibble (=BOOL_TRUE=/=BOOL_FALSE=), since the compact
+protocol encodes a bool's value *in the header*, not as a following byte
+(=num_nulls=(2)/=num_rows=(3) are skipped: =num_values=, nulls included,
+already gives the page's row count for any non-repeated column — the only
+kind that reaches a page read at all, since a genuinely REPEATED column is
+rejected earlier at the =unsupported_repeated= check in =read_geoparquet=,
+before its pages are ever touched).
+
+Rather than a parallel V2 decode path, =decode_data_page_v2_body= *bridges*
+V2's on-disk shape into V1's — =[u32 rle_len][RLE levels][values]=, what
+=split_definition_levels= already parses — so every consumer from
+=decode_data_page= onward needs zero V2-specific code:
+- V2's definition-level RLE stream has *no* 4-byte length prefix (the length
+  is already in the header) — synthesized here so the reassembled body still
+  matches V1's shape. Skipped entirely for a REQUIRED column (=max_def_level
+  == 0=), matching how V1's own body has no level section at all in that
+  case — miss it and a bare 4-byte zero-length prefix gets prepended even to
+  values that should start immediately, silently corrupting every REQUIRED
+  column.
+- Unlike V1 (whose whole page body, levels included, is one compressed
+  blob), V2 only ever compresses the *values* section — decompression is
+  applied to =comp[def_levels_byte_length..]= alone, gated by =is_compressed=,
+  never to the levels.
+- =repetition_levels_byte_length != 0= (a genuinely list-valued/REPEATED
+  column) errors clearly rather than misreading — reachable only if the
+  earlier =unsupported_repeated= schema check and this page ever disagreed,
+  which would itself be a bug worth surfacing loudly.
+
+Verified against a real pyarrow fixture
+(=tests/fixtures/pyarrow_data_page_v2_{plain,dict}.parquet=, both PLAIN- and
+dictionary-encoded, =data_page_version="2.0"=) with a REQUIRED non-nullable
+column (=max_def_level == 0=, the case above), an OPTIONAL column with a real
+null pattern, and geometry.
+
+*** 6. Geometry variation — *6b/6c DONE (detection), 6a remains*
 - WKB with Z / M / ZM (3D/4D) — extend =wkb::decode= and the =Geometry= model,
-  or project to 2D with a documented note.
-- The =geo= metadata may list multiple geometry columns or a non-CRS84 CRS —
-  read =geo= rather than assuming defaults (ties into CRS handling on the write
-  side too).
-- Some writers use the newer Parquet native =GEOMETRY= logical type instead of
-  the GeoParquet =geo= key/value convention — detect which is present.
+  or project to 2D with a documented note. *Not started* — a genuine IR-scope
+  decision (does =Geometry=/=Position= grow a Z, touching every writer, or does
+  the reader silently drop it), not just a decode-path addition.
+- *6b — DONE (as a clean rejection; real multi-geometry decode/write is now a
+  separate plan).* The =geo= metadata may list multiple geometry columns or a
+  non-CRS84 CRS — read =geo= rather than assuming defaults.
 
-*** 7. Nested/repeated (list-valued) columns — *SCOPING, not yet implemented*
+  Non-CRS84 CRS via =geo= metadata already worked before 6b:
+  =parquet::geo::parse_crs= (=src/parquet/geo.rs=) reads
+  =geo["columns"][primary_column]["crs"]=, not a hardcoded default — that's
+  the exact mechanism =crs.org='s WKT→PROJJSON translation round-trips
+  through already. There is no CRS-reading gap in the classic =geo=-metadata
+  path; only the native-logicalType path needed new CRS plumbing (6c's
+  =parse_native_geometry_crs=).
+
+  *What 6b actually implemented: detecting multiple geometry columns declared
+  via =geo["columns"]=.* Per the GeoParquet spec, every key in that object
+  names a geometry column, not just =primary_column=. =geo_geometry_columns=
+  (=src/parquet/reader.rs=) now parses every key of =geo["columns"]= into
+  =Meta::geo_geometry_columns: Vec<String>=, and =read_geoparquet='s
+  per-column loop rejects a second column named there with a clear
+  =Error::Parquet= (mirroring 6c's existing native-tag collision error)
+  instead of falling into the ordinary property path and failing on
+  "invalid utf-8" the way it used to.
+
+  Verified against two *real* fixtures, no synthetic metadata needed for one
+  of them: =tests/fixtures/duckdb_multi_geometry.parquet= — DuckDB's spatial
+  extension (v1.5.4) genuinely writes multi-geometry-column GeoParquet
+  (=CREATE TABLE t(geom GEOMETRY, geom2 GEOMETRY, ...)= → =COPY ... TO
+  parquet=), so this fixture needed zero hand-authoring, contrary to this
+  section's original assumption that no mainstream tool produces this shape.
+  GDAL 3.13's Parquet driver, by contrast, confirmed *not* to support writing
+  more than one geometry column (an OGR VRT with two =<GeometryField>=
+  elements silently downgrades the second to a plain string property on
+  write) — so DuckDB, not GDAL, is the real-world source here.
+  =tests/fixtures/pyarrow_multi_geometry.parquet= is the semi-synthetic
+  fixture this section originally anticipated (real WKB via pyarrow/shapely,
+  hand-authored =geo= JSON, since pyarrow has no geometry concept), kept as a
+  second, independent code path (no covering-bbox column, no dictionary
+  encoding). Both fixtures are DuckDB-oracle-verified and covered by unit
+  tests in =parquet/reader.rs=.
+
+  *Actually decoding a second geometry column* (rather than rejecting it) —
+  keeping it in the =Feature= IR and round-tripping it through GeoParquet
+  write, with a text fallback for every other target format — is scoped
+  separately in
+  [[file:multi-geometry-columns.org][multi-geometry-columns.org]], since it
+  needs an IR change (=Feature= currently holds exactly one geometry) and
+  isn't just a reader-side fix.
+- *6c — DONE:* some writers use Parquet's native =GEOMETRY=/=GEOGRAPHY=
+  logical type (=SchemaElement.logicalType=) instead of, or alongside, the
+  =geo= key/value convention — GDAL 3.13's Parquet driver supports writing it
+  (=-lco USE_PARQUET_GEO_TYPES=YES/ONLY=; pyarrow 25 cannot write it, only
+  GDAL can, as of this writing). The physical encoding is unchanged (still
+  plain =BYTE_ARRAY= WKB), so this was purely a *detection* gap, not a new
+  decode path.
+
+  =parse_geometry_logical_type= (=src/parquet/reader.rs=) parses
+  =SchemaElement.logicalType= (field 10, a thrift union) looking for member
+  17 (=GeometryType=) or 18 (=GeographyType=) — *both field IDs confirmed by
+  reading a real =ogr2ogr=-produced file's raw thrift bytes*, since
+  parquet-format's docs don't tabulate them plainly. When found, the same
+  parse also reads the member's own field 1, =crs= — a raw PROJJSON string,
+  confirmed the same way against an =EPSG:3857= fixture (absent means the
+  format default, OGC:CRS84, empirically confirmed against a WGS84 fixture).
+  =SchemaNode=/=LeafInfo=/=ColumnMeta= each grow =is_geometry=/=geometry_crs=
+  fields, following the same plumbing pattern milestone 4 established for
+  =type_length=/=scale=.
+
+  In =parse_file_metadata=, the native tag fills in whatever the =geo= metadata
+  left unset — never overrides it: if =geo= didn't name a =primary_column= and
+  exactly one schema leaf is native-geometry-tagged, its name becomes the
+  geometry column (recovering a *non*-default-named geometry column, e.g.
+  GDAL's =GEOMETRY_NAME=shape=, with no =geo= key to name it at all); if the
+  CRS is still unresolved, the primary column's native =crs= is parsed via the
+  new =parquet::geo::parse_native_geometry_crs= (refactored to share
+  =parse_crs='s PROJJSON→=Crs= lifting rather than duplicate it). A *second*
+  native-geometry-tagged column that isn't the chosen primary is rejected with
+  a clear error in =read_geoparquet= (Geosetta's =Feature= IR has room for one
+  geometry per feature; silently misdecoding WKB as a text property, or
+  silently dropping real geometry data, would both be worse than failing
+  loudly) — true multi-geometry support is
+  [[file:multi-geometry-columns.org][multi-geometry-columns.org]]'s job, not
+  6c's.
+
+  Verified against two real =ogr2ogr -f Parquet -lco USE_PARQUET_GEO_TYPES=ONLY=
+  fixtures (=tests/fixtures/gdal_native_geometry_custom_name.parquet=, a
+  non-default =GEOMETRY_NAME=shape= column with the default WGS84 CRS and *no*
+  =geo= key at all; =gdal_native_geometry_3857.parquet=, the default column name
+  with an =EPSG:3857= CRS carried only in the native =crs= field) plus a unit
+  test for =parse_geometry_logical_type= itself, hand-encoding the union shape
+  with the crate's own =CompactWriter= rather than raw bytes.
+
+*** 7. Nested/repeated (list-valued) columns — *DONE (list of scalars; structs/nested lists still rejected)*
 The §3c fix taught the reader to compute definition levels correctly for any
 column nested under an OPTIONAL group (=flatten_schema='s tree walk), and to
-detect a REPEATED ancestor and reject it with a clear
-=Error::Parquet("column \"...\" is a nested/repeated (list-valued) column,
-which is not supported yet")= rather than attempt (and silently misparse) a
-decode. This milestone is about actually *decoding* that case instead of
-just detecting it.
+detect a REPEATED ancestor. This milestone decodes the common case of that —
+a single-level list of scalars — instead of just detecting and rejecting it;
+a list of structs or a list nested inside another list still gets the same
+clear =Error::Parquet= reject as before (see "What was actually implemented"
+below for exactly which shapes qualify).
 
 **** Concrete example
 A property that's an array — a GeoJSON feature with
@@ -290,46 +444,87 @@ there with zero changes. No format gets special-cased, including Shapefile —
 it's already in the same "flatten to text" boat as every other format for
 array-valued properties, list-typed source column or not.
 
-**** What decoding needs (sketch, not yet designed in detail)
-- Parse the repetition-level stream the same structural way
-  =split_definition_levels=/=decode_levels= already parse definition
-  levels (same RLE/bit-pack hybrid, a second bit-width derived from the
-  schema's max *repetition* level rather than max *definition* level) —
-  =flatten_schema= already has enough tree information to compute a max
-  repetition level per leaf (count of REPEATED ancestors) alongside the
-  max definition level it already computes; it just doesn't expose that
-  number yet.
-- Group consecutive values into per-row lists using the repetition levels
-  (a repetition level of 0 marks the start of a new row's list; anything
-  higher continues the current row's).
-- Detect the standard 3-level list encoding structurally (a REPEATED group
-  with exactly one child, itself either a leaf or a nested group) rather
-  than only via the =LogicalType= annotation, since some writers only set
-  the legacy =ConvertedType= =LIST= (=converted_type= 3) — mirrors how §4
-  already prefers =converted_type= over parsing the =logicalType= union
-  where both exist.
-- Scope question: start with a list of scalars (covers the GDAL
-  =StringList=/=IntegerList= case, the one with a real driver) and
-  explicitly reject a list of structs/nested lists with a clear error,
-  rather than trying to handle arbitrary nesting depth in the first pass.
+**** What was actually implemented
+- *Structural detection, not just the =LogicalType=/=ConvertedType= tag*
+  (=flatten_schema=, =src/parquet/reader.rs=): every leaf now carries a
+  =max_rep_level= (count of REPEATED ancestors, mirroring =max_def_level='s
+  existing accumulation) and a =list_eligible= flag, computed by walking the
+  schema tree and tracking whether every REPEATED ancestor along the path had
+  *exactly one child* — a REPEATED group with more than one child is a list
+  of structs (each element has several fields; one leaf's column chunk alone
+  can't decode a row's elements from it) and =max_rep_level >= 2= is a list
+  nested inside another list; both are real Parquet shapes but harder
+  problems this reader still declines, with the same clear
+  =Error::Parquet("... is a nested/repeated (list-valued) column, which is
+  not supported yet")= as before (=ColumnMeta::unsupported_repeated= now
+  means specifically "repeated *and* not list-eligible," not "repeated at
+  all"). Both the standard 3-level =optional group tags (LIST) { repeated
+  group list { optional binary element } }= shape and the legacy bare
+  =repeated binary tags= (2-level, no wrapping group) qualify as eligible.
+- *Repetition-level parsing* (=split_list_levels=, a =read_prefixed_levels=
+  helper shared with its definition-level section): reuses =decode_levels=
+  verbatim, exactly as scoped, for both the rep and def sections of a V1 page
+  body (=[u32 len][RLE rep]?[u32 len][RLE def][values]=). V2's separate
+  =rep_levels_byte_length= header field — previously hard-rejected in
+  =decode_data_page_v2_body= as "not supported" — is now bridged into the
+  same prefixed shape rather than erroring.
+- *Row grouping* (=group_list_values=): groups the chunk's flat,
+  across-all-pages repetition levels, definition levels, and already-decoded
+  per-occurrence values (reusing =decode_values=, the same PLAIN/dictionary
+  dispatch every ordinary column already goes through — a list column's
+  values are decoded exactly the same way, just at occurrence granularity
+  instead of row granularity) into one =JsonValue= per row: =Null= for an
+  absent list, =Array= (possibly empty) otherwise. The threshold between
+  "list absent," "list present but empty," and "a real element" is a single
+  new per-leaf number, =list_group_def_level= (the definition level achieved
+  *at* the REPEATED ancestor itself) — computed once during the schema walk,
+  reused directly rather than re-deriving it per row.
+- *Correct row-counting across page boundaries* — the one real subtlety
+  beyond the original sketch: a REPEATED column's page =num_values= counts
+  *occurrences* (list elements plus one marker per empty/null row), not
+  rows, so the ordinary column path's "stop once =rows_done >= rg_rows="
+  loop doesn't apply, and nothing guarantees a single row's elements stay
+  within one physical page. =decode_list_column= uses the column chunk's own
+  =ColumnMetaData.num_values= (newly parsed, thrift field 5) — the
+  chunk's total occurrence count — as its stopping bound instead, so a row
+  split across a page boundary still gets all its elements; grouping into
+  rows happens once, after every page in the chunk is read, not per-page.
+- *Property naming*: a list column's decoded value is keyed by the *outer*
+  list property's name (=tags=), not the innermost leaf's own bare name
+  (=element=, always the same for the standard 3-level shape) — an
+  easy-to-miss bug this session's fixtures caught immediately (every
+  decoded list surfaced under the property key "element" until fixed).
 
-**** Testing
-- A real fixture: =ogr2ogr= writing a =StringList= (or =IntegerList=)
-  OGR field to GeoParquet — same sourcing discipline as
-  =gdal_covering_bbox.parquet=, committed small and real rather than
-  hand-built. DuckDB can likely produce an equivalent list-typed column
-  too (=LIST(VARCHAR)=), giving a second independent oracle.
-- Unit tests for the repetition-level decode itself, mirroring
-  =decode_levels_single_rle_run=/=decode_levels_bit_packed=: hand-built
-  repetition-level streams for "all rows have exactly one element,"
-  "some rows empty," and "some rows with several elements," checked
-  against the expected row groupings directly (no full file needed).
-- End-to-end: decode the fixture, confirm each row's =JsonValue::Array=
-  matches the source data, then confirm the existing write path (§ "Where
-  this connects to the write side" above) already turns it into the right
-  JSON-string text in at least one non-GeoParquet format (Shapefile =.dbf=
-  or GeoPackage =TEXT=) with *no new write-side code* — that's the
-  milestone's actual completion bar, not just "the read decodes."
+**** Testing — done against real fixtures from two independent tools
+- =tests/fixtures/duckdb_list_column.parquet= — DuckDB =LIST(VARCHAR)=, 3
+  rows (a 2-element list, a present-but-empty list, a 1-element list),
+  PLAIN-encoded, single page.
+- =tests/fixtures/duckdb_list_column_dict.parquet= — same shape, 60 rows
+  over a 3-string vocabulary, =PLAIN_DICTIONARY=-encoded — the harder
+  decode path (dictionary indices routed through =decode_values= at
+  occurrence granularity, not just PLAIN bytes).
+- =tests/fixtures/gdal_list_column.parquet= — =ogr2ogr -f Parquet= on a
+  GeoJSON with a =tags= =StringList= OGR field. GDAL writes the identical
+  standard 3-level shape DuckDB does, *and* (as it does by default) a
+  =geometry_bbox= covering-bbox struct alongside — a real file exercising
+  milestone 7 and §3c's nested-OPTIONAL-group definition levels together,
+  from an independent tool.
+- Unit tests for the primitives directly, hand-built byte streams, no full
+  file needed: =split_list_levels_parses_rep_then_def_then_values= and two
+  =group_list_values_*= tests covering multi-element/empty/null-element rows
+  and the whole-list-null-vs-present-empty distinction — mirroring
+  =decode_levels_single_rle_run=/=decode_levels_bit_packed='s existing style,
+  as scoped.
+- End-to-end, the milestone's actual completion bar: decoding each fixture
+  confirms =parsed.properties=' =tags= column matches the source row for
+  row, then converting through the real CLI (=geosetta in.parquet
+  out.shp=/=out.geojson=) confirms the existing write path already turns it
+  into the right JSON-string text in a non-GeoParquet format (Shapefile
+  =.dbf=, verified via =ogrinfo=: =tags (String) = ["park","historic"]=) —
+  and, for GeoJSON specifically, comes back out as a real JSON array rather
+  than text, since GeoJSON has no schema to flatten against. *Zero write-side
+  code changed* — =schema.rs=, every format's writer, all untouched, exactly
+  as this section originally predicted.
 
 ** ROBUSTNESS / VALIDATION
 - Bounds-check every offset and length from the footer before slicing (the

@@ -346,6 +346,153 @@ mod tests {
         }
     }
 
+    /// Shared checker for the pyarrow DECIMAL/INT96/FIXED_LEN_BYTE_ARRAY
+    /// fixtures — one PLAIN-encoded, one dictionary-encoded, same 40 rows
+    /// (`i` from 0 to 39), generated with `store_decimal_as_integer=True` and
+    /// `use_deprecated_int96_timestamps=True` so all three DECIMAL physical
+    /// encodings and the legacy INT96 timestamp are exercised:
+    ///   decimal_i32   DECIMAL(6,2)  on INT32               (i-20)*12.34
+    ///   decimal_i64   DECIMAL(15,3) on INT64               (i-20)*1234.567
+    ///   decimal_flba  DECIMAL(25,4) on FIXED_LEN_BYTE_ARRAY (i-20)*100000.1234
+    ///   ts_ns         TIMESTAMP(ns) on INT96                1_600_000_000e9 + i*1_000_000_001
+    ///   raw4          plain FIXED_LEN_BYTE_ARRAY(4), non-DECIMAL           [i,i+1,i+2,i+3]
+    ///   geometry      WKB Point(i, i*2)
+    fn check_pyarrow_types_fixture(bytes: &[u8]) {
+        let out = geoparquet_to_geojson(bytes).unwrap();
+        let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
+        assert_eq!(fc.features.len(), 40);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        let cases: &[(usize, &str, &str, &str, &str, &str)] = &[
+            (0, "-246.80", "-24691.340", "-2000002.4680", "2020-09-13T12:26:40", "00010203"),
+            (1, "-234.46", "-23456.773", "-1900002.3446", "2020-09-13T12:26:41.000000001", "01020304"),
+            (20, "0.00", "0.000", "0.0000", "2020-09-13T12:27:00.000000020", "14151617"),
+            (39, "234.46", "23456.773", "1900002.3446", "2020-09-13T12:27:19.000000039", "2728292a"),
+        ];
+        for &(i, dec_i32, dec_i64, dec_flba, ts, raw) in cases {
+            let f = &fc.features[i];
+            assert_eq!(prop(f, "decimal_i32").as_str(), Some(dec_i32), "row {i} decimal_i32");
+            assert_eq!(prop(f, "decimal_i64").as_str(), Some(dec_i64), "row {i} decimal_i64");
+            assert_eq!(prop(f, "decimal_flba").as_str(), Some(dec_flba), "row {i} decimal_flba");
+            assert_eq!(prop(f, "ts_ns").as_str(), Some(ts), "row {i} ts_ns");
+            assert_eq!(prop(f, "raw4").as_str(), Some(raw), "row {i} raw4");
+            assert_eq!(
+                f.geometry,
+                Some(crate::geometry::Geometry::Point([i as f64, i as f64 * 2.0])),
+                "row {i} geometry"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_pyarrow_decimal_int96_flba_dictionary() {
+        check_pyarrow_types_fixture(include_bytes!("../tests/fixtures/pyarrow_types_dict.parquet"));
+    }
+
+    #[test]
+    fn reads_pyarrow_decimal_int96_flba_plain() {
+        check_pyarrow_types_fixture(include_bytes!("../tests/fixtures/pyarrow_types_plain.parquet"));
+    }
+
+    /// Shared checker for the pyarrow DATA_PAGE_V2 fixtures (`data_page_version=
+    /// "2.0"`) — one PLAIN-encoded, one dictionary-encoded, same 60 rows:
+    ///   id        INT32 REQUIRED (non-nullable)             i
+    ///   bucket    INT64 OPTIONAL, null every 5th row         i*3
+    ///   color     BYTE_ARRAY OPTIONAL, null every 7th row    "color_{i%4}"
+    ///   req       INT32 REQUIRED (non-nullable, def level 0) i*2
+    ///   geometry  BYTE_ARRAY REQUIRED                        WKB Point(i, i*2)
+    /// `id`/`req` exercise DATA_PAGE_V2's max_def_level==0 (bare-values, no
+    /// definition-level section) path; `bucket`/`color` exercise the
+    /// present-mask path with a real null pattern.
+    fn check_data_page_v2_fixture(bytes: &[u8]) {
+        let out = geoparquet_to_geojson(bytes).unwrap();
+        let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
+        assert_eq!(fc.features.len(), 60);
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        for i in 0..60usize {
+            let f = &fc.features[i];
+            assert_eq!(prop(f, "id").as_f64(), Some(i as f64), "row {i} id");
+            assert_eq!(prop(f, "req").as_f64(), Some((i * 2) as f64), "row {i} req");
+            if i % 5 == 0 {
+                assert_eq!(prop(f, "bucket"), crate::json::JsonValue::Null, "row {i} bucket");
+            } else {
+                assert_eq!(prop(f, "bucket").as_f64(), Some((i * 3) as f64), "row {i} bucket");
+            }
+            if i % 7 == 0 {
+                assert_eq!(prop(f, "color"), crate::json::JsonValue::Null, "row {i} color");
+            } else {
+                assert_eq!(prop(f, "color").as_str(), Some(format!("color_{}", i % 4).as_str()), "row {i} color");
+            }
+            assert_eq!(
+                f.geometry,
+                Some(crate::geometry::Geometry::Point([i as f64, i as f64 * 2.0])),
+                "row {i} geometry"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_data_page_v2_dictionary() {
+        check_data_page_v2_fixture(include_bytes!("../tests/fixtures/pyarrow_data_page_v2_dict.parquet"));
+    }
+
+    #[test]
+    fn reads_data_page_v2_plain() {
+        check_data_page_v2_fixture(include_bytes!("../tests/fixtures/pyarrow_data_page_v2_plain.parquet"));
+    }
+
+    /// Real GDAL fixture (`ogr2ogr -f Parquet -lco USE_PARQUET_GEO_TYPES=ONLY
+    /// -lco GEOMETRY_NAME=shape`): the geometry column is named `shape`, not
+    /// `geometry`, and the file carries *no* `geo` key/value metadata at all —
+    /// ONLY mode drops the classic GeoParquet convention entirely in favor of
+    /// Parquet's native `GEOMETRY` logical type (`SchemaElement.logicalType`).
+    /// Exercises the schema-only geometry-column detection path: without it,
+    /// this file's "shape" column would be read as an ordinary property and
+    /// fail UTF-8 validation on its WKB bytes.
+    #[test]
+    fn reads_gdal_native_geometry_with_a_non_default_column_name() {
+        let bytes = include_bytes!("../tests/fixtures/gdal_native_geometry_custom_name.parquet");
+        let fc = parquet_to_features(bytes).unwrap();
+        assert_eq!(fc.features.len(), 3);
+        assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
+
+        let prop = |f: &Feature, k: &str| {
+            f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
+        };
+        let expected = [("a", [1.5, 2.5]), ("b", [3.5, 4.5]), ("c", [-5.25, 10.75])];
+        for (f, (name, coords)) in fc.features.iter().zip(expected) {
+            assert_eq!(prop(f, "name").as_str(), Some(name));
+            assert_eq!(f.geometry, Some(crate::geometry::Geometry::Point(coords)));
+        }
+    }
+
+    /// Real GDAL fixture (`ogr2ogr -f Parquet -lco USE_PARQUET_GEO_TYPES=ONLY
+    /// -a_srs EPSG:3857`): default geometry column name, no `geo` metadata,
+    /// CRS assigned (not reprojected — coordinates are untouched) to
+    /// EPSG:3857 and carried in the native `GeometryType.crs` field as
+    /// PROJJSON. Exercises CRS recovery from the schema when `geo` metadata
+    /// isn't there to supply it.
+    #[test]
+    fn reads_gdal_native_geometry_crs_without_geo_metadata() {
+        use crate::crs::Crs;
+        let bytes = include_bytes!("../tests/fixtures/gdal_native_geometry_3857.parquet");
+        let fc = parquet_to_features(bytes).unwrap();
+        assert_eq!(fc.features.len(), 3);
+        match fc.crs {
+            Some(Crs::Named(n)) => {
+                assert_eq!(n.authority.as_deref(), Some("EPSG"));
+                assert_eq!(n.code.as_deref(), Some("3857"));
+            }
+            other => panic!("expected EPSG:3857 recovered from the native logicalType, got {other:?}"),
+        }
+        assert_eq!(fc.features[0].geometry, Some(crate::geometry::Geometry::Point([1.5, 2.5])));
+    }
+
     fn fgb_to_fc(bytes: &[u8]) -> FeatureCollection {
         let out = convert(Format::FlatGeobuf, Format::GeoJson, bytes).unwrap();
         geojson::from_json(&json::parse(std::str::from_utf8(&out).unwrap()).unwrap()).unwrap()

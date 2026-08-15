@@ -26,7 +26,7 @@ The project aims to be:
 
 ## STATUS
 
-Current version: **0.22.0**.
+Current version: **0.23.0**.
 
 Eight formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
@@ -77,7 +77,7 @@ up to three ways, tried in order: (1) an opt-in **embedded CRS registry** —
 PROJ's `proj.db`, re-encoded as a ~1 MB `(authority, code) → {PROJJSON, WKT1,
 WKT2}` blob covering all 13,790 CRSes across every authority, gated behind the
 `crs-registry` Cargo feature and shipped in a sibling crate
-([`geosetta-crs-data`](https://github.com/dxgeo/geosetta-crs-data)) so the
+([`geoscribe`](https://github.com/dxgeo/geoscribe)) so the
 default build stays dependency-free; it also recovers a code from an id-less
 WKT's name (e.g. Esri-flavor Shapefile `.prj` text, which carries no authority
 id), validated against the CRS's own ellipsoid before ever trusting a match; (2)
@@ -86,7 +86,7 @@ PROJJSON object — geographic and the common projected CRSes (WKT2, and WKT1 fo
 the unambiguous methods), compiled in by default; (3) an *id-reference +
 warning* fallback. Every resolution path is verified against PROJ's `projinfo`
 at 100% identification (or, for name recovery, zero wrong matches — see
-`geosetta-crs-data`'s design doc for the bulk-oracle methodology). When a target
+`geoscribe`'s design doc for the bulk-oracle methodology). When a target
 can't express the source CRS at all (GeoJSON forces WGS 84; CSV/WKT record none),
 the CLI *warns* rather than silently mislabeling; `--quiet` suppresses.
 
@@ -107,9 +107,19 @@ type), so a column nested under an OPTIONAL group decodes correctly too — the
 case that matters in practice is GDAL/OGR's GeoParquet 1.1 `geometry_bbox`
 "covering" column, which it writes by default; Geosetta recognizes it via the
 `geo` metadata and excludes it from `properties` rather than surfacing it as a
-fake column (fixture: `tests/fixtures/gdal_covering_bbox.parquet`). Remaining
-gaps — `DATA_PAGE_V2`, `DECIMAL`/`INT96`, genuinely nested/repeated (list-valued)
-columns, 3D geometry, Brotli — are reported as clear errors and tracked in
+fake column (fixture: `tests/fixtures/gdal_covering_bbox.parquet`). `DECIMAL`
+(`INT32`/`INT64`/`FIXED_LEN_BYTE_ARRAY`-backed, rendered as an exact base-10
+string), `INT96` (legacy Impala/Hive timestamps), the `JSON` logical type, and
+`DATA_PAGE_V2` are also supported now (the `DECIMAL`/`INT96`/`JSON` trio
+verified against a real pyarrow-generated fixture, `DATA_PAGE_V2` against a
+real GDAL one, both in PLAIN and dictionary encodings). The reader also
+recognizes Parquet's *native* `GEOMETRY`/`GEOGRAPHY` logical type (not just
+the classic `geo` key/value metadata convention some writers now omit
+entirely), recovering the geometry column's name and CRS straight from the
+schema when `geo` doesn't supply them (fixtures:
+`tests/fixtures/gdal_native_geometry_{custom_name,3857}.parquet`). Remaining
+gaps — genuinely nested/repeated (list-valued) columns, 3D (Z/M) geometry,
+multiple geometry columns, Brotli — are reported as clear errors and tracked in
 [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org).
 
 
@@ -164,7 +174,24 @@ specification rather than pulled from a crate:
     translation, default-compiled) and, behind the opt-in `crs-registry`
     feature, `crs/registry.rs` (the embedded-registry reader and id-less-WKT
     name recovery, backed by the sibling
-    [`geosetta-crs-data`](https://github.com/dxgeo/geosetta-crs-data) crate)
+    [`geoscribe`](https://github.com/dxgeo/geoscribe) crate). Wired in as an
+    optional path dependency:
+
+    ```toml
+    # Cargo.toml
+    [dependencies]
+    geoscribe = { path = "../geoscribe", version = "0.3.0", optional = true }
+
+    [features]
+    crs-registry = ["dep:geoscribe"]
+    ```
+
+    `crs/registry.rs` calls straight through to `geoscribe`'s public API
+    rather than keeping its own copy of the decoder: `geoscribe::resolve
+    (authority, code)` for lookup by id (R1), `geoscribe::resolve_by_name
+    (name)` for id-less-WKT name recovery, validated against ellipsoid
+    params before being trusted (R2), and `geoscribe::CRS_COUNT` to
+    sanity-check the embedded dataset size.
 -   **`cli.rs` / `convert.rs`:** argument parsing and the hub-and-spoke conversion
     pipeline (`read(from) → FeatureCollection → write(to)`)
 
@@ -268,14 +295,14 @@ columns, and DATE/TIMESTAMP rendering. The next steps, in rough priority:
     (rasterize / vectorize) is a separate, further-out concern.
 -   **Deferred, lower-priority GeoParquet milestones** (parked in
     [plans/arbitrary-geoparquet.org](plans/arbitrary-geoparquet.org); diminishing returns / testing friction):
-    -   `DATA_PAGE_V2` — DuckDB doesn't emit it; a test fixture needs pyarrow.
     -   Brotli — a full from-scratch codec on the scale of ZSTD, rarely used here.
-    -   `DECIMAL` / `INT96` / `FIXED_LEN_BYTE_ARRAY`, and 3D (Z/M) geometry — niche.
+    -   Nested/repeated (list-valued) columns and 3D (Z/M) geometry — scoped, see
+        the plan file's milestones 6-7.
 -   **CRS handling** — implemented: pass-through across all formats, CRS-loss
     warnings, structural WKT↔PROJJSON translation for geographic and common
     projected CRSes (scoped in [plans/crs.org](plans/crs.org)), and — opt-in via
     `--features crs-registry` — a full embedded `proj.db` registry
-    ([`geosetta-crs-data`](https://github.com/dxgeo/geosetta-crs-data), plan in
+    ([`geoscribe`](https://github.com/dxgeo/geoscribe), plan in
     that repo's `crs-registry.org`) resolving any `(authority, code)`, recovering
     codes from id-less WKT names (geographic and projected, ellipsoid-validated),
     and emitting WKT2:2019. Remaining: re-scoping whether the registry's own

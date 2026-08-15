@@ -20,21 +20,27 @@ pub struct Encoded {
     pub shx: Vec<u8>,
     pub dbf: Vec<u8>,
     pub prj: Option<String>,
+    /// Non-fatal warnings from lossy `.dbf` truncation (a property value or
+    /// name too long for dBase's fixed-width fields) — see [`dbf::write`].
+    /// Empty in the overwhelmingly common case where nothing was truncated.
+    pub warnings: Vec<String>,
 }
 
 /// Encode a feature collection as a Shapefile. Errors when the geometries mix
 /// incompatible Shapefile shape families, or contain a `GeometryCollection`
-/// (Shapefile cannot represent either) — see [`geometry::write`].
+/// (Shapefile cannot represent either) — see [`geometry::write`] — or when the
+/// `.dbf` can't represent the properties without silently corrupting or
+/// merging data — see [`dbf::write`].
 pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
     let geometries: Vec<Option<Geometry>> = fc.features.iter().map(|f| f.geometry.clone()).collect();
     let (shp, shx) = geometry::write(&geometries)?;
 
     let columns = infer_columns(&fc.features);
-    let dbf_bytes = dbf::write(&columns);
+    let (dbf_bytes, warnings) = dbf::write(&columns)?;
 
     let prj = fc.crs.as_ref().and_then(prj_wkt);
 
-    Ok(Encoded { shp, shx, dbf: dbf_bytes, prj })
+    Ok(Encoded { shp, shx, dbf: dbf_bytes, prj, warnings })
 }
 
 /// The WKT text to write to `.prj` for this CRS, or `None` when it can't be

@@ -9,16 +9,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
 
 [[package]]
-name = "geosetta"
-version = "0.22.0"
-dependencies = [
- "geosetta-crs-data",
- "wbprojection",
-]
+name = "geoscribe"
+version = "0.3.0"
 
 [[package]]
-name = "geosetta-crs-data"
-version = "0.2.0"
+name = "geosetta"
+version = "0.23.0"
+dependencies = [
+ "geoscribe",
+ "wbprojection",
+]
 
 [[package]]
 name = "proc-macro2"

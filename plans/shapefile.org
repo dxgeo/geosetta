@@ -38,14 +38,35 @@ Deferred / out of scope, matching the plan below: Z/M/MultiPatch shape types
 and =.dbf= memo (=M=) fields. *Projected* Esri =.prj= structural recovery —
 originally deferred here pending real fixtures — has since shipped as R2's
 projected half (=resolve_projected_by_name= in =crs/registry.rs=, 2026-08-12);
-see § CRS INTEGRATION below. The two § OPEN QUESTIONS resolved during
-implementation: DBF field width overflow *truncates* (string columns, at a
-char boundary) rather than erroring or warning; ring containment uses the
-appearance-order heuristic (shell immediately followed by its holes), not full
+see § CRS INTEGRATION below. Ring containment uses the appearance-order
+heuristic (shell immediately followed by its holes), not full
 point-in-polygon, and no real fixture has yet been found that needs the
 fallback.
 
-This plan is also =geosetta-crs-data/crs-registry.org='s named *R4* — the
+*DBF field-width policy* (formerly an § OPEN QUESTIONS item; resolved
+2026-08-14): a string property over 255 bytes is truncated at a char
+boundary *and now warns* (=dbf::write= returns =Vec<String>= warnings
+alongside the bytes, printed on =stderr= by =main.rs=, suppressed by
+=--quiet= — the same mechanism/gating as the CRS-loss warning). A property
+*name* over dBase's separate 10-byte field-name limit is likewise truncated
+and warned about — previously silent and undocumented even here. Two
+property names that truncate to the *same* 10-byte field name *error*
+instead (an ambiguous .dbf with two identically-named fields is worse than
+information loss, so this doesn't get the truncate-and-warn treatment).
+Fixed alongside this: a real bug where a large-magnitude =Double= value's
+fixed-point rendering could exceed the old hardcoded 32-byte numeric-field
+cap — Rust's ={:>width$}= formatting *pads* a too-narrow width rather than
+truncating, so this used to silently emit more bytes than the field's
+declared width, desyncing every field/row after it in the file. Numeric
+fields are now sized to the actual observed width (never clamped down from
+that), with the structural ceiling raised to 255 (dBase's real per-field
+byte limit); a value that's still too wide even then (an ~e300-magnitude
+double, the only realistic way to hit this) errors rather than truncating —
+unlike text, cutting off a number's digits silently produces a *different,
+wrong* number. See =src/shapefile/dbf.rs='s =write=/=dbf_field=/
+=resolve_field_names= doc comments and their tests.
+
+This plan is also =geoscribe/crs-registry.org='s named *R4* — the
 original driver for the whole CRS-registry pivot. See § CRS INTEGRATION.
 
 ** WHAT MAKES SHAPEFILE DIFFERENT: it's not one file
@@ -153,8 +174,9 @@ deleted), decode per the type mapping above into
 get typed columns from the source features; map =ColumnType= → a DBF field
 type + width (=Bool→L=, =Int64→N=, =Double→N= with a fixed decimal count,
 =String→C= sized to the longest observed value, capped at DBF's 255-byte
-field-width limit — see § OPEN QUESTIONS for the truncation policy); write
-header + descriptors + fixed-width records.
+field-width limit, truncated-and-warned past that — see § STATUS above for
+the resolved truncation/collision/overflow policy); write header +
+descriptors + fixed-width records.
 
 *** 3. =.prj= codec — thin, reuses existing CRS machinery
 Read: =std::fs::read_to_string= → =Crs::from_authority_code(None, None,
@@ -249,9 +271,6 @@ Once this reader exists:
   bulk-oracle pattern to projected CRSes; see § CRS INTEGRATION.
 
 ** OPEN QUESTIONS
-- *DBF field-width policy* for a string property over 255 bytes: silently
-  truncate, truncate with a warning, or something else? No existing precedent
-  elsewhere in the crate (CSV/Parquet/etc. have no per-field width cap).
 - *Encoding fallback depth*: UTF-8 attempt → ISO-8859-1 (Latin-1) fallback is
   the minimal dependency-free option when =.cpg= is absent. Is a small
   hand-built Windows-1252 table (a common real-world shapefile encoding,

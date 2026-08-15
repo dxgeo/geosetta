@@ -27,7 +27,7 @@ pub(crate) use wkt_projjson::{projjson_to_wkt, wkt_to_projjson};
 
 // Embedded CRS registry (code -> authoritative definition). Feature-gated so the
 // default build stays dependency-free; the data lives in the sibling
-// `geosetta-crs-data` crate. Skeleton — see `../../geosetta-crs-data/crs-registry.org`.
+// `geoscribe` crate. Skeleton — see `../../geoscribe/crs-registry.org`.
 #[cfg(feature = "crs-registry")]
 mod registry;
 

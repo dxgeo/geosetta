@@ -69,7 +69,7 @@ mod tests {
         let fc = one_point_fc();
         let columns = infer_columns(&fc.features);
         // A .dbf with zero records paired against a one-record .shp.
-        let empty_dbf = dbf::write(&columns[..0]);
+        let (empty_dbf, _warnings) = dbf::write(&columns[..0]).unwrap();
         let (shp, _shx) = crate::shapefile::geometry::write(&[Some(Geometry::Point([0.0, 0.0]))]).unwrap();
         assert!(read(&shp, &empty_dbf, None, None).is_err());
     }

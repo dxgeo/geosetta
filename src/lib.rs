@@ -5,8 +5,8 @@
 //! any input format converts to any output format the writers support.
 //!
 //! The whole crate is standard-library only — every wire format (GeoJSON,
-//! GeoParquet, FlatGeobuf, CSV, WKT, GeoPackage, Shapefile) is implemented from
-//! its specification, with no third-party dependencies.
+//! GeoParquet, FlatGeobuf, CSV, WKT, GeoPackage, Shapefile, KML/KMZ) is
+//! implemented from its specification, with no third-party dependencies.
 //!
 //! # Example
 //!

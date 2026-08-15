@@ -102,7 +102,7 @@ fn run() -> Result<()> {
     if args.progress {
         eprintln!("writing {}...", args.to.extension());
     }
-    write_collection(args.to, &args.output, &fc)
+    write_collection(args.to, &args.output, &fc, args.quiet)
 }
 
 /// Read the input into the Feature IR. Shapefile is multi-file, so its
@@ -132,12 +132,12 @@ fn read_input(args: &cli::Args) -> Result<FeatureCollection> {
 /// single-collection path and GeoPackage's per-layer fan-out
 /// (`run_geopackage_read`), so a multi-layer `.gpkg` → Shapefile conversion
 /// gets one `layer.shp` sibling set per layer for free.
-fn write_collection(to: Format, output_path: &str, fc: &FeatureCollection) -> Result<()> {
+fn write_collection(to: Format, output_path: &str, fc: &FeatureCollection, quiet: bool) -> Result<()> {
     if to == Format::Shapefile {
         if output_path == "-" {
             return Err(no_stdio_for_multifile("Shapefile"));
         }
-        return write_shapefile_to_path(output_path, fc);
+        return write_shapefile_to_path(output_path, fc, quiet);
     }
     let bytes = convert::write_features(to, fc)?;
     write_bytes(output_path, &bytes)?;
@@ -168,8 +168,13 @@ fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<FeatureCol
 /// Write a Shapefile's sibling files under `output_path`'s stem (a trailing
 /// `.shp`/`.SHP`, if present, is stripped so `roads.shp` and `roads` both name
 /// the same `roads.{shp,shx,dbf,prj}` set).
-fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection) -> Result<()> {
+fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection, quiet: bool) -> Result<()> {
     let encoded = shapefile::write(fc)?;
+    if !quiet {
+        for w in &encoded.warnings {
+            eprintln!("{w}");
+        }
+    }
     let stem = strip_shp_extension(output_path);
     std::fs::write(format!("{stem}.shp"), &encoded.shp)?;
     std::fs::write(format!("{stem}.shx"), &encoded.shx)?;
@@ -257,7 +262,7 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
         && (args.output.ends_with('/') || std::path::Path::new(&args.output).is_dir());
     if layers.len() == 1 && !as_dir {
         let (_, fc) = &layers[0];
-        return write_collection(args.to, &args.output, fc);
+        return write_collection(args.to, &args.output, fc, args.quiet);
     }
     if !as_dir {
         return Err(Error::Usage(
@@ -269,7 +274,7 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
     let dir = std::path::Path::new(&args.output);
     for (name, fc) in &layers {
         let path = dir.join(format!("{name}.{}", args.to.extension()));
-        write_collection(args.to, &path.to_string_lossy(), fc)?;
+        write_collection(args.to, &path.to_string_lossy(), fc, args.quiet)?;
     }
     Ok(())
 }

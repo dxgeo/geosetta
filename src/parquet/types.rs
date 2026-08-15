@@ -54,7 +54,9 @@ pub mod page {
 /// compatibility alongside the newer logical types.
 pub mod converted {
     pub const UTF8: i32 = 0;
+    pub const DECIMAL: i32 = 5;
     pub const DATE: i32 = 6;
     pub const TIMESTAMP_MILLIS: i32 = 9;
     pub const TIMESTAMP_MICROS: i32 = 10;
+    pub const JSON: i32 = 19;
 }

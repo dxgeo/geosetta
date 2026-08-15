@@ -130,21 +130,37 @@ pub fn parse_crs(geo: &str) -> Option<Crs> {
     match column.get("crs") {
         // Absent or explicit null → the GeoParquet default, OGC:CRS84.
         None | Some(JsonValue::Null) => Some(Crs::Wgs84),
-        Some(crs) => {
-            let id = crs.get("id");
-            let authority = id
-                .and_then(|i| i.get("authority"))
-                .and_then(JsonValue::as_str)
-                .map(String::from);
-            let code = id.and_then(|i| i.get("code")).and_then(json_code_as_string);
-            Some(Crs::from_authority_code(
-                authority,
-                code,
-                None,
-                Some(crs.to_json_string()),
-            ))
-        }
+        Some(crs) => Some(crs_from_projjson_value(crs)),
     }
+}
+
+/// Recover the CRS from Parquet's native `GEOMETRY`/`GEOGRAPHY` logical
+/// type's own `crs` field (`SchemaElement.logicalType`, parsed in
+/// `parquet/reader.rs`'s `parse_geometry_logical_type`) — a raw PROJJSON
+/// string, unlike `geo` metadata's `crs`, which is nested under
+/// `columns.<primary>.crs`. Absent means the format's own default, OGC:CRS84
+/// (mirrors `geo`'s absent/null `crs` convention in [`parse_crs`]) — this is
+/// the on-schema fallback for writers (e.g. `ogr2ogr -lco
+/// USE_PARQUET_GEO_TYPES=ONLY`) that drop `geo` entirely in favor of the
+/// native type.
+pub fn parse_native_geometry_crs(crs_projjson: Option<&str>) -> Option<Crs> {
+    match crs_projjson {
+        None => Some(Crs::Wgs84),
+        Some(s) => crate::json::parse(s).ok().map(|v| crs_from_projjson_value(&v)),
+    }
+}
+
+/// Shared by [`parse_crs`] and [`parse_native_geometry_crs`]: lift a PROJJSON
+/// object's `id.authority`/`id.code`, if present, alongside the verbatim
+/// PROJJSON text.
+fn crs_from_projjson_value(crs: &JsonValue) -> Crs {
+    let id = crs.get("id");
+    let authority = id
+        .and_then(|i| i.get("authority"))
+        .and_then(JsonValue::as_str)
+        .map(String::from);
+    let code = id.and_then(|i| i.get("code")).and_then(json_code_as_string);
+    Crs::from_authority_code(authority, code, None, Some(crs.to_json_string()))
 }
 
 /// A PROJJSON `id.code` value read back as a string, whichever JSON type it

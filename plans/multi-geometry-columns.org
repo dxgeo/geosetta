@@ -1,0 +1,312 @@
+#+TITLE: Plan: Multiple Geometry Columns
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Multiple Geometry Columns (a Feature With More Than One Geometry)
+
+** GOAL
+Let a source with genuinely more than one geometry column per feature (today,
+in practice, only GeoParquet — see BACKGROUND) survive a Geosetta conversion
+instead of being rejected outright. "Survive" doesn't have to mean "every
+target keeps every column as real geometry" — see DESIGN's text-fallback
+proposal, which lets *any* target keep the data (as WKT text) even when it
+can't structurally keep it as geometry.
+
+** STATUS
+Not started; blocked on the IR decision in DESIGN. Extends
+[[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]'s milestone 6b,
+which (as landed this session) makes =read_geoparquet= *reject* a second
+geometry column with a clear error rather than misdecode it. This plan turns
+that reject into a real decode, on both the read and write sides — 6b's
+detection code becomes this plan's M2 starting point, not a fork.
+
+** BACKGROUND
+
+*** Where this actually shows up: only GeoParquet, in practice
+A genuine "N geometry columns for one feature" case needs a schema that lets
+more than one field be independently typed "geometry" — a property only
+Arrow/Parquet's general column model has among Geosetta's spokes:
+
+- *GeoParquet* — yes, per spec: every key of the =geo= metadata's =columns=
+  object names a geometry column, and Parquet's native
+  =GEOMETRY=/=GEOGRAPHY= logical type can tag more than one schema leaf.
+- *GeoPackage* — no. The GeoPackage spec requires exactly one geometry
+  column per feature table (=gpkg_geometry_columns= is effectively 1:1 with
+  the table); a second geometry would need a second *table* — a different
+  layer in Geosetta's existing fan-out model — not a second column on the
+  same one.
+- *FlatGeobuf, Shapefile, GeoJSON, CSV/WKT, KML/KMZ* — no format-native
+  concept of more than one geometry per feature at all. (GeoJSON's/KML's
+  =GeometryCollection=/=MultiGeometry= bundles several *shapes* under the
+  one geometry slot — a different thing; still one slot.)
+
+Empirically confirmed this session:
+- *DuckDB* (spatial extension, v1.5.4) genuinely writes it:
+  =CREATE TABLE t(geom GEOMETRY, geom2 GEOMETRY, ...); COPY t TO
+  'x.parquet' (FORMAT PARQUET)= produces a real =geo= metadata block naming
+  both columns, each an ordinary =BYTE_ARRAY= WKB column (no
+  dictionary/logical-type wrinkle at small scale). Fixture:
+  =tests/fixtures/duckdb_multi_geometry.parquet= (not yet committed).
+- *GDAL's Parquet driver* (3.13.2) does *not* support writing more than one
+  geometry column — confirmed by feeding =ogr2ogr -f Parquet= an OGR VRT
+  layer with two =<GeometryField>= elements (VRT itself represents this
+  fine; =ogrinfo= reports "Geometry Column 1"/"Geometry Column 2" on the
+  VRT). The Parquet output silently downgrades the second geometry field to
+  a plain string property — =ogrinfo --format Parquet='s layer creation
+  option list has nothing that surfaces this capability. So GDAL is not a
+  real-world *source* of multi-geometry-column GeoParquet today; only
+  DuckDB is.
+- *pyarrow* has no geometry concept at all — a multi-geometry-column
+  pyarrow file can only be produced by hand-authoring the =geo= key/value
+  metadata over real WKB byte columns (fixture:
+  =tests/fixtures/pyarrow_multi_geometry.parquet=, not yet committed) — the
+  same technique =arbitrary-geoparquet.org='s 6b section anticipated needing.
+
+*** Current behavior (as of this session)
+=arbitrary-geoparquet.org='s 6b (=geo=-metadata-declared) and 6c
+(native-logicalType-tagged) both land as a *read-time reject*:
+=read_geoparquet= returns a clear =Error::Parquet= naming the offending
+column as soon as it sees a second geometry column. Confirmed end-to-end
+against both real fixtures above — every target format fails identically,
+since the rejection happens before the =Feature= IR is ever populated:
+#+begin_src text
+$ geosetta duckdb_multi_geometry.parquet out.shp
+geosetta: invalid parquet: column "geom2" is a geometry column (per the "geo" metadata),
+but "geom" is already the primary geometry column — multiple geometry columns are not supported yet
+#+end_src
+This plan replaces that reject with a real decode — into the IR on read
+(M2), and back out for GeoParquet specifically on write (M4).
+
+*** Why this needs an IR decision, not just a reader change
+=Feature= (=src/feature.rs=) is:
+#+begin_src rust
+pub struct Feature {
+    pub geometry: Option<Geometry>,
+    pub properties: Vec<(Rc<str>, JsonValue)>,
+}
+#+end_src
+One geometry slot. Every one of the eight format spokes reads into and
+writes out of this same struct — there's no format-specific =Feature=
+variant. So "decode the second column" has to answer, up front, where that
+second geometry *goes* structurally. That's DESIGN, not an implementation
+detail to defer.
+
+** DESIGN
+
+*** The IR change
+Add a second field to =Feature=, plus a =FeatureCollection=-level manifest
+naming the extra columns (and, per column, its own CRS — see the CRS open
+question below):
+#+begin_src rust
+pub struct Feature {
+    pub geometry: Option<Geometry>,
+    /// Named geometry columns beyond the primary `geometry` — empty for
+    /// every feature from every source except a multi-geometry-column
+    /// GeoParquet file. Order matches
+    /// `FeatureCollection::extra_geometry_columns`.
+    pub extra_geometries: Vec<Option<Geometry>>,
+    pub properties: Vec<(Rc<str>, JsonValue)>,
+}
+
+pub struct GeometryColumn {
+    pub name: Rc<str>,
+    pub crs: Option<Crs>,
+}
+
+pub struct FeatureCollection {
+    pub features: Vec<Feature>,
+    pub crs: Option<Crs>,                              // the *primary* geometry's CRS, unchanged
+    pub extra_geometry_columns: Vec<GeometryColumn>,    // new
+}
+#+end_src
+=extra_geometries= empty and =extra_geometry_columns= empty is the
+overwhelmingly common case (every non-GeoParquet source, and every
+single-geometry GeoParquet), so this is additive and backward compatible —
+no existing writer needs to change to keep compiling or keep its current
+output byte-identical.
+
+*** What a writer that can't hold a second geometry column does with it
+Every non-GeoParquet writer needs an answer for "the feature has an extra
+geometry, and my format has nowhere to put a second geometry column." Losing
+it silently is exactly the failure mode the project has consistently refused
+elsewhere — see =crs.rs='s downgrade-warning precedent for CRS loss, and
+=schema.rs='s "arrays/objects can only be represented as JSON text" fallback
+for property values a target's column-type model can't express structurally.
+The consistent answer here is the same shape: *fall back to text*.
+
+- Each extra geometry column becomes an ordinary *property* on write,
+  encoded as WKT (reusing the existing =geometry/wkt.rs= encoder — the same
+  2D-only representation the rest of the IR already has, so no new
+  geometry-model work). See OPEN QUESTIONS for the column-name-collision
+  case.
+- =main.rs= emits a warning once per conversion when this happens, mirroring
+  =Crs::downgrade_warning='s exact mechanism (computed once, gated by the
+  existing =--quiet= flag, not a per-row cost) — e.g. "1 secondary geometry
+  column flattened to WKT text: geom2" — so converting DuckDB's
+  multi-geometry Parquet to Shapefile produces a working file with the
+  second geometry still *present*, just not spatially typed, instead of
+  either data loss or today's hard failure.
+- GeoParquet→GeoParquet is the only pair that can keep a second geometry
+  *as* geometry (M4) — every other target gets the WKT-text fallback.
+  That's a real capability gain even without a second multi-geometry-native
+  target existing among Geosetta's eight spokes today.
+
+*** Alternative considered: only allow multi-geometry into another GeoParquet, reject every other target
+Simpler (no fallback path, no schema-inference change) but strictly worse:
+=duckdb_multi_geometry.parquet → *anything but parquet*= would keep failing
+exactly as it does today. The WKT fallback is cheap (the encoder already
+exists) and never *wrong*, only sometimes not what a user wanted (a real
+spatial column instead of text). Rejecting could still be offered later as
+an opt-in =--strict-geometry-columns= if the fallback surprises people in
+practice; starting permissive-with-a-warning matches how the project already
+treats CRS loss.
+
+** MILESTONES
+
+*** M1 — IR: `Feature::extra_geometries` + `FeatureCollection::extra_geometry_columns`
+Add the fields exactly as in DESIGN, defaulted empty everywhere. Every
+existing test should pass unchanged — that's the actual backward-
+compatibility bar, not just "it compiles." No format wiring yet.
+
+*** M2 — GeoParquet read: decode instead of reject
+Flip both of =arbitrary-geoparquet.org='s 6b/6c reject-with-error branches
+in =read_geoparquet= into real decodes:
+- For each column beyond the chosen primary that's a geometry column (per
+  =geo_geometry_columns= or =is_native_geometry=), decode its WKB the same
+  way the primary column already does — =decode_column='s =ColumnSink::Wkb=
+  arm is already generic over *which* column it's decoding; it's only
+  =read_geoparquet='s calling loop that special-cases "the" geometry
+  column — and push the result into =extra_geometries= (aligned to
+  =extra_geometry_columns='s declared order) instead of erroring.
+- Per-column CRS: GeoParquet's =geo= metadata already allows a *different*
+  CRS per column (each entry under =columns= can carry its own =crs= key);
+  =parse_crs= today only ever resolves the primary's. Extend it (or add a
+  sibling) to resolve each extra column's own CRS into
+  =GeometryColumn::crs=. A native-logicalType-tagged extra column resolves
+  its CRS from its own schema leaf's =crs= field the same way
+  =parse_native_geometry_crs= already does for the primary.
+- Tests: both real fixtures already in hand
+  (=tests/fixtures/duckdb_multi_geometry.parquet=,
+  =tests/fixtures/pyarrow_multi_geometry.parquet=) — assert
+  =extra_geometries= decodes to the right coordinates per row, including
+  each fixture's deliberate null in row 2's =geom2=.
+
+*** M3 — Universal WKT-text write fallback + warning
+- A new small pass (=schema.rs= or a sibling): for any =FeatureCollection=
+  with a non-empty =extra_geometry_columns=, when writing to any format
+  *other than* GeoParquet, fold each feature's =extra_geometries= into its
+  properties as WKT-text values under the column's name, *before* the
+  format-specific writer ever sees the =Feature=. Keeps every existing
+  writer (=geojson/=, =csv.rs=, =flatgeobuf/=, =geopackage/=, =shapefile/=,
+  =src/xml.rs= for KML) completely untouched — the same trick =convert.rs=
+  already uses to keep format-neutral concerns out of eight separate
+  writers.
+- Name collision with an existing property of the same name: reject with a
+  clear =Error= naming both, rather than silently overwriting or silently
+  suffixing (matches the project's "fail loud, don't guess" posture — see
+  OPEN QUESTIONS for whether a suffix convention should replace this once
+  there's real usage to learn from).
+- =main.rs= warning: extend the =downgrade_warning=-style mechanism (or add
+  a sibling on =FeatureCollection=) — fires once per conversion, suppressed
+  by =--quiet=, naming the flattened column(s).
+- Tests: convert both fixtures (GeoParquet→GeoJSON, GeoParquet→Shapefile,
+  GeoParquet→GeoPackage) and assert the secondary geometry survives as a
+  WKT-string property with the right column name and value, plus the
+  stderr warning (absent under =--quiet=).
+
+*** M4 — GeoParquet write: real multi-column output
+The one target that *can* keep a second geometry as real geometry. Needs
+writer-side work — today =parquet/geo.rs=, =parquet/types.rs=, and the
+schema-building step in =parquet/writer.rs= all assume exactly one
+designated geometry column:
+- =geo= metadata: emit one entry per =GeometryColumn= (name, encoding,
+  geometry_types, bbox — the same per-column stats the primary column
+  already computes, just looped) under =columns=, keeping =primary_column=
+  pointed at =Feature::geometry='s column.
+- Schema/page writer: each extra geometry column becomes its own top-level
+  =BYTE_ARRAY= schema leaf and its own column chunk, written the same way
+  the primary geometry column already is (WKB bytes, nullable) — no new
+  physical encoding, just looping the existing single-column logic.
+- Round-trip test: DuckDB's real fixture through =geosetta in.parquet
+  out.parquet= should read back in DuckDB with both =geom= and =geom2=
+  intact (=ST_AsText= match including the null row) — the same
+  oracle-verification style the rest of the GeoParquet writer already uses.
+
+*** M5 — stretch, not required for correctness: CLI ergonomics
+Open design space, not scoped in detail yet:
+- A way to promote an extra geometry column to primary
+  (=--geometry-column NAME=) — today the primary is whichever column
+  GeoParquet's own =primary_column= metadata names.
+- A way to *drop* an extra geometry column instead of flattening it to WKT
+  text, for a user who doesn't want the fallback text noise in a
+  GeoJSON/Shapefile output.
+Neither blocks M1–M4; both are additive CLI sugar on top of the IR the
+earlier milestones establish.
+
+** TESTING
+- Fixtures already generated and DuckDB-oracle-verified this session (real
+  round trip through =ST_AsText=), not yet committed:
+  - =tests/fixtures/duckdb_multi_geometry.parquet= — real, unmodified
+    DuckDB spatial-extension output, 3 rows, a =LineString= in the primary
+    column, a null in the second column's middle row.
+  - =tests/fixtures/pyarrow_multi_geometry.parquet= — real WKB via
+    =shapely=/=pyarrow=, hand-authored =geo= metadata (pyarrow has no
+    geometry concept of its own) — same 3-row shape as the DuckDB fixture,
+    an independent code path (no covering-bbox column, no dictionary
+    encoding).
+- Unit tests per milestone as scoped above. Keep the existing
+  =geo_geometry_columns=/=is_native_geometry= detection unit tests — M2
+  changes what happens *after* detection, not detection itself.
+- No fixture exists (or is obtainable from a mainstream tool, per
+  BACKGROUND) for a *target* format receiving multi-geometry-column data
+  other than via this pipeline itself, so M3/M4's tests are necessarily
+  Geosetta-fixture-through-Geosetta-then-oracle (DuckDB for M4's round
+  trip; string assertion on WKT text for M3), not three-independent-real-
+  tools the way [[file:reproject-composability.org][reproject-composability.org]]
+  achieved.
+
+** OPEN QUESTIONS
+- *Per-column differing CRS*: GeoParquet's spec allows it (each =columns=
+  entry can carry its own =crs=), but nothing in Geosetta's format
+  ecosystem has ever needed more than one CRS per file before —
+  =FeatureCollection::crs= is a single field. M2 as scoped stores each
+  extra column's CRS in =GeometryColumn::crs= without resolving what M3's
+  WKT-text fallback should do when an extra column's CRS differs from the
+  primary's — WKT text carries no CRS at all, so the target format's
+  declared CRS (the primary's) would silently seem to apply to text that's
+  actually in a different CRS if a downstream tool ever parsed it back as
+  coordinates. Likely answer: M3's warning should call this out by name
+  when it happens; the deeper fix (CRS-annotated WKT-with-comment, or
+  refusing the fallback specifically when CRSes differ) needs a decision
+  before M3 ships, not silent deferral.
+- *Property-name collision on the WKT fallback* (M3): reject-with-error is
+  the safe default per DESIGN, but a user hitting it on a large batch
+  conversion may prefer an automatic suffix (=geom2_wkt=) over a hard stop.
+  Revisit once M3 has real usage, not before.
+- *GeoPackage's structural ban on >1 geometry column*: could a second
+  geometry column instead become a second *layer* (a second feature table)
+  the way Geosetta's multi-layer fan-out already works for
+  GeoPackage↔Shapefile? That would keep it as real geometry instead of
+  falling back to text — genuinely nicer, but a bigger change (the write
+  path would need "this one FeatureCollection's extra column becomes a
+  sibling layer," which doesn't fit the current single-layer-in/
+  single-layer-out shape of one =write()= call). Parked; M3's WKT fallback
+  for GeoPackage is the pragmatic default until this is scoped separately.
+- *Does M4 need the =crs-registry= feature for anything new?* Almost
+  certainly not — per-column CRS emission reuses the same WKT→PROJJSON/
+  registry paths the primary column's CRS already goes through, just once
+  per extra column instead of once. Worth confirming no part of the
+  existing single-CRS code path silently assumes "exactly one geometry
+  column" before M4 starts (e.g. any global, not-keyed-by-column state).
+
+** DEPENDS ON / RELATED
+- Extends [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]'s
+  milestone 6b — its =geo_geometry_columns= detection and the collision
+  check become this plan's M2 starting point, not thrown away.
+- Reuses [[file:crs.org][crs.org]]'s CRS resolution machinery per extra
+  column (M2) and its downgrade-warning mechanism's shape for the new
+  WKT-fallback warning (M3), rather than inventing a second warning system.
+- =schema.rs='s existing array/object → JSON-text fallback is the direct
+  precedent for M3's geometry → WKT-text fallback: represent structurally
+  when the target can, degrade to text with a warning when it can't — same
+  posture, different value kind.

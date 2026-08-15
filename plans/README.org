@@ -74,9 +74,9 @@ they are ordered by dependency.
   every authority (EPSG, ESRI, IGNF, OGC, IAU_2015 planetary, …) and type — in
   *~2.3 MB*, decoded by =geosetta='s own =compress/zstd.rs=. Supersedes =crs.org=
   milestone D and reframes C. Because it embeds third-party dataset data (with its
-  own terms), it lives in a *sibling crate*, =geosetta-crs-data=, pulled in behind
+  own terms), it lives in a *sibling crate*, =geoscribe=, pulled in behind
   a =crs-registry= feature so the core stays pure-MIT and dependency-free. Plan and
-  =NOTICE= live there (=../../geosetta-crs-data/crs-registry.org=). *Depends on
+  =NOTICE= live there (=../../geoscribe/crs-registry.org=). *Depends on
   =crs.org=.*
 - [[file:shapefile.org][shapefile.org]] :: Add Shapefile — the first *multi-file*
   spoke (=.shp=+=.shx=+=.dbf=+=.prj=+=.cpg= sharing a basename, the inverse
@@ -130,3 +130,25 @@ they are ordered by dependency.
   PROJ, and the =wbprojection= crate) in =tests/reproject_pipe.rs=. *Depends
   on =crs.org='s opaque-CRS design* (the IR never interprets a =Crs=, so
   swapping it out after an external transform needs no Geosetta-side code).
+- [[file:crs-geoscribe-fallback.org][crs-geoscribe-fallback.org]] :: Close the
+  bare-build (=--features crs-registry= off) gap where a source with an
+  authority+code but no expanded WKT/PROJJSON body warns instead of
+  resolving, by shelling out to the =geoscribe= CLI (the sibling registry
+  crate's new CLI front end) at *runtime* as a fallback — trading a
+  compile-time dependency for an optional one. Narrowly scoped to the
+  trusted-id case only; does *not* touch the separate id-less-WKT/name-recovery
+  gap. *Scoping only, not yet implemented* — one open question (silent
+  fallback vs. an opt-in flag) flagged for review before starting.
+- [[file:multi-geometry-columns.org][multi-geometry-columns.org]] :: Let a
+  source with more than one geometry column per feature — in practice, only
+  GeoParquet, and today only DuckDB actually writes it — survive a
+  conversion instead of being rejected outright. Adds
+  =Feature::extra_geometries= to the IR; extra columns decode for real on
+  GeoParquet read, round-trip as real columns on GeoParquet write, and fall
+  back to WKT-text properties (with a warning, =crs.rs='s downgrade-warning
+  precedent) for every other target format, none of which has a
+  format-native concept of more than one geometry per feature. *Scoping
+  only, not yet implemented.* Extends
+  [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]'s milestone
+  6b, whose reject-with-error behavior becomes this plan's read-side
+  detection step.

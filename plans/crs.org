@@ -415,7 +415,7 @@ plan originally recommended (c).
 *As shipped, instead: option (b), but kept out of the dependency-free core.*
 The *CRS registry* effort (moved out of this repo — see =plans/README.org=)
 built exactly the full-dataset option, as the sibling
-[[https://github.com/dxgeo/geosetta-crs-data][=geosetta-crs-data=]] crate: all
+[[https://github.com/dxgeo/geoscribe][=geoscribe=]] crate: all
 13,790 =proj.db= CRSes, zstd-compressed to ~1 MB, decoded by =geosetta='s own
 =compress/zstd.rs=. It is pulled in behind the =crs-registry= Cargo feature, so
 the default build's dependency-free identity is untouched — the "collision
@@ -441,7 +441,7 @@ details; this file only tracks that D's gap is closed for the opt-in build.
    *done* (fixes gpkg→parquet in GDAL/QGIS); the PROJJSON→WKT reverse is also
    *done* ([[file:projjson-to-wkt.org][projjson-to-wkt.org]]). Datum ensembles
    remain (no faithful WKT1 rendering exists), each its own effort.
-4. *D* — *done*, via the opt-in =crs-registry= feature (=geosetta-crs-data='s
+4. *D* — *done*, via the opt-in =crs-registry= feature (=geoscribe='s
    full embedded registry); the default dependency-free build still declines,
    as originally recommended.
 

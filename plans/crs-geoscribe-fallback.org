@@ -1,0 +1,148 @@
+#+TITLE: Plan: Resolve Id-Only CRS References via a Runtime `geoscribe` Fallback
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Runtime `geoscribe` CRS-Resolution Fallback
+
+** STATUS -- SCOPING ONLY, NOT YET IMPLEMENTED
+Came out of a conversation about giving [[https://github.com/dxgeo/geoscribe][=geoscribe=]]
+(the sibling CRS-registry crate) a CLI. First framed as a CRS-*assignment*
+flag (=ogr2ogr -a_srs= style); that's the wrong shape for the actual gap --
+see § WHY. This plan is the corrected design: not assignment, *resolution* --
+closing a specific hole in the *bare* (=--features crs-registry= off) build.
+
+** WHY
+=geoscribe= now ships a CLI (=geoscribe AUTHORITY:CODE [--wkt|--wkt2|--projjson]=)
+that does exactly one thing: the *trusted-id* lookup, =resolve(authority,
+code) -> definition=. That's the same lookup =geosetta='s own
+=--features crs-registry= path already does at compile time
+(=registry::def_projjson=/=def_wkt=, now a thin call-through to
+=geoscribe::resolve= per =public-api.org='s R6). A bare build has no
+compiled-in registry, so it hits a specific, well-defined wall today --
+closing that wall with the *already-shipped* =geoscribe= CLI, at *runtime*,
+needs zero changes to =geoscribe= itself.
+
+** THE GAP (precisely, with citations)
+Bare build, a source that supplies only an authority+code reference with
+*no* expanded WKT/PROJJSON body -- converting to a target that needs the
+full definition, not just a code:
+
+- =NamedCrs::registry_projjson()= (=src/crs.rs:310-313=) is unconditionally
+  =None= without =crs-registry=.
+- That makes =parquet_expressible()= (=crs.rs:278-282=) and Shapefile's
+  =shapefile_expressible()= (=crs.rs:224-238= vicinity) fail for a bare
+  authority+code with no body, which fires =downgrade_warning=
+  (=crs.rs:188-207= for GeoParquet, =:224-238= for Shapefile). Both carry the
+  literal hint (=crs.rs:200=/=:232=):
+  #+begin_quote
+  ...id reference... Rebuild with `--features crs-registry` for full CRS
+  resolution.
+  #+end_quote
+- The test pair nails the exact before/after: =parquet_warns_for_a_code_only_crs=
+  (=crs.rs:530-541=, =#[cfg(not(feature = "crs-registry"))]=) -- a bare
+  =EPSG:7844= code-only =NamedCrs= to GeoParquet warns with the hint above;
+  =parquet_resolves_a_code_only_crs_via_registry= (=crs.rs:543-551=) --
+  same input, feature on, warning vanishes because
+  =registry::def_projjson(auth, code)= resolves it. The comment there calls
+  this "R1's headline behavior change ... the hint stops firing."
+- *FlatGeobuf and GeoPackage are unaffected* -- =wkt_expressible()=
+  (=crs.rs:322-324=) treats a bare code as natively sufficient (those
+  formats store the code directly, not an expanded definition), so this gap
+  is GeoParquet- and Shapefile-specific.
+
+** WHAT THIS DOES *NOT* FIX
+A second, unrelated gap: an *id-less* WKT (e.g. Esri-flavor Shapefile
+=.prj=) where structural translation declines. That needs *name* recovery
+(=registry::resolve_geographic_by_name=/=resolve_projected_by_name=,
+=crs.rs:307=) -- the weaker, unvalidated lookup =geoscribe='s CLI
+*deliberately* does not expose (see =geoscribe/src/main.rs='s module doc
+comment: it only wraps the trusted-id =resolve=, not =resolve_by_name=,
+since the latter needs a caller-side trust policy the CLI has no way to
+apply safely). A shellout to =geoscribe AUTHORITY:CODE= cannot help here --
+there is no id to look up. Out of scope for this plan; would need either a
+new unvalidated =geoscribe --by-name= subcommand (with geosetta doing its own
+ellipsoid validation on the returned candidates, duplicating the policy it
+already carries under =crs-registry=) or nothing changes and bare geosetta
+keeps declining these the way it does today.
+
+** DESIGN
+At the exact point bare geosetta hits the wall above (the
+=registry_projjson=/=registry_wkt= call sites, =crs.rs= ~305), attempt a
+runtime fallback instead of going straight to the warning:
+
+#+begin_src rust
+// bare build only -- #[cfg(not(feature = "crs-registry"))]
+fn geoscribe_cli_resolve(authority: &str, code: &str, dialect: &str) -> Option<String> {
+    let out = std::process::Command::new("geoscribe")
+        .arg(format!("{authority}:{code}"))
+        .arg(dialect) // "--projjson" or "--wkt"
+        .output()
+        .ok()?;
+    out.status.success().then(|| String::from_utf8(out.stdout).ok())?
+}
+#+end_src
+
+- *GeoParquet* wants PROJJSON (=--projjson=, also the CLI's default).
+- *Shapefile* wants WKT1 (=--wkt=); errors if the entry has none -- same
+  degrade-to-warning as today, just one layer further out.
+- On any failure (binary missing, non-zero exit, bad UTF-8) fall straight
+  through to today's existing warning, unchanged. This is strictly additive:
+  a bare build with no =geoscribe= on =PATH= behaves exactly as it does now.
+- No new dependency, compiled or otherwise -- =std::process::Command= only,
+  consistent with the crate's "dependency-free by default" rule (this adds
+  an *optional runtime* companion binary, not a compile-time one).
+
+** OPEN QUESTION -- silent or opt-in?
+The one real design decision, not yet made: does this shellout happen
+*silently* whenever a bare build hits the wall (best-effort enhancement,
+invisible when it works), or only behind an explicit new flag (e.g.
+=--resolve-via-geoscribe=)?
+
+- *Silent* is more useful by default (most users won't know to ask for it)
+  but is a real behavior change for a crate whose whole pitch is
+  dependency-free and predictable -- spawning an external process nobody
+  asked for, on a code path that previously never touched the OS process
+  table, is worth pausing on.
+- *Opt-in* keeps the default build's behavior fully inert (matches today
+  exactly unless asked), at the cost of most users never discovering it.
+
+Leaning silent-with-a-clear-progress/stderr-note-when-it-fires (so it's
+never a *surprise*, just not gated behind a flag), but this is the one thing
+worth deciding before implementation starts.
+
+** SCOPE
+- =src/crs.rs= :: the fallback call, gated =#[cfg(not(feature =
+  "crs-registry"))]=, at the =registry_projjson=/=registry_wkt= call sites.
+- No changes needed in =geoscribe= itself -- its CLI already does exactly the
+  lookup this needs.
+- No changes needed to =src/cli.rs= if the silent-default option above is
+  chosen; a new flag if opt-in is chosen instead.
+
+** TESTING
+- A fake =geoscribe= binary on =PATH= (a tiny test-only shell script or a
+  second Rust binary target) that echoes a canned PROJJSON/WKT string, to
+  test the success path without needing the real crate built.
+- =PATH= manipulation to simulate "binary missing" and confirm the fallback
+  degrades to today's exact warning text, unchanged.
+- A non-zero-exit stub (simulating an unknown code) to confirm that also
+  degrades to the warning rather than erroring the whole conversion.
+- Regression: the existing =parquet_warns_for_a_code_only_crs= /
+  =parquet_resolves_a_code_only_crs_via_registry= pair (=crs.rs:530-551=)
+  should gain a third sibling -- bare build, no =crs-registry=, but
+  =geoscribe= *is* on =PATH= -- asserting the warning also vanishes via this
+  path, not just the compiled-in one.
+
+** RISKS / NOTES
+- Process-spawn latency per unresolved id-only reference -- fine for a CLI
+  conversion tool (this fires at most once per distinct missing CRS, not
+  per-feature), worth noting as a non-issue rather than ignoring it.
+- =geoscribe= version skew: the runtime binary on a user's =PATH= could be a
+  different version/dataset snapshot than what =--features crs-registry=
+  would have compiled in. Not a correctness risk (both are the same
+  authoritative =proj.db=-derived data by construction), just a possible
+  source of confusing "why did this resolve differently on my machine"
+  reports if someone has a stale =geoscribe= installed.
+- Keep the shellout narrowly scoped to exactly the id-only-reference case
+  above -- resist the temptation to widen it into a general "ask geoscribe
+  about anything" escape hatch, which would blur back into the assignment
+  framing this plan explicitly moved away from.

@@ -1,0 +1,879 @@
+#+TITLE: Plan: 3D/4D Geometry (Z and M Ordinates)
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* 3D/4D Geometry — Z (elevation) and M (measure) Ordinates
+
+** GOAL
+Let Geosetta carry a Z (elevation) and/or M (linear-referencing measure)
+ordinate through the IR and every format spoke, instead of silently dropping
+them on read the way three spokes already do today (see BACKGROUND). This is
+=arbitrary-geoparquet.org='s milestone 6a, split out into its own plan
+because — as that file itself flags — it's a genuine IR-scope decision, not a
+decode-path addition: every one of the eight format spokes touches the
+=Position= type this plan changes.
+
+** STATUS
+*M1 through M5 are DONE (all 2026-08-17).* Written up on request after
+[[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]'s 6a was
+surveyed against the actual codebase (not just the plan doc) to scope what
+touching =Position= really costs; the DESIGN decision below (struct, not a
+wider array or a parallel enum) was accepted and implemented as scoped. M1
+landed the IR change with =z=/=m= defaulting to =None= everywhere (pure
+plumbing, no behavior change); M2 landed the WKB codec itself, dimension-
+aware on both encode and decode, confirmed against real DuckDB/GDAL bytes
+before implementing; M3 landed GeoJSON read/write, which is what makes M2's
+codec capability actually *reachable* — a real GeoJSON→GeoParquet→GeoJSON
+conversion through the CLI now carries Z end-to-end, externally verified via
+=ogrinfo=/DuckDB reading the intermediate =.parquet= as genuine 3D geometry;
+M4 landed WKT read/write (including the write side, never previously
+scoped in detail), the ISO-keyword-vs-bare-tuple ambiguity confirmed via
+real DuckDB/GDAL output before implementing, and verified end-to-end through
+the real CLI via CSV (WKT's actual consumer in this crate) cross-checked
+against =ogrinfo=. M5 confirmed GeoPackage needed *zero production code
+changes* — =gpkg_geometry=/=strip_gpkg_header= were already dimension-
+agnostic wrappers around WKB, verified via the real CLI and cross-checked
+against both =ogrinfo= and DuckDB; also found and closed a real,
+pre-existing gap in the process (the envelope-size branch had no test
+coverage at all before this) — first with a spec-grounded synthetic test,
+then a real fixture once the actual cause (GDAL skips the envelope for a
+degenerate =Point= bbox but writes one for a =LineString=) was tracked down,
+now committed as =tests/fixtures/gdal_linestring_z.gpkg=.
+
+*All nine milestones are now DONE (2026-08-17).* M6, M7, and M9 landed
+after the initial M1–M5 writeup above; M7 additionally got a same-day
+M-ordinate follow-up (full M support, both within Z-shapes and the M-only
+shape types); a user question during that follow-up ("does M1–M6 also have
+full M support?") prompted an audit that closed a real test-coverage gap in
+M5 (GeoPackage's M support was real but untested) and confirmed M2/M4 were
+already fully M-capable by design. M8 (GeoParquet =geo= metadata's
+=" Z"=/=" M"=/=" ZM"= suffixes) landed last, closing the one gap flagged as
+known-but-deferred above — its first landing wrongly concluded GeoParquet
+had no M vocabulary at all (generalized from DuckDB's writer alone,
+corrected once a user question prompted actually reading the spec text);
+see M8's own section for the full account. See each milestone's own
+section for details, verification method, and test counts.
+
+*** M1 completion notes
+- Every call site the compiler flagged was fixed by hand
+  (=p[0]=/=p[1]=→=p.x=/=p.y=, array-literal Position construction
+  →=Position::new(x, y)=), exactly the mechanical, compiler-driven process
+  DESIGN predicted — this touched more files than M1's own list named
+  (=convert.rs=, =csv.rs=, =spatial.rs=, and each format's =writer.rs=/
+  =reader.rs= test modules all had their own literal constructions too, not
+  just the eight files M1 enumerated).
+- *A real hazard found doing this, worth flagging for any future bulk
+  find-and-replace on this codebase*: a blind regex pass
+  (=\[(-?\d+\.\d+), (-?\d+\.\d+)\]= → =Position::new($1, $2)=) silently
+  corrupted several raw-string (=r#"..."#=) GeoJSON test fixtures — e.g.
+  =convert.rs='s =SAMPLE= constant — because a JSON =[lon, lat]= coordinate
+  pair inside a Rust string literal is lexically indistinguishable from a
+  real Rust array-literal =Position= value to a text-level regex. Caught
+  only because the corrupted text (=Position::new(...)= inside a
+  =r#"..."#= block) still didn't type-check as a *string*, or fortuitously
+  would have if it had — the safety net here was manually grepping every
+  file for ="coordinates".*Position::new= after the bulk pass and fixing
+  five hits across =convert.rs=, =geojson/mod.rs=, and =kml/writer.rs=
+  before trusting the migration; the full test suite (which round-trips
+  these exact fixtures) is what would have caught it if that grep hadn't.
+  *Lesson for M2 onward: prefer compiler-error-driven fixes over blind
+  text substitution wherever a file mixes real Rust code with embedded
+  string fixtures* (GeoJSON/WKT/JSON test text appears throughout this
+  crate's test modules).
+- Verified: =cargo test= (default) 299+3+1 passed/4 ignored, and
+  =cargo test --features crs-registry= 313+3+1 passed/6 ignored — both
+  match their pre-M1 baseline counts exactly (no behavior change, per M1's
+  own bar). =cargo clippy --all-targets= clean both feature configs.
+  =tests/reproject_pipe.rs='s =composes_with_wbprojection_library= passes
+  unchanged, confirming the DESIGN section's prediction that wbprojection
+  itself is unaffected by the =Position= shape change (only Geosetta's own
+  four-line glue closure needed the mechanical =p[0]=→=p.x= fix).
+
+** BACKGROUND
+
+*** Three spokes already receive Z-bearing input and silently discard it
+Not hypothetical — found while scoping this plan:
+- =src/geojson/mod.rs= (~line 300): the position parser's own doc comment
+  says it plainly — *"extra ordinates (z/m) are skipped"*. RFC 7946 natively
+  allows a 3-element =[lon, lat, elevation]= position; Geosetta reads it and
+  throws the third number away.
+- =src/kml/reader.rs=: =<coordinates>lon,lat,alt</coordinates>= is
+  real, common KML (every =<Point>= with an altitude, every LIDAR/survey
+  export) — =parse_coordinates= parses all three numbers but returns
+  =Position= (today a 2-tuple), so altitude never reaches the IR.
+- =src/shapefile/geometry.rs= (line 71): =PointZ=/=PolygonZ=/=PolyLineZ=/
+  =MultiPointZ= shape types are rejected outright — *"unsupported shape type
+  {other} (Z/M/MultiPatch out of scope)"*. A shapefile of building footprints
+  or LIDAR-derived points with real elevation data fails to convert at all
+  today, not just loses the Z.
+
+*** What's dimension-agnostic already, for free
+- *GeoPackage* (=src/geopackage/{reader,writer}.rs=): the writer already
+  emits =flags: 0x01= (little-endian header ints, *no* envelope) and wraps
+  plain WKB with no 2D-specific logic; the reader's envelope-skip already
+  branches generically on =(flags >> 1) & 0x07= for the xy/xyz/xym/xyzm
+  envelope byte counts (=reader.rs:202-208=). Once WKB itself carries Z/M,
+  GeoPackage inherits it with no format-specific code — the same "no new CRS
+  code needed" story Shapefile's =.prj= had for R2 name recovery.
+- *CSV (WKT column)* inherits whatever the WKT codec does; no separate work.
+
+** DESIGN
+
+*** The IR change: `Position` becomes a struct, not a wider array
+Today (=src/geometry/mod.rs:15=):
+#+begin_src rust
+pub type Position = [f64; 2];
+#+end_src
+Proposed:
+#+begin_src rust
+pub struct Position {
+    pub x: f64,
+    pub y: f64,
+    pub z: Option<f64>,
+    pub m: Option<f64>,
+}
+#+end_src
+Every =Geometry= variant's *shape* stays exactly as it is today —
+=Point(Position)=, =LineString(Vec<Position>)=,
+=Polygon(Vec<Vec<Position>>)=, and so on. Nothing about ring/part/collection
+nesting changes; only the leaf type widens. =bbox=/=extend_bbox=,
+=for_each_position_mut=, and =for_each_position_run_mut= keep their existing
+recursion structure untouched — only the leaf access (=p[0]=/=p[1]= indexing
+today) becomes =p.x=/=p.y=/=p.z=/=p.m= field access.
+
+*Alternatives considered and rejected:*
+- =[f64; 4]= with a =NaN= sentinel for absent Z/M — rejected: conflates
+  "ordinate absent" with a real numeric edge case, and =f64= comparisons/
+  =min=/=max= (used throughout =Bbox::add=) handle =NaN= inconsistently. An
+  =Option<f64>= makes "this geometry has no Z" a type-level fact instead of a
+  magic-value convention every call site has to remember to check.
+- A parallel =Geometry3D= enum alongside the existing 2D =Geometry= —
+  rejected: doubles every match arm in every writer/reader (the actual bulk
+  of this plan's work) instead of widening one leaf type. Every format that
+  can express Z (all except CSV's raw columns and the pure-2D formats) would
+  need two near-identical code paths instead of one dimension-aware one.
+- Keeping =Position= 2D and adding a *separate* per-point Z/M side-channel
+  (e.g. =Vec<Option<f64>>= parallel to each coordinate =Vec=) — rejected:
+  every ring/part-splitting helper (=split_rings=, =flatten_rings=, KML's
+  ring parsing, Shapefile's part arrays) would need to thread a second
+  parallel structure through the exact same recursion =Position=-as-struct
+  gets for free by keeping z/m *on* the position.
+
+*** Z and M share the IR change; format-level *support* for each is scoped separately
+Folding both =z= and =m= into =Position= now (rather than doing a Z-only
+migration and a second M-shaped migration later) avoids paying the
+mechanical "touch every =p[0]=/=p[1]= call site" cost twice. But real-world
+prevalence differs sharply — Z (elevation) is common (LIDAR, survey,
+building-footprint data); M (linear-referencing measure, e.g. highway
+mile-markers) is comparatively rare and Geosetta has no evidence of a real
+consumer today. So the milestones below build Z per format as the primary
+target; M-specific format work (Shapefile's M-only shape types 21/23/25/28,
+WKT's =M= keyword, FlatGeobuf's =m= vector) is flagged *stretch, not
+required* per milestone rather than assumed — see OPEN QUESTIONS.
+
+*** A source-breaking, but purely mechanical, call-site change
+=for_each_position_mut=/=for_each_position_run_mut=
+([[file:reproject-composability.org][reproject-composability.org]]'s public
+seam for an external reprojection library) hands callers =&mut Position=/
+=&mut [Position]=. Changing =Position= from =[f64; 2]= to a struct is
+source-breaking for any caller indexing it positionally (=p[0]=/=p[1]=)
+instead of by field. Checked directly against the one real external
+consumer in this repo, =tests/reproject_pipe.rs='s
+=composes_with_wbprojection_library= test: wbprojection's own API
+(=Crs::transform_to(x: f64, y: f64, …) -> (f64, f64)=) takes and returns
+plain =f64=s — it has *no* knowledge of =Position='s shape at all. The only
+code that touches =Position= positionally is Geosetta's own four-line glue
+closure (=p[0]=/=p[1]= read and write, lines 272-274/287/294) — a two-line
+mechanical fix (=p.x=/=p.y=), not a capability loss. wbprojection keeps
+reprojecting mid-flight identically once that's fixed; nothing about *its*
+ability to compose through the seam changes. The real, narrower consequence:
+wbprojection's =transform_to= is 2D-only (no Z in, no Z out), so a Z-bearing
+point piped through it today would have Z pass through *untouched* by
+default — correct per Geosetta's own "label, never reproject" posture, but
+worth being explicit that wbprojection specifically has no way to apply a
+vertical-datum shift even if a future version wanted to. Since =geosetta= is
+published to crates.io, any external crate consuming this API the same
+positional way as the old test code would need the same trivial fix — worth
+a release-note mention, but not a functional regression for anyone.
+
+** MILESTONES
+
+*** M1 — IR: `Position` struct + migrate every call site — *DONE (2026-08-17)*
+Change the type as in DESIGN. This alone will not compile until every
+=p[0]=/=p[1]= indexing site across the crate is updated to =.x=/=.y= — the
+compiler enumerates every call site that needs a look
+(=geometry/mod.rs=, =geometry/wkb.rs=, =geometry/wkt.rs=, =geojson/mod.rs=,
+=kml/{reader,writer}.rs=, =shapefile/geometry.rs=,
+=flatgeobuf/{reader,writer}.rs=), so this is mechanical, compiler-driven
+work, not a design decision in itself. =Bbox= stays XY-only (see OPEN
+QUESTIONS on why 3D bbox is out of scope for now); =z=/=m= default to
+=None= everywhere until a later milestone starts populating them, so every
+existing test should pass unchanged on 2D input — the real backward-
+compatibility bar, matching how =multi-geometry-columns.org='s M1 scoped
+its own additive IR change.
+
+*** M2 — WKB Z/M codec (`src/geometry/wkb.rs`) — *DONE (2026-08-17)*
+The type-code convention was *confirmed against real fixtures before
+committing*, not assumed — matching this project's established discipline
+(see =geoscribe/handoff.org='s =usages=-stripping and embedded-newline
+generator bugs, both found only once a real bulk oracle ran). Two live
+conventions existed as candidates:
+- *ISO SFA* (what GeoParquet's spec calls for): base type code +1000 for Z,
+  +2000 for M, +3000 for ZM (e.g. =PointZ= = 1001).
+- *EWKB* (PostGIS-native, not GeoParquet's): high bit flags
+  (=0x80000000= Z, =0x40000000= M) plus an optional SRID.
+
+*Confirmed via two independent real tools*, not just one:
+=duckdb -c "LOAD spatial; SELECT hex(ST_AsWKB(ST_GeomFromText('POINT Z (1 2 3)')))"=
+and Python/GDAL's =ogr.CreateGeometryFromWkt('POINT Z (1 2 3)').ExportToIsoWkb()=
+both emit type code =1001= (=0xE9030000= little-endian) — *ISO SFA*, not
+EWKB. (GDAL's *non*-ISO =ExportToWkb()= does emit the EWKB flag form
+=0x80000001=, confirming that path exists but isn't what GeoParquet
+producers use — worth knowing so a future session doesn't get the two GDAL
+export methods confused.) Also verified the *nesting* convention:
+=MULTIPOINT Z (0 0 0, 1 1 1)='s outer wrapper type code (1004) and each
+embedded sub-point's own type code (1001) are *both* independently
+Z-suffixed, and =GEOMETRYCOLLECTION Z (...)= behaves the same way — this
+directly shaped the encoder's per-part dimension derivation (see below).
+
+*Implementation*: =Position='s own =z=/=m= fields already carry
+dimensionality per position (from M1), so the codec derives a geometry's
+declared WKB dimensionality from its *first* position (=dim_of_first=/
+=dim_of_rings=/=dim_of_geometry= — a =LineString=/=Polygon= gets one
+dimension-suffixed header for the whole geometry, exactly matching how WKB
+itself declares dimensionality once per geometry, not per point) rather
+than threading it in from outside. =header=/=wkb_size=/=point=/=read_point=
+(and every variant's encode/decode arm) became dimension-aware; each
+=MultiPoint=/=MultiLineString=/=MultiPolygon= part gets its *own*
+independently-derived dimension-suffixed header, matching the verified
+nesting convention above. A position whose =z=/=m= the geometry's declared
+dimensionality expects but which itself lacks (not a real case today — no
+reader populates Z yet) falls back to =0.0= on encode rather than panicking,
+since WKB has no per-point "no data" marker the way Shapefile's M does.
+
+*Testing*: 16 new unit tests in =wkb.rs=, including — per this project's own
+bar of not trusting a round-trip against *only* our own encoder — a test
+that decodes *raw hex bytes captured directly from DuckDB and GDAL* (not
+just re-encoded output) for =POINT Z=, =POINT M=, =POINT ZM=,
+=LINESTRING Z=, and =MULTIPOINT Z=, plus round-trip coverage across every
+=Geometry= variant at Z/M/ZM, the outer/inner nesting check, the
+mixed-dimensionality fallback, and an EWKB-style-code rejection test. All
+2D-only existing tests pass byte-identical (Dim::XY's offset is 0, so no
+behavior change for any input without Z/M — matching M1's degraded-mode
+bar). Full suite verified: =cargo test= 308 passed (299 baseline + 9 new)/4
+ignored; =cargo test --features crs-registry= 322 passed (313 baseline + 9
+new)/6 ignored; =cargo clippy --all-targets= clean both configs;
+=tests/reproject_pipe.rs= (incl. =composes_with_wbprojection_library=)
+unaffected.
+
+*** M3 — GeoJSON (`src/geojson/mod.rs`) — *DONE (2026-08-17)*
+Smallest change of any spoke, as predicted: RFC 7946 already allows a
+3-element position natively. Both position parsers — the streaming reader's
+=stream_position= *and* the tree reader's =position= (two independent code
+paths that must agree, per =streaming_reader_matches_tree_reader=) — now
+read a present third array element as Z instead of skipping it; a fourth+
+element (M — RFC 7946 gives it no defined meaning in bare GeoJSON
+coordinates, out of scope by spec, not by choice, as predicted) is still
+parsed past but discarded. Both writers — the streaming =write_position=
+and the =#[cfg(test)]=-only tree-model =position_to_json= (used to build
+the reference =JsonValue= the byte-for-byte writer-equivalence test checks
+against) — emit a third element when =z= is =Some=, omitted entirely
+otherwise (so 2D output is unchanged, matching the degraded-mode bar). A
+non-numeric third element now errors clearly on both paths (tightened from
+the old behavior, which tolerated *any* JSON value there since it was
+unconditionally skipped — not a real behavior loss since RFC 7946 requires
+coordinates to be numbers).
+
+*This is the milestone that makes M2's WKB codec capability actually
+reachable end-to-end*, not just exercised by =wkb.rs='s own unit tests: a
+real GeoJSON→GeoParquet→GeoJSON conversion through the actual CLI now
+carries Z all the way through. Verified two ways:
+- In-process: =z_bearing_geojson_round_trips_through_geoparquet= encodes a
+  parsed Z position to WKB and decodes it back.
+- *End-to-end through the real binary*, checked against two independent
+  external tools: =cargo run -- z_in.geojson z_mid.parquet= then
+  =cargo run -- z_mid.parquet z_out.geojson= round-trips
+  =[-73.9857,40.7484,381]= byte-identical in the final GeoJSON, and the
+  intermediate =.parquet= is independently confirmed as real 3D geometry by
+  both =ogrinfo -al= (=POINT Z (-73.9857 40.7484 381)=) and DuckDB
+  (=SELECT ST_AsText(geometry) FROM read_parquet(...)= → the same =POINT
+  Z=) — not just Geosetta agreeing with itself.
+
+*Known, expected gap (not M3's job, still open — see M8)*: the written
+GeoParquet's own =geo= metadata still declares ="geometry_types":["Point"]=,
+not the spec's =["Point Z"]= — confirmed via
+=duckdb parquet_kv_metadata()=. GDAL/DuckDB both still correctly identify
+the geometry as 3D by inspecting the WKB's own type code directly (which is
+why the external-tool checks above passed despite this), so this isn't an
+interop break today, just non-compliant metadata — M8's scope, unchanged by
+M3.
+
+5 new tests (Z round-trip through both readers, a 2D point still writes
+with no third element, a 4th ordinate is tolerated-but-dropped, a
+non-numeric Z errors, and the WKB round-trip above). Full suite: =cargo
+test= 313 passed (308 baseline + 5)/4 ignored; =--features crs-registry= 327
+passed (322 baseline + 5)/6 ignored; clippy clean both configs; doctests and
+=reproject_pipe.rs= unaffected.
+
+*** M4 — WKT text (`src/geometry/wkt.rs`) — *DONE (2026-08-17)*
+The flagged ambiguity was real, confirmed empirically rather than guessed:
+- DuckDB (=ST_AsText=) and GDAL's *ISO* export (=ExportToIsoWkt()=) both
+  always emit an explicit =Z=/=M=/=ZM= keyword — =POINT Z (1 2 3)=,
+  =POINT M (1 2 4)=, =POINT ZM (1 2 3 4)=, no ambiguity.
+- GDAL's *plain, non-ISO* =ExportToWkt()= genuinely emits a bare
+  =POINT (1 2 3)= — no keyword at all — for a 3D point (and silently
+  *drops* M entirely rather than ever writing an unlabeled M-bearing
+  tuple). This is the exact real-world ambiguity source the milestone
+  flagged, and it settles the fallback unambiguously: an unlabeled extra
+  ordinate is *always* Z in practice (never M), matching this crate's own
+  WKB codec and GeoJSON reader conventions already, so no new inconsistency
+  was introduced.
+- Nesting convention also confirmed and implemented accordingly: a
+  =MULTIPOINT Z=/=POLYGON Z='s members are bare tuples sharing the *outer*
+  keyword (=MULTIPOINT Z (0 0 0, 1 1 1)=, no per-member repeat), but a
+  =GEOMETRYCOLLECTION=='s members are complete, independent WKT geometries
+  that each carry their *own* keyword (=GEOMETRYCOLLECTION Z (POINT Z (1 2
+  3))=) — the parser threads a =dim= parameter down through
+  =coord=/=coord_list=/=ring_list=/=multipoint=/=polygon_list= for the
+  former, but =geometry_list= (GeometryCollection's member list) calls
+  =self.geometry()= fresh per member with no outer =dim= passed in, since
+  each member re-derives its own.
+
+*Also implemented (not previously scoped in detail): the write side.* The
+old encoder never looked at =Position::z=/=m= at all — =write_coord= only
+ever wrote =x y=. =write_header= now emits the =Z=/=M=/=ZM= keyword (derived
+from the geometry's first position, mirroring =wkb.rs='s =dim_of_first=/
+=dim_of_rings=/=dim_of_geometry= helpers — kept as an independent copy in
+this module rather than shared, matching every other format spoke's
+self-contained style) before the coordinate list; =write_coord= appends =z=
+then =m= when present. 2D output is byte-identical to before (=Dim::XY=
+adds no keyword and no extra ordinates).
+
+*Verified against real external tools, not just self-consistency*: beyond
+matching DuckDB/GDAL's captured text byte-for-byte in unit tests (11 new
+tests total), routed a real =POINT Z (-73.9857 40.7484 381)= through the
+actual CLI — =geosetta z.csv z.geojson= then =geosetta z.geojson
+z_back.csv= — confirming =381= survives the full CSV→GeoJSON→CSV round
+trip (CSV is WKT's real consumer in this crate, per =csv.rs=), and
+=ogrinfo -al= independently parses the written CSV's =WKT= column as real
+=POINT Z= geometry, not just a string. Full suite: =cargo test= 321 passed
+(313 baseline + 8)/4 ignored; =--features crs-registry= 335 passed (327
+baseline + 8)/6 ignored; clippy clean both configs; doctests and
+=reproject_pipe.rs= unaffected.
+
+*** M5 — GeoPackage — mostly free — *DONE (2026-08-17), zero production code changed*
+Confirmed, not just assumed: =gpkg_geometry= (=writer.rs=) really does just
+call =to_wkb(g)= and wrap it in the 8-byte header with no dimension-specific
+logic at all, and =strip_gpkg_header= (=reader.rs=) really does already
+branch generically on the flags byte's envelope-size indicator (0/32/48/48/
+64 bytes for none/XY/XYZ/XYM/XYZM, GeoPackage §2.1.3) before handing the
+rest to =from_wkb=. So M2's WKB codec alone was enough — this milestone was
+verification-only, no source change beyond two new tests.
+
+*Verified end-to-end through the real CLI, cross-checked against two
+independent tools*: =geosetta z_in.geojson z.gpkg= then =geosetta z.gpkg
+z_out.geojson= round-trips =381= (elevation) intact; both =ogrinfo -al= and
+DuckDB's =ST_AsText(ST_Read(...))= independently confirm the written
+=.gpkg= holds real =POINT Z (-73.9857 40.7484 381)= geometry, not just
+Geosetta agreeing with itself.
+
+*A real, if narrow, pre-existing gap found while verifying this, not
+introduced by M5*: =strip_gpkg_header='s envelope-size branch had *no* test
+coverage at all before this milestone — this crate's own writer always
+chooses "no envelope" (=flags = 0x01=), so the branch was reachable only
+from external input. First attempt to source a real fixture — DuckDB
+(=COPY ... TO 'x.gpkg' (FORMAT GDAL, DRIVER 'GPKG')=) and =ogr2ogr -f GPKG=
+on a single =POINT Z= feature — found neither tool populated an envelope
+(both chose =flags=0x01=, matching this crate's own default), so a
+synthetic, spec-table-grounded test
+(=strip_gpkg_header_skips_every_envelope_size_per_the_spec_table=, all five
+indicator codes) was added as a stand-in. *Root cause turned out to be the
+geometry, not the tool*: a =Point='s bbox is a single, degenerate
+coordinate (no filtering benefit), so GDAL skips the envelope for it —
+=ogr2ogr -f GPKG= on a real =LINESTRING Z (0 0 0, 10 10 10, 20 5 3)= (a
+non-degenerate bbox) *does* populate one — =flags=0x05=, indicator 2 (XYZ,
+48 bytes), envelope values =(0,20,0,10,0,10)= confirmed by hand-decoding
+the raw file to match the geometry's true bounds exactly before trusting
+it. (One red herring on the way there: a naive byte-search for the =b"GP"=
+magic matched *first* inside SQLite's own 100-byte file header at a
+coincidental offset, not the real GPB blob — resolved by searching past
+byte 100 and cross-checking the recovered WKB's own bytes decode to the
+expected coordinates.) Committed as
+=tests/fixtures/gdal_linestring_z.gpkg= (106 KB, in line with the existing
+=points.gpkg= fixture's 98 KB) with a dedicated test,
+=reads_a_real_envelope_bearing_z_fixture=, reading it through the real
+=read_layers= entry point (not just =strip_gpkg_header= in isolation) and
+confirming the exact =LineString Z= geometry recovered. The synthetic
+spec-table test stays too — it still covers XYM/XYZM, which no tool tried
+here happened to produce — but indicator 2 (XYZ) is now real-fixture-backed
+rather than spec-only.
+
+Optionally *emitting* a Z-range envelope (the spec allows it; the writer
+always chooses "no envelope") remains a non-goal *for this milestone*, but
+is no longer a closed question: per a 2026-08-17 user decision, envelope
+computation is scoped as its own plan in the =geoscribe= sibling crate —
+=geoscribe/plans/envelope-computation.org= — under a broader charter that
+=geoscribe= owns any metadata =geosetta= must *compute* rather than simply
+carry through from a source (the same shape CRS resolution already has).
+See that plan for the design and open questions (feature-flag naming,
+default-on vs. opt-in, and the charter/identity implications of broadening
+=geoscribe= past "CRS registry").
+
+Full suite: =cargo test= 324 passed (321 baseline + 3)/4 ignored;
+=--features crs-registry= 338 passed (335 baseline + 3)/6 ignored; clippy
+clean both configs; doctests and =reproject_pipe.rs= unaffected.
+
+**** M follow-up: closed a real test-coverage gap for M — *DONE (2026-08-17)*
+Prompted by a user question during M7's own M follow-up ("does M1-M6 also
+have full M support?"): auditing every spoke found GeoPackage's M support
+was *real* (it inherits whatever M2's WKB codec underneath supports, for
+free, the same way it inherited Z) but had *zero test coverage* — an actual
+gap, unlike M3 (GeoJSON) and M9 (KML), where M is correctly unsupported
+because their own formats have no M concept at all. Closed with a real
+fixture, sourced the same way M7's M follow-up unblocked Shapefile M
+fixtures: =ogr2ogr -f GPKG= from a =LINESTRING ZM (...)= WKT/CSV source
+(=tests/fixtures/gdal_linestring_zm.gpkg=). Verified via direct SQLite blob
+inspection (not just =ogrinfo=/DuckDB agreeing) before trusting it: the GPB
+header's envelope indicator is 2 (XYZ, 48 bytes) — *GDAL's envelope only
+ever tracks Z, never M, even for a ZM geometry*, a real finding worth
+knowing, not assumed — and the inner WKB's own type code is =0x0BBA= = 3002
+= ISO SFA =LineString= + 3000 (ZM), matching both external tools reading it
+back as =LINESTRING ZM (0 0 1 10,10 10 2 20,20 5 3 30)=. New test:
+=geopackage::reader::tests::reads_a_real_m_bearing_fixture=. Full suite:
+=--features crs-registry= 369 passed (368 baseline + 1)/6 ignored; clippy
+clean.
+
+*** M6 — FlatGeobuf (`src/flatgeobuf/{reader,writer}.rs`) — *DONE (2026-08-17)*
+Real new work, as scoped: the FlatBuffers =Header= table has =hasZ=/=hasM=
+bools (field indices 3/4) and the per-feature =Geometry= table has separate
+=z=/=m= vector fields (indices 2/3) alongside =xy= (index 1) — *confirmed
+against real =ogr2ogr -f FlatGeobuf= output before implementing*, not
+assumed from the =.fbs= schema alone: a probe against a real 3D-point fixture
+showed header field 3 = =1= (=hasZ=) and geometry field 2 a length-1 vector
+(=z=), matching this project's established verification discipline.
+
+*Reader*: =positions()= now takes optional =z=/=m= =Vector=s alongside =xy=
+and interleaves them per point (erroring if either's length doesn't match
+the point count), constructed directly as =Position { x, y, z, m }=
+matching =wkb.rs='s =read_point= style. *Deliberately does not read the
+header's =hasZ=/=hasM= flags at all* — Z/M presence is derived directly from
+whether each =Geometry= table's own =z=/=m= vector field is present, the
+same source of truth =xy=already used, and more robust than trusting a
+file-level summary hint on a file whose per-geometry dimensionality might
+not be perfectly uniform.
+
+*Writer*: =dim_of_first=/=dim_of_rings=/=dim_of_geometry= (independent
+copies, mirroring =wkb.rs='s helpers of the same name, per this crate's
+per-spoke self-contained style) derive Z/M presence from a position list's
+*first* element — one dimension decision per geometry/ring-list/part, not
+per point, matching WKB's own convention. A position within a Z/M-bearing
+geometry that itself lacks the ordinate falls back to =0.0= on encode (no
+per-point "no data" marker in FlatGeobuf's flat =z=/=m= vectors, same
+reasoning as M2's WKB fallback). Each =MultiPolygon= part derives its own
+dimensionality independently, same as WKB's per-part headers. The header's
+=hasZ=/=hasM= are set from whether *any* feature's geometry is Z/M-bearing —
+a file-level hint for external readers; each geometry's own vectors are
+still correct even if this summary undercounts a mixed file.
+
+*Verified end-to-end through the real CLI, cross-checked against two
+independent tools*: =geosetta z_in.geojson z_mid.fgb= then =geosetta
+z_mid.fgb z_out.geojson= round-trips a real =381= elevation byte-identical;
+both =ogrinfo -al= (reporting =Geometry: 3D Point=, confirming the header
+flag is doing real interop work, not just decoration) and DuckDB's
+=ST_AsText(ST_Read(...))= independently read geosetta's written =.fgb= as
+genuine =POINT Z (-73.9857 40.7484 381)=. Reverse direction also checked: a
+real =ogr2ogr -f FlatGeobuf=-written 3D =LINESTRING Z= fixture
+(=tests/fixtures/gdal_linestring_z.fgb=, confirmed via =ogrinfo= before
+committing) round-trips through geosetta's CLI with all three Z values
+intact (=[0,0,1],[1,1,2],[2,0,3]=) — incidentally also confirming, correctly
+and unrelated to this milestone, that GDAL's FlatGeobuf writer records
+EPSG:4979 (3D WGS 84) for this CRS and geosetta's existing CRS-downgrade
+warning fires as designed when that gets converted to always-2D GeoJSON.
+
+6 new tests: 5 in =flatgeobuf/writer.rs= (Z point, Z+M =LineString=, Z
+=Polygon= with a hole, a =MultiPolygon= with independently-dimensioned parts,
+and a 2D point writing no =z=/=m= vector at all) plus 1 real-fixture read in
+=convert.rs= against =gdal_linestring_z.fgb=. Full suite: =cargo test= 334
+passed (328 baseline + 6)/4 ignored; =--features crs-registry= 348 passed
+(342 baseline + 6)/6 ignored; clippy clean both configs.
+
+*** M7 — Shapefile (`src/shapefile/geometry.rs`) — *DONE (2026-08-17); M follow-up also DONE (2026-08-17)*
+Real new work, as scoped: unlike WKB's per-point interleaving, =.shp='s Z
+variants (=PointZ=(11), =PolyLineZ=(13), =PolygonZ=(15), =MultiPointZ=(18))
+store Z as a *separate trailing section* per record — =Zmin=, =Zmax=, then
+one Z value per point in the same order as the existing X/Y array — a
+genuinely separate codec path from M2's WKB work, not a reuse of it.
+*Every byte layout was confirmed against real =ogr2ogr -f "ESRI
+Shapefile"= output before implementing*, hand-decoded field-by-field with a
+throwaway Python script rather than trusting the whitepaper alone: =PointZ=
+is =type+X+Y+Z= (28 bytes, *no* bbox or Zmin/Zmax at all — a real content-
+length check confirmed this, since Point/PointZ records carry no range
+fields per the spec); =PolyLineZ=/=PolygonZ=/=MultiPointZ= all share the
+same tail shape (bbox, numParts if applicable, numPoints, parts, XY array,
+then =Zmin=,=Zmax=,Z-array) confirmed via three separate real fixtures (a
+3D LineString, a 3D Polygon-with-hole, and a 3D MultiPoint). *In every real
+fixture GDAL wrote, the trailing M section was completely absent* (content
+length matched the Z-only layout exactly, not the whitepaper's fixed
+=PointZ={X,Y,Z,M}= description) — this settles M's optionality empirically
+rather than by spec-reading alone.
+
+*Scope cut, matching DESIGN's Z-primary lean*: M support (both the M-only
+shape types 21/23/25/28 *and* the optional M section within a Z-shape) is
+*not implemented this pass* — no real M-bearing fixture was available to
+verify against (GeoJSON, this project's easiest source format, has no M
+concept at all), and unlike M6's FlatGeobuf M (which was a free extra
+vector once Z's mechanism existed), Shapefile's M needs its own no-data-
+sentinel logic that would ship unverified against real bytes, breaking this
+project's own verification bar. =read_parts='s trailing M bytes (when a
+real file does carry them) are simply never touched — record boundaries
+still come from the record header's own content-length prefix, so this is
+safe, not a truncation bug. =MultiPatch=(31) stays explicitly out of scope,
+unchanged (=geometry.rs='s existing comment already excluded it, and it's a
+fundamentally different multi-surface shape with no =Geometry= variant to
+decode into at all).
+
+*Design: file-wide Z promotion, not per-geometry*. A =.shp= declares exactly
+one shape type for the whole file — unlike FlatGeobuf's per-Geometry-table
+independent =z= vector (M6), Shapefile has no per-record way to say "this
+one lacks Z." So =write()= computes =has_z= once, file-wide (=geometry_has_z=,
+=true= if *any* geometry carries Z), and promotes the *entire* file to the
+Z-variant shape type when so — a mixed 2D/3D source (e.g. one GeoJSON
+feature missing its third ordinate) still produces one valid, uniformly-
+Z-shaped file, with the 2D feature's Z falling back to =0.0= per point
+(=write_z_section=), the same convention =wkb.rs=/=flatgeobuf/writer.rs= use
+for the same reason (no per-point "no data" marker for Z, unlike M's
+sentinel). The file header's own Zmin/Zmax (bytes 68–83, previously always
+=0.0=/=0.0=) now reflect the real range when =has_z= (=fold_z=, a small
+independent traversal kept separate from the shared 2D-only =Bbox= type
+rather than widening it — see OPEN QUESTIONS on why =Bbox= stays 2D-only).
+=read_parts= gained a =has_z: bool= parameter shared between the 2D and Z
+paths (=PolyLine=/=PolyLineZ=, =Polygon=/=PolygonZ=) rather than duplicating
+the whole function, mirroring how =wkb.rs='s dimension-aware helpers avoid
+duplicating per-variant encode/decode logic.
+
+*Verified end-to-end through the real CLI, cross-checked against two
+independent tools*: =geosetta z_in.geojson z_mid.shp= then =geosetta
+z_mid.shp z_out.geojson= round-trips a real =381= elevation byte-identical;
+both =ogrinfo -al= (reporting =Geometry: 3D Point=) and DuckDB's
+=ST_AsText(ST_Read(...))= independently read geosetta's written =.shp= as
+genuine =POINT Z (-73.9857 40.7484 381)=. (The CRS-downgrade warning seen
+during this check is pre-existing, unrelated =.prj= round-trip behavior —
+confirmed by reproducing it on a plain 2D shapefile round trip too, not a
+regression from this milestone.)
+
+8 new tests: 6 in =shapefile/geometry.rs= (Z point, Z multipoint, Z
+line/multiline, Z polygon-with-hole, a 2D-only collection confirming no
+false-positive promotion to the Z shape type, and a mixed 2D/3D collection
+confirming file-wide promotion with a correct =0.0= fallback) plus 2
+real-fixture reads in =convert.rs= against =gdal_point_z.shp= and
+=gdal_polygon_z.shp= (both hand-decoded and =ogrinfo=-verified before
+committing). Full suite (Z-only landing): =cargo test= 342 passed (334
+baseline + 8)/4 ignored; =--features crs-registry= 356 passed (348
+baseline + 8)/6 ignored; clippy clean both configs.
+
+**** M follow-up: full M support, both within Z-shapes and the M-only shape types
+Requested immediately after the Z-only landing above, once real M-bearing
+fixtures turned out to be obtainable after all (see BACKGROUND below) —
+removing the original reason M had been scoped out. Covers *both* halves
+DESIGN's OPEN QUESTIONS had separately flagged: M riding alongside Z within
+=PointZ=/=PolyLineZ=/=PolygonZ=/=MultiPointZ=, *and* the pure M-only shape
+types =PointM=(21)/=PolyLineM=(23)/=PolygonM=(25)/=MultiPointM=(28) that the
+original M7 landing deferred as "stretch, no fixture."
+
+*BACKGROUND: how the fixture blocker actually got resolved.* GeoJSON (the
+easiest source format used throughout this plan) has no M concept at all,
+which is what made M feel unreachable during the Z-only landing. The fix:
+GDAL's =ESRI Shapefile= driver can source geometry from a WKT column via
+CSV + =-oo GEOM_POSSIBLE_NAMES=wkt=, and WKT natively supports =POINT M=/
+=POINT ZM= etc. — so =ogr2ogr -f "ESRI Shapefile" out.shp in.csv -oo
+GEOM_POSSIBLE_NAMES=wkt= produces real, oracle-quality M-bearing =.shp=
+bytes on demand. This unblocks M fixture-sourcing for *any* future Shapefile
+work, not just this one — worth remembering the next time a GeoJSON-only
+sourcing habit makes a format feature look unreachable.
+
+*Every byte layout confirmed against real =ogr2ogr=-written bytes before
+implementing*, hand-decoded with Python, mirroring the Z landing's own
+discipline:
+- =POINT ZM (-73.9857 40.7484 381 12.5)= → shape type *11* (=PointZ=, not a
+  separate "ZM" code — there isn't one), content 36 bytes = type+X+Y+Z+M.
+  Confirms M rides on the *same* type code as Z-only, distinguished purely
+  by content length, exactly like M7's original Z/no-Z finding.
+- =POINT M (1 2 5)= (no Z at all) → shape type *21* (=PointM=), content 28
+  bytes = type+X+Y+M — genuinely different from a Z-only =PointZ= (also 28
+  bytes, but type+X+Y+*Z*): same byte count, different field, only the
+  shape-type code disambiguates them.
+- =LINESTRING ZM=/=POLYGON ZM=/=MULTIPOINT ZM= sources all wrote a full
+  =Mmin=,=Mmax=,M-array trailing section — *confirmed via two independent
+  tools*, not just =ogrinfo=: DuckDB's =ST_AsText(ST_Read(...))= read the
+  same real =.shp= back as the identical =LINESTRING ZM (0 0 1 10,1 1 2
+  20,2 0 3 30)=.
+
+*Design*: =geometry_has_m= mirrors =geometry_has_z= exactly (file-wide OR
+across every position); the file's final shape type is =z_variant(base)=
+whenever =has_z= (M rides along regardless of =has_m=, matching the real
+=POINT ZM= finding above), else =m_variant(base)= whenever =has_m= alone,
+else =base= — extracted into one shared =dim_shape_type= helper used by
+=encode_point=/=encode_multipoint=/=encode_parts= instead of three separate
+inline conditionals. =write_m_section= mirrors =write_z_section='s shape
+(Mmin, Mmax, then one =f64= per point) but differs in two ways matching
+ESRI's own stated M semantics, neither guessed: a position missing M writes
+the "no data" sentinel (=NO_DATA_M = -1e38=, per the ESRI Shapefile
+Technical Description) rather than a =0.0= fallback, since M (unlike Z) has
+an established no-data convention; and the header's own Mmin/Mmax
+(=fold_m=) *skip* unmeasured points entirely rather than folding in the
+sentinel, so one unmeasured point can't blow out the file's declared M
+range — verified by =header_m_range_ignores_unmeasured_points=. On read,
+=apply_m_if_present= detects the M section (for *any* shape family, Z or
+not) purely from remaining content length, exactly mirroring how the Z-only
+landing already disambiguated "M section present" — no shape-type-specific
+special-casing needed. A nice consequence of that content-length-driven
+design: =POINT=/=POINT_M= share one decode arm (M offset 20 only ever has
+real bytes behind it for a genuine =PointM= record) and
+=POLYLINE=/=POLYLINE_M= and =POLYGON=/=POLYGON_M= share =read_parts(...,
+false)= outright — M's optionality was already the load-bearing mechanism,
+so the M-only types needed no new parsing path, only new *type codes* that
+route into the existing one.
+
+*The one thing no external tool could exercise*: the per-point "no data"
+sentinel firing *within* an otherwise M-bearing shape (one point measured,
+another not, in the same geometry) — WKT has no syntax to express a
+partially-measured geometry, so this is verified only by this crate's own
+encoder/decoder agreeing with each other
+(=a_point_with_no_m_within_an_m_bearing_file_round_trips_as_none_not_the_sentinel=),
+the same bar the original M7 Z =0.0= fallback used for the same reason.
+
+*Verified end-to-end through the real CLI*, via the CSV/WKT path since
+GeoJSON can't carry M: a real =gdal_point_zm.shp= fixture through =geosetta
+gdal_point_zm.shp mid.csv= (correctly emitting =POINT ZM (-73.9857 40.7484
+381 12.5)= in the WKT column — confirming M4's WKT codec already carried M
+generically through =Position::m=, no change needed there) then =geosetta
+mid.csv back.shp=; both =ogrinfo -al= (=3D Measured Point=) and DuckDB
+independently read geosetta's own written =.shp= back as the identical
+=POINT ZM (-73.9857 40.7484 381 12.5)=.
+
+12 new tests: 7 in =shapefile/geometry.rs= (M-only point/multipoint/polygon-
+with-hole, a ZM point confirming the shared Z-variant type code, a ZM
+LineString, the per-point sentinel-to-=None= round trip, and the header
+Mmin/Mmax-skips-unmeasured-points check) plus 5 real-fixture reads in
+=convert.rs= against =gdal_point_m.shp=, =gdal_point_zm.shp=,
+=gdal_linestring_zm.shp=, =gdal_polygon_zm.shp= (shell + hole, each with
+independent Z/M ranges), and =gdal_multipoint_zm.shp=. Full suite: =cargo
+test= 354 passed (342 baseline + 12)/4 ignored; =--features crs-registry=
+368 passed (356 baseline + 12)/6 ignored; clippy clean both configs
+(including a redundant-closure fix
+in =fold_range='s call sites).
+
+*** M8 — GeoParquet metadata (`src/convert.rs`) — *DONE (2026-08-17)*
+The =geo= metadata's =geometry_types= array now gets GeoParquet's own
+=" Z"=/=" M"=/=" ZM"= suffix (e.g. ="Point Z"=/="Point M"=/="Point ZM"=
+instead of a bare ="Point"=) for any Z- and/or M-bearing geometry written.
+Derived *per-geometry*, from its first position
+(=geoparquet_first_position_dim=, an independent copy of =wkb.rs='s own
+=first_position=-based dimension derivation, kept separate per this
+project's per-spoke self-contained style, living in =convert.rs= since it's
+GeoParquet-metadata-specific naming rather than a general geometry
+operation) — a mixed 2D/3D dataset within one column produces *both*
+=["Point","Point Z"]= as independent set entries, not a single file-wide
+flag, confirmed against real DuckDB-written GeoParquet =geo= metadata. The
+type-collection loop in =features_to_parquet= changed from a
+=BTreeSet<&'static str>= of bare =Geometry::type_name()= values to a
+=BTreeSet<String>= of =format!("{}{}", type_name, dim_suffix)=.
+
+*A real mistake made and then caught, worth recording as its own lesson*:
+the first version of this milestone concluded, from DuckDB's GeoParquet
+writer producing *zero* =geo= metadata for a =POINT M=/=POINT ZM= source
+(falling back to an undeclared plain BLOB column), that *"GeoParquet has no
+M representation at all"* — and shipped =geoparquet_dim_suffix= never
+emitting =" M"=/=" ZM"= on that basis. A user question ("is it that
+GeoParquet doesn't do it, or DuckDB doesn't do it?") forced actually
+checking the spec text rather than one tool's behavior: the GeoParquet spec
+(=format-specs/geoparquet.md=) explicitly defines all three suffixes —
+=" Z"= for XYZ, =" M"= for XYM, =" ZM"= for XYZM — and GDAL's own writer
+confirms it, producing =geometry_types":["Point ZM"]= for the identical
+=POINT ZM= source DuckDB silently dropped M from. *DuckDB's omission was a
+writer-specific gap, not a spec limitation* — the error was generalizing
+from one real tool's behavior to "the spec" without reading the spec text
+itself, exactly the shortcut this project's own verification discipline
+exists to catch. Fixed by fetching and reading the actual spec, then
+correcting =geoparquet_dim_suffix= to emit all three suffixes based on
+=(has_z, has_m)= rather than =has_z= alone.
+
+*Verified end-to-end through the real CLI, cross-checked against two
+independent tools, for the corrected M/ZM case specifically*: =geosetta
+zm.csv zm.parquet= (via CSV/WKT, since GeoJSON can't carry M) produces
+=geometry_types":["Point ZM"]=; both =ogrinfo -al= (=3D Measured Point=)
+and DuckDB's own =SELECT geometry FROM 'zm.parquet'= independently decode
+the WKB back as genuine =POINT ZM (-73.9857 40.7484 381 12.5)= despite
+DuckDB itself never writing that declaration — confirming the earlier M8
+finding still holds structurally: the WKB bytes are the real source of
+truth for any competent reader, =geometry_types= is purely an advisory
+summary, now a *correct* one instead of an undersold one. Round-tripped
+back through =geosetta= to CSV/WKT losslessly too.
+
+Full 3D bbox support (GeoParquet's 6-element =[xmin, ymin, zmin, xmax,
+ymax, zmax]= covering-bbox form, vs. the 4-element 2D form
+=arbitrary-geoparquet.org='s §3c work already handles) remains a follow-on,
+not required for a correct landing — a 3D file still writes/reads correctly
+with a 2D covering bbox that's simply less tight for spatial pruning
+purposes; real DuckDB/GDAL output confirms this is a real gap (their own
+bbox fields are the 6-element 3D form), just an explicitly out-of-scope one
+here.
+
+4 new tests in =convert.rs= (Z-bearing gets the suffix, mixed 2D/3D gets
+both entries, 2D-only output is unaffected — the degraded-mode bar — and an
+M/ZM test added *after* the correction that would have caught the original
+bug had it existed first). Full suite: =cargo test= 359 passed (355
+baseline + 4)/4 ignored; =--features crs-registry= 373 passed (369
+baseline + 4)/6 ignored; clippy clean both configs.
+
+*** M9 — KML (`src/kml/{reader,writer}.rs`) — *DONE (2026-08-17)*
+The smallest fix of any milestone, as predicted: =kml/reader.rs='s
+=parse_tuple= already parsed a real
+=<coordinates>lon,lat,alt</coordinates>= tuple's third number (to catch
+malformed input) and threw it away; it now returns =Position::with_z(lon,
+lat, alt)= instead of =Position::new(lon, lat)=, mirroring M3's GeoJSON
+change almost exactly. =kml/writer.rs='s =coordinates_element= gained the
+inverse: a third =,z= segment is appended when =Position::z= is =Some=, and
+omitted entirely otherwise, matching every other spoke's degraded-mode bar
+(2D output byte-identical to before).
+
+*The =<altitudeMode>= open question was resolved empirically, not guessed*:
+=ogr2ogr -f KML= and =ogr2ogr -f LIBKML=, both run fresh against a real
+3D-point GeoJSON source, emit =<coordinates>lon,lat,alt</coordinates>= with
+*no* =<altitudeMode>= element at all — confirmed directly by inspecting
+their output, not assumed from the spec. This settles the question in favor
+of the simplest option, Z-without-=altitudeMode=, because it's what this
+project's own real-tool oracle does by default, not merely the easiest
+implementation. =<altitudeMode>= itself remains unmodeled — a real
+=<Point>= that carries one on read has that element silently ignored (it
+was never read before this milestone either), same as every other
+presentation-layer KML element this crate already drops (see
+=plans/kml.org=).
+
+*Verified end-to-end through the real CLI, cross-checked against
+=ogrinfo=, both directions*: =geosetta z_in.geojson z_mid.kml= then
+=geosetta z_mid.kml z_out.geojson= round-trips a real =381= altitude
+byte-identical, and =ogrinfo -al= independently reads geosetta's own
+written KML back as genuine =POINT Z (-73.9857 40.7484 381)= geometry, not
+just geosetta agreeing with itself; feeding a real =ogr2ogr -f KML=-written
+file into geosetta and back out to GeoJSON round-trips the same altitude
+correctly in the reverse direction too.
+
+*A real, pre-existing fixture assumption corrected in the process, not
+introduced by M9*: =convert.rs='s
+=reads_a_real_gdal_libkml_networklink_kmz= test asserted 2D-only positions
+for a real =tests/fixtures/gdal_networklink.kmz= fixture (sourced from
+=ogr2ogr -f LIBKML=) that, on direct inspection of its raw
+=layers/geoms.kml= entry, turns out to already carry an explicit =,0=
+third ordinate on *every* coordinate — Point, LineString, and every
+Polygon ring — because LIBKML's own writer always emits a Z ordinate,
+defaulting to =0= when the source geometry has none. The test's assertions
+were quietly wrong (2D) for a fixture that was never actually 2D; M9
+surfacing that ordinate correctly is what exposed it. Updated to assert
+=z: Some(0.0)= throughout, which is what the real bytes always contained.
+
+Test additions: 3 new =kml::reader= tests (a 2D point still parses with no
+=z=; a =LineString='s per-point Z all round-trip; a non-numeric altitude
+errors) and 1 new =kml::writer= test (a Z-bearing point emits the third
+coordinate), plus the existing GeoJSON→KML→GeoJSON round-trip test in
+=writer.rs= now carries a Z-bearing point through its fixture rather than a
+2D one. Full suite: =cargo test= 328 passed (324 baseline + 4)/4 ignored;
+=--features crs-registry= 342 passed (338 baseline + 4)/6 ignored; clippy
+clean both configs.
+
+** TESTING
+Matching this project's established discipline everywhere else (CRS bulk
+oracles, DuckDB/GDAL-generated Shapefile/KML fixtures, pyarrow fixtures for
+GeoParquet edge cases) — no milestone should be called done on hand-built
+byte fixtures alone:
+- A real 3D GeoParquet fixture (DuckDB =ST_MakePoint(x,y,z)= or
+  =ogr2ogr -f Parquet= from a 3D source) round-tripped and diffed against
+  the source tool's own read-back (=ST_AsText=/=ogrinfo=), the same
+  oracle-verification style every other milestone in
+  [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]] used.
+- A real =PointZ=/=PolygonZ= shapefile — DuckDB's spatial extension or
+  =ogr2ogr= can both emit one, matching how the existing
+  =tests/fixtures/duckdb_*.{shp,shx,dbf,prj}= fixtures were sourced for R4.
+- A real KML file with =<coordinates>lon,lat,alt</coordinates>=, verified
+  against =ogrinfo=/=ogr2ogr -f LIBKML= reading the altitude back correctly.
+- Unit tests for the pure codec pieces (WKB Z/M encode/decode round trip,
+  Shapefile's Z/M trailing-section reader/writer) directly, mirroring the
+  project's existing per-primitive test style.
+
+** OPEN QUESTIONS
+- *WKB dimension-flag convention (ISO vs. EWKB)* — must be confirmed against
+  a real fixture before M2 starts, per M2's own note; do not guess from
+  written specs alone given this project's repeated experience of specs and
+  real writer output disagreeing in the details.
+- *M ordinate scope — resolved, both remaining gaps closed.* M6
+  (FlatGeobuf) shipped M in its own landing, since it was a free extra
+  vector once Z's mechanism existed. M7 (Shapefile) initially deferred M —
+  no real fixture seemed obtainable via this plan's usual GeoJSON sourcing,
+  since GeoJSON has no M concept — but that blocker turned out to be a
+  sourcing-method gap, not a real one: =ogr2ogr= can source from a WKT/CSV
+  column instead, and WKT natively supports =POINT M=/=POINT ZM=. Once that
+  was found, M7 got a same-day follow-up implementing *both* halves this
+  entry used to flag as open — M riding alongside Z, and the four M-only
+  shape types (=PointM=(21)/=PolyLineM=(23)/=PolygonM=(25)/
+  =MultiPointM=(28)) — oracle-verified via =ogrinfo= and, for the
+  multi-vertex shapes, DuckDB independently too. M ordinate support is now
+  complete across every implemented spoke (M6, M7). M8 (GeoParquet
+  metadata) also got M/ZM suffixes in its own landing, after an initial
+  version wrongly assumed (from DuckDB's writer alone) that GeoParquet had
+  no M vocabulary — corrected once the actual spec text was checked. M
+  ordinate support is now complete everywhere it can meaningfully exist in
+  this ecosystem; only GeoJSON (M3) and KML (M9) lack it, and both do so
+  because their own formats have no M concept at all, not because of any
+  remaining work here.
+- *Does reprojection get to touch Z? — resolved, documented (2026-08-17).*
+  Geosetta's own posture is "label, never reproject" (=crs.org=), consistent
+  with passing Z through unexamined — the question was whether the
+  =for_each_position_mut=/=for_each_position_run_mut= seam's contract should
+  say so explicitly, rather than leaving it to be discovered by a future
+  caller. Now documented directly on both methods (=geometry/mod.rs=,
+  mirrored in =feature.rs='s =FeatureCollection= wrappers): =z=/=m= are
+  handed to the callback exactly like =x=/=y=, unexamined; a purely
+  horizontal backend (=wbprojection=, the one real integration this seam has
+  today) is free to leave =z= untouched, matching Geosetta's own posture, and
+  a caller wanting a full 3D transform (e.g. a vertical-datum shift) can
+  read/rewrite =p.z= itself inside the closure — nothing in the seam
+  prevents it. =m= is never a reprojection concern at all (a
+  linear-referencing measure, not a spatial coordinate), stated so a future
+  backend author doesn't wonder whether it needs one.
+- *Breaking-change handling — resolved (2026-08-17): don't care, not yet
+  stable.* =Position= changing from =[f64; 2]= to a struct is source-breaking
+  for any external code indexing it positionally (confirmed harmless in
+  practice for =wbprojection= itself — see DESIGN). Per a direct user
+  decision, no compatibility shim (=Index<usize>=/=From<[f64;2]>=) is being
+  added, and no semver-major-bump ceremony is needed either — =geosetta=
+  hasn't reached a stable (1.0) release yet, so breaking changes to its
+  public API are an accepted, unremarkable part of pre-1.0 development, not
+  something requiring the mitigation this entry originally flagged. Revisit
+  this stance if/when the crate approaches a 1.0 release.
+- *3D bbox / GeoParquet covering-bbox column* — out of scope for the first
+  landing (see M8); revisit once basic Z round-tripping is verified.
+- *Spatial index stays 2D — explicit non-goal, not a gap.* The Hilbert
+  curve/packed-R-tree primitives in =spatial.rs= (feeding FlatGeobuf's
+  packed R-tree, =--sort-hilbert=, and GeoPackage's =--rtree=) operate on
+  2D bbox pruning; nothing about Z changes their correctness or requires
+  them to become Z-aware. Stated here so a future reader doesn't mistake
+  this for an overlooked gap.
+- *KML's =<altitudeMode>=, resolved by M9* — real =ogr2ogr -f KML=/=-f
+  LIBKML= output for a 3D point carries no =<altitudeMode>= element at all,
+  so M9 shipped Z-without-altitudeMode as its final answer, not a
+  placeholder; =<altitudeMode>= itself stays unmodeled/dropped-on-read, same
+  as KML's other presentation-layer elements.
+
+** DEPENDS ON / RELATED
+- Is [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]'s milestone
+  6a, split into its own plan because it's IR-scope, not decode-path-scope —
+  6a's own text should be updated to point here once this plan is accepted.
+- Breaks the calling contract of
+  [[file:reproject-composability.org][reproject-composability.org]]'s
+  =for_each_position_mut=/=for_each_position_run_mut= seam; the
+  =wbprojection= dev-dependency integration in =tests/reproject_pipe.rs=
+  needs updating in the same change, not as a follow-up.
+- =shapefile.org='s STATUS section already named Z/M/MultiPatch as
+  deliberately deferred at R4 time — M7 here is that deferral's payoff.
+- Explicitly does *not* touch [[file:spatial-index.org][spatial-index.org]]'s
+  Hilbert/R-tree work (see OPEN QUESTIONS' non-goal note).

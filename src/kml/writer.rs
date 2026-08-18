@@ -114,11 +114,18 @@ fn boundary_element(tag: &str, ring: &[Position]) -> XmlElement {
 fn coordinates_element(points: &[Position]) -> XmlElement {
     use std::fmt::Write;
     let mut text = String::new();
-    for (i, [lon, lat]) in points.iter().enumerate() {
+    for (i, p) in points.iter().enumerate() {
         if i > 0 {
             text.push(' ');
         }
-        let _ = write!(text, "{lon},{lat}");
+        match p.z {
+            Some(z) => {
+                let _ = write!(text, "{},{},{}", p.x, p.y, z);
+            }
+            None => {
+                let _ = write!(text, "{},{}", p.x, p.y);
+            }
+        }
     }
     XmlElement::leaf("coordinates", text)
 }
@@ -139,7 +146,7 @@ mod tests {
     #[test]
     fn writes_name_description_and_extended_data() {
         let fc = FeatureCollection::new(vec![feature(
-            Some(Geometry::Point([1.0, 2.0])),
+            Some(Geometry::Point(Position::new(1.0, 2.0))),
             vec![
                 ("name", JsonValue::String("A Point".into())),
                 ("description", JsonValue::String("desc".into())),
@@ -155,11 +162,21 @@ mod tests {
     }
 
     #[test]
+    fn writes_z_bearing_point_with_third_coordinate() {
+        let fc = FeatureCollection::new(vec![feature(
+            Some(Geometry::Point(Position::with_z(-73.9857, 40.7484, 381.0))),
+            vec![],
+        )]);
+        let text = String::from_utf8(write(&fc)).unwrap();
+        assert!(text.contains("<Point><coordinates>-73.9857,40.7484,381</coordinates></Point>"));
+    }
+
+    #[test]
     fn writes_polygon_with_hole() {
         let fc = FeatureCollection::new(vec![feature(
             Some(Geometry::Polygon(vec![
-                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
-                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 4.0), Position::new(0.0, 0.0)],
+                vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
             ])),
             vec![],
         )]);
@@ -171,7 +188,7 @@ mod tests {
     #[test]
     fn writes_multi_point_as_multi_geometry() {
         let fc = FeatureCollection::new(vec![feature(
-            Some(Geometry::MultiPoint(vec![[0.0, 0.0], [1.0, 1.0]])),
+            Some(Geometry::MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])),
             vec![],
         )]);
         let text = String::from_utf8(write(&fc)).unwrap();
@@ -183,9 +200,9 @@ mod tests {
         use crate::geojson;
         use crate::json;
         let src = r#"{"type":"FeatureCollection","features":[
-            {"type":"Feature","geometry":{"type":"Point","coordinates":[-73.9857,40.7484]},
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[-73.9857, 40.7484, 381]},
              "properties":{"name":"Empire State","height_m":381,"landmark":true}},
-            {"type":"Feature","geometry":{"type":"LineString","coordinates":[[-73.99,40.75],[-73.98,40.76]]},
+            {"type":"Feature","geometry":{"type":"LineString","coordinates":[[-73.99, 40.75],[-73.98, 40.76]]},
              "properties":{"name":"A Path"}}
         ]}"#;
         let original = geojson::from_json(&json::parse(src).unwrap()).unwrap();

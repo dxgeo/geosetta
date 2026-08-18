@@ -40,6 +40,8 @@ mod header {
     pub const NAME: usize = 0;
     pub const ENVELOPE: usize = 1;
     pub const GEOMETRY_TYPE: usize = 2;
+    pub const HAS_Z: usize = 3;
+    pub const HAS_M: usize = 4;
     pub const COLUMNS: usize = 7;
     pub const FEATURES_COUNT: usize = 8;
     pub const INDEX_NODE_SIZE: usize = 9;
@@ -65,6 +67,8 @@ mod feature {
 mod geometry {
     pub const ENDS: usize = 0;
     pub const XY: usize = 1;
+    pub const Z: usize = 2;
+    pub const M: usize = 3;
     pub const TYPE: usize = 6;
     pub const PARTS: usize = 7;
     pub const NUM_FIELDS: usize = 8;
@@ -76,13 +80,23 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     // this row's cell for each column.
     let columns = infer_columns(&fc.features);
 
-    // Bounding box and the geometry-type set across all features.
+    // Bounding box, the geometry-type set, and Z/M presence across all
+    // features (the header's `hasZ`/`hasM` are file-level hints; a source
+    // whose Z-bearing-ness varies per geometry still gets each geometry's own
+    // z/m vectors written correctly — see `dim_of_first`/`dim_of_rings`/
+    // `dim_of_geometry` below, mirroring `wkb.rs`'s per-geometry dimension
+    // derivation).
     let mut bbox = Bbox::empty();
     let mut types = std::collections::BTreeSet::new();
+    let mut has_z = false;
+    let mut has_m = false;
     for f in &fc.features {
         if let Some(g) = &f.geometry {
             g.extend_bbox(&mut bbox);
             types.insert(fgb_geometry_type(g));
+            let dim = dim_of_geometry(g);
+            has_z |= dim.0;
+            has_m |= dim.1;
         }
     }
     // A single shared type if uniform, else Unknown (per-feature type is always
@@ -121,6 +135,8 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
         &columns,
         &bbox,
         header_type,
+        has_z,
+        has_m,
         fc.features.len() as u64,
         node_size,
         fc.crs.as_ref(),
@@ -139,10 +155,13 @@ fn feature_bbox(f: &crate::feature::Feature) -> Bbox {
     f.geometry.as_ref().map(|g| g.bbox()).unwrap_or_else(Bbox::empty)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_header(
     columns: &[crate::schema::Column],
     bbox: &Bbox,
     header_type: u8,
+    has_z: bool,
+    has_m: bool,
     features_count: u64,
     node_size: u16,
     crs: Option<&crate::crs::Crs>,
@@ -172,6 +191,8 @@ fn build_header(
         b.add_offset(header::ENVELOPE, env);
     }
     b.add_u8(header::GEOMETRY_TYPE, header_type, gtype::UNKNOWN);
+    b.add_u8(header::HAS_Z, has_z as u8, 0);
+    b.add_u8(header::HAS_M, has_m as u8, 0);
     b.add_offset(header::COLUMNS, columns_vec);
     b.add_u64(header::FEATURES_COUNT, features_count, 0);
     // Default index_node_size is 16, so an indexed file (16) omits the field and
@@ -240,22 +261,30 @@ fn build_feature(geom: Option<&Geometry>, columns: &[crate::schema::Column], row
 }
 
 /// Encode a geometry into a Geometry table, returning its rev-offset. Children
-/// (xy / ends / parts) are built before the table.
+/// (xy / z / m / ends / parts) are built before the table.
 fn encode_geometry(b: &mut Builder, g: &Geometry) -> usize {
     let ty = fgb_geometry_type(g);
     match g {
         Geometry::Point(p) => {
-            let xy = b.create_f64_vector(&[p[0], p[1]]);
-            geom_table(b, ty, None, Some(xy), None)
+            let xy = b.create_f64_vector(&[p.x, p.y]);
+            let z = p.z.map(|z| b.create_f64_vector(&[z]));
+            let m = p.m.map(|m| b.create_f64_vector(&[m]));
+            geom_table(b, ty, None, Some(xy), None, z, m)
         }
         Geometry::LineString(ps) | Geometry::MultiPoint(ps) => {
             let xy = b.create_f64_vector(&flatten(ps));
-            geom_table(b, ty, None, Some(xy), None)
+            let dim = dim_of_first(ps);
+            let z = dim.0.then(|| b.create_f64_vector(&flatten_z(ps)));
+            let m = dim.1.then(|| b.create_f64_vector(&flatten_m(ps)));
+            geom_table(b, ty, None, Some(xy), None, z, m)
         }
         Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
             let xy = b.create_f64_vector(&flatten_rings(rings));
             let ends = (rings.len() > 1).then(|| b.create_u32_vector(&ring_ends(rings)));
-            geom_table(b, ty, ends, Some(xy), None)
+            let dim = dim_of_rings(rings);
+            let z = dim.0.then(|| b.create_f64_vector(&flatten_rings_z(rings)));
+            let m = dim.1.then(|| b.create_f64_vector(&flatten_rings_m(rings)));
+            geom_table(b, ty, ends, Some(xy), None, z, m)
         }
         Geometry::MultiPolygon(polys) => {
             let part_offsets: Vec<usize> = polys
@@ -263,26 +292,32 @@ fn encode_geometry(b: &mut Builder, g: &Geometry) -> usize {
                 .map(|rings| {
                     let xy = b.create_f64_vector(&flatten_rings(rings));
                     let ends = (rings.len() > 1).then(|| b.create_u32_vector(&ring_ends(rings)));
-                    geom_table(b, gtype::POLYGON, ends, Some(xy), None)
+                    let dim = dim_of_rings(rings);
+                    let z = dim.0.then(|| b.create_f64_vector(&flatten_rings_z(rings)));
+                    let m = dim.1.then(|| b.create_f64_vector(&flatten_rings_m(rings)));
+                    geom_table(b, gtype::POLYGON, ends, Some(xy), None, z, m)
                 })
                 .collect();
             let parts = b.create_offset_vector(&part_offsets);
-            geom_table(b, ty, None, None, Some(parts))
+            geom_table(b, ty, None, None, Some(parts), None, None)
         }
         Geometry::GeometryCollection(geoms) => {
             let part_offsets: Vec<usize> = geoms.iter().map(|g| encode_geometry(b, g)).collect();
             let parts = b.create_offset_vector(&part_offsets);
-            geom_table(b, ty, None, None, Some(parts))
+            geom_table(b, ty, None, None, Some(parts), None, None)
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn geom_table(
     b: &mut Builder,
     ty: u8,
     ends: Option<usize>,
     xy: Option<usize>,
     parts: Option<usize>,
+    z: Option<usize>,
+    m: Option<usize>,
 ) -> usize {
     b.start_table(geometry::NUM_FIELDS);
     b.add_u8(geometry::TYPE, ty, gtype::UNKNOWN);
@@ -291,6 +326,12 @@ fn geom_table(
     }
     if let Some(xy) = xy {
         b.add_offset(geometry::XY, xy);
+    }
+    if let Some(z) = z {
+        b.add_offset(geometry::Z, z);
+    }
+    if let Some(m) = m {
+        b.add_offset(geometry::M, m);
     }
     if let Some(p) = parts {
         b.add_offset(geometry::PARTS, p);
@@ -344,11 +385,71 @@ fn fgb_column_type(ty: ColumnType) -> u8 {
 }
 
 fn flatten(ps: &[Position]) -> Vec<f64> {
-    ps.iter().flat_map(|p| [p[0], p[1]]).collect()
+    ps.iter().flat_map(|p| [p.x, p.y]).collect()
 }
 
 fn flatten_rings(rings: &[Vec<Position>]) -> Vec<f64> {
     rings.iter().flat_map(|r| flatten(r)).collect()
+}
+
+/// A position list's `z`/`m` values, in the same order as `flatten`'s `xy`.
+/// FlatGeobuf's `z`/`m` vectors have no per-point "no data" marker (unlike
+/// Shapefile's M sentinel), so a position that lacks the ordinate a
+/// Z/M-bearing geometry declares falls back to `0.0` — the same choice
+/// `wkb.rs`'s encoder makes for the same reason.
+fn flatten_z(ps: &[Position]) -> Vec<f64> {
+    ps.iter().map(|p| p.z.unwrap_or(0.0)).collect()
+}
+
+fn flatten_m(ps: &[Position]) -> Vec<f64> {
+    ps.iter().map(|p| p.m.unwrap_or(0.0)).collect()
+}
+
+fn flatten_rings_z(rings: &[Vec<Position>]) -> Vec<f64> {
+    rings.iter().flat_map(|r| flatten_z(r)).collect()
+}
+
+fn flatten_rings_m(rings: &[Vec<Position>]) -> Vec<f64> {
+    rings.iter().flat_map(|r| flatten_m(r)).collect()
+}
+
+/// The dimensionality implied by a position list's first element (or 2D if
+/// empty), returned as `(has_z, has_m)` — used to pick one z/m-presence
+/// decision for an entire `LineString`/`MultiPoint`/ring list, matching how
+/// `wkb.rs`'s `dim_of_first` declares dimensionality once per geometry
+/// rather than per point. Kept as an independent copy in this module rather
+/// than shared, matching every other format spoke's self-contained style.
+fn dim_of_first(ps: &[Position]) -> (bool, bool) {
+    ps.first().map(|p| (p.z.is_some(), p.m.is_some())).unwrap_or((false, false))
+}
+
+/// The dimensionality implied by a ring list's first position (its first
+/// ring's first point), or 2D if empty.
+fn dim_of_rings(rings: &[Vec<Position>]) -> (bool, bool) {
+    rings.first().map(|r| dim_of_first(r)).unwrap_or((false, false))
+}
+
+/// The dimensionality of a geometry's very first position, found by
+/// recursing into whichever variant it is — used for the file-level
+/// `hasZ`/`hasM` header hint (each geometry's own z/m vectors are still
+/// derived independently in `encode_geometry`, so a per-feature dimension
+/// mismatch never loses data, only the header's summary hint).
+fn dim_of_geometry(g: &Geometry) -> (bool, bool) {
+    first_position(g).map(|p| (p.z.is_some(), p.m.is_some())).unwrap_or((false, false))
+}
+
+fn first_position(g: &Geometry) -> Option<Position> {
+    match g {
+        Geometry::Point(p) => Some(*p),
+        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => ps.first().copied(),
+        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
+            rings.first().and_then(|r| r.first()).copied()
+        }
+        Geometry::MultiPolygon(polys) => {
+            polys.first().and_then(|p| p.first()).and_then(|r| r.first()).copied()
+        }
+        Geometry::GeometryCollection(geoms) => geoms.first().and_then(first_position),
+    }
 }
 
 /// Cumulative point counts marking the end of each ring/line.
@@ -481,7 +582,7 @@ mod tests {
         // computed and skipped; a correct round trip proves that sizing.
         let features: Vec<Feature> = (0..50)
             .map(|i| Feature {
-                geometry: Some(Geometry::Point([(i % 10) as f64, (i / 10) as f64])),
+                geometry: Some(Geometry::Point(Position::new((i % 10) as f64, (i / 10) as f64))),
                 properties: vec![(
                     "id".into(),
                     JsonValue::Number { value: i as f64, is_int: true },
@@ -502,9 +603,104 @@ mod tests {
         assert_eq!(ids, (0..50).collect::<Vec<_>>());
     }
 
+    #[test]
+    fn z_bearing_point_round_trips() {
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::with_z(1.0, 2.0, 381.0))),
+            properties: vec![],
+        }]);
+        let bytes = write(&fc);
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 381.0))));
+    }
+
+    #[test]
+    fn zm_bearing_line_string_round_trips() {
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::LineString(vec![
+                Position::with_zm(0.0, 0.0, 1.0, 10.0),
+                Position::with_zm(1.0, 1.0, 2.0, 20.0),
+            ])),
+            properties: vec![],
+        }]);
+        let bytes = write(&fc);
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+        assert_eq!(
+            back.features[0].geometry,
+            Some(Geometry::LineString(vec![
+                Position::with_zm(0.0, 0.0, 1.0, 10.0),
+                Position::with_zm(1.0, 1.0, 2.0, 20.0),
+            ]))
+        );
+    }
+
+    #[test]
+    fn z_bearing_polygon_with_hole_round_trips() {
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Polygon(vec![
+                vec![
+                    Position::with_z(0.0, 0.0, 1.0),
+                    Position::with_z(4.0, 0.0, 1.0),
+                    Position::with_z(4.0, 4.0, 1.0),
+                    Position::with_z(0.0, 4.0, 1.0),
+                    Position::with_z(0.0, 0.0, 1.0),
+                ],
+                vec![
+                    Position::with_z(1.0, 1.0, 2.0),
+                    Position::with_z(2.0, 1.0, 2.0),
+                    Position::with_z(2.0, 2.0, 2.0),
+                    Position::with_z(1.0, 2.0, 2.0),
+                    Position::with_z(1.0, 1.0, 2.0),
+                ],
+            ])),
+            properties: vec![],
+        }]);
+        let bytes = write(&fc);
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+        assert_eq!(back.features[0].geometry, fc.features[0].geometry);
+    }
+
+    #[test]
+    fn z_bearing_multipolygon_round_trips_independent_part_dimensionality() {
+        // Each MultiPolygon part derives its own z-presence independently
+        // (mirroring wkb.rs's per-part dimension derivation) — one part is
+        // Z-bearing, the other stays 2D.
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::MultiPolygon(vec![
+                vec![vec![
+                    Position::with_z(0.0, 0.0, 5.0),
+                    Position::with_z(1.0, 0.0, 5.0),
+                    Position::with_z(1.0, 1.0, 5.0),
+                    Position::with_z(0.0, 0.0, 5.0),
+                ]],
+                vec![vec![
+                    Position::new(5.0, 5.0),
+                    Position::new(6.0, 5.0),
+                    Position::new(6.0, 6.0),
+                    Position::new(5.0, 5.0),
+                ]],
+            ])),
+            properties: vec![],
+        }]);
+        let bytes = write(&fc);
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+        assert_eq!(back.features[0].geometry, fc.features[0].geometry);
+    }
+
+    #[test]
+    fn a_2d_point_writes_no_z_or_m_vector() {
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![],
+        }]);
+        let bytes = write(&fc);
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
+    }
+
     fn one_point(crs: Option<crate::crs::Crs>) -> FeatureCollection {
         let mut fc = FeatureCollection::new(vec![Feature {
-            geometry: Some(Geometry::Point([1.0, 2.0])),
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
         }]);
         fc.crs = crs;

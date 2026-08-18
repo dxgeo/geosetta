@@ -9,7 +9,7 @@ use std::rc::Rc;
 use crate::format::Format;
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
-use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox};
+use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox, Geometry, Position};
 use crate::{csv, flatgeobuf, geojson, kml, parquet};
 // `json` is only needed by the test helpers below (the read path streams
 // GeoJSON directly rather than through a JsonValue tree).
@@ -120,24 +120,82 @@ fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
     // Property columns (schema inferred by scanning all features).
     let columns = crate::schema::infer_columns(&fc.features);
 
-    // Geometry column: WKB per feature, plus bbox and the set of types.
+    // Geometry column: WKB per feature, plus bbox and the set of types. Each
+    // type name carries GeoParquet's own `" Z"`/`" M"`/`" ZM"` suffix per the
+    // spec (M8) — derived per-geometry, not file-wide, since a mixed
+    // 2D/3D dataset needs *both* "Point" and "Point Z" as independent set
+    // entries (confirmed against real DuckDB-written GeoParquet `geo`
+    // metadata for the Z case, and GDAL's for M/ZM, before implementing).
     let mut bbox = Bbox::empty();
-    let mut types: BTreeSet<&'static str> = BTreeSet::new();
+    let mut types: BTreeSet<String> = BTreeSet::new();
     let mut geometry: Vec<Option<Vec<u8>>> = Vec::with_capacity(fc.features.len());
     for feature in &fc.features {
         match &feature.geometry {
             Some(g) => {
                 g.extend_bbox(&mut bbox);
-                types.insert(g.type_name());
+                types.insert(format!("{}{}", g.type_name(), geoparquet_dim_suffix(g)));
                 geometry.push(Some(to_wkb(g)));
             }
             None => geometry.push(None),
         }
     }
 
-    let type_names: Vec<String> = types.into_iter().map(String::from).collect();
+    let type_names: Vec<String> = types.into_iter().collect();
     let geo = parquet::geo_metadata(&type_names, &bbox, fc.crs.as_ref());
     parquet::write_geoparquet(&columns, &geometry, &geo)
+}
+
+/// GeoParquet's own `geometry_types` dimensionality suffix: `" Z"`, `" M"`,
+/// or `" ZM"` per the geometry's first position, empty for plain 2D —
+/// mirroring `wkb.rs`'s own `dim_of_first`/`first_position` convention
+/// (kept as an independent copy here, matching every other format spoke's
+/// self-contained style, since this is GeoParquet-metadata-specific naming,
+/// not a general geometry operation).
+///
+/// *Correction, 2026-08-17*: an earlier version of this function never
+/// emitted `" M"`/`" ZM"`, reasoning from DuckDB's GeoParquet writer
+/// producing *no* `geo` metadata at all for a `POINT M`/`POINT ZM` source
+/// and concluding the *spec* had no M vocabulary. That was wrong — the
+/// GeoParquet spec text itself defines all three suffixes explicitly
+/// (`" Z"`/`" M"`/`" ZM"`), and GDAL's own writer confirms it, producing
+/// `"geometry_types":["Point ZM"]` for the identical source. DuckDB's
+/// omission was a writer-specific gap, not a spec limitation — generalizing
+/// from one tool's behavior to "the spec" without reading the spec text was
+/// the mistake; fixed by checking the actual spec
+/// (=raw.githubusercontent.com/opengeospatial/geoparquet/main/format-specs/geoparquet.md=)
+/// rather than inferring it from DuckDB alone.
+fn geoparquet_dim_suffix(g: &Geometry) -> &'static str {
+    let (z, m) = geoparquet_first_position_dim(g);
+    match (z, m) {
+        (true, true) => " ZM",
+        (true, false) => " Z",
+        (false, true) => " M",
+        (false, false) => "",
+    }
+}
+
+fn geoparquet_first_position_dim(g: &Geometry) -> (bool, bool) {
+    fn dim(p: Position) -> (bool, bool) {
+        (p.z.is_some(), p.m.is_some())
+    }
+    match g {
+        Geometry::Point(p) => dim(*p),
+        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => {
+            ps.first().map(|p| dim(*p)).unwrap_or((false, false))
+        }
+        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
+            rings.first().and_then(|r| r.first()).map(|p| dim(*p)).unwrap_or((false, false))
+        }
+        Geometry::MultiPolygon(polys) => polys
+            .first()
+            .and_then(|p| p.first())
+            .and_then(|r| r.first())
+            .map(|p| dim(*p))
+            .unwrap_or((false, false)),
+        Geometry::GeometryCollection(geoms) => {
+            geoms.first().map(geoparquet_first_position_dim).unwrap_or((false, false))
+        }
+    }
 }
 
 /// GeoParquet bytes → Feature IR.
@@ -188,6 +246,7 @@ fn geoparquet_to_geojson(bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Position;
 
     const SAMPLE: &str = r#"{
         "type": "FeatureCollection",
@@ -196,10 +255,10 @@ mod tests {
              "geometry": {"type": "Point", "coordinates": [-73.9857, 40.7484]},
              "properties": {"name": "Empire State", "height_m": 381, "landmark": true, "rating": 4.7}},
             {"type": "Feature",
-             "geometry": {"type": "LineString", "coordinates": [[-73.99,40.75],[-73.98,40.76]]},
+             "geometry": {"type": "LineString", "coordinates": [[-73.99, 40.75],[-73.98, 40.76]]},
              "properties": {"name": "A Path", "landmark": false, "rating": 3.2}},
             {"type": "Feature",
-             "geometry": {"type": "Polygon", "coordinates": [[[-74,40.7],[-73.95,40.7],[-73.95,40.75],[-74,40.7]]]},
+             "geometry": {"type": "Polygon", "coordinates": [[[-74,40.7],[-73.95, 40.7],[-73.95, 40.75],[-74,40.7]]]},
              "properties": {"name": "A Zone", "height_m": 12, "rating": 5}},
             {"type": "Feature",
              "geometry": {"type": "Point", "coordinates": [-73.968, 40.7851]},
@@ -217,7 +276,7 @@ mod tests {
         // Geometry survives the WKB round trip.
         assert_eq!(
             fc.features[0].geometry,
-            Some(crate::geometry::Geometry::Point([-73.9857, 40.7484]))
+            Some(crate::geometry::Geometry::Point(Position::new(-73.9857, 40.7484)))
         );
         // A present string property, including non-ASCII.
         let cafe = &fc.features[3];
@@ -266,7 +325,7 @@ mod tests {
             let g = (i % 4) as f64;
             assert_eq!(
                 f.geometry,
-                Some(crate::geometry::Geometry::Point([g, g * 2.0]))
+                Some(crate::geometry::Geometry::Point(Position::new(g, g * 2.0)))
             );
         }
     }
@@ -341,7 +400,7 @@ mod tests {
             assert_eq!(prop(f, "f32").as_f64(), Some((i as f32 * 1.25) as f64));
             assert_eq!(
                 f.geometry,
-                Some(crate::geometry::Geometry::Point([i as f64, (i * 2) as f64]))
+                Some(crate::geometry::Geometry::Point(Position::new(i as f64, (i * 2) as f64)))
             );
         }
     }
@@ -380,7 +439,7 @@ mod tests {
             assert_eq!(prop(f, "raw4").as_str(), Some(raw), "row {i} raw4");
             assert_eq!(
                 f.geometry,
-                Some(crate::geometry::Geometry::Point([i as f64, i as f64 * 2.0])),
+                Some(crate::geometry::Geometry::Point(Position::new(i as f64, i as f64 * 2.0))),
                 "row {i} geometry"
             );
         }
@@ -430,7 +489,7 @@ mod tests {
             }
             assert_eq!(
                 f.geometry,
-                Some(crate::geometry::Geometry::Point([i as f64, i as f64 * 2.0])),
+                Some(crate::geometry::Geometry::Point(Position::new(i as f64, i as f64 * 2.0))),
                 "row {i} geometry"
             );
         }
@@ -464,7 +523,7 @@ mod tests {
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
-        let expected = [("a", [1.5, 2.5]), ("b", [3.5, 4.5]), ("c", [-5.25, 10.75])];
+        let expected = [("a", Position::new(1.5, 2.5)), ("b", Position::new(3.5, 4.5)), ("c", Position::new(-5.25, 10.75))];
         for (f, (name, coords)) in fc.features.iter().zip(expected) {
             assert_eq!(prop(f, "name").as_str(), Some(name));
             assert_eq!(f.geometry, Some(crate::geometry::Geometry::Point(coords)));
@@ -490,7 +549,7 @@ mod tests {
             }
             other => panic!("expected EPSG:3857 recovered from the native logicalType, got {other:?}"),
         }
-        assert_eq!(fc.features[0].geometry, Some(crate::geometry::Geometry::Point([1.5, 2.5])));
+        assert_eq!(fc.features[0].geometry, Some(crate::geometry::Geometry::Point(Position::new(1.5, 2.5))));
     }
 
     fn fgb_to_fc(bytes: &[u8]) -> FeatureCollection {
@@ -512,22 +571,40 @@ mod tests {
                 .clone()
                 .unwrap()
         };
-        assert_eq!(by_id(1), LineString(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]));
+        assert_eq!(by_id(1), LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, 0.0)]));
         assert_eq!(
             by_id(2),
             Polygon(vec![
-                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
-                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 4.0), Position::new(0.0, 0.0)],
+                vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
             ])
         );
         assert_eq!(
             by_id(3),
             MultiPolygon(vec![
-                vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
-                vec![vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 5.0]]],
+                vec![vec![Position::new(0.0, 0.0), Position::new(1.0, 0.0), Position::new(1.0, 1.0), Position::new(0.0, 0.0)]],
+                vec![vec![Position::new(5.0, 5.0), Position::new(6.0, 5.0), Position::new(6.0, 6.0), Position::new(5.0, 5.0)]],
             ])
         );
-        assert_eq!(by_id(4), MultiPoint(vec![[0.0, 0.0], [1.0, 1.0]]));
+        assert_eq!(by_id(4), MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)]));
+    }
+
+    #[test]
+    fn reads_a_real_gdal_flatgeobuf_z_fixture() {
+        use crate::geometry::Geometry::LineString;
+        // `ogr2ogr -f FlatGeobuf` output for a real 3D LineString, confirmed
+        // via `ogrinfo -al` to read back as `LINESTRING Z (0 0 1,1 1 2,2 0 3)`
+        // before trusting the fixture (see M6 of `plans/zm-geometry.org`).
+        let fc = fgb_to_fc(include_bytes!("../tests/fixtures/gdal_linestring_z.fgb"));
+        assert_eq!(fc.features.len(), 1);
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(LineString(vec![
+                Position::with_z(0.0, 0.0, 1.0),
+                Position::with_z(1.0, 1.0, 2.0),
+                Position::with_z(2.0, 0.0, 3.0),
+            ]))
+        );
     }
 
     #[test]
@@ -542,7 +619,7 @@ mod tests {
         assert_eq!(prop("label").as_str(), Some("alpha"));
         assert_eq!(prop("score").as_f64(), Some(1.5));
         assert_eq!(prop("ok"), crate::json::JsonValue::Bool(true));
-        assert_eq!(feat.geometry, Some(crate::geometry::Geometry::Point([-73.9, 40.7])));
+        assert_eq!(feat.geometry, Some(crate::geometry::Geometry::Point(Position::new(-73.9, 40.7))));
     }
 
     #[test]
@@ -603,7 +680,7 @@ mod tests {
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point([10.0, 20.0])));
+        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(10.0, 20.0))));
         assert_eq!(prop(&fc.features[0], "population").as_f64(), Some(120000.0));
         assert_eq!(prop(&fc.features[0], "capital"), crate::json::JsonValue::Bool(true));
         // Quoted field with an embedded comma.
@@ -633,15 +710,79 @@ mod tests {
     fn hilbert_reorder_preserves_the_feature_set() {
         use crate::geometry::Geometry::Point;
         let mut fc = FeatureCollection::new(vec![
-            Feature { geometry: Some(Point([100.0, 100.0])), properties: vec![] },
-            Feature { geometry: Some(Point([0.0, 0.0])), properties: vec![] },
-            Feature { geometry: Some(Point([1.0, 1.0])), properties: vec![] },
+            Feature { geometry: Some(Point(Position::new(100.0, 100.0))), properties: vec![] },
+            Feature { geometry: Some(Point(Position::new(0.0, 0.0))), properties: vec![] },
+            Feature { geometry: Some(Point(Position::new(1.0, 1.0))), properties: vec![] },
         ]);
         let before = sorted_geoms(&fc);
         reorder_hilbert(&mut fc);
         assert_eq!(sorted_geoms(&fc), before); // same set, reordered
         // The far point ends up last; the origin cluster is first.
-        assert_eq!(fc.features.last().unwrap().geometry, Some(Point([100.0, 100.0])));
+        assert_eq!(fc.features.last().unwrap().geometry, Some(Point(Position::new(100.0, 100.0))));
+    }
+
+    #[test]
+    fn geoparquet_z_bearing_point_gets_the_z_suffix_in_geometry_types() {
+        // M8: confirmed against real DuckDB-written GeoParquet
+        // (`parquet_kv_metadata`) before implementing — `POINT Z` produces
+        // `"geometry_types":["Point Z"]`, not the bare `"Point"` this crate
+        // wrote before M8.
+        let doc = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0,3.0]},"properties":{}}
+        ]}"#;
+        let pq = geojson_to_geoparquet(doc).unwrap();
+        let text = String::from_utf8_lossy(&pq);
+        assert!(text.contains("\"geometry_types\":[\"Point Z\"]"), "missing Z-suffixed geometry_types");
+    }
+
+    #[test]
+    fn geoparquet_mixed_2d_and_3d_points_get_both_type_entries() {
+        // Confirmed against real DuckDB output: a mixed-dimensionality
+        // dataset gets *both* "Point" and "Point Z" as independent set
+        // entries, not a single file-wide flag — this is derived
+        // per-geometry, matching that real-world behavior.
+        let doc = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}},
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0,3.0]},"properties":{}}
+        ]}"#;
+        let pq = geojson_to_geoparquet(doc).unwrap();
+        let text = String::from_utf8_lossy(&pq);
+        assert!(text.contains("\"geometry_types\":[\"Point\",\"Point Z\"]"), "expected both dimensionalities listed");
+    }
+
+    #[test]
+    fn geoparquet_2d_only_point_gets_no_suffix() {
+        // Degraded-mode bar: 2D-only output is unaffected by M8.
+        let doc = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[1.0,2.0]},"properties":{}}
+        ]}"#;
+        let pq = geojson_to_geoparquet(doc).unwrap();
+        let text = String::from_utf8_lossy(&pq);
+        assert!(text.contains("\"geometry_types\":[\"Point\"]"));
+        assert!(!text.contains("Point Z"));
+    }
+
+    #[test]
+    fn geoparquet_m_and_zm_geometries_get_the_correct_suffix() {
+        // GeoJSON can't carry M, so this constructs the Feature IR directly
+        // rather than parsing GeoJSON. Confirmed against real GDAL-written
+        // GeoParquet before implementing (`ogr2ogr -f Parquet` from a
+        // `POINT ZM` WKT source produces `"geometry_types":["Point ZM"]`) —
+        // this test would have caught the earlier bug where M/ZM were never
+        // suffixed at all.
+        let fc = FeatureCollection::new(vec![
+            Feature {
+                geometry: Some(crate::geometry::Geometry::Point(Position::with_m(1.0, 2.0, 5.0))),
+                properties: vec![],
+            },
+            Feature {
+                geometry: Some(crate::geometry::Geometry::Point(Position::with_zm(3.0, 4.0, 5.0, 6.0))),
+                properties: vec![],
+            },
+        ]);
+        let pq = features_to_parquet(&fc);
+        let text = String::from_utf8_lossy(&pq);
+        assert!(text.contains("\"geometry_types\":[\"Point M\",\"Point ZM\"]"), "{text}");
     }
 
     #[test]
@@ -684,7 +825,7 @@ mod tests {
         // though neither format is the source: authority+code is the portable
         // token both speak.
         let mut src = FeatureCollection::new(vec![Feature {
-            geometry: Some(crate::geometry::Geometry::Point([1.0, 2.0])),
+            geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
         }]);
         src.crs = Some(Crs::Named(NamedCrs {
@@ -741,7 +882,7 @@ mod tests {
         // survives to every authority+code target — here FlatGeobuf -> Parquet.
         let wkt = "GEOGCRS[\"GDA2020\",DATUM[\"GDA2020\",ELLIPSOID[\"GRS 1980\",6378137,298.257222101,ID[\"EPSG\",7019]]],CS[ellipsoidal,2],ID[\"EPSG\",7844]]";
         let mut fc = FeatureCollection::new(vec![Feature {
-            geometry: Some(crate::geometry::Geometry::Point([1.0, 2.0])),
+            geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
         }]);
         fc.crs = Some(Crs::Named(NamedCrs {
@@ -791,7 +932,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(fc.features.len(), 1);
-        assert_eq!(fc.features[0].geometry, Some(Point([1.5, 2.5])));
+        assert_eq!(fc.features[0].geometry, Some(Point(Position::new(1.5, 2.5))));
         let prop = |k: &str| {
             fc.features[0].properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
@@ -812,8 +953,8 @@ mod tests {
         assert_eq!(
             fc.features[0].geometry,
             Some(MultiLineString(vec![
-                vec![[0.0, 0.0], [1.0, 0.0]],
-                vec![[5.0, 5.0], [6.0, 6.0], [7.0, 5.0]],
+                vec![Position::new(0.0, 0.0), Position::new(1.0, 0.0)],
+                vec![Position::new(5.0, 5.0), Position::new(6.0, 6.0), Position::new(7.0, 5.0)],
             ]))
         );
     }
@@ -828,7 +969,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![[0.0, 0.0], [1.0, 1.0], [2.0, -1.0]])));
+        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, -1.0)])));
     }
 
     #[test]
@@ -844,8 +985,8 @@ mod tests {
         assert_eq!(
             fc.features[0].geometry,
             Some(Polygon(vec![
-                vec![[0.0, 0.0], [0.0, 4.0], [4.0, 4.0], [4.0, 0.0], [0.0, 0.0]],
-                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(0.0, 4.0), Position::new(4.0, 4.0), Position::new(4.0, 0.0), Position::new(0.0, 0.0)],
+                vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
             ]))
         );
     }
@@ -863,18 +1004,183 @@ mod tests {
         assert_eq!(
             fc.features[0].geometry,
             Some(MultiPolygon(vec![
-                vec![vec![[0.0, 0.0], [0.0, 1.0], [1.0, 1.0], [1.0, 0.0], [0.0, 0.0]]],
-                vec![vec![[5.0, 5.0], [5.0, 6.0], [6.0, 6.0], [6.0, 5.0], [5.0, 5.0]]],
+                vec![vec![Position::new(0.0, 0.0), Position::new(0.0, 1.0), Position::new(1.0, 1.0), Position::new(1.0, 0.0), Position::new(0.0, 0.0)]],
+                vec![vec![Position::new(5.0, 5.0), Position::new(5.0, 6.0), Position::new(6.0, 6.0), Position::new(6.0, 5.0), Position::new(5.0, 5.0)]],
             ]))
+        );
+    }
+
+    #[test]
+    fn reads_a_real_gdal_point_z_shapefile() {
+        // `ogr2ogr -f "ESRI Shapefile"` output for a real 3D point, confirmed
+        // via `ogrinfo -al` (`POINT Z (-73.9857 40.7484 381)`) and by
+        // hand-decoding the raw record bytes before trusting the fixture
+        // (see M7 of `plans/zm-geometry.org`) — PointZ has no bbox/Z-range
+        // fields at all (unlike PolyLineZ/PolygonZ/MultiPointZ below), a
+        // genuinely different record shape worth its own real fixture.
+        use crate::geometry::Geometry::Point;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/gdal_point_z.shp"),
+            include_bytes!("../tests/fixtures/gdal_point_z.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fc.features[0].geometry, Some(Point(Position::with_z(-73.9857, 40.7484, 381.0))));
+    }
+
+    #[test]
+    fn reads_a_real_gdal_polygon_z_shapefile() {
+        // Same sourcing/verification method as above, for a PolygonZ with a
+        // hole — exercises the shared numParts/numPoints/Z-array path
+        // `read_parts(.., true)` also uses for PolyLineZ.
+        use crate::geometry::Geometry::Polygon;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/gdal_polygon_z.shp"),
+            include_bytes!("../tests/fixtures/gdal_polygon_z.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(Polygon(vec![
+                vec![
+                    Position::with_z(0.0, 0.0, 1.0),
+                    Position::with_z(0.0, 4.0, 1.0),
+                    Position::with_z(4.0, 4.0, 1.0),
+                    Position::with_z(4.0, 0.0, 1.0),
+                    Position::with_z(0.0, 0.0, 1.0),
+                ],
+                vec![
+                    Position::with_z(1.0, 1.0, 2.0),
+                    Position::with_z(2.0, 1.0, 2.0),
+                    Position::with_z(2.0, 2.0, 2.0),
+                    Position::with_z(1.0, 2.0, 2.0),
+                    Position::with_z(1.0, 1.0, 2.0),
+                ],
+            ]))
+        );
+    }
+
+    #[test]
+    fn reads_a_real_gdal_point_m_shapefile() {
+        // `ogr2ogr -f "ESRI Shapefile"` output from a `POINT M (1 2 5)` WKT
+        // source (via a CSV with a `wkt` column, GDAL's `GEOM_POSSIBLE_NAMES`
+        // option) — confirmed via `ogrinfo -al` ("Measured Point") and by
+        // hand-decoding the raw record bytes (shape type 21, content
+        // type+X+Y+M, no Z field at all) before trusting the fixture.
+        use crate::geometry::Geometry::Point;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/gdal_point_m.shp"),
+            include_bytes!("../tests/fixtures/gdal_point_m.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fc.features[0].geometry, Some(Point(Position::with_m(1.0, 2.0, 5.0))));
+    }
+
+    #[test]
+    fn reads_a_real_gdal_point_zm_shapefile() {
+        // Same sourcing method, from `POINT ZM (-73.9857 40.7484 381 12.5)`
+        // — confirmed via `ogrinfo -al` ("3D Measured Point") that M rides
+        // alongside Z on shape type 11 (`PointZ`), not a separate code.
+        use crate::geometry::Geometry::Point;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/gdal_point_zm.shp"),
+            include_bytes!("../tests/fixtures/gdal_point_zm.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(fc.features[0].geometry, Some(Point(Position::with_zm(-73.9857, 40.7484, 381.0, 12.5))));
+    }
+
+    #[test]
+    fn reads_a_real_gdal_linestring_zm_shapefile() {
+        // From `LINESTRING ZM (0 0 1 10, 1 1 2 20, 2 0 3 30)` — confirmed via
+        // both `ogrinfo -al` ("3D Measured Line String") and DuckDB's
+        // `ST_AsText(ST_Read(...))` reading the same fixture back
+        // byte-identical before trusting it.
+        use crate::geometry::Geometry::LineString;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/gdal_linestring_zm.shp"),
+            include_bytes!("../tests/fixtures/gdal_linestring_zm.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(LineString(vec![
+                Position::with_zm(0.0, 0.0, 1.0, 10.0),
+                Position::with_zm(1.0, 1.0, 2.0, 20.0),
+                Position::with_zm(2.0, 0.0, 3.0, 30.0),
+            ]))
+        );
+    }
+
+    #[test]
+    fn reads_a_real_gdal_polygon_zm_shapefile() {
+        // From `POLYGON ZM ((0 0 1 10, 0 4 1 11, 4 4 1 12, 4 0 1 13, 0 0 1
+        // 10),(1 1 2 20, 2 1 2 21, 2 2 2 22, 1 2 2 23, 1 1 2 20))` —
+        // exercises both a shell and a hole carrying independent Z and M
+        // ranges together, hand-decoded before trusting the fixture.
+        use crate::geometry::Geometry::Polygon;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/gdal_polygon_zm.shp"),
+            include_bytes!("../tests/fixtures/gdal_polygon_zm.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(Polygon(vec![
+                vec![
+                    Position::with_zm(0.0, 0.0, 1.0, 10.0),
+                    Position::with_zm(0.0, 4.0, 1.0, 11.0),
+                    Position::with_zm(4.0, 4.0, 1.0, 12.0),
+                    Position::with_zm(4.0, 0.0, 1.0, 13.0),
+                    Position::with_zm(0.0, 0.0, 1.0, 10.0),
+                ],
+                vec![
+                    Position::with_zm(1.0, 1.0, 2.0, 20.0),
+                    Position::with_zm(2.0, 1.0, 2.0, 21.0),
+                    Position::with_zm(2.0, 2.0, 2.0, 22.0),
+                    Position::with_zm(1.0, 2.0, 2.0, 23.0),
+                    Position::with_zm(1.0, 1.0, 2.0, 20.0),
+                ],
+            ]))
+        );
+    }
+
+    #[test]
+    fn reads_a_real_gdal_multipoint_zm_shapefile() {
+        // From `MULTIPOINT ZM ((0 0 1 10), (1 1 2 20))`.
+        use crate::geometry::Geometry::MultiPoint;
+        let fc = crate::shapefile::read(
+            include_bytes!("../tests/fixtures/gdal_multipoint_zm.shp"),
+            include_bytes!("../tests/fixtures/gdal_multipoint_zm.dbf"),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(MultiPoint(vec![Position::with_zm(0.0, 0.0, 1.0, 10.0), Position::with_zm(1.0, 1.0, 2.0, 20.0)]))
         );
     }
 
     #[test]
     fn reads_shapefile_prj_as_id_less_named_crs() {
         // DuckDB/GDAL's WGS 84 .prj carries no AUTHORITY node (real-world Esri
-        // shape — the case crs-registry.org's R2 targets), so it recovers as a
-        // Named CRS with no lifted id, not the Wgs84 default; see KEY FINDINGS
-        // in handoff.org for why this is expected without the registry feature.
+        // shape), so it recovers as a Named CRS with no lifted id, not the
+        // Wgs84 default: geosetta reads what a format records and never infers
+        // an identity from a CRS's name. `--print-crs-code` therefore has
+        // nothing to report for such a source, and `--crs` is the way to give
+        // it one.
         let prj = std::str::from_utf8(include_bytes!("../tests/fixtures/duckdb_crs_pt.prj")).unwrap();
         let fc = crate::shapefile::read(
             include_bytes!("../tests/fixtures/duckdb_crs_pt.shp"),
@@ -998,19 +1304,19 @@ mod tests {
 
         let alpha = by_name("alpha");
         assert_eq!(prop(alpha, "n").as_str(), Some("1"));
-        assert_eq!(alpha.geometry, Some(Point([1.5, 2.5])));
+        assert_eq!(alpha.geometry, Some(Point(Position::new(1.5, 2.5))));
 
         let beta = by_name("beta");
         assert_eq!(prop(beta, "n").as_str(), Some("2"));
-        assert_eq!(beta.geometry, Some(LineString(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]])));
+        assert_eq!(beta.geometry, Some(LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, 0.0)])));
 
         let gamma = by_name("gamma");
         assert_eq!(prop(gamma, "n").as_str(), Some("3"));
         assert_eq!(
             gamma.geometry,
             Some(Polygon(vec![
-                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
-                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 4.0), Position::new(0.0, 0.0)],
+                vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
             ]))
         );
     }
@@ -1074,7 +1380,13 @@ mod tests {
         // every *.kml archive entry, not just the first (see
         // kml::read_kmz's doc comment). Sourced from the same geometries as
         // duckdb_geoms.kml's oracle fixture: a polygon with a hole, a mixed
-        // GeometryCollection, and a MultiPolygon.
+        // GeometryCollection, and a MultiPolygon. LIBKML's own writer always
+        // emits an explicit third `,0` altitude ordinate on every coordinate
+        // here, even though the source geometries carried no real elevation
+        // — confirmed by inspecting the fixture's raw `layers/geoms.kml`
+        // directly, not assumed — so every position below is `z: Some(0.0)`
+        // once M9 routes KML's altitude into `Position::z` instead of
+        // discarding it.
         use crate::geometry::Geometry::{GeometryCollection, LineString, MultiPolygon, Point, Polygon};
         let bytes = include_bytes!("../tests/fixtures/gdal_networklink.kmz");
         let fc = read_features(Format::Kmz, bytes).unwrap();
@@ -1089,22 +1401,22 @@ mod tests {
         assert_eq!(
             by_name("square-with-hole").geometry,
             Some(Polygon(vec![
-                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
-                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+                vec![Position::with_z(0.0, 0.0, 0.0), Position::with_z(4.0, 0.0, 0.0), Position::with_z(4.0, 4.0, 0.0), Position::with_z(0.0, 4.0, 0.0), Position::with_z(0.0, 0.0, 0.0)],
+                vec![Position::with_z(1.0, 1.0, 0.0), Position::with_z(2.0, 1.0, 0.0), Position::with_z(2.0, 2.0, 0.0), Position::with_z(1.0, 2.0, 0.0), Position::with_z(1.0, 1.0, 0.0)],
             ]))
         );
         assert_eq!(
             by_name("mixed-collection").geometry,
             Some(GeometryCollection(vec![
-                Point([10.0, 10.0]),
-                LineString(vec![[10.0, 10.0], [11.0, 11.0]]),
+                Point(Position::with_z(10.0, 10.0, 0.0)),
+                LineString(vec![Position::with_z(10.0, 10.0, 0.0), Position::with_z(11.0, 11.0, 0.0)]),
             ]))
         );
         assert_eq!(
             by_name("multipoly").geometry,
             Some(MultiPolygon(vec![
-                vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 0.0]]],
-                vec![vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 5.0]]],
+                vec![vec![Position::with_z(0.0, 0.0, 0.0), Position::with_z(1.0, 0.0, 0.0), Position::with_z(1.0, 1.0, 0.0), Position::with_z(0.0, 0.0, 0.0)]],
+                vec![vec![Position::with_z(5.0, 5.0, 0.0), Position::with_z(6.0, 5.0, 0.0), Position::with_z(6.0, 6.0, 0.0), Position::with_z(5.0, 5.0, 0.0)]],
             ]))
         );
     }

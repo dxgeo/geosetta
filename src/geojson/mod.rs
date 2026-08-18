@@ -297,8 +297,9 @@ fn stream_coordinates(p: &mut Parser, ty: &str) -> Result<Geometry> {
     }
 }
 
-/// A single `[x, y]` position; extra ordinates (z/m) are skipped, matching the
-/// tree reader.
+/// A single `[x, y, z?]` position, matching the tree reader: a third
+/// ordinate is read as Z; a fourth (M — RFC 7946 gives it no defined
+/// meaning) is parsed only far enough to skip it.
 fn stream_position(p: &mut Parser) -> Result<Position> {
     p.skip_ws();
     p.expect(b'[')?;
@@ -308,18 +309,26 @@ fn stream_position(p: &mut Parser) -> Result<Position> {
     p.expect(b',')?;
     p.skip_ws();
     let y = p.parse_f64()?;
+    let mut z = None;
     loop {
         p.skip_ws();
         match p.bump() {
             Some(b']') => break,
             Some(b',') => {
                 p.skip_ws();
-                p.skip_value()?; // extra ordinate (z/m), ignored
+                if z.is_none() {
+                    z = Some(p.parse_f64()?);
+                } else {
+                    p.skip_value()?; // a fourth+ ordinate (M or beyond), ignored
+                }
             }
             _ => return Err(p.err("expected ',' or ']' in coordinate")),
         }
     }
-    Ok([x, y])
+    Ok(match z {
+        Some(z) => Position::with_z(x, y, z),
+        None => Position::new(x, y),
+    })
 }
 
 fn stream_positions(p: &mut Parser) -> Result<Vec<Position>> {
@@ -431,9 +440,13 @@ fn write_geometry(out: &mut String, g: &Geometry) {
 fn write_position(out: &mut String, p: Position) {
     use std::fmt::Write;
     out.push('[');
-    let _ = write!(out, "{}", p[0]);
+    let _ = write!(out, "{}", p.x);
     out.push(',');
-    let _ = write!(out, "{}", p[1]);
+    let _ = write!(out, "{}", p.y);
+    if let Some(z) = p.z {
+        out.push(',');
+        let _ = write!(out, "{z}");
+    }
     out.push(']');
 }
 
@@ -519,7 +532,11 @@ fn geometry_to_json(g: &Geometry) -> JsonValue {
 
 #[cfg(test)]
 fn position_to_json(p: Position) -> JsonValue {
-    JsonValue::Array(vec![coord(p[0]), coord(p[1])])
+    let mut v = vec![coord(p.x), coord(p.y)];
+    if let Some(z) = p.z {
+        v.push(coord(z));
+    }
+    JsonValue::Array(v)
 }
 
 #[cfg(test)]
@@ -601,7 +618,8 @@ fn geometry_from_coords(ty: &str, coords: &JsonValue) -> Result<Geometry> {
     }
 }
 
-/// A single `[x, y]` (extra ordinates ignored).
+/// A single `[x, y, z?]` position; a fourth+ ordinate (M — RFC 7946 gives it
+/// no defined meaning) is ignored, matching the streaming reader.
 fn position(value: &JsonValue) -> Result<Position> {
     let arr = value
         .as_array()
@@ -615,7 +633,13 @@ fn position(value: &JsonValue) -> Result<Position> {
     let y = arr[1]
         .as_f64()
         .ok_or_else(|| Error::GeoJson("coordinate y is not a number".into()))?;
-    Ok([x, y])
+    match arr.get(2) {
+        None => Ok(Position::new(x, y)),
+        Some(z) => {
+            let z = z.as_f64().ok_or_else(|| Error::GeoJson("coordinate z is not a number".into()))?;
+            Ok(Position::with_z(x, y, z))
+        }
+    }
 }
 
 /// An array of positions.
@@ -656,8 +680,68 @@ mod tests {
         }"#;
         let fc = from_json(&parse(doc).unwrap()).unwrap();
         assert_eq!(fc.features.len(), 1);
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point([1.0, 2.0])));
+        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
         assert_eq!(fc.features[0].properties[0].0.as_ref(), "name");
+    }
+
+    #[test]
+    fn parses_and_writes_a_z_bearing_point() {
+        let doc = r#"{"type":"Point","coordinates":[1.0,2.0,3.0]}"#;
+        let fc = from_json(&parse(doc).unwrap()).unwrap();
+        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))));
+
+        // Streaming path agrees.
+        let streamed = from_geojson_str(doc).unwrap();
+        assert_eq!(streamed, fc);
+
+        // Round trip through the real writer: Z survives, re-parses back the same.
+        let written = to_geojson_string(&fc);
+        let back = from_json(&parse(&written).unwrap()).unwrap();
+        assert_eq!(back, fc);
+        assert!(written.contains("[1,2,3]") || written.contains("[1.0,2.0,3.0]"), "unexpected coordinates rendering: {written}");
+    }
+
+    #[test]
+    fn a_bare_xy_point_writes_with_no_third_element() {
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![],
+        }]);
+        let written = to_geojson_string(&fc);
+        assert!(written.contains("\"coordinates\":[1,2]}") || written.contains("\"coordinates\":[1.0,2.0]}"));
+    }
+
+    #[test]
+    fn fourth_ordinate_m_is_parsed_past_but_not_kept() {
+        // RFC 7946 gives a 4th coordinate no defined meaning; both readers
+        // must still accept it (real producers emit it) without keeping it.
+        let doc = r#"{"type":"Point","coordinates":[1.0,2.0,3.0,4.0]}"#;
+        let fc = from_json(&parse(doc).unwrap()).unwrap();
+        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))));
+        let streamed = from_geojson_str(doc).unwrap();
+        assert_eq!(streamed, fc);
+    }
+
+    #[test]
+    fn rejects_a_non_numeric_z() {
+        let doc = r#"{"type":"Point","coordinates":[1.0,2.0,"bad"]}"#;
+        assert!(from_json(&parse(doc).unwrap()).is_err());
+        assert!(from_geojson_str(doc).is_err());
+    }
+
+    #[test]
+    fn z_bearing_geojson_round_trips_through_geoparquet() {
+        // The real payoff of M2 (the WKB codec) + M3 (this GeoJSON change):
+        // GeoJSON -> GeoParquet -> GeoJSON now carries Z all the way through,
+        // reachable via the actual conversion pipeline, not just this module's
+        // own reader/writer in isolation.
+        let doc = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[1.5,2.5,100.0]},"properties":{}}
+        ]}"#;
+        let fc = from_json(&parse(doc).unwrap()).unwrap();
+        let wkb = crate::geometry::to_wkb(fc.features[0].geometry.as_ref().unwrap());
+        let back = crate::geometry::from_wkb(&wkb).unwrap();
+        assert_eq!(back, Geometry::Point(Position::with_z(1.5, 2.5, 100.0)));
     }
 
     #[test]
@@ -682,7 +766,7 @@ mod tests {
             r#"{"type":"FeatureCollection","features":[
                 {"type":"Feature","geometry":{"type":"Point","coordinates":[-73.9857,40.7484,12.5]},
                  "properties":{"name":"Café ☕","h":381,"ok":true,"r":4.7,"tags":["a",{"b":1}],"z":null}},
-                {"type":"Feature","geometry":{"coordinates":[[0,0],[1.5,2.25]],"type":"LineString"},
+                {"type":"Feature","geometry":{"coordinates":[[0,0],[1.5, 2.25]],"type":"LineString"},
                  "properties":null},
                 {"type":"Feature","properties":{"only":"props"},"geometry":null},
                 {"geometry":{"type":"MultiPolygon","coordinates":[[[[0,0],[1,0],[1,1],[0,0]]]]},"type":"Feature","id":7},
@@ -720,9 +804,9 @@ mod tests {
         let doc = r#"{
             "type": "FeatureCollection",
             "features": [
-                {"type":"Feature","geometry":{"type":"Point","coordinates":[-73.9857,40.7484]},
+                {"type":"Feature","geometry":{"type":"Point","coordinates":[-73.9857, 40.7484]},
                  "properties":{"name":"Café ☕","h":381,"ok":true,"r":4.7,"tags":["a","b"],"z":null}},
-                {"type":"Feature","geometry":{"type":"LineString","coordinates":[[0,0],[1.5,2.25]]},
+                {"type":"Feature","geometry":{"type":"LineString","coordinates":[[0,0],[1.5, 2.25]]},
                  "properties":{}},
                 {"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]},
                  "properties":{"n":12}},

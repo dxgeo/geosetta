@@ -34,8 +34,12 @@ multi-layer fan-out), CRS pass-through, the mixed-shape-family write error, and
 case-insensitive sibling lookup — see the session that implemented this for the
 transcript.
 
-Deferred / out of scope, matching the plan below: Z/M/MultiPatch shape types
-and =.dbf= memo (=M=) fields. *Projected* Esri =.prj= structural recovery —
+Deferred / out of scope, matching the plan below: =.dbf= memo (=M=) fields
+and =MultiPatch=(31) — never modeled, no =Geometry= variant exists to
+decode into. *Z/M shape types, originally deferred here, have since
+shipped* — see [[file:zm-geometry.org][zm-geometry.org]]'s M7 (Z, plus a
+same-day follow-up for M, both within the Z-variant shape types and the
+four M-only ones). *Projected* Esri =.prj= structural recovery —
 originally deferred here pending real fixtures — has since shipped as R2's
 projected half (=resolve_projected_by_name= in =crs/registry.rs=, 2026-08-12);
 see § CRS INTEGRATION below. Ring containment uses the appearance-order
@@ -66,8 +70,12 @@ unlike text, cutting off a number's digits silently produces a *different,
 wrong* number. See =src/shapefile/dbf.rs='s =write=/=dbf_field=/
 =resolve_field_names= doc comments and their tests.
 
-This plan is also =geoscribe/crs-registry.org='s named *R4* — the
-original driver for the whole CRS-registry pivot. See § CRS INTEGRATION.
+This plan was also =geoscribe='s =crs-registry.org= *R4* — the original driver
+for the whole CRS-registry pivot. That pivot has since been reversed in geosetta
+(0.24.0: feature and dependency removed), so a bare-code =.prj= is now written
+only from a =--crs= definition the user supplies
+([[file:crs-external-resolution.org][crs-external-resolution.org]]). See § CRS
+INTEGRATION, which is kept as written.
 
 ** WHAT MAKES SHAPEFILE DIFFERENT: it's not one file
 Every spoke so far is either single-file/single-layer (GeoJSON, CSV, WKT,
@@ -103,8 +111,12 @@ is touching — no blanket "read as LE."
     + parts[i32×numParts] (each part's start index into the flat points array)
     + points[2×f64×numPoints].
   - =8= MultiPoint — bbox + numPoints + points[2×f64×numPoints].
-  - Z/M variants (=11/13/15/18=, =21/23/25/28=) and =31= MultiPatch — *out of
-    scope*, matching the 2D-only stance already taken for GeoParquet/FlatGeobuf.
+  - Z/M variants (=11/13/15/18= Z, optionally with a trailing M section;
+    =21/23/25/28= M-only) — implemented, see
+    [[file:zm-geometry.org][zm-geometry.org]]'s M7. =31= MultiPatch remains
+    *out of scope* — a fundamentally different multi-surface shape with no
+    =Geometry= variant to decode into at all, not a 2D-only-stance
+    deferral.
 - *The one real algorithm in this spoke:* Shapefile has no distinct
   "MultiPolygon" shape type — type =5= covers both =Polygon= and
   =MultiPolygon=. Disambiguation is by ring *winding* (shoelace-formula signed
@@ -181,10 +193,11 @@ descriptors + fixed-width records.
 *** 3. =.prj= codec — thin, reuses existing CRS machinery
 Read: =std::fs::read_to_string= → =Crs::from_authority_code(None, None,
 Some(wkt), None)=. Write: prefer =named.wkt= verbatim if the source carried
-one; else, with =crs-registry= on, a bare-code =NamedCrs= can now write a
-=.prj= via =registry::def_wkt(authority, code)= — R1's =def_wkt= exists today
-with *no consumer yet*; this is its first one. Without a WKT or a registry
-hit, omit =.prj= (no CRS on write), matching the project's never-guess
+one; else a structural PROJJSON→WKT translation. (This step originally read
+"else, with =crs-registry= on, resolve a bare code via =registry::def_wkt=";
+that path was removed in 0.24.0 — a bare code now reaches =.prj= only through
+=--crs=.) Without any of those, omit =.prj= (no CRS on write), matching the
+project's never-guess
 convention, surfaced via a new =Format::Shapefile= arm in
 =Crs::downgrade_warning= (grouped with the existing =FlatGeobuf | Gpkg= "speaks
 WKT" arm, since a Shapefile-target warning is the same shape: PROJJSON-only or

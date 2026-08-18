@@ -33,8 +33,8 @@ FlatGeobuf/GeoPackage/Shapefile's =.prj=.
 GeoParquet's only CRS channel is PROJJSON. Reading a GeoParquet source today
 (=parquet::geo::parse_crs=) already lifts an embedded =id= (authority+code)
 into the IR when the PROJJSON has one — that CRS then round-trips to
-FlatGeobuf/GeoPackage (via authority+code, or the registry's =def_wkt= when
-=crs-registry= is on) and to Shapefile's =.prj= the same way. *That case is
+FlatGeobuf/GeoPackage (via authority+code) and to Shapefile's =.prj= the same
+way. (Originally this also listed the registry's =def_wkt=, removed in 0.24.0.) *That case is
 already handled, not this gap.*
 
 The gap is a PROJJSON object with *no =id= at all* — a custom or
@@ -260,8 +260,10 @@ Not resolved by this plan — future work, not follow-ups it depends on.
   existing consumer already reads as WKT1 — so WKT2 text would be correct data
   in the wrong field for two of the three targets. But GeoPackage separately
   has a *real* WKT2 slot, =definition_12_063= (the R5 CRS-WKT extension
-  column, =src/geopackage/writer.rs:126-152=), populated today only by the
-  registry's =registry_wkt2()= when =crs-registry= is on. A structural
+  column), which was populated only by the registry's =registry_wkt2()= — so
+  with the registry removed in 0.24.0 the column is gone too, and this idea now
+  means *adding it back* on a structural basis rather than filling an existing
+  one. A structural
   =projjson_to_wkt2= (arguably *simpler* than the WKT1 projected renderer here
   — PROJJSON's method/parameter =id= transfers straight into WKT2
   =METHOD[...,ID[...]]=, no crosswalk reversal needed) could fill that column

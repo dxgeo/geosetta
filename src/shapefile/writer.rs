@@ -21,16 +21,16 @@ pub struct Encoded {
     pub dbf: Vec<u8>,
     pub prj: Option<String>,
     /// Non-fatal warnings from lossy `.dbf` truncation (a property value or
-    /// name too long for dBase's fixed-width fields) — see [`dbf::write`].
+    /// name too long for dBase's fixed-width fields) — see `dbf::write`.
     /// Empty in the overwhelmingly common case where nothing was truncated.
     pub warnings: Vec<String>,
 }
 
 /// Encode a feature collection as a Shapefile. Errors when the geometries mix
 /// incompatible Shapefile shape families, or contain a `GeometryCollection`
-/// (Shapefile cannot represent either) — see [`geometry::write`] — or when the
+/// (Shapefile cannot represent either) — see `geometry::write` — or when the
 /// `.dbf` can't represent the properties without silently corrupting or
-/// merging data — see [`dbf::write`].
+/// merging data — see `dbf::write`.
 pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
     let geometries: Vec<Option<Geometry>> = fc.features.iter().map(|f| f.geometry.clone()).collect();
     let (shp, shx) = geometry::write(&geometries)?;
@@ -44,36 +44,32 @@ pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
 }
 
 /// The WKT text to write to `.prj` for this CRS, or `None` when it can't be
-/// expressed: prefer the source's own verbatim WKT, else — with the
-/// `crs-registry` feature — the registry's authoritative WKT for a known
-/// authority+code (R1's `def_wkt`, this spoke is its first consumer), else a
-/// structural PROJJSON→WKT translation for an id-less PROJJSON-only source
-/// (see `NamedCrs::structural_wkt`).
+/// expressed: prefer the source's own verbatim WKT (including one supplied with
+/// `--crs`, which is installed on the IR like any other), else a structural
+/// PROJJSON→WKT translation for an id-less PROJJSON-only source (see
+/// `NamedCrs::structural_wkt`).
 fn prj_wkt(crs: &Crs) -> Option<String> {
     match crs {
         Crs::Wgs84 => Some(WGS84_WKT1.to_string()),
-        Crs::Named(n) => n
-            .wkt
-            .clone()
-            .or_else(|| n.registry_wkt().map(str::to_string))
-            .or_else(|| n.structural_wkt()),
+        Crs::Named(n) => n.wkt.clone().or_else(|| n.structural_wkt()),
     }
 }
 
 /// The canonical Esri-flavor WGS 84 `.prj` text — the exact spelling countless
-/// real-world shapefiles carry verbatim, so the common case needs no registry
-/// lookup or translation to write.
+/// real-world shapefiles carry verbatim, so the common case needs no
+/// translation to write.
 const WGS84_WKT1: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[\"WGS_1984\",6378137.0,298.257223563]],PRIMEM[\"Greenwich\",0.0],UNIT[\"Degree\",0.0174532925199433]]";
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Position;
     use crate::crs::NamedCrs;
     use crate::feature::Feature;
 
     fn one_point_fc(crs: Option<Crs>) -> FeatureCollection {
         let mut fc = FeatureCollection::new(vec![Feature {
-            geometry: Some(Geometry::Point([1.0, 2.0])),
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
         }]);
         fc.crs = crs;
@@ -101,21 +97,17 @@ mod tests {
     }
 
     #[test]
-    fn bare_code_without_wkt_writes_no_prj_without_the_registry_feature() {
+    fn bare_code_without_wkt_writes_no_prj() {
         // Shapefile's .prj has no code slot of its own (unlike FlatGeobuf/
-        // GeoPackage); without crs-registry there is nothing to translate a
-        // bare code into, so no .prj is written.
+        // GeoPackage), and geosetta never invents a definition for a code, so
+        // no .prj is written. `--crs` is how a user supplies one.
         let crs = Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
             code: Some("3857".into()),
             ..Default::default()
         });
         let encoded = write(&one_point_fc(Some(crs))).unwrap();
-        #[cfg(not(feature = "crs-registry"))]
         assert_eq!(encoded.prj, None);
-        // With the registry on, this now resolves via def_wkt.
-        #[cfg(feature = "crs-registry")]
-        assert!(encoded.prj.is_some());
     }
 
     #[test]

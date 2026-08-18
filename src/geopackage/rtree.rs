@@ -355,10 +355,10 @@ fn round_up(v: f64) -> f32 {
 mod tests {
     use super::*;
     use crate::feature::Feature;
-    use crate::geometry::Geometry;
+    use crate::geometry::{Geometry, Position};
 
     fn point_feat(x: f64, y: f64) -> Feature {
-        Feature { geometry: Some(Geometry::Point([x, y])), properties: vec![] }
+        Feature { geometry: Some(Geometry::Point(Position::new(x, y))), properties: vec![] }
     }
 
     #[test]

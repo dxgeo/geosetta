@@ -11,6 +11,12 @@
 //! ```text
 //! reproject-tool --to EPSG:3857 < in.geojson | geosetta --from geojson --to fgb - out.fgb
 //! ```
+//! The same principle runs through `--crs` / `--print-crs-code`: geosetta
+//! reports the CRS code it cannot resolve and accepts the definition someone
+//! else resolved, but never runs that someone else itself, so every external
+//! step is visible in the command the user typed (see
+//! `plans/crs-external-resolution.org`).
+//!
 //! Shapefile is excluded: it's sibling files (`.shp`/`.shx`/`.dbf`/`.prj`),
 //! not a single byte stream, so there's nothing to pipe. Route it through a
 //! single-buffer format instead (FlatGeobuf and GeoParquet both carry the CRS
@@ -19,7 +25,8 @@
 use std::io::{Read, Write};
 
 use geosetta::{cli, convert, geopackage, shapefile};
-use geosetta::{Crs, Error, FeatureCollection, Format, Result};
+use geosetta::Crs;
+use geosetta::{Error, FeatureCollection, Format, Result};
 
 /// Read `path`'s bytes, or all of stdin when `path` is `"-"`.
 fn read_bytes(path: &str) -> Result<Vec<u8>> {
@@ -67,15 +74,28 @@ fn main() {
 fn run() -> Result<()> {
     let args = cli::parse(std::env::args())?;
 
+    // `--print-crs-code` reads a source and reports on it: no output, no
+    // conversion. It returns before every write-side path below, GeoPackage's
+    // included (that container's multi-layer read has its own answer for what
+    // to report — see `print_crs_code`).
+    let out = match &args.mode {
+        cli::Mode::PrintCrsCode => return print_crs_code(&args),
+        cli::Mode::Convert { output, to } => Output { path: output, format: *to },
+    };
+
+    // Read the `--crs` override up front: a malformed one should fail before
+    // anything has been read or written, not midway through.
+    let crs_override = load_crs_override(&args)?;
+
     // GeoPackage is a multi-layer container, so it doesn't fit the plain
     // single-collection convert path.
-    match (args.from, args.to) {
-        (_, Format::Gpkg) => return run_geopackage_write(&args),
-        (Format::Gpkg, _) => return run_geopackage_read(&args),
+    match (args.from, out.format) {
+        (_, Format::Gpkg) => return run_geopackage_write(&args, &out, crs_override.as_ref()),
+        (Format::Gpkg, _) => return run_geopackage_read(&args, &out, crs_override.as_ref()),
         _ => {}
     }
 
-    if args.from == args.to {
+    if args.from == out.format {
         return Err(Error::Usage(format!(
             "input and output are the same format ({:?}); nothing to convert",
             args.from
@@ -98,11 +118,140 @@ fn run() -> Result<()> {
             eprintln!("sorted {} features by Hilbert locality", fc.features.len());
         }
     }
-    warn_crs_loss(&args, fc.crs.as_ref());
-    if args.progress {
-        eprintln!("writing {}...", args.to.extension());
+    // Before the warnings: a supplied override is exactly as authoritative as a
+    // CRS read from the file, so it must be in place before anything predicts
+    // what the target can record.
+    if let Some(crs) = &crs_override {
+        install_crs_override(&mut fc, crs);
     }
-    write_collection(args.to, &args.output, &fc, args.quiet)
+    print_warnings(&collect_conversion_warnings(&fc, out.format), args.quiet);
+    if args.progress {
+        eprintln!("writing {}...", out.format.extension());
+    }
+    write_collection(out.format, out.path, &fc, args.quiet)
+}
+
+/// The destination half of a conversion — where output goes and in what format.
+/// Lifted out of [`cli::Mode::Convert`] once, in [`run`], so nothing downstream
+/// has to re-match the mode to find out whether it has an output at all.
+struct Output<'a> {
+    path: &'a str,
+    format: Format,
+}
+
+/// Read and parse the `--crs` override, if one was given: text from a file, or
+/// from stdin for `-`.
+///
+/// Whatever produced that text — PROJ, GDAL, a web service, a registry crate, a
+/// human — is the user's business and is invisible here. Geosetta spawns nothing
+/// (`plans/crs-external-resolution.org`), so the only thing that crosses this
+/// boundary is bytes the user pointed it at.
+fn load_crs_override(args: &cli::Args) -> Result<Option<Crs>> {
+    let Some(path) = &args.crs else { return Ok(None) };
+    let text = if path == "-" {
+        let mut s = String::new();
+        std::io::stdin().lock().read_to_string(&mut s)?;
+        s
+    } else {
+        std::fs::read_to_string(path)?
+    };
+    Crs::from_definition_text(&text).map(Some)
+}
+
+/// Install a `--crs` override on one collection.
+///
+/// `--crs` is *assign, not enrich*: it replaces whatever the source carried — or
+/// its lack of a CRS — outright, `ogr2ogr -a_srs` style. Geosetta deliberately
+/// does not reconcile the override against the source's own declared identity,
+/// because it has no view on where the text came from or why the user is
+/// supplying it. And it relabels only: no coordinate is touched, here or
+/// anywhere else in the crate.
+fn install_crs_override(fc: &mut FeatureCollection, crs: &Crs) {
+    fc.crs = Some(crs.clone());
+}
+
+/// [`install_crs_override`] across a GeoPackage's layers, plus the one warning
+/// only a multi-layer source can earn.
+///
+/// Overriding is the user's explicit instruction, so a single CRS being replaced
+/// has nothing to report. But when the layers *disagreed*, one identity now
+/// stands in for several — a real relabel the user may not have pictured when
+/// they pointed `--crs` at a container rather than a file. Announcing it rather
+/// than performing it quietly is the same convention every other lossy path in
+/// this crate follows (`plans/lossy-conversion-warnings.org`).
+fn apply_crs_override(layers: &mut [(String, FeatureCollection)], crs: &Crs) -> Vec<String> {
+    let mut distinct: Vec<Option<Crs>> = Vec::new();
+    for (_, fc) in layers.iter() {
+        if !distinct.contains(&fc.crs) {
+            distinct.push(fc.crs.clone());
+        }
+    }
+    for (_, fc) in layers.iter_mut() {
+        install_crs_override(fc, crs);
+    }
+    if distinct.len() < 2 {
+        return Vec::new();
+    }
+    vec![format!(
+        "--crs relabels all {} layers as {}, but the source declared {} different CRSes; \
+         the override replaces every one of them.",
+        layers.len(),
+        crs.authority_code().unwrap_or_else(|| "the supplied definition".into()),
+        distinct.len(),
+    )]
+}
+
+/// `--print-crs-code`: report the source's CRS identity as `AUTHORITY:CODE` on
+/// stdout and exit without converting anything.
+///
+/// Unconditional by design. It prints whenever the source *has* an identity,
+/// never only when geosetta judges that identity to need resolving — deciding
+/// that on the user's behalf would make the flag's behavior situational, and a
+/// user who wants to run a resolver should always be able to.
+///
+/// A multi-layer GeoPackage can carry more than one code, so they are printed
+/// one per line, de-duplicated in layer order: the usual single-CRS file still
+/// yields exactly one line for a `$(...)` substitution, and `--layer` narrows
+/// anything else. Empty stdout with a nonzero exit means there was genuinely
+/// nothing to report — no CRS at all, or one with no authority code (an id-less
+/// WKT). Note that a GeoJSON or KML source is *not* that case: its spec fixes it
+/// at WGS 84, so it has a real identity that simply isn't written in the file
+/// (see `Crs::authority_code`).
+fn print_crs_code(args: &cli::Args) -> Result<()> {
+    let sources: Vec<FeatureCollection> = if args.from == Format::Gpkg {
+        let input = read_bytes(&args.input)?;
+        let mut layers = geopackage::read_layers(&input)?;
+        if let Some(name) = &args.layer {
+            layers.retain(|(n, _)| n == name);
+            if layers.is_empty() {
+                return Err(Error::Usage(format!("no layer named \"{name}\"")));
+            }
+        }
+        layers.into_iter().map(|(_, fc)| fc).collect()
+    } else {
+        vec![read_input(args)?]
+    };
+
+    let mut codes: Vec<String> = Vec::new();
+    for fc in &sources {
+        if let Some(code) = fc.crs.as_ref().and_then(Crs::authority_code)
+            && !codes.contains(&code)
+        {
+            codes.push(code);
+        }
+    }
+    if codes.is_empty() {
+        return Err(Error::Usage(format!(
+            "{}: no CRS authority code to report — the source carries no CRS, or one with no \
+             authority and code (an id-less WKT definition). Supply a definition with --crs \
+             instead of asking for a code to resolve.",
+            io_label(&args.input, "stdin"),
+        )));
+    }
+    for code in &codes {
+        println!("{code}");
+    }
+    Ok(())
 }
 
 /// Read the input into the Feature IR. Shapefile is multi-file, so its
@@ -170,11 +319,7 @@ fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<FeatureCol
 /// the same `roads.{shp,shx,dbf,prj}` set).
 fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection, quiet: bool) -> Result<()> {
     let encoded = shapefile::write(fc)?;
-    if !quiet {
-        for w in &encoded.warnings {
-            eprintln!("{w}");
-        }
-    }
+    print_warnings(&encoded.warnings, quiet);
     let stem = strip_shp_extension(output_path);
     std::fs::write(format!("{stem}.shp"), &encoded.shp)?;
     std::fs::write(format!("{stem}.shx"), &encoded.shx)?;
@@ -225,7 +370,7 @@ fn sibling_path(shp_path: &str, ext: &str) -> Option<String> {
 /// naming: a directory (existing or trailing `/`) gets one `layer.ext` file
 /// each; a single layer goes to the plain output path; multiple layers to a
 /// plain path is an error unless `--layer` selects one.
-fn run_geopackage_read(args: &cli::Args) -> Result<()> {
+fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs>) -> Result<()> {
     let input = read_bytes(&args.input)?;
     if args.progress {
         eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
@@ -252,17 +397,20 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
             convert::reorder_hilbert(fc);
         }
     }
-    warn_crs_loss_layers(args, &layers);
+    if let Some(crs) = crs_override {
+        print_warnings(&apply_crs_override(&mut layers, crs), args.quiet);
+    }
+    print_warnings(&collect_layer_warnings(&layers, out.format), args.quiet);
 
     // "-" (stdout) is never a directory, regardless of what happens to exist
     // in the current directory — a multi-layer .gpkg piped out is rejected
     // below by the same "give a directory or --layer" error a plain file path
     // gets, since a single stream can't fan out to more than one layer.
-    let as_dir = args.output != "-"
-        && (args.output.ends_with('/') || std::path::Path::new(&args.output).is_dir());
+    let as_dir = out.path != "-"
+        && (out.path.ends_with('/') || std::path::Path::new(out.path).is_dir());
     if layers.len() == 1 && !as_dir {
         let (_, fc) = &layers[0];
-        return write_collection(args.to, &args.output, fc, args.quiet);
+        return write_collection(out.format, out.path, fc, args.quiet);
     }
     if !as_dir {
         return Err(Error::Usage(
@@ -270,18 +418,18 @@ fn run_geopackage_read(args: &cli::Args) -> Result<()> {
         ));
     }
 
-    std::fs::create_dir_all(&args.output)?;
-    let dir = std::path::Path::new(&args.output);
+    std::fs::create_dir_all(out.path)?;
+    let dir = std::path::Path::new(out.path);
     for (name, fc) in &layers {
-        let path = dir.join(format!("{name}.{}", args.to.extension()));
-        write_collection(args.to, &path.to_string_lossy(), fc, args.quiet)?;
+        let path = dir.join(format!("{name}.{}", out.format.extension()));
+        write_collection(out.format, &path.to_string_lossy(), fc, args.quiet)?;
     }
     Ok(())
 }
 
 /// Write a layer into a GeoPackage, creating it or appending (upserting the
 /// layer if it already exists). The layer name defaults to the input file stem.
-fn run_geopackage_write(args: &cli::Args) -> Result<()> {
+fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Crs>) -> Result<()> {
     let mut new_layers = if args.from == Format::Gpkg {
         // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
         let input = read_bytes(&args.input)?;
@@ -316,49 +464,77 @@ fn run_geopackage_write(args: &cli::Args) -> Result<()> {
             convert::reorder_hilbert(fc);
         }
     }
-    warn_crs_loss_layers(args, &new_layers);
+    if let Some(crs) = crs_override {
+        print_warnings(&apply_crs_override(&mut new_layers, crs), args.quiet);
+    }
+    print_warnings(&collect_layer_warnings(&new_layers, out.format), args.quiet);
 
     // Append into the existing GeoPackage if the output already exists. "-"
     // (stdout) is never "existing" — there's nothing to read back from a pipe
     // you're about to write to, so piping to a .gpkg always starts fresh.
-    let existing = if args.output == "-" { None } else { std::fs::read(&args.output).ok() };
+    let existing = if out.path == "-" { None } else { std::fs::read(out.path).ok() };
     if args.progress {
         let verb = if existing.is_some() { "appending to" } else { "writing" };
         let idx = if args.rtree { " (+rtree index)" } else { "" };
-        eprintln!("{verb} {}{idx}...", io_label(&args.output, "stdout"));
+        eprintln!("{verb} {}{idx}...", io_label(out.path, "stdout"));
     }
     let bytes = geopackage::write_layers(existing.as_deref(), &new_layers, args.rtree)?;
-    write_bytes(&args.output, &bytes)?;
-    eprintln!("wrote {} ({} bytes)", io_label(&args.output, "stdout"), bytes.len());
+    write_bytes(out.path, &bytes)?;
+    eprintln!("wrote {} ({} bytes)", io_label(out.path, "stdout"), bytes.len());
     Ok(())
 }
 
-/// Warn on stderr when the target format cannot record `crs` (unless `--quiet`).
-/// A correctness warning — the conversion still proceeds and succeeds; see
-/// [`Crs::downgrade_warning`].
-fn warn_crs_loss(args: &cli::Args, crs: Option<&Crs>) {
-    if args.quiet {
-        return;
+/// Every pre-write predictive lossy-conversion check this crate knows about,
+/// run against one collection and its target format. Each check is an
+/// independent `Option<String>` function (see [`Crs::downgrade_warning`],
+/// [`FeatureCollection::m_downgrade_warning`]) — adding a new kind of loss
+/// (a new format spoke's capability gap, a new IR field) is one line here,
+/// not a new wrapper-function pair. See `plans/lossy-conversion-warnings.org`.
+fn collect_conversion_warnings(fc: &FeatureCollection, target: Format) -> Vec<String> {
+    let mut warnings = Vec::new();
+    if let Some(w) = fc.crs.as_ref().and_then(|c| c.downgrade_warning(target)) {
+        warnings.push(w);
     }
-    if let Some(w) = crs.and_then(|c| c.downgrade_warning(args.to)) {
-        eprintln!("{w}");
+    if let Some(w) = fc.m_downgrade_warning(target) {
+        warnings.push(w);
     }
+    warnings
 }
 
-/// [`warn_crs_loss`] across a GeoPackage's layers, de-duplicating identical
-/// messages so a single-CRS `.gpkg` (the usual case) warns just once even when
-/// it fans out to many output files.
-fn warn_crs_loss_layers(args: &cli::Args, layers: &[(String, FeatureCollection)]) {
-    if args.quiet {
+/// [`collect_conversion_warnings`] across a GeoPackage's layers,
+/// de-duplicating identical messages so a single-CRS `.gpkg` (the usual
+/// case) warns just once even when it fans out to many output files.
+fn collect_layer_warnings(layers: &[(String, FeatureCollection)], target: Format) -> Vec<String> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut out = Vec::new();
+    for (_, fc) in layers {
+        for w in collect_conversion_warnings(fc, target) {
+            if seen.insert(w.clone()) {
+                out.push(w);
+            }
+        }
+    }
+    out
+}
+
+/// Print each warning to stderr, unless `quiet`. Shared by both
+/// lossy-conversion mechanisms this crate uses: the pre-write predictive
+/// checks above, and a writer's own post-write `Encoded.warnings` (e.g.
+/// Shapefile's `.dbf` field-truncation warnings in `write_shapefile_to_path`)
+/// — see `plans/lossy-conversion-warnings.org`.
+///
+/// The `warning: ` prefix the convention requires is added *here*, not by each
+/// check, so a new check cannot forget it or spell it differently — which is
+/// exactly what had happened: the `.dbf` warnings were written with the
+/// `shapefile: ` tag the shapefile *errors* use, and so read as errors. Checks
+/// return the message body; presentation is this function's job. A message may
+/// still carry its own component tag after the prefix (`warning: shapefile: …`).
+fn print_warnings(warnings: &[String], quiet: bool) {
+    if quiet {
         return;
     }
-    let mut seen = std::collections::BTreeSet::new();
-    for (_, fc) in layers {
-        if let Some(w) = fc.crs.as_ref().and_then(|c| c.downgrade_warning(args.to))
-            && seen.insert(w.clone())
-        {
-            eprintln!("{w}");
-        }
+    for w in warnings {
+        eprintln!("warning: {w}");
     }
 }
 

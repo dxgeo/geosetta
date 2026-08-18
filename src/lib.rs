@@ -6,7 +6,9 @@
 //!
 //! The whole crate is standard-library only — every wire format (GeoJSON,
 //! GeoParquet, FlatGeobuf, CSV, WKT, GeoPackage, Shapefile, KML/KMZ) is
-//! implemented from its specification, with no third-party dependencies.
+//! implemented from its specification, with no third-party dependencies and no
+//! optional ones — there is no feature that adds any (see [`crs`] for how a CRS
+//! geosetta cannot resolve structurally is supplied instead).
 //!
 //! # Example
 //!

@@ -1,0 +1,172 @@
+#+TITLE: Convention: Lossy Conversions Must Warn, Never Silently Succeed
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Convention: Lossy Conversions Must Warn, Never Silently Succeed
+
+** STATUS -- standing rule, in effect (2026-08-17)
+Not a milestone plan with an end state — a written-down *policy* this
+project already partly followed (=crs.rs='s CRS-downgrade warnings existed
+before this doc did) and now applies deliberately, going forward, to every
+format-capability gap. Prompted by a real mistake: M8
+([[file:zm-geometry.org][zm-geometry.org]]) initially shipped GeoParquet's
+=geo= metadata never emitting an =" M"=/=" ZM"= suffix, reasoning from
+DuckDB's writer alone that the *spec* had no M vocabulary — wrong, caught
+only when a user asked "is it that GeoParquet doesn't do it, or DuckDB
+doesn't do it?" and the actual spec text said otherwise. That mistake was
+about a *declared-metadata* gap (the summary string undersold what the WKB
+bytes already carried correctly); this doc is about the different, worse
+case — an actual *silent data drop* — and exists so the next such gap gets
+caught by a warning firing automatically, not by a user's follow-up
+question.
+
+** THE RULE
+Any format conversion that would silently drop, truncate, or degrade
+information the source actually carries — because the target format has no
+way to represent it — must emit a =warning: ...= to =stderr= (suppressed
+only by =--quiet=) instead of just succeeding. The conversion still
+*proceeds*: Geosetta is a format translator, not a validator, and refusing
+to convert at all would be worse than a loud, honest downgrade. The bar is
+*loud*, not *blocking*.
+
+This applies retroactively (existing gaps found and not yet warned-about
+are bugs, not accepted debt) and prospectively (every new format spoke or
+new IR field must ship its capability gaps' warnings in the same pass as
+the feature itself, not as a follow-up).
+
+** THE TWO EXISTING MECHANISMS -- extend these, don't invent a third
+Two shapes already exist in this codebase; a new gap should fit one of
+them, not grow a bespoke path. As of the *generalization pass* below, both
+funnel through the same two shared =main.rs= functions rather than each
+growing its own wrapper — see § GENERALIZED COLLECTION.
+
+*** 1. Pre-write predictive check (preferred when the answer doesn't depend on the actual encoding)
+A pure function taking the source data and the target =Format=, returning
+=Option<String>= — =None= when nothing is lost, =Some(warning)= otherwise.
+Three real instances now, each just an entry in
+=main.rs='s =collect_conversion_warnings= (see below) rather than its own
+wrapper-function pair:
+- [[file:crs.org][=Crs::downgrade_warning(&self, target: Format) ->
+  Option<String>=]] (=crs.rs=) — CRS-loss warnings, the original instance
+  this pattern is named after.
+- =FeatureCollection::m_downgrade_warning(&self, target: Format) ->
+  Option<String>= (=feature.rs=) — the M-ordinate case this doc was
+  originally written for.
+- A narrower =Crs::downgrade_warning= branch (=crs.rs=) for FlatGeobuf/
+  GeoPackage's alphanumeric-authority-code case (e.g. IGNF's =LAMB93=) —
+  found and closed in the same pass as the M-ordinate warning, once the
+  general question ("what else silently drops today?") was actually asked
+  instead of stopping at the one case named in the request. Both
+  =flatgeobuf/writer.rs= and =geopackage/writer.rs= already had *tested*
+  behavior for this (=alphanumeric_code_is_dropped_but_org_and_wkt_survive=,
+  =alphanumeric_code_falls_back_to_a_synthetic_srs_id=) with *zero* runtime
+  warning until this pass — a gap that had been sitting there, known and
+  tested, since =projjson-to-wkt.org='s era.
+
+*** 2. Post-write actual-outcome collection (when the loss is only knowable during real encoding)
+A writer returns its warnings alongside its bytes, collected as the actual
+encoding happens (field-name collisions, fixed-width truncation — things a
+pure pre-check can't predict without redoing the writer's own work).
+- =shapefile::writer::Encoded { warnings: Vec<String>, ... }= (=dbf.rs='s
+  field-name/value truncation) — =main.rs='s =write_shapefile_to_path=
+  prints them via the same shared =print_warnings= the pre-write checks
+  use (see below), same =--quiet= gate.
+
+** GENERALIZED COLLECTION -- one place to add a check, one place to print
+Adding the M-ordinate warning alongside the existing CRS one meant
+copy-pasting =warn_crs_loss=/=warn_crs_loss_layers= almost verbatim into
+=warn_ordinate_loss=/=warn_ordinate_loss_layers= — identical =--quiet=
+gate, identical =eprintln!= loop, identical =BTreeSet= de-dup for the
+layers variant, the only difference being which check function got called.
+With more format spokes (and more capability gaps) planned, that
+per-warning-type wrapper-function-pair was real, and growing, duplication —
+so it was collapsed once a second real instance made the pattern
+undeniable and a third was explicitly expected.
+
+*What's shared now (=main.rs=)*:
+- =collect_conversion_warnings(fc: &FeatureCollection, target: Format) ->
+  Vec<String>= — runs every registered pre-write check (§1) against one
+  collection, in order, returning whichever fired. *A new check is one
+  line added here* — no new wrapper function, no new call sites to
+  remember.
+- =collect_layer_warnings(layers: &[(String, FeatureCollection)], target:
+  Format) -> Vec<String>= — the same de-duplicating fan-out
+  =warn_crs_loss_layers= used to do alone, now built once on top of
+  =collect_conversion_warnings= and shared by every check.
+- =print_warnings(warnings: &[String], quiet: bool)= — the =--quiet= gate
+  and =eprintln!= loop, shared by *both* mechanisms (§1 and §2): the
+  three =main.rs= call sites use =print_warnings(&collect_conversion_warnings(...),
+  ...)=/=print_warnings(&collect_layer_warnings(...), ...)=, and
+  =write_shapefile_to_path= calls =print_warnings(&encoded.warnings, quiet)=
+  directly for its post-write =Encoded.warnings=.
+
+*What deliberately stayed independent*: the check functions themselves
+(=Crs::downgrade_warning=, =FeatureCollection::m_downgrade_warning=) were
+*not* forced through a shared trait or a common input shape. They happen
+to both take =(&self, target: Format)= today, but that's coincidental, not
+fundamental — a future check (a property-schema limit, a geometry type a
+target can't represent) might need a different shape entirely (a column
+list, a single =&Geometry=, …). Generalizing the *collection-and-printing
+boilerplate* removed real, measured duplication; generalizing the *checks
+themselves* into one interface would have meant guessing a shape for cases
+that don't exist yet — the same over-abstraction =geoscribe='s own charter
+scrutiny (see =architecture.org=) warns against. Add new checks as their
+own naturally-typed functions; only the boilerplate around them is shared.
+
+** KNOWN GAPS THIS RULE HAS ALREADY CLOSED
+- GeoJSON/KML/KMZ silently dropping M when converting from an M-bearing
+  source — [[file:zm-geometry.org][zm-geometry.org]]'s M7/M8 work landed
+  full M *support* everywhere it can exist; this doc's warning is what
+  fires for the two spokes (GeoJSON, KML/KMZ) where M *can't* exist by
+  spec, so the user finds out at conversion time, not by diffing output.
+- FlatGeobuf/GeoPackage silently substituting a dropped/synthetic id for an
+  alphanumeric authority code (=crs.rs=, this pass).
+
+** OPEN CANDIDATES -- known, not yet warned, lower priority
+Found while scoping this doc; not fixed in this pass because each is a
+narrower or lower-real-world-impact case than the two above. Listed so the
+next pass through this area doesn't have to rediscover them:
+- KML's =<altitudeMode>= is never modeled at all (see
+  [[file:zm-geometry.org][zm-geometry.org]]'s M9 OPEN QUESTIONS) — arguably
+  out of scope for *this* rule specifically, since it's dropped uniformly
+  on *read*, not conversion-target-dependent the way every case above is;
+  a pre-write predictive check has nothing to compare against for it.
+- GeoParquet's full 3D covering-bbox (6-element =[xmin,ymin,zmin,xmax,ymax,zmax]=
+  vs. the 4-element 2D form this crate writes) is a *tightness* loss
+  (spatial pruning is less effective), not a data loss — real DuckDB/GDAL
+  output confirms the gap exists, but it doesn't fit this rule's "the
+  source's information is gone" bar. Explicitly out of scope, not an
+  oversight (see M8's own section in =zm-geometry.org=).
+- Shapefile's M-only shape types' rarer stretch cases (already implemented,
+  per =zm-geometry.org='s M7 follow-up) and =MultiPatch=(31) (never
+  modeled, no =Geometry= variant exists to decode into) — not conversion
+  losses in the sense this rule covers.
+
+** HOW TO APPLY THIS TO FUTURE WORK
+When adding a new format spoke, a new IR field, or discovering an existing
+capability gap:
+1. Ask, explicitly, "does every other current target actually represent
+   this, or does at least one silently degrade it?" — the M8 mistake
+   happened specifically because this question was answered by checking
+   *one* tool's behavior instead of the actual capability.
+2. If a gap exists, write the pre-write predictive check (§1) unless the
+   loss is only knowable during actual encoding, in which case use the
+   writer-returns-warnings shape (§2).
+3. For a §1 check: add one line to =main.rs='s =collect_conversion_warnings=
+   calling it. That's the whole wiring step — it already reaches all three
+   =main.rs= entry points (single-file convert, GeoPackage fan-out read,
+   GeoPackage fan-out write) through =collect_conversion_warnings=/
+   =collect_layer_warnings=, so there is no longer a way to wire a new
+   check into only *some* of them by mistake (the exact failure mode this
+   note used to warn about, before the collection was generalized — see §
+   GENERALIZED COLLECTION). For a §2 check: have the writer collect into
+   its own =Encoded.warnings=-shaped field and call =print_warnings= on it
+   where the writer's bytes get written.
+4. Test both the *positive* case (the warning fires, with the right target
+   named) and the *negative* case (a target that legitimately supports the
+   feature stays silent) — mirroring this doc's own two new tests
+   (=feature::tests::m_downgrade_warning_fires_only_for_m_incapable_targets_with_real_m=,
+   =crs::tests::wkt_targets_warn_for_an_alphanumeric_code_even_with_wkt_present=).
+5. Verify the warning's wording against what actually happens, not what
+   you'd expect to happen — end-to-end through the real CLI, the same
+   verification bar every other plan in this repo uses.

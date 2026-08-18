@@ -64,8 +64,6 @@ fn build(layers: &[(String, FeatureCollection)], rtree: bool) -> Result<Vec<u8>>
         let names: Vec<String> = layers.iter().map(|(n, _)| n.clone()).collect();
         extension_rows.extend(rtree::extension_rows(&names));
     }
-    #[cfg(feature = "crs-registry")]
-    extension_rows.push(crs_wkt_extension_row());
     if !extension_rows.is_empty() {
         specs.push(extensions_table(extension_rows));
     }
@@ -122,20 +120,6 @@ fn extensions_table(rows: Vec<ExtensionRow>) -> TableSpec {
     }
 }
 
-/// The `gpkg_extensions` row declaring R5's CRS-WKT extension: the
-/// `gpkg_spatial_ref_sys.definition_12_063` column carries WKT2:2019
-/// alongside the mandatory WKT1 `definition` column.
-#[cfg(feature = "crs-registry")]
-fn crs_wkt_extension_row() -> ExtensionRow {
-    ExtensionRow {
-        table_name: "gpkg_spatial_ref_sys".into(),
-        column_name: "definition_12_063".into(),
-        extension_name: "gpkg_crs_wkt".into(),
-        definition: "http://www.geopackage.org/spec120/#extension_crs_wkt".into(),
-        scope: "read-write".into(),
-    }
-}
-
 /// A `gpkg_spatial_ref_sys` row for a CRS beyond the three mandatory defaults.
 struct SrsReg {
     srs_id: i64,
@@ -143,13 +127,6 @@ struct SrsReg {
     organization: String,
     organization_coordsys_id: i64,
     definition: String,
-    /// R5's WKT2:2019, for the `definition_12_063` extension column — only
-    /// ever real text with `crs-registry` on (`registry_wkt2` is always
-    /// `None` off-feature, so this is `"undefined"` uniformly then, same as
-    /// `definition`'s own no-WKT fallback). Computed unconditionally here
-    /// since it's cheap and keeps `resolve_srs` feature-agnostic; only
-    /// `spatial_ref_sys`'s column emission is feature-gated.
-    definition_12_063: String,
 }
 
 /// The srs_id chosen for each layer (aligned with `layers`), plus the extra
@@ -184,8 +161,6 @@ fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
             Some(Crs::Named(n)) => {
                 let definition =
                     n.wkt.clone().or_else(|| n.structural_wkt()).unwrap_or_else(|| "undefined".into());
-                let definition_12_063 =
-                    n.registry_wkt2().map(str::to_string).unwrap_or_else(|| "undefined".into());
                 let numeric_code = n.code.as_deref().and_then(|c| c.parse::<i64>().ok());
                 match numeric_code {
                     // EPSG:4326 is exactly the default row.
@@ -202,7 +177,6 @@ fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
                                 organization,
                                 organization_coordsys_id: code,
                                 definition,
-                                definition_12_063,
                             }),
                         )
                     }
@@ -220,7 +194,6 @@ fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
                                 organization: n.authority.clone().unwrap_or_else(|| "NONE".into()),
                                 organization_coordsys_id: numeric_code.unwrap_or(srs_id),
                                 definition,
-                                definition_12_063,
                             }),
                         )
                     }
@@ -238,18 +211,10 @@ fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
 }
 
 fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
-    // With `crs-registry`, an extra `definition_12_063` column carries R5's
-    // WKT2:2019 (the GeoPackage CRS-WKT extension) alongside the mandatory
-    // WKT1 `definition` — declared via a `gpkg_extensions` row
-    // (`crs_wkt_extension_row`) whenever it's present. Off-feature the schema
-    // is unchanged from pre-R5.
-    let has_wkt2_col = cfg!(feature = "crs-registry");
-    let undefined = "undefined".to_string();
-
     // srs_id is INTEGER PRIMARY KEY, so its column value is Null and the rowid
     // carries it; rows must be rowid-ordered.
-    let row = |srs_id: i64, name: &str, org: &str, org_id: i64, def: &str, desc: &str, def2: &str| {
-        let mut vals = vec![
+    let row = |srs_id: i64, name: &str, org: &str, org_id: i64, def: &str, desc: &str| {
+        let vals = vec![
             Value::Text(name.into()),
             Value::Null,
             Value::Text(org.into()),
@@ -257,16 +222,12 @@ fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
             Value::Text(def.into()),
             Value::Text(desc.into()),
         ];
-        if has_wkt2_col {
-            vals.push(Value::Text(def2.into()));
-        }
         (srs_id, vals)
     };
-    let wgs84_def2 = crate::crs::wgs84_registry_wkt2().unwrap_or(&undefined);
     let mut rows = vec![
-        row(-1, "Undefined cartesian SRS", "NONE", -1, "undefined", "undefined cartesian", "undefined"),
-        row(0, "Undefined geographic SRS", "NONE", 0, "undefined", "undefined geographic", "undefined"),
-        row(WGS84_SRS_ID, "WGS 84 geodetic", "EPSG", 4326, WGS84_WKT, "WGS 84", wgs84_def2),
+        row(-1, "Undefined cartesian SRS", "NONE", -1, "undefined", "undefined cartesian"),
+        row(0, "Undefined geographic SRS", "NONE", 0, "undefined", "undefined geographic"),
+        row(WGS84_SRS_ID, "WGS 84 geodetic", "EPSG", 4326, WGS84_WKT, "WGS 84"),
     ];
     for reg in registrations {
         rows.push(row(
@@ -276,16 +237,11 @@ fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
             reg.organization_coordsys_id,
             &reg.definition,
             "",
-            &reg.definition_12_063,
         ));
     }
     // Rows must be rowid- (srs_id-) ordered for the b-tree writer.
     rows.sort_by_key(|(srs_id, _)| *srs_id);
-    let sql = if has_wkt2_col {
-        "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER NOT NULL PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT, definition_12_063 TEXT)"
-    } else {
-        "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER NOT NULL PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT)"
-    };
+    let sql = "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER NOT NULL PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT)";
     TableSpec { name: "gpkg_spatial_ref_sys".into(), sql: sql.into(), rows }
 }
 
@@ -442,11 +398,12 @@ fn quote(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::geometry::Position;
     use crate::feature::Feature;
     use crate::json::JsonValue;
 
     fn point(x: f64, y: f64) -> Option<Geometry> {
-        Some(Geometry::Point([x, y]))
+        Some(Geometry::Point(Position::new(x, y)))
     }
     fn fc(features: Vec<Feature>) -> FeatureCollection {
         FeatureCollection::new(features)
@@ -483,49 +440,25 @@ mod tests {
         assert_eq!(back[0].1.features[0].properties[1].1.as_f64(), Some(5.0));
     }
 
-    // R5's actual payoff: EPSG:4979 (WGS 84, Geographic 3D) has no faithful
-    // WKT1 (`has_wkt=0` in the registry — PROJ itself declines to export
-    // WKT1 for a Geographic 3D CRS), so the mandatory `definition` column
-    // falls back to the literal string "undefined". `definition_12_063`
-    // (R5's CRS-WKT extension) is where this CRS actually gets a real,
-    // authoritative definition — WKT2:2019 can express it.
     #[test]
-    #[cfg(feature = "crs-registry")]
-    fn geographic_3d_crs_gets_wkt2_extension_column() {
-        use crate::crs::{Crs, NamedCrs};
-        use crate::sqlite::Database;
-
-        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
-        layer.crs = Some(Crs::Named(NamedCrs {
-            authority: Some("EPSG".into()),
-            code: Some("4979".into()),
-            wkt: None,
-            projjson: None,
-        }));
-        let bytes = write_layers(None, &[("pts".into(), layer)], false).unwrap();
-
-        let db = Database::open(&bytes).unwrap();
-        let table = db.tables().unwrap().into_iter().find(|t| t.name == "gpkg_spatial_ref_sys").unwrap();
-        let def_col = table.columns.iter().position(|c| c == "definition").unwrap();
-        let def2_col = table
-            .columns
-            .iter()
-            .position(|c| c == "definition_12_063")
-            .expect("definition_12_063 column present with crs-registry");
-
-        // Identify the EPSG:4979 row by its definition_12_063 content (the
-        // srs_id/rowid-alias column itself stores Null on disk, per SQLite's
-        // INTEGER PRIMARY KEY convention — not useful for matching here).
-        let rows = db.read_rows(&table).unwrap();
-        let target = rows
-            .iter()
-            .find(|r| matches!(r.get(def2_col), Some(Value::Text(t)) if t.contains("EPSG\",4979")))
-            .expect("EPSG:4979 row present with a populated definition_12_063");
-        assert_eq!(target[def_col], Value::Text("undefined".into()), "no WKT1 for a Geographic 3D CRS");
-        let Value::Text(wkt2) = &target[def2_col] else { panic!("definition_12_063 not text") };
-        assert!(wkt2.starts_with("GEOGCRS[") || wkt2.starts_with("GEOGCS["), "{wkt2}");
-        assert!(wkt2.contains("ID[\"EPSG\",4979]"), "{wkt2}");
+    fn write_then_read_round_trips_z_and_m() {
+        // GeoPackage needed zero new format-specific code for this (see
+        // plans/zm-geometry.org's M5) — `gpkg_geometry` just wraps
+        // `to_wkb(g)`, and `strip_gpkg_header` already skips whichever
+        // envelope size the flags byte declares, so M2's WKB codec alone
+        // should carry Z/M through untouched. Confirmed here, not assumed.
+        let layer = fc(vec![Feature {
+            geometry: Some(Geometry::Point(Position::with_zm(1.0, 2.0, 3.0, 4.0))),
+            properties: vec![],
+        }]);
+        let bytes = write_layers(None, &[("places".into(), layer)], false).unwrap();
+        let back = read_layers(&bytes).unwrap();
+        assert_eq!(
+            back[0].1.features[0].geometry,
+            Some(Geometry::Point(Position::with_zm(1.0, 2.0, 3.0, 4.0)))
+        );
     }
+
 
     #[test]
     fn rtree_index_is_emitted_and_round_trips() {

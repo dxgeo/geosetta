@@ -1,0 +1,360 @@
+#+TITLE: Plan: External CRS Resolution via a `--crs` Override
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* External CRS Resolution (`--crs` Override)
+
+** STATUS -- IMPLEMENTED (0.24.0)
+Both flags ship. In the same change the opt-in =crs-registry= feature and its
+sibling-crate dependency were *removed*, which turns this plan from a
+nice-to-have into the crate's *only* answer for a CRS structural translation
+can't reach. The trade was deliberate: the registry was geosetta's sole
+dependency of any kind and the sole reason the build had features at all, and
+=--crs= closes the same gap at run time, for pre-built binaries too.
+
+*Scope the loss precisely.* The *default* build is byte-for-byte unchanged:
+every registry entry point (=registry_projjson=, =registry_wkt=,
+=registry_wkt2=) was a =None= stub without the feature, so every expression they
+appeared in was already dead there -- =parquet_expressible='s third term,
+=shapefile_expressible='s second, =prj_wkt='s second, and the
+=definition_12_063= column's =cfg!= gate. Only a =--features crs-registry= build
+loses anything. The bare build's known *weakness* is likewise the pre-existing
+status quo, not a new regression: structural translation of Esri-flavor
+spellings identifies WGS 84 at only ~70% and gets NAD83/NAD27 outright wrong,
+which is precisely why the registry existed.
+
+What a feature-on build loses is *name recovery from an id-less WKT* -- its
+mechanism was a registry lookup, so it has no data source left; § WHAT THIS DOES
+NOT DO already noted it was out of scope for this plan. Worth recording how
+narrow it was in production, since the module doc oversells it: geographic CRSes
+only, sources declaring *neither* authority nor code, and GeoParquet output only
+(=registry_projjson= was its sole call site; =registry_wkt=, the =.prj= path,
+was trusted-id only). =resolve_projected_by_name= was written, documented, and
+bulk-oracle-tested over 2,274 real Esri fixtures -- and never wired to a call
+site at all, living under the file's =#![allow(dead_code)]=. See § CROSS-REPO
+FOLLOW-UP for where it should come back.
+
+Implementation notes, for the reader diffing this against the code:
+- =Args= gained a =Mode= enum rather than =Option= fields. =--print-crs-code=
+  has no output at all, so putting the output path and format *inside*
+  =Mode::Convert= is what stops the diagnostic path from reaching for one --
+  the compiler enforces it instead of a runtime unwrap.
+- =crs_from_projjson_value= moved from =parquet/geo.rs= to =crs.rs= (with
+  =wkt_projjson::number= made =pub(super)= for its numeric-code formatting), so
+  a =--crs= override and a file's own PROJJSON recover their identity by one
+  rule rather than two.
+- Both flags *are* wired into the GeoPackage fan-out, which the original SCOPE
+  section missed; without that, =--crs= would have silently no-opped on every
+  =.gpkg=.
+
+** SUPERSEDED PLAN
+Supersedes [[file:crs-geoscribe-fallback.org][crs-geoscribe-fallback.org]] (deleted).
+That plan proposed closing the bare-build (=--features crs-registry= off) gap
+by having *geosetta itself* shell out to the =geoscribe= CLI at runtime,
+silently, on hitting an unresolved id-only CRS reference. Rejected on security
+grounds (user decision, 2026-08-17): geosetta must never silently execute an
+arbitrary same-named binary off =PATH= with no visible action in the user's own
+command line. This plan replaces that design entirely: no subprocess spawned by
+geosetta, ever. Instead, geosetta gains a way to *accept* an externally-resolved
+CRS definition that the user supplies explicitly, on the command line, by
+composing geosetta with a resolver of their choosing themselves via ordinary
+shell piping/substitution.
+
+** WHY
+Bare build, a source that supplies only an authority+code reference with *no*
+expanded WKT/PROJJSON body -- converting to a target that needs the full
+definition, not just a code (GeoParquet, Shapefile's =.prj=) -- warns and falls
+back to an id-only reference. See =crs.rs='s =downgrade_warning= (GeoParquet
+branch ~line 199, Shapefile branch ~line 258) and the =parquet_warns_for_a_code_
+only_crs= / =parquet_resolves_a_code_only_crs_via_registry= test pair
+(=crs.rs:530-551=) for the exact before/after. =--features crs-registry= closes
+this at compile time. This plan closes it at *run* time, without a compiled-in
+dependency and without geosetta ever executing anything on its own.
+
+** TOOL AGNOSTICISM (a hard constraint, not a preference)
+Neither flag knows, names, or assumes anything about what produced the text it
+consumes or what consumes the text it prints. =--crs= takes WKT or PROJJSON on
+its input; =--print-crs-code= puts =AUTHORITY:CODE= on stdout. Any tool that
+speaks those forms composes:
+
+#+begin_src sh
+projinfo -o WKT2 -q EPSG:7844          # PROJ
+gdalsrsinfo -o wkt EPSG:7844           # GDAL
+curl -s https://epsg.io/7844.wkt2      # a web service
+geoscribe EPSG:7844 --wkt              # the sibling registry crate
+#+end_src
+
+=geoscribe= is *one* such producer, not a privileged one. It is already an
+optional, feature-gated *library* dependency for the compiled-in registry
+(=crs/registry.rs=, =--features crs-registry=); nothing in this plan adds a
+second, runtime coupling to it, and no code, message, error text, or test in
+this plan may reference it by name. Concretely, that means: no special-casing
+of any producer's output format, no naming a tool in a hint or warning string,
+and no test that requires a particular binary on =PATH=. Where an end-to-end
+piped test wants a real producer, prefer =projinfo= -- this repo already
+depends on it for the CRS bulk oracles, so it is the tool most likely to exist
+wherever the suite runs.
+
+*Where the line sits: docs may recommend a tool; code may not name one.* User
+decision, 2026-08-17. =project.org= and =README.md= recommend =geoscribe= for
+resolving a bare authority code, because a user staring at an unresolvable CRS
+deserves a concrete next step rather than a shrug. That is a *documentation*
+recommendation and costs nothing: no build input changes, no message or test
+depends on it, and swapping in =projinfo= or =gdalsrsinfo= needs no code change
+because there is no code to change. The prohibition stays exactly where it was
+-- source, error text, warning text, and tests name no producer. In particular
+the =downgrade_warning= hint says "supply the definition with =--crs=" and not
+"install X": a warning that names a specific binary is the first step back
+toward the =PATH=-executing design this plan exists to replace.
+
+** DESIGN
+Two new flags, both purely mechanical -- geosetta parses/validates/installs
+text, it never fetches or resolves anything itself.
+
+*** `--crs <path|->`
+Reads WKT (WKT1 or WKT2) or PROJJSON text from a file, or from stdin if the
+argument is =-=, and installs it as the =FeatureCollection='s CRS before write.
+
+- *Dialect sniffing*: PROJJSON starts with =\{=; WKT starts with a keyword
+  (=GEOGCS=/=PROJCS=/=GEOGCRS=/=PROJCRS=/=BOUNDCRS=/…). Reuses the existing
+  parsers (=crs/wkt_projjson.rs=, the PROJJSON handling in =parquet/geo.rs=) --
+  no new parsing logic, just a cheap dispatch on the first non-whitespace byte.
+- *Identity lift, same as every reader path*: the override's own authority+code
+  is lifted out of the text and fed through =Crs::from_authority_code=, so the
+  WGS 84 collapse and the id-lift behave identically to a CRS recovered from a
+  file. WKT already has =wkt_authority_code= (=crs.rs:474=); the PROJJSON
+  equivalent is =crs_from_projjson_value= (=parquet/geo.rs:156=), today private
+  to the Parquet spoke -- it moves to =crs.rs= and Parquet calls it there.
+- *Semantics: assign, not enrich.* =--crs= replaces whatever CRS the source
+  carries (or the lack of one), full stop -- =ogr2ogr -a_srs= style. It does
+  *not* attempt to match the override's authority+code against the source's
+  own declared code first. This is deliberate: geosetta is fully agnostic
+  about where the text came from or why the user is supplying it. Its job stops
+  at "accept valid WKT/PROJJSON text and use it." No policy, no matching, no
+  validation beyond "does this parse."
+- *Stdin conflict*: =--crs -= and a piped main input (the =-= input positional,
+  used by the existing reprojection-pipe pattern) cannot both claim stdin --
+  geosetta must reject that combination with a clear error rather than
+  silently picking one.
+
+*** `--print-crs-code`
+A read-only diagnostic mode: reads just enough of the source to report its
+=NamedCrs= authority+code identity, prints =AUTHORITY:CODE= to stdout, and
+exits -- no output path required, no conversion performed. *Always* prints the
+code when the source's =NamedCrs= carries one, unconditionally -- whether or
+not that CRS already resolves fully today (compiled-in registry, structural
+translation, whatever). It does not try to decide on the user's behalf whether
+resolution is "needed" (user decision, 2026-08-17: predictable, unconditional
+behavior over a clever-but-situational one -- a user who wants to run an
+external resolver should always be able to, not only when geosetta judges it
+useful). Empty output + nonzero exit only when the source carries no
+authority+code at all (id-less WKT, or no CRS) -- there is genuinely nothing to
+print. This is the piece that makes command-line-only composition possible:
+without it, the only place an unresolved code surfaces today is inside a
+human-readable warning sentence on stderr, which is prose, not a contract, and
+isn't safe to script against.
+
+Two cases the "print the =NamedCrs= identity" rule does not by itself settle --
+a WGS 84 source (no =NamedCrs= to read) and a multi-layer GeoPackage (possibly
+several) -- are open, see § OPEN QUESTIONS.
+
+*** Composition
+Both flags together let a single shell line do what the old plan wanted
+geosetta to do internally -- with every subprocess spawned fully visible in
+what the user typed, none of it hidden inside geosetta. Any resolver slots into
+the same shape (see § TOOL AGNOSTICISM):
+
+#+begin_src sh
+geosetta in.parquet out.gpkg \
+  --crs <(projinfo -o WKT2 -q "$(geosetta in.parquet --print-crs-code)")
+
+# or with a plain pipe, no process substitution:
+geosetta in.parquet --print-crs-code | xargs gdalsrsinfo -o wkt \
+  | geosetta in.parquet out.shp --crs -
+#+end_src
+
+** WHAT THIS DOES NOT DO
+- *No automatic or silent resolution.* The entire point is that every external
+  invocation is explicit, visible, and authored by the user -- geosetta's own
+  behavior when neither flag is given is unchanged from today (warn, degrade
+  to id-reference, continue).
+- *Does not replace `--features crs-registry`.* That remains the zero-friction,
+  no-shell-composition path for anyone able to rebuild; this plan is for
+  pre-built binaries and one-off/scripted use.
+- *Does not solve id-less WKT name recovery.* =--print-crs-code= only has
+  something to print when the source already carries an authority+code --
+  an id-less Esri-flavor =.prj= has none to extract this way, same limitation
+  the superseded plan's own § WHAT THIS DOES NOT FIX noted. Out of scope here
+  too; would need a completely different mechanism (structural inspection of
+  an id-less WKT) if ever pursued.
+
+** SCOPE
+- =src/cli.rs= :: new =--crs <path|->= flag; new =--print-crs-code= mode
+  (early-exit, bypasses the normal read→convert→write pipeline once the source
+  is read). Stdin-conflict validation (=--crs -= + input =-=) at
+  argument-parsing time. *Structural change*: =parse= today hard-requires
+  exactly two positionals (=cli.rs:92=), but the diagnostic mode takes one and
+  has no output. Lowest-ripple shape is =output: Option<String>= / =to:
+  Option<Format>= on =Args=, with =run()= branching to the diagnostic path
+  before either is read. =USAGE= updated for both flags.
+- =src/crs.rs= :: one new entry point, =Crs::from_definition_text(&str) ->
+  Result<Crs>= -- dialect sniffing for arbitrary override text (WKT vs
+  PROJJSON), routed through the existing parsers plus the identity lift
+  described above. No new parsing code. Also a real accessor for the print
+  path: =NamedCrs::label()= is private and produces *prose* (=code 3857=, =the
+  source CRS=), which is not a scriptable contract -- add
+  =NamedCrs::authority_code() -> Option<(&str, &str)>= and print from that.
+- =src/parquet/geo.rs= :: =crs_from_projjson_value= moves to =crs.rs= (it is
+  the PROJJSON identity lift both spokes now need); Parquet calls it there.
+  Pure relocation, no behavior change.
+- =src/main.rs= :: wire =--print-crs-code= as a read-only diagnostic path (read
+  source, report =NamedCrs= identity, exit -- skip write entirely); wire
+  =--crs= to install the override onto =FeatureCollection.crs= right after read,
+  before =downgrade_warning=/write, so a successfully-supplied override
+  suppresses the id-reference warning the same way registry resolution does.
+- =src/main.rs=, GeoPackage paths :: *both flags must be wired into
+  =run_geopackage_read= and =run_geopackage_write= as well.* Those branch out of
+  =run()= before the plain pipeline (=main.rs:71-76=) and fan out over
+  =read_layers=, so a =--crs= override installed only on the single-collection
+  path would silently no-op on every =.gpkg= conversion -- the exact class of
+  silent-drop this project warns about everywhere else. The override is
+  assigned per layer; =--print-crs-code= needs its own answer for multi-layer
+  input (see § OPEN QUESTIONS) and must branch *before* the GeoPackage dispatch.
+- =src/crs.rs=, warning text :: both =downgrade_warning= hints (=crs.rs:199=,
+  =crs.rs:258=) currently offer only "Rebuild with =--features crs-registry=".
+  With =--crs= shipped there is a *runtime* option to name as well, and the
+  =#[cfg(not(feature = "crs-registry"))]=-only truthfulness argument in that
+  comment needs re-checking against the new branch.
+- No changes needed to =Feature=/=FeatureCollection= -- =Crs= is already an
+  opaque =Option<Crs>= (per =crs.org='s original design), so installing an
+  override is a plain assignment, same seam the reprojection-composability
+  work already relies on (=reproject-composability.org=).
+- No changes needed in any external tool, and none permitted: the flags consume
+  and emit generic WKT/PROJJSON/=AUTHORITY:CODE= text (§ TOOL AGNOSTICISM).
+
+** TESTING -- as built, in =tests/crs_external.rs= (19 tests) plus =crs.rs= units
+- =--print-crs-code= against fixtures with a bare authority+code CRS (prints
+  correctly); a source whose CRS already resolves fully (e.g. carries its own
+  WKT body, or resolves via a compiled-in =crs-registry=) -- confirm it *still*
+  prints unconditionally, not just when a gap exists; an id-less WKT (empty
+  output, nonzero exit); and no CRS at all (same).
+- =--print-crs-code= against a multi-layer GeoPackage fixture, per whatever
+  § OPEN QUESTIONS settles on, and against a single-layer one.
+- =--crs= accepting WKT1, WKT2, and PROJJSON text, each correctly sniffed and
+  installed; confirm the installed CRS reaches the target format's writer
+  (GeoParquet =crs= metadata, Shapefile =.prj=) correctly -- *and* reaches a
+  GeoPackage writer's layers, guarding the fan-out wiring above.
+- =--crs -= reading from stdin end-to-end. No binary needs to exist for this:
+  unlike the superseded plan, geosetta never spawns anything, so there is
+  nothing to stub -- the test only has to feed stdin. One optional end-to-end
+  case may pipe from a real resolver; use =projinfo= (already required by the
+  CRS bulk oracles) and skip when absent, never =geoscribe= (§ TOOL
+  AGNOSTICISM).
+- The stdin-conflict error case (=--crs -= together with a =-= input positional).
+- A malformed override (neither WKT nor PROJJSON) is a hard error, not a
+  silent ignore.
+- Regression: =parquet_warns_for_a_code_only_crs= gains a sibling asserting the
+  warning vanishes when =--crs= supplies a body for that same bare code,
+  mirroring how =parquet_resolves_a_code_only_crs_via_registry= already covers
+  the compiled-in-registry case.
+
+** CROSS-REPO FOLLOW-UP -- id-less WKT identification belongs in =geoscribe=
+*RESOLVED: shipped in geoscribe, geosetta unchanged.* =geoscribe --identify=
+now reads an id-less WKT from a file or stdin and emits a definition, so the
+pipeline below closes the gap:
+
+#+begin_src sh
+geoscribe --identify --projjson parcels.prj \
+  | geosetta parcels.shp parcels.parquet --crs -
+#+end_src
+
+The prediction at the end of this section held exactly: *geosetta needed zero
+changes.* Where several CRSes fit equally well, geoscribe prints nothing and
+exits =2=, and geosetta's hard error on an empty =--crs= turns that into a
+loud pipeline failure -- the two contracts compose, verified end to end
+against both real binaries. See =geoscribe/plans/wkt-identify.org=
+§ BOUNDARY -- RESOLVED and § RESULTS.
+
+The original problem statement follows, as written:
+
+=--print-crs-code= reports nothing for an id-less definition, so the
+report-resolve-supply pipeline cannot serve the one case the removed registry
+was best at. Restoring it *here* is not an option -- geosetta has no lookup
+table and is not getting one -- and geoscribe's CLI cannot do it either: it
+deliberately exposes only the trusted-id lookup
+(=geoscribe <AUTHORITY:CODE> [--wkt|--wkt2|--projjson]=), so its output "is
+always safe to pipe without a human eyeballing it first".
+
+The recovery algorithm splits cleanly along ownership lines, and the split
+favors moving it:
+
+| part                                    | lived in | belongs in                |
+|-----------------------------------------+----------+---------------------------|
+| =NAMES= index + records                 | geoscribe | geoscribe                |
+| WKT name/ellipsoid extraction           | geosetta  | geoscribe (port, ~100 ln) |
+| type check + 1e-6 ellipsoid validation  | geosetta  | geoscribe                 |
+
+Nothing in that trust policy knows what a Shapefile is; it lived in geosetta
+only because that is where the consumer was. Scoped in the sibling repo as
+=geoscribe/plans/wkt-identify.org=, which also has to argue with
+=geoscribe/plans/public-api.org= § BOUNDARY -- a deliberate, documented decision
+that this exact policy must *not* move into the registry crate. Geosetta needs
+*zero* changes either way: =--crs= already accepts whatever text comes back.
+
+** CONVENTIONS / CONSTRAINTS
+- *Strict fallback carries over*: geosetta still never guesses -- =--crs=
+  requires the user to supply something that parses; a malformed override is a
+  hard error, not a silent ignore.
+- *Dependency-free by default, unaffected*: neither flag adds a dependency,
+  compiled or runtime -- both are pure text-in, text-out, no process spawning.
+- *Never reproject* -- unchanged; =--crs= relabels identity, same as every
+  other CRS path in the crate. It does not transform coordinates.
+- *Commits*: the user commits deliberately (don't commit unbidden). Do NOT add
+  a =Co-Authored-By= trailer to commit messages in this project.
+
+** DECISIONS (settled 2026-08-17)
+*** A WGS 84 source prints =OGC:CRS84=, and exits 0
+=Crs::Wgs84= is fieldless by design -- =EPSG:4326= and =OGC:CRS84= both collapse
+into it in =Crs::from_authority_code= -- so reporting an identity for it means
+*choosing* a spelling. =OGC:CRS84= is the one that matches what the variant
+asserts: WGS 84 in longitude/latitude order (=EPSG:4326= is authoritatively
+latitude/longitude). It also round-trips to a no-op -- resolve it, feed the
+definition back through =--crs=, and the id lift collapses it straight back to
+=Crs::Wgs84=. See =crs::WGS84_CRS_CODE=.
+
+Exiting nonzero for it was rejected: a nonzero exit must mean "there is no
+identity here", and for a GeoJSON that is simply false. Failing on the single
+most common input would break the guarantee in the case that matters most, and
+kill any =set -e= script wrapping the flag.
+
+The distinction that has to be preserved -- and which the IR already carries --
+is *no CRS* versus *a CRS that the format's spec fixes and therefore never
+encodes*. =Option<Crs>= is exactly that distinction: =None= for CSV and WKT,
+which have no CRS channel at all (nothing was ever recorded), against
+=Some(Crs::Wgs84)= for GeoJSON and KML/KMZ, whose specs *mandate* WGS 84 so the
+file has no reason to write it down. The identity in the second case is real and
+known, merely unwritten, and is reported like any other. Only the first is the
+empty-output/nonzero-exit case.
+
+*** A multi-layer GeoPackage prints one code per line, de-duplicated
+In layer order. All three candidates behave identically for a single-layer
+=.gpkg= -- the overwhelming majority -- so the simplest wins. It also follows a
+precedent in the same file: =collect_layer_warnings= already de-duplicates
+identical messages across layers so a single-CRS =.gpkg= warns once. =--layer=
+already exists for anyone wanting to narrow it, and the failure mode under a
+naive =$(...)= on a genuinely mixed file is that the downstream resolver
+receives =EPSG:3857 EPSG:7844= and errors loudly, which is the right kind of
+failure. Erroring outright, or demanding =--layer=, would spend a hard failure
+on a file geosetta can describe accurately.
+
+*** =--crs= on a mixed-CRS GeoPackage warns and proceeds
+A third decision this exposed, which the original scoping missed. Applying one
+override to layers that *disagreed* silently relabels every layer that differed
+-- exactly the class of thing =lossy-conversion-warnings.org= says must be
+announced. Warn-and-proceed rather than refuse: =--crs= is explicitly "assign,
+not enrich", so overriding *is* the user's stated intent; they simply deserve to
+be told how many layers it landed on. See =main.rs='s =apply_crs_override=.
+
+*** Flag names
+=--crs= and =--print-crs-code= as originally proposed; no better candidate
+emerged.

@@ -1,7 +1,8 @@
 //! Geometry model shared by the readers/writers, plus bounding-box support.
 //!
-//! Coordinates are 2D (X = longitude, Y = latitude). Any additional ordinates
-//! in the source (e.g. elevation) are dropped for this first version.
+//! Coordinates are X/Y (longitude/latitude) plus optional Z (elevation) and
+//! M (linear-referencing measure) ordinates, present only where a source
+//! format actually declares them.
 
 mod wkb;
 mod wkt;
@@ -11,8 +12,39 @@ pub use wkb::encode as to_wkb;
 pub use wkt::decode as from_wkt;
 pub use wkt::encode as to_wkt;
 
-/// A single 2D coordinate: `[x, y]`.
-pub type Position = [f64; 2];
+/// A single coordinate. `x`/`y` are always present; `z` (elevation) and `m`
+/// (measure) are per-position, since some formats (e.g. Shapefile's M
+/// "no-data" sentinel) allow an individual point within an otherwise
+/// Z/M-bearing geometry to omit one.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Position {
+    pub x: f64,
+    pub y: f64,
+    pub z: Option<f64>,
+    pub m: Option<f64>,
+}
+
+impl Position {
+    /// A 2D position — no Z, no M. The common case.
+    pub fn new(x: f64, y: f64) -> Self {
+        Position { x, y, z: None, m: None }
+    }
+
+    /// An X/Y/Z position (no M).
+    pub fn with_z(x: f64, y: f64, z: f64) -> Self {
+        Position { x, y, z: Some(z), m: None }
+    }
+
+    /// An X/Y/M position (no Z).
+    pub fn with_m(x: f64, y: f64, m: f64) -> Self {
+        Position { x, y, z: None, m: Some(m) }
+    }
+
+    /// A full X/Y/Z/M position.
+    pub fn with_zm(x: f64, y: f64, z: f64, m: f64) -> Self {
+        Position { x, y, z: Some(z), m: Some(m) }
+    }
+}
 
 /// A vector geometry, mirroring the GeoJSON geometry types.
 ///
@@ -71,6 +103,23 @@ impl Geometry {
         }
     }
 
+    /// Whether any position in this geometry carries an M (measure)
+    /// ordinate. Used by [`crate::feature::FeatureCollection::has_m`] to
+    /// decide whether converting to a format with no M concept (GeoJSON,
+    /// KML/KMZ) would silently drop data — see
+    /// [`crate::feature::FeatureCollection::m_downgrade_warning`].
+    pub fn has_m(&self) -> bool {
+        match self {
+            Geometry::Point(p) => p.m.is_some(),
+            Geometry::LineString(ps) | Geometry::MultiPoint(ps) => ps.iter().any(|p| p.m.is_some()),
+            Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
+                rings.iter().flatten().any(|p| p.m.is_some())
+            }
+            Geometry::MultiPolygon(polys) => polys.iter().flatten().flatten().any(|p| p.m.is_some()),
+            Geometry::GeometryCollection(geoms) => geoms.iter().any(Geometry::has_m),
+        }
+    }
+
     /// Visit every coordinate in the geometry by mutable reference, recursing
     /// into rings/parts/collections the same way [`Self::extend_bbox`] does.
     ///
@@ -80,6 +129,20 @@ impl Geometry {
     /// pair it with [`crate::FeatureCollection::for_each_position_mut`] to
     /// rewrite every coordinate in place without hand-rolling a match over
     /// every `Geometry` variant.
+    ///
+    /// **The Z/M contract**: `Position::z`/`Position::m`, when present, are
+    /// handed to the callback exactly like `x`/`y` — this seam makes no
+    /// promise about what a purely horizontal reprojection does with them.
+    /// A 2D-only backend (e.g. `wbprojection`, the dev-dependency
+    /// `tests/reproject_pipe.rs` verifies against) will typically leave `z`
+    /// untouched, which is correct per Geosetta's own "label, never
+    /// reproject" posture — Z passes through unexamined by default, the
+    /// same as every other ordinate this crate doesn't interpret. A caller
+    /// wanting a full 3D transform (e.g. a vertical-datum shift alongside
+    /// the horizontal one) is free to read and rewrite `p.z` itself inside
+    /// the closure; nothing here prevents it. `m` is never touched by any
+    /// reprojection concern at all — it's a linear-referencing measure, not
+    /// a spatial coordinate — so a backend has no reason to alter it.
     pub fn for_each_position_mut(&mut self, mut f: impl FnMut(&mut Position)) {
         self.visit_positions_mut(&mut f);
     }
@@ -117,6 +180,10 @@ impl Geometry {
     /// over a slice lets them transform a whole run in one call instead of
     /// paying per-coordinate call/FFI overhead. A caller that only wants
     /// pointwise access can just iterate the slice itself.
+    ///
+    /// Same Z/M contract as [`Self::for_each_position_mut`]: both ordinates
+    /// are handed to the callback unexamined, and it's the caller's choice
+    /// whether to touch `z` at all.
     pub fn for_each_position_run_mut(&mut self, mut f: impl FnMut(&mut [Position])) {
         self.visit_position_runs_mut(&mut f);
     }
@@ -162,10 +229,10 @@ impl Bbox {
 
     /// Grow the box to include `p`.
     pub fn add(&mut self, p: Position) {
-        self.min_x = self.min_x.min(p[0]);
-        self.min_y = self.min_y.min(p[1]);
-        self.max_x = self.max_x.max(p[0]);
-        self.max_y = self.max_y.max(p[1]);
+        self.min_x = self.min_x.min(p.x);
+        self.min_y = self.min_y.min(p.y);
+        self.max_x = self.max_x.max(p.x);
+        self.max_y = self.max_y.max(p.y);
     }
 
     /// True until at least one point has been added.
@@ -181,29 +248,29 @@ mod tests {
     // A negate-both-ordinates stand-in for a real reprojection: cheap to
     // verify every position was actually visited (and none double-visited).
     fn negate(p: &mut Position) {
-        p[0] = -p[0];
-        p[1] = -p[1];
+        p.x = -p.x;
+        p.y = -p.y;
     }
 
     #[test]
     fn for_each_position_mut_visits_a_point() {
-        let mut g = Geometry::Point([1.0, 2.0]);
+        let mut g = Geometry::Point(Position::new(1.0, 2.0));
         g.for_each_position_mut(negate);
-        assert_eq!(g, Geometry::Point([-1.0, -2.0]));
+        assert_eq!(g, Geometry::Point(Position::new(-1.0, -2.0)));
     }
 
     #[test]
     fn for_each_position_mut_visits_polygon_rings_including_holes() {
         let mut g = Geometry::Polygon(vec![
-            vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 0.0]],
-            vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 1.0]],
+            vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 0.0)],
+            vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 1.0)],
         ]);
         g.for_each_position_mut(negate);
         assert_eq!(
             g,
             Geometry::Polygon(vec![
-                vec![[0.0, 0.0], [-4.0, 0.0], [-4.0, -4.0], [0.0, 0.0]],
-                vec![[-1.0, -1.0], [-2.0, -1.0], [-2.0, -2.0], [-1.0, -1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(-4.0, 0.0), Position::new(-4.0, -4.0), Position::new(0.0, 0.0)],
+                vec![Position::new(-1.0, -1.0), Position::new(-2.0, -1.0), Position::new(-2.0, -2.0), Position::new(-1.0, -1.0)],
             ])
         );
     }
@@ -211,15 +278,15 @@ mod tests {
     #[test]
     fn for_each_position_mut_visits_multipolygon_parts() {
         let mut g = Geometry::MultiPolygon(vec![
-            vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]],
-            vec![vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0]]],
+            vec![vec![Position::new(0.0, 0.0), Position::new(1.0, 0.0), Position::new(1.0, 1.0)]],
+            vec![vec![Position::new(5.0, 5.0), Position::new(6.0, 5.0), Position::new(6.0, 6.0)]],
         ]);
         g.for_each_position_mut(negate);
         assert_eq!(
             g,
             Geometry::MultiPolygon(vec![
-                vec![vec![[0.0, 0.0], [-1.0, 0.0], [-1.0, -1.0]]],
-                vec![vec![[-5.0, -5.0], [-6.0, -5.0], [-6.0, -6.0]]],
+                vec![vec![Position::new(0.0, 0.0), Position::new(-1.0, 0.0), Position::new(-1.0, -1.0)]],
+                vec![vec![Position::new(-5.0, -5.0), Position::new(-6.0, -5.0), Position::new(-6.0, -6.0)]],
             ])
         );
     }
@@ -227,17 +294,17 @@ mod tests {
     #[test]
     fn for_each_position_mut_recurses_into_geometry_collections() {
         let mut g = Geometry::GeometryCollection(vec![
-            Geometry::Point([1.0, 2.0]),
-            Geometry::LineString(vec![[3.0, 4.0], [5.0, 6.0]]),
-            Geometry::GeometryCollection(vec![Geometry::Point([7.0, 8.0])]),
+            Geometry::Point(Position::new(1.0, 2.0)),
+            Geometry::LineString(vec![Position::new(3.0, 4.0), Position::new(5.0, 6.0)]),
+            Geometry::GeometryCollection(vec![Geometry::Point(Position::new(7.0, 8.0))]),
         ]);
         g.for_each_position_mut(negate);
         assert_eq!(
             g,
             Geometry::GeometryCollection(vec![
-                Geometry::Point([-1.0, -2.0]),
-                Geometry::LineString(vec![[-3.0, -4.0], [-5.0, -6.0]]),
-                Geometry::GeometryCollection(vec![Geometry::Point([-7.0, -8.0])]),
+                Geometry::Point(Position::new(-1.0, -2.0)),
+                Geometry::LineString(vec![Position::new(-3.0, -4.0), Position::new(-5.0, -6.0)]),
+                Geometry::GeometryCollection(vec![Geometry::Point(Position::new(-7.0, -8.0))]),
             ])
         );
     }
@@ -248,8 +315,8 @@ mod tests {
         // counting closure catches over- or under-visiting that an equality
         // check on symmetric negation could miss.
         let mut g = Geometry::GeometryCollection(vec![
-            Geometry::MultiPoint(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]),
-            Geometry::MultiLineString(vec![vec![[0.0, 0.0], [1.0, 0.0]], vec![[2.0, 0.0], [3.0, 0.0], [4.0, 0.0]]]),
+            Geometry::MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, 2.0)]),
+            Geometry::MultiLineString(vec![vec![Position::new(0.0, 0.0), Position::new(1.0, 0.0)], vec![Position::new(2.0, 0.0), Position::new(3.0, 0.0), Position::new(4.0, 0.0)]]),
         ]);
         let mut count = 0;
         g.for_each_position_mut(|_| count += 1);
@@ -264,17 +331,17 @@ mod tests {
 
     #[test]
     fn for_each_position_run_mut_treats_a_point_as_a_length_one_run() {
-        let mut g = Geometry::Point([1.0, 2.0]);
+        let mut g = Geometry::Point(Position::new(1.0, 2.0));
         let mut runs = Vec::new();
         g.for_each_position_run_mut(|ps| runs.push(ps.len()));
         assert_eq!(runs, vec![1]);
         g.for_each_position_run_mut(negate_slice);
-        assert_eq!(g, Geometry::Point([-1.0, -2.0]));
+        assert_eq!(g, Geometry::Point(Position::new(-1.0, -2.0)));
     }
 
     #[test]
     fn for_each_position_run_mut_yields_the_whole_linestring_as_one_run() {
-        let mut g = Geometry::LineString(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 2.0]]);
+        let mut g = Geometry::LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, 2.0)]);
         let mut runs = Vec::new();
         g.for_each_position_run_mut(|ps| runs.push(ps.len()));
         assert_eq!(runs, vec![3]);
@@ -283,8 +350,8 @@ mod tests {
     #[test]
     fn for_each_position_run_mut_yields_one_run_per_polygon_ring() {
         let mut g = Geometry::Polygon(vec![
-            vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 0.0]],
-            vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 1.0]],
+            vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 0.0)],
+            vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 1.0)],
         ]);
         let mut runs = Vec::new();
         g.for_each_position_run_mut(|ps| runs.push(ps.len()));
@@ -293,8 +360,8 @@ mod tests {
         assert_eq!(
             g,
             Geometry::Polygon(vec![
-                vec![[0.0, 0.0], [-4.0, 0.0], [-4.0, -4.0], [0.0, 0.0]],
-                vec![[-1.0, -1.0], [-2.0, -1.0], [-2.0, -2.0], [-1.0, -1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(-4.0, 0.0), Position::new(-4.0, -4.0), Position::new(0.0, 0.0)],
+                vec![Position::new(-1.0, -1.0), Position::new(-2.0, -1.0), Position::new(-2.0, -2.0), Position::new(-1.0, -1.0)],
             ])
         );
     }
@@ -305,10 +372,10 @@ mod tests {
         // each still keyed to its own polygon's ring, not flattened across
         // polygons.
         let mut g = Geometry::MultiPolygon(vec![
-            vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]],
+            vec![vec![Position::new(0.0, 0.0), Position::new(1.0, 0.0), Position::new(1.0, 1.0)]],
             vec![
-                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 0.0]],
-                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 0.0)],
+                vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 1.0)],
             ],
         ]);
         let mut runs = Vec::new();
@@ -319,9 +386,9 @@ mod tests {
     #[test]
     fn for_each_position_run_mut_recurses_into_geometry_collections() {
         let mut g = Geometry::GeometryCollection(vec![
-            Geometry::Point([1.0, 2.0]),
-            Geometry::LineString(vec![[3.0, 4.0], [5.0, 6.0]]),
-            Geometry::GeometryCollection(vec![Geometry::MultiPoint(vec![[7.0, 8.0], [9.0, 10.0]])]),
+            Geometry::Point(Position::new(1.0, 2.0)),
+            Geometry::LineString(vec![Position::new(3.0, 4.0), Position::new(5.0, 6.0)]),
+            Geometry::GeometryCollection(vec![Geometry::MultiPoint(vec![Position::new(7.0, 8.0), Position::new(9.0, 10.0)])]),
         ]);
         let mut runs = Vec::new();
         g.for_each_position_run_mut(|ps| runs.push(ps.len()));
@@ -330,9 +397,9 @@ mod tests {
         assert_eq!(
             g,
             Geometry::GeometryCollection(vec![
-                Geometry::Point([-1.0, -2.0]),
-                Geometry::LineString(vec![[-3.0, -4.0], [-5.0, -6.0]]),
-                Geometry::GeometryCollection(vec![Geometry::MultiPoint(vec![[-7.0, -8.0], [-9.0, -10.0]])]),
+                Geometry::Point(Position::new(-1.0, -2.0)),
+                Geometry::LineString(vec![Position::new(-3.0, -4.0), Position::new(-5.0, -6.0)]),
+                Geometry::GeometryCollection(vec![Geometry::MultiPoint(vec![Position::new(-7.0, -8.0), Position::new(-9.0, -10.0)])]),
             ])
         );
     }
@@ -342,8 +409,8 @@ mod tests {
         // Same coordinate set, visited two different ways: the total number
         // of coordinates touched must match regardless of run grouping.
         let mut g = Geometry::MultiPolygon(vec![
-            vec![vec![[0.0, 0.0], [1.0, 0.0], [1.0, 1.0]]],
-            vec![vec![[5.0, 5.0], [6.0, 5.0], [6.0, 6.0], [5.0, 6.0]]],
+            vec![vec![Position::new(0.0, 0.0), Position::new(1.0, 0.0), Position::new(1.0, 1.0)]],
+            vec![vec![Position::new(5.0, 5.0), Position::new(6.0, 5.0), Position::new(6.0, 6.0), Position::new(5.0, 6.0)]],
         ]);
         let mut by_point = 0;
         g.for_each_position_mut(|_| by_point += 1);

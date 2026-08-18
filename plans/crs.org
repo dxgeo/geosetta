@@ -412,6 +412,12 @@ of it. The three options considered here were (a) a curated table of common
 CRSes, (b) embed the full dataset, or (c) decline and document the limit; this
 plan originally recommended (c).
 
+*Superseded (0.24.0):* the =crs-registry= feature and the =geoscribe=
+dependency were removed; a bare code is now resolved by the user via
+=--crs= ([[file:crs-external-resolution.org][crs-external-resolution.org]]).
+Text below describing the registry as available is kept as the record of
+what was true when it was written.
+
 *As shipped, instead: option (b), but kept out of the dependency-free core.*
 The *CRS registry* effort (moved out of this repo — see =plans/README.org=)
 built exactly the full-dataset option, as the sibling
@@ -441,9 +447,11 @@ details; this file only tracks that D's gap is closed for the opt-in build.
    *done* (fixes gpkg→parquet in GDAL/QGIS); the PROJJSON→WKT reverse is also
    *done* ([[file:projjson-to-wkt.org][projjson-to-wkt.org]]). Datum ensembles
    remain (no faithful WKT1 rendering exists), each its own effort.
-4. *D* — *done*, via the opt-in =crs-registry= feature (=geoscribe='s
-   full embedded registry); the default dependency-free build still declines,
-   as originally recommended.
+4. *D* — was *done* via the opt-in =crs-registry= feature, then *undone* in
+   0.24.0 with that feature's removal. Geosetta now declines a bare code
+   unconditionally, as this milestone originally recommended, and the user
+   supplies the definition with =--crs= instead
+   ([[file:crs-external-resolution.org][crs-external-resolution.org]]).
 
 ** OPEN QUESTIONS / DECISIONS
 - *Warning suppression* — *resolved for now:* shipped =--quiet= (alias

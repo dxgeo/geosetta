@@ -1,8 +1,8 @@
 [package]
 name = "geosetta"
-version = "0.23.0"
+version = "0.24.0"
 edition = "2024"
-description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, Shapefile, KML/KMZ, CSV, WKT), dependency-free."
+description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, Shapefile, KML/KMZ, CSV, WKT), carrying Z/M ordinates and CRS labels through. Warns on stderr whenever a conversion would drop something the target format cannot represent. Dependency-free, standard library only."
 license = "MIT"
 # Dev-only tooling kept in the repo but out of the published crate.
 exclude = ["bench/"]
@@ -16,10 +16,10 @@ name = "geosetta"
 path = "src/main.rs"
 
 [dependencies]
-# Optional embedded CRS registry data (PROJ/EPSG/Esri/IGN/IAU/NKG-derived). Kept
-# in a sibling crate so its third-party dataset terms are isolated and the default
-# build stays dependency-free. Enabled by the `crs-registry` feature.
-geoscribe = { path = "../geoscribe", version = "0.3.0", optional = true }
+# None. The crate is standard-library only, unconditionally. A CRS geosetta
+# cannot resolve structurally is supplied at run time as text via `--crs`
+# (see plans/crs-external-resolution.org) rather than by a compiled-in registry,
+# so there is no optional dependency either.
 
 [dev-dependencies]
 # Used only by tests/reproject_pipe.rs, to prove the reprojection seam
@@ -30,12 +30,15 @@ geoscribe = { path = "../geoscribe", version = "0.3.0", optional = true }
 # `parallel` (rayon) feature, which the tests don't need.
 wbprojection = { version = "0.3.3", default-features = false }
 
-[features]
-# CRS registry: resolve a source's (authority, code) to an authoritative CRS
-# definition via the embedded proj.db-derived table (see geoscribe/NOTICE
-# for data terms). OFF by default: the default build stays pure-MIT and
-# dependency-free; opt in with --features crs-registry.
-crs-registry = ["dep:geoscribe"]
+# Intra-doc links are part of the docs staying true: a link that silently stops
+# resolving (a renamed item, a module demoted to `pub(crate)`) is the same class
+# of drift as prose going stale, so it fails the build rather than scrolling past
+# as a warning. `private_intra_doc_links` additionally catches a *public* item's
+# docs pointing at crate-internal code — the link cannot exist on docs.rs, so it
+# should be a plain code span instead.
+[lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
 
 [profile.release]
 lto = true

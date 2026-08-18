@@ -215,8 +215,8 @@ fn combine(geoms: Vec<Geometry>) -> Geometry {
 
 /// Whitespace-*or*-newline-separated `lon,lat[,alt]` tuples — real-world KML
 /// (Google Earth exports especially) is inconsistent about which separator it
-/// uses. Altitude, if present, is parsed (to catch malformed input) and
-/// dropped, matching the project's 2D-only stance.
+/// uses. Altitude, if present, becomes `Position::z` — mirroring GeoJSON's
+/// third-array-element handling (M3) — rather than being parsed and dropped.
 fn parse_coordinates(text: &str) -> Result<Vec<Position>> {
     text.split_ascii_whitespace().map(parse_tuple).collect()
 }
@@ -227,9 +227,10 @@ fn parse_tuple(tuple: &str) -> Result<Position> {
     let lon: f64 = parts.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
     let lat: f64 = parts.next().and_then(|s| s.parse().ok()).ok_or_else(bad)?;
     if let Some(alt) = parts.next() {
-        alt.parse::<f64>().map_err(|_| bad())?;
+        let alt: f64 = alt.parse().map_err(|_| bad())?;
+        return Ok(Position::with_z(lon, lat, alt));
     }
-    Ok([lon, lat])
+    Ok(Position::new(lon, lat))
 }
 
 #[cfg(test)]
@@ -248,7 +249,7 @@ mod tests {
         assert_eq!(fc.crs, Some(Crs::Wgs84));
         assert_eq!(fc.features.len(), 1);
         let f = &fc.features[0];
-        assert_eq!(f.geometry, Some(Point([-73.9857, 40.7484])));
+        assert_eq!(f.geometry, Some(Point(Position::with_z(-73.9857, 40.7484, 10.0))));
         let prop = |k: &str| f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone());
         assert_eq!(prop("name").unwrap().as_str(), Some("Empire State"));
         assert_eq!(prop("description").unwrap().as_str(), Some("A building"));
@@ -267,13 +268,13 @@ mod tests {
         assert_eq!(fc.features.len(), 2);
         assert_eq!(
             fc.features[0].geometry,
-            Some(LineString(vec![[0.0, 0.0], [1.0, 1.0], [2.0, 0.0]]))
+            Some(LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, 0.0)]))
         );
         assert_eq!(
             fc.features[1].geometry,
             Some(Polygon(vec![
-                vec![[0.0, 0.0], [4.0, 0.0], [4.0, 4.0], [0.0, 4.0], [0.0, 0.0]],
-                vec![[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0], [1.0, 1.0]],
+                vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 4.0), Position::new(0.0, 0.0)],
+                vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
             ]))
         );
     }
@@ -285,7 +286,7 @@ mod tests {
             <Point><coordinates>1,1</coordinates></Point>
         </MultiGeometry></Placemark></kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![[0.0, 0.0], [1.0, 1.0]])));
+        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])));
     }
 
     #[test]
@@ -298,8 +299,8 @@ mod tests {
         assert_eq!(
             fc.features[0].geometry,
             Some(GeometryCollection(vec![
-                Point([0.0, 0.0]),
-                LineString(vec![[0.0, 0.0], [1.0, 1.0]]),
+                Point(Position::new(0.0, 0.0)),
+                LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)]),
             ]))
         );
     }
@@ -345,12 +346,39 @@ mod tests {
     fn tolerates_newline_separated_coordinates() {
         let kml = "<kml><Placemark><LineString><coordinates>\n0,0\n1,1\n</coordinates></LineString></Placemark></kml>";
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features[0].geometry, Some(LineString(vec![[0.0, 0.0], [1.0, 1.0]])));
+        assert_eq!(fc.features[0].geometry, Some(LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])));
     }
 
     #[test]
     fn rejects_malformed_coordinates() {
         let kml = "<kml><Placemark><Point><coordinates>not-a-number,0</coordinates></Point></Placemark></kml>";
+        assert!(read(kml.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_2d_point_has_no_z() {
+        let kml = "<kml><Placemark><Point><coordinates>0,0</coordinates></Point></Placemark></kml>";
+        let fc = read(kml.as_bytes()).unwrap();
+        assert_eq!(fc.features[0].geometry, Some(Point(Position::new(0.0, 0.0))));
+    }
+
+    #[test]
+    fn line_string_carries_z_per_point() {
+        let kml = "<kml><Placemark><LineString><coordinates>0,0,1 1,1,2 2,0,3</coordinates></LineString></Placemark></kml>";
+        let fc = read(kml.as_bytes()).unwrap();
+        assert_eq!(
+            fc.features[0].geometry,
+            Some(LineString(vec![
+                Position::with_z(0.0, 0.0, 1.0),
+                Position::with_z(1.0, 1.0, 2.0),
+                Position::with_z(2.0, 0.0, 3.0),
+            ]))
+        );
+    }
+
+    #[test]
+    fn rejects_non_numeric_altitude() {
+        let kml = "<kml><Placemark><Point><coordinates>0,0,not-a-number</coordinates></Point></Placemark></kml>";
         assert!(read(kml.as_bytes()).is_err());
     }
 }

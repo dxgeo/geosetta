@@ -26,9 +26,8 @@
 //! rather than fail when it's missing — a contributor without GDAL/PROJ
 //! installed still gets a clean `cargo test`, matching this repo's existing
 //! convention of not requiring optional external tools for the default run
-//! (see `src/crs/registry.rs`'s `#[ignore]`d `projinfo`-based oracle tests,
-//! which take the opposite tradeoff for a much longer-running, ~13.8k-call
-//! oracle rather than a handful of quick checks).
+//! (`tests/crs_external.rs` and the `projinfo`-based oracles in
+//! `src/crs/wkt_projjson.rs` do the same).
 //!
 //! All three transform the same three-point WGS 84 fixture to EPSG:3857 and
 //! are checked against the same oracle values, cross-verified by hand:
@@ -269,9 +268,9 @@ fn composes_with_wbprojection_library() {
     let web_mercator = wbprojection::Crs::from_epsg(3857).expect("wbprojection knows EPSG:3857");
 
     fc.for_each_position_mut(|p| {
-        let (x, y) = wgs84.transform_to(p[0], p[1], &web_mercator).expect("wbprojection transform");
-        p[0] = x;
-        p[1] = y;
+        let (x, y) = wgs84.transform_to(p.x, p.y, &web_mercator).expect("wbprojection transform");
+        p.x = x;
+        p.y = y;
     });
     fc.crs = Some(geosetta::Crs::from_authority_code(
         Some("EPSG".into()),
@@ -284,7 +283,7 @@ fn composes_with_wbprojection_library() {
         .features
         .iter()
         .map(|f| match f.geometry.as_ref().unwrap() {
-            geosetta::Geometry::Point(p) => (p[0], p[1]),
+            geosetta::Geometry::Point(p) => (p.x, p.y),
             other => panic!("expected Point, got {other:?}"),
         })
         .collect();

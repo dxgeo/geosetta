@@ -292,11 +292,17 @@ dictionary-encoded, =data_page_version="2.0"=) with a REQUIRED non-nullable
 column (=max_def_level == 0=, the case above), an OPTIONAL column with a real
 null pattern, and geometry.
 
-*** 6. Geometry variation — *6b/6c DONE (detection), 6a remains*
+*** 6. Geometry variation — *6a, 6b, 6c all DONE*
 - WKB with Z / M / ZM (3D/4D) — extend =wkb::decode= and the =Geometry= model,
-  or project to 2D with a documented note. *Not started* — a genuine IR-scope
-  decision (does =Geometry=/=Position= grow a Z, touching every writer, or does
-  the reader silently drop it), not just a decode-path addition.
+  or project to 2D with a documented note. Was a genuine IR-scope decision
+  (does =Geometry=/=Position= grow a Z, touching every writer, or does the
+  reader silently drop it), not just a decode-path addition, so it was
+  scoped out into its own plan: [[file:zm-geometry.org][zm-geometry.org]].
+  *That plan's all nine milestones are now DONE* (2026-08-17) — =Position=
+  grew =z=/=m= fields, and every format spoke either carries both fully
+  (WKB, WKT/CSV, GeoPackage, FlatGeobuf, Shapefile, GeoParquet) or has no
+  way to represent M by its own spec (GeoJSON, KML/KMZ — Z-only there,
+  correctly, per that plan's own scoping).
 - *6b — DONE (as a clean rejection; real multi-geometry decode/write is now a
   separate plan).* The =geo= metadata may list multiple geometry columns or a
   non-CRS84 CRS — read =geo= rather than assuming defaults.

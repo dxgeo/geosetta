@@ -44,13 +44,13 @@ pub fn read(shp: &[u8], dbf_bytes: &[u8], prj: Option<&str>, cpg: Option<&str>) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Geometry;
+    use crate::geometry::{Geometry, Position};
     use crate::schema::infer_columns;
     use crate::shapefile::writer;
 
     fn one_point_fc() -> FeatureCollection {
         FeatureCollection::new(vec![Feature {
-            geometry: Some(Geometry::Point([1.0, 2.0])),
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![("name".into(), crate::json::JsonValue::String("a".into()))],
         }])
     }
@@ -61,7 +61,7 @@ mod tests {
         let encoded = writer::write(&fc).unwrap();
         let back = read(&encoded.shp, &encoded.dbf, encoded.prj.as_deref(), None).unwrap();
         assert_eq!(back.features.len(), 1);
-        assert_eq!(back.features[0].geometry, Some(Geometry::Point([1.0, 2.0])));
+        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
     }
 
     #[test]
@@ -70,7 +70,7 @@ mod tests {
         let columns = infer_columns(&fc.features);
         // A .dbf with zero records paired against a one-record .shp.
         let (empty_dbf, _warnings) = dbf::write(&columns[..0]).unwrap();
-        let (shp, _shx) = crate::shapefile::geometry::write(&[Some(Geometry::Point([0.0, 0.0]))]).unwrap();
+        let (shp, _shx) = crate::shapefile::geometry::write(&[Some(Geometry::Point(Position::new(0.0, 0.0)))]).unwrap();
         assert!(read(&shp, &empty_dbf, None, None).is_err());
     }
 

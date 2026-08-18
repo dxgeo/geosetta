@@ -42,10 +42,28 @@ explicitly to prove third-party interop, not just that the API compiles.
   batching: PROJ's =proj_trans_array=/=proj_trans_generic= exist specifically
   because per-call FFI/context overhead dominates at scalar granularity, and
   a SIMD kernel needs a contiguous slice to pack into vector registers in
-  the first place. =Position= (=[f64; 2]=) is already the interleaved xy
-  layout PROJ's array API expects, so a run hands over with no copying.
-  Both visitors coexist — =_run_= for a batch-capable backend,
-  =for_each_position_mut= for a simple pointwise one.
+  the first place — a batch backend still extracts =x=/=y= per element from
+  the =&mut [Position]= slice into its own flat array (cheap, no allocation
+  beyond what the backend already needs for its own call), not a raw
+  memory-reinterpret handoff; that framing was accurate when =Position= was
+  literally =[f64; 2]=, before =zm-geometry.org='s M1 widened it to a
+  ={x,y,z,m}= struct, and is corrected here rather than left stale. Both
+  visitors coexist — =_run_= for a batch-capable backend,
+  =for_each_position_mut= for a simple pointwise one — and =tests/
+  reproject_pipe.rs='s real =wbprojection= integration in fact uses the
+  pointwise seam, not this one; nothing has exercised the batch path
+  against a real tool yet.
+  *Z/M contract, resolved 2026-08-17*: both visitors hand =z=/=m= to the
+  callback exactly like =x=/=y=, unexamined — a purely horizontal backend
+  (=wbprojection=, the one real integration) is free to leave =z=
+  untouched, matching Geosetta's own "label, never reproject" posture; a
+  caller wanting a full 3D transform (e.g. a vertical-datum shift) can
+  read/rewrite =z= itself inside the closure. =m= is never a reprojection
+  concern at all — a linear-referencing measure, not a spatial coordinate.
+  Documented directly on both methods in =geometry/mod.rs=/=feature.rs=
+  rather than only here, so it's discoverable from the API itself, not just
+  this plan (see =zm-geometry.org='s OPEN QUESTIONS for the question this
+  resolves).
 
 **** 2. The stdin/stdout piping seam (process composition)
 - =-= as =<input>=/=<output>= (=src/cli.rs=, =src/main.rs=) means stdin/stdout,

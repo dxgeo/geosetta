@@ -42,6 +42,13 @@ mod ctype {
 }
 
 // Field indices within each FlatBuffers table.
+// Note: no `HAS_Z`/`HAS_M` constants here. The header carries those as a
+// file-level hint (confirmed against real `ogr2ogr -f FlatGeobuf` output:
+// field index 3 is `hasZ`), but this reader determines Z/M presence
+// directly from each `Geometry` table's own `z`/`m` vector fields instead —
+// the same source of truth `xy`'s presence already uses, and more robust
+// than trusting a summary flag on a file whose per-geometry dimensionality
+// might not be perfectly uniform.
 mod header {
     pub const GEOMETRY_TYPE: usize = 2;
     pub const COLUMNS: usize = 7;
@@ -65,6 +72,8 @@ mod feature {
 mod geometry {
     pub const ENDS: usize = 0;
     pub const XY: usize = 1;
+    pub const Z: usize = 2;
+    pub const M: usize = 3;
     pub const TYPE: usize = 6;
     pub const PARTS: usize = 7;
 }
@@ -182,14 +191,16 @@ fn index_size(num_items: usize, node_size: usize) -> usize {
 fn decode_geometry(g: &Table, default_type: u8) -> Result<Geometry> {
     let ty = g.read_u8(geometry::TYPE, default_type)?;
     let xy = g.read_vector(geometry::XY)?;
+    let z = g.read_vector(geometry::Z)?;
+    let m = g.read_vector(geometry::M)?;
     let ends = g.read_vector(geometry::ENDS)?;
 
     let geom = match ty {
-        gtype::POINT => Geometry::Point(point_at(&positions(xy)?, 0)?),
-        gtype::LINESTRING => Geometry::LineString(positions(xy)?),
-        gtype::MULTIPOINT => Geometry::MultiPoint(positions(xy)?),
-        gtype::POLYGON => Geometry::Polygon(split_rings(&positions(xy)?, ends)?),
-        gtype::MULTILINESTRING => Geometry::MultiLineString(split_rings(&positions(xy)?, ends)?),
+        gtype::POINT => Geometry::Point(point_at(&positions(xy, z, m)?, 0)?),
+        gtype::LINESTRING => Geometry::LineString(positions(xy, z, m)?),
+        gtype::MULTIPOINT => Geometry::MultiPoint(positions(xy, z, m)?),
+        gtype::POLYGON => Geometry::Polygon(split_rings(&positions(xy, z, m)?, ends)?),
+        gtype::MULTILINESTRING => Geometry::MultiLineString(split_rings(&positions(xy, z, m)?, ends)?),
         gtype::MULTIPOLYGON => {
             let mut polys = Vec::new();
             for part in parts(g)? {
@@ -212,8 +223,9 @@ fn decode_geometry(g: &Table, default_type: u8) -> Result<Geometry> {
     Ok(geom)
 }
 
-/// Flat `xy` doubles into `[x, y]` positions.
-fn positions(xy: Option<Vector>) -> Result<Vec<Position>> {
+/// Flat `xy` doubles, plus optional parallel `z`/`m` vectors (same length as
+/// the point count), into positions.
+fn positions(xy: Option<Vector>, z: Option<Vector>, m: Option<Vector>) -> Result<Vec<Position>> {
     let xy = match xy {
         Some(v) => v,
         None => return Ok(Vec::new()),
@@ -221,9 +233,24 @@ fn positions(xy: Option<Vector>) -> Result<Vec<Position>> {
     if xy.len() % 2 != 0 {
         return Err(Error::FlatGeobuf("odd number of xy coordinates".into()));
     }
-    let mut out = Vec::with_capacity(xy.len() / 2);
-    for i in 0..xy.len() / 2 {
-        out.push([xy.get_f64(2 * i)?, xy.get_f64(2 * i + 1)?]);
+    let n = xy.len() / 2;
+    for (name, v) in [("z", z), ("m", m)] {
+        if let Some(v) = v
+            && v.len() != n
+        {
+            return Err(Error::FlatGeobuf(format!(
+                "{name} vector length ({}) does not match point count ({n})",
+                v.len()
+            )));
+        }
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let x = xy.get_f64(2 * i)?;
+        let y = xy.get_f64(2 * i + 1)?;
+        let z = z.map(|v| v.get_f64(i)).transpose()?;
+        let m = m.map(|v| v.get_f64(i)).transpose()?;
+        out.push(Position { x, y, z, m });
     }
     Ok(out)
 }

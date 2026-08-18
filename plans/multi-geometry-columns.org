@@ -292,10 +292,11 @@ earlier milestones establish.
   sibling layer," which doesn't fit the current single-layer-in/
   single-layer-out shape of one =write()= call). Parked; M3's WKT fallback
   for GeoPackage is the pragmatic default until this is scoped separately.
-- *Does M4 need the =crs-registry= feature for anything new?* Almost
-  certainly not — per-column CRS emission reuses the same WKT→PROJJSON/
-  registry paths the primary column's CRS already goes through, just once
-  per extra column instead of once. Worth confirming no part of the
+- *Does M4 need anything new from CRS handling?* Almost certainly not —
+  per-column CRS emission reuses the same WKT→PROJJSON path the primary
+  column's CRS already goes through, just once per extra column instead of
+  once. (This question originally asked about the =crs-registry= feature,
+  removed in 0.24.0.) Worth confirming no part of the
   existing single-CRS code path silently assumes "exactly one geometry
   column" before M4 starts (e.g. any global, not-keyed-by-column state).
 

@@ -232,7 +232,7 @@ fn value_to_json(v: &Value) -> JsonValue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Geometry;
+    use crate::geometry::{Geometry, Position};
 
     #[test]
     fn reads_a_geopackage_layer() {
@@ -245,11 +245,86 @@ mod tests {
         assert_eq!(fc.features.len(), 2);
 
         // Geometry: GPKG-binary header stripped, WKB decoded.
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point([10.0, 20.0])));
+        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(10.0, 20.0))));
         // Properties exclude the geometry column and the fid rowid-alias.
         let props: Vec<&str> = fc.features[0].properties.iter().map(|(k, _)| &**k).collect();
         assert_eq!(props, vec!["name", "pop", "score"]);
         assert_eq!(fc.features[1].properties[0].1.as_str(), Some("Beta"));
         assert_eq!(fc.features[1].properties[1].1.as_f64(), Some(200.0));
+    }
+
+    #[test]
+    fn reads_a_real_envelope_bearing_z_fixture() {
+        // Real `ogr2ogr -f GPKG` output, found after `strip_gpkg_header`'s
+        // envelope-size branch turned out to have no fixture coverage at
+        // all: a `Point`'s degenerate bbox gets no envelope from GDAL, but
+        // a real `LineString Z` does — flags=0x05, envelope indicator 2
+        // (XYZ, 48 bytes), envelope values (0,20,0,10,0,10) confirmed by
+        // hand-decoding the raw file to exactly match the geometry's true
+        // bounds before committing this fixture. This is the real-fixture
+        // exercise of the envelope-skip path the synthetic test below
+        // stood in for.
+        let bytes = include_bytes!("../../tests/fixtures/gdal_linestring_z.gpkg");
+        let layers = read_layers(bytes).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(
+            layers[0].1.features[0].geometry,
+            Some(Geometry::LineString(vec![
+                Position::with_z(0.0, 0.0, 0.0),
+                Position::with_z(10.0, 10.0, 10.0),
+                Position::with_z(20.0, 5.0, 3.0),
+            ]))
+        );
+    }
+
+    #[test]
+    fn reads_a_real_m_bearing_fixture() {
+        // GeoPackage was M5's "zero production code changes" milestone —
+        // `strip_gpkg_header`/`from_wkb` are dimension-agnostic wrappers, so
+        // M should already work for free the same way Z did, purely because
+        // the WKB codec underneath (M2) is dimension-generic. Never had a
+        // fixture confirming that until now. Sourced via `ogr2ogr -f GPKG`
+        // from a `LINESTRING ZM (...)` WKT/CSV source (GDAL has no direct
+        // GeoJSON-to-M path, since GeoJSON itself has no M concept — see
+        // `plans/zm-geometry.org`'s M7 M follow-up for the same sourcing
+        // trick applied to Shapefile). Confirmed via direct SQLite blob
+        // inspection before trusting the fixture: the GPB header's envelope
+        // indicator is 2 (XYZ, 48 bytes — GDAL's envelope only ever tracks
+        // Z, not M, even for a ZM geometry) and the inner WKB's own type
+        // code is `0x0BBA` = 3002 = ISO SFA `LineString` + 3000 (ZM),
+        // matching `ogrinfo`/DuckDB both independently reading it back as
+        // `LINESTRING ZM (0 0 1 10,10 10 2 20,20 5 3 30)`.
+        let bytes = include_bytes!("../../tests/fixtures/gdal_linestring_zm.gpkg");
+        let layers = read_layers(bytes).unwrap();
+        assert_eq!(layers.len(), 1);
+        assert_eq!(
+            layers[0].1.features[0].geometry,
+            Some(Geometry::LineString(vec![
+                Position::with_zm(0.0, 0.0, 1.0, 10.0),
+                Position::with_zm(10.0, 10.0, 2.0, 20.0),
+                Position::with_zm(20.0, 5.0, 3.0, 30.0),
+            ]))
+        );
+    }
+
+    #[test]
+    fn strip_gpkg_header_skips_every_envelope_size_per_the_spec_table() {
+        // GeoPackage §2.1.3's envelope contents indicator code: 0 = none (0
+        // bytes), 1 = XY (32), 2 = XYZ (48), 3 = XYM (48), 4 = XYZM (64).
+        // Indicator 2 (XYZ) is now also covered by a real fixture (above);
+        // this test still exercises every code, including the two (XYM,
+        // XYZM) no real tool tried here happened to produce.
+        let wkb = crate::geometry::to_wkb(&Geometry::Point(Position::with_z(1.0, 2.0, 3.0)));
+        for (indicator, envelope_len) in [(0u8, 0usize), (1, 32), (2, 48), (3, 48), (4, 64)] {
+            let mut blob = Vec::new();
+            blob.extend_from_slice(b"GP");
+            blob.push(0); // version
+            blob.push(0x01 | (indicator << 1)); // flags: LE + this envelope size
+            blob.extend_from_slice(&0i32.to_le_bytes()); // srs_id
+            blob.resize(blob.len() + envelope_len, 0); // dummy envelope bytes
+            blob.extend_from_slice(&wkb);
+            let stripped = strip_gpkg_header(&blob).unwrap();
+            assert_eq!(stripped, wkb.as_slice(), "indicator {indicator} (envelope {envelope_len} bytes)");
+        }
     }
 }

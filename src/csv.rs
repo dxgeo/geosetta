@@ -185,14 +185,14 @@ fn cell_text(cell: &Cell) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Geometry;
+    use crate::geometry::{Geometry, Position};
 
     #[test]
     fn reads_wkt_and_typed_properties() {
         let text = "name,pop,geometry\nA,100,\"POINT (1 2)\"\n\"B, city\",50,\"LINESTRING (0 0, 1 1)\"\n";
         let fc = read(text.as_bytes()).unwrap();
         assert_eq!(fc.features.len(), 2);
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point([1.0, 2.0])));
+        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
         assert_eq!(fc.features[0].properties[0], ("name".into(), JsonValue::String("A".into())));
         assert_eq!(
             fc.features[0].properties[1],
@@ -206,7 +206,7 @@ mod tests {
     fn round_trips_through_csv() {
         let fc = FeatureCollection::new(vec![
                 Feature {
-                    geometry: Some(Geometry::Point([-73.9, 40.7])),
+                    geometry: Some(Geometry::Point(Position::new(-73.9, 40.7))),
                     properties: vec![
                         ("name".into(), JsonValue::String("x".into())),
                         ("n".into(), JsonValue::Number { value: 3.0, is_int: true }),
@@ -214,10 +214,10 @@ mod tests {
                 },
                 Feature {
                     geometry: Some(Geometry::Polygon(vec![vec![
-                        [0.0, 0.0],
-                        [1.0, 0.0],
-                        [1.0, 1.0],
-                        [0.0, 0.0],
+                        Position::new(0.0, 0.0),
+                        Position::new(1.0, 0.0),
+                        Position::new(1.0, 1.0),
+                        Position::new(0.0, 0.0),
                     ]])),
                     properties: vec![
                         ("name".into(), JsonValue::String("y".into())),

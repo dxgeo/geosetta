@@ -2,8 +2,8 @@
 #+AUTHOR: Daniel Okuniewicz Jr.
 
 * Plans
-Design notes for work not yet implemented. Each file is a self-contained plan;
-they are ordered by dependency.
+Design notes, one self-contained plan per file, ordered by dependency. Most are
+implemented — each entry says so; the few marked /scoping only/ are not.
 
 - [[file:reverse-roundtrip.org][reverse-roundtrip.org]] :: GeoParquet → GeoJSON,
   reading back Geosetta's *own* output. The reader skeleton (thrift reader,
@@ -60,24 +60,32 @@ they are ordered by dependency.
   and structural WKT→PROJJSON translation for GeoParquet. Milestones A (CRS-loss
   warnings), B (WKT id lifting), and C (WKT→PROJJSON: geographic, WKT2 projected,
   and common WKT1 projected, gated by =projinfo= bulk oracles) are *DONE*.
-  *Remaining in the dependency-free core:* ambiguous/rare WKT1 projections
-  (declined by design — no safe disambiguation) and bare-code definition
-  synthesis without the registry feature. Bare-code synthesis (milestone D) is
-  otherwise *DONE* when the opt-in =crs-registry= feature is on — see the *CRS
-  registry* entry below. The PROJJSON→WKT reverse is *DONE* — see
+  *Remaining in the core:* ambiguous/rare WKT1 projections (declined by design
+  — no safe disambiguation) and bare-code definition synthesis, which geosetta
+  no longer attempts at all: milestone D was once covered by the opt-in
+  =crs-registry= feature, removed in 0.24.0, and is now the user's to supply
+  via =--crs= — see
+  [[file:crs-external-resolution.org][crs-external-resolution.org]]. The
+  PROJJSON→WKT reverse is *DONE* — see
   [[file:projjson-to-wkt.org][projjson-to-wkt.org]].
-- *CRS registry* (moved out of this repo) :: Embedded CRS registry — *resolve a
-  source's (authority, code) (inline id, name→code, or structural match), then
-  emit the authoritative definition* in the target's dialect, instead of
-  translating the CRS string. A build-time-generated, zstd-compressed
-  =(auth,code)→{PROJJSON,WKT1}= blob covering *all 13 790 CRSes in proj.db* —
-  every authority (EPSG, ESRI, IGNF, OGC, IAU_2015 planetary, …) and type — in
-  *~2.3 MB*, decoded by =geosetta='s own =compress/zstd.rs=. Supersedes =crs.org=
-  milestone D and reframes C. Because it embeds third-party dataset data (with its
-  own terms), it lives in a *sibling crate*, =geoscribe=, pulled in behind
-  a =crs-registry= feature so the core stays pure-MIT and dependency-free. Plan and
-  =NOTICE= live there (=../../geoscribe/crs-registry.org=). *Depends on
-  =crs.org=.*
+- *CRS registry* (REMOVED from this repo in 0.24.0) :: An embedded
+  =(auth,code)→{PROJJSON,WKT1,WKT2}= blob covering all 13 790 CRSes in
+  =proj.db=, in ~1 MB, reached through the opt-in =crs-registry= feature and the
+  sibling =geoscribe= crate; =geosetta='s =crs/registry.rs= was a thin
+  call-through plus the identity-*recovery* policy (name→code, ellipsoid-
+  validated) layered on it. *Removed* along with the feature and the dependency:
+  it was this crate's only dependency of any kind, and
+  [[file:crs-external-resolution.org][crs-external-resolution.org]]'s =--crs=
+  closes the same bare-code gap at run time, for pre-built binaries too. *The
+  default build is unchanged* — every registry entry point was a =None= stub
+  off-feature, so removing them is a no-op there; only a =--features
+  crs-registry= build loses anything. What it loses is name→code recovery from
+  an id-less WKT, and only narrowly (geographic CRSes, id-less sources,
+  GeoParquet output — the projected resolver was never wired in at all). Its
+  mechanism *was* the lookup table, so it has no data source here; restoring it
+  properly is scoped in the sibling repo as =geoscribe/plans/wkt-identify.org=.
+  The registry itself lives on in =geoscribe=, usable as an ordinary library or
+  CLI by anyone who wants it; geosetta simply no longer depends on it.
 - [[file:shapefile.org][shapefile.org]] :: Add Shapefile — the first *multi-file*
   spoke (=.shp=+=.shx=+=.dbf=+=.prj=+=.cpg= sharing a basename, the inverse
   shape of GeoPackage's one-file-many-layers), a from-scratch mixed-endian
@@ -85,9 +93,10 @@ they are ordered by dependency.
   Polygon/MultiPolygon disambiguation) and dBase =.dbf= attribute codec, plus
   =main.rs= multi-file I/O special-casing. *DONE* (read+write, both directions,
   including GeoPackage↔Shapefile fan-out) — see the file's STATUS section for
-  what's deliberately deferred (Z/M/MultiPatch, memo fields, projected-Esri
-  =.prj= structural recovery). This is also the CRS registry plan's named *R4*
-  — the shapefile =.prj='s id-less, Esri-flavor WKT1 is the original driver for
+  what's deliberately deferred (=MultiPatch=, memo fields, projected-Esri =.prj=
+  structural recovery; Z/M has since shipped via =zm-geometry.org=). This is
+  also the CRS registry plan's named *R4* — the shapefile =.prj='s id-less,
+  Esri-flavor WKT1 is the original driver for
   the whole registry pivot; R2's geographic name-recovery already applies to it
   with no new CRS code, and =.prj= writing is the first consumer of R1's
   =registry::def_wkt=. *Depends on the CRS registry* (for full =.prj= fidelity;
@@ -130,15 +139,60 @@ they are ordered by dependency.
   PROJ, and the =wbprojection= crate) in =tests/reproject_pipe.rs=. *Depends
   on =crs.org='s opaque-CRS design* (the IR never interprets a =Crs=, so
   swapping it out after an external transform needs no Geosetta-side code).
-- [[file:crs-geoscribe-fallback.org][crs-geoscribe-fallback.org]] :: Close the
-  bare-build (=--features crs-registry= off) gap where a source with an
-  authority+code but no expanded WKT/PROJJSON body warns instead of
-  resolving, by shelling out to the =geoscribe= CLI (the sibling registry
-  crate's new CLI front end) at *runtime* as a fallback — trading a
-  compile-time dependency for an optional one. Narrowly scoped to the
-  trusted-id case only; does *not* touch the separate id-less-WKT/name-recovery
-  gap. *Scoping only, not yet implemented* — one open question (silent
-  fallback vs. an opt-in flag) flagged for review before starting.
+- [[file:crs-external-resolution.org][crs-external-resolution.org]] :: Close the
+  gap where a source carries an authority+code but no expanded WKT/PROJJSON
+  body, so targets needing a full definition (GeoParquet, Shapefile's =.prj=)
+  warn instead of resolving — not by geosetta shelling out itself (an earlier
+  framing, rejected on security grounds: silently executing an arbitrary
+  same-named binary off =PATH= with no visible action), but by a =--crs
+  <path|->= flag accepting externally-resolved WKT/PROJJSON text, plus a
+  =--print-crs-code= diagnostic so the unresolved code can be extracted and
+  piped to *any* tool that speaks those forms — every subprocess visible in the
+  user's own command line, none hidden inside geosetta. *DONE* (0.24.0), and
+  since =crs-registry='s removal in the same change it is the crate's only
+  answer for a bare code. Verified end to end in =tests/crs_external.rs=,
+  including one case piping through a real =projinfo=.
+- [[file:zm-geometry.org][zm-geometry.org]] :: Carry a Z (elevation) and/or M
+  (linear-referencing measure) ordinate through the IR and every format spoke,
+  instead of silently dropping them (GeoJSON, KML) or rejecting the input
+  outright (Shapefile =PointZ=/etc.) as three spokes originally did. Widens
+  =Position= from =[f64; 2]= to a struct carrying optional =z=/=m= fields —
+  every =Geometry= variant's shape stays the same, only the leaf type grows —
+  which is source-breaking for external code indexing it positionally
+  (confirmed harmless for the =wbprojection= dev-dependency specifically, via
+  the =for_each_position_mut=/=for_each_position_run_mut= reprojection seam,
+  [[file:reproject-composability.org][reproject-composability.org]]; no
+  compatibility shim added — pre-1.0, breaking changes are accepted). *All
+  nine milestones are DONE (2026-08-17).* Each dimension-flag/keyword
+  ambiguity (WKB's ISO-vs-EWKB, WKT's keyword-vs-bare-tuple) and every M
+  section's optionality was confirmed against real DuckDB/GDAL output before
+  implementing, not assumed from a spec — including a caught-and-corrected
+  mistake at M8, where GeoParquet's =geo= metadata was first assumed to have
+  no M vocabulary (based on one tool's writer behavior) before the actual
+  spec text was checked. Z is now carried end-to-end by every spoke; M is
+  fully supported everywhere it can exist (WKB, WKT/CSV, GeoPackage,
+  FlatGeobuf, Shapefile — both within Z-shapes and the four M-only shape
+  types — and GeoParquet's =" M"=/=" ZM"= metadata suffixes), with GeoJSON
+  and KML/KMZ the only spokes lacking M, because neither format has any M
+  concept in its own spec. Extracted from
+  [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]'s milestone
+  6a. Prompted the standing
+  [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]
+  convention below.
+- [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] ::
+  Standing convention, not a milestone plan — any format conversion that
+  would silently drop/degrade information the source carries must warn on
+  =stderr= (suppressible with =--quiet=), never just succeed. Documents the
+  two mechanisms this applies to (=Crs::downgrade_warning='s pre-write
+  predictive check, Shapefile's =dbf.rs= post-write =Encoded.warnings=).
+  *In effect* — closed the GeoJSON/KML M-drop gap and a pre-existing,
+  tested-but-unwarned FlatGeobuf/GeoPackage alphanumeric-CRS-code gap in the
+  same pass that established the rule. *Generalized* once a second
+  near-identical check made the per-check wrapper-function-pair pattern's
+  duplication undeniable: =main.rs='s =collect_conversion_warnings=/
+  =collect_layer_warnings=/=print_warnings= now do the collecting/de-duping/
+  printing for every check in one place — adding a new check is one line,
+  not a new function pair plus three call sites.
 - [[file:multi-geometry-columns.org][multi-geometry-columns.org]] :: Let a
   source with more than one geometry column per feature — in practice, only
   GeoParquet, and today only DuckDB actually writes it — survive a

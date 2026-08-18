@@ -714,8 +714,9 @@ fn default_axis_abbreviation(direction: &str) -> String {
 
 /// Format a coordinate/measure as a JSON number, avoiding a trailing `.0` on
 /// integer-valued values (e.g. `6378137`, not `6378137.0`). Mirrors
-/// `parquet::geo::fmt_num`.
-fn number(v: f64) -> String {
+/// `parquet::geo::fmt_num`. Visible to the parent module, which needs the same
+/// rule to read a PROJJSON `id.code` back as a string.
+pub(super) fn number(v: f64) -> String {
     if v == v.trunc() && v.abs() < 1e15 {
         format!("{}", v as i64)
     } else {

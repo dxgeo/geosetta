@@ -5,7 +5,7 @@
 //! The Hilbert mapping uses a fixed 16-bit resolution over the dataset extent,
 //! matching FlatGeobuf's convention so our index agrees with GDAL's reader.
 
-use crate::geometry::Bbox;
+use crate::geometry::{Bbox, Position};
 
 const HILBERT_MAX: u32 = (1 << 16) - 1;
 
@@ -91,8 +91,8 @@ pub fn hilbert_order(bboxes: &[Bbox]) -> Vec<usize> {
     let mut extent = Bbox::empty();
     for b in bboxes {
         if !b.is_empty() {
-            extent.add([b.min_x, b.min_y]);
-            extent.add([b.max_x, b.max_y]);
+            extent.add(Position::new(b.min_x, b.min_y));
+            extent.add(Position::new(b.max_x, b.max_y));
         }
     }
     let mut keyed: Vec<(u32, usize)> = bboxes
@@ -129,7 +129,7 @@ mod tests {
         // the Hilbert order.
         let bb = |x: f64, y: f64| {
             let mut b = Bbox::empty();
-            b.add([x, y]);
+            b.add(Position::new(x, y));
             b
         };
         let boxes = vec![bb(0.0, 0.0), bb(100.0, 100.0), bb(1.0, 1.0), bb(101.0, 99.0)];

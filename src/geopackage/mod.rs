@@ -1,4 +1,4 @@
-//! GeoPackage (GPKG) reader, built on the from-scratch [`crate::sqlite`] reader.
+//! GeoPackage (GPKG) reader, built on the from-scratch `crate::sqlite` reader.
 //!
 //! A `.gpkg` is a SQLite database that can hold several feature tables
 //! ("layers"). Reading fans out over all of them: [`read_layers`] returns each

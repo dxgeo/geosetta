@@ -1,0 +1,41 @@
+#+TITLE: Current Working Items
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Current Working Items
+Live list of what's open right now — not the full historical plan index (see
+[[file:README.org][README.org]] for that, ordered by dependency, everything
+DONE included). Each entry is just a link to its real plan/section for detail;
+check it off and remove it once the item ships or is shelved.
+
+- [X] *Cross-repo:* =geoscribe/plans/wkt-identify.org= — *DONE, in geoscribe.*
+  =geoscribe --identify= identifies an id-less =.prj= by name + ellipsoid
+  validation and emits a definition, so the capability lost with
+  =crs-registry='s removal is back through =--crs= composition. Geosetta needed
+  *zero* changes, as predicted. One thing worth knowing on this side: where
+  several CRSes fit a =.prj= equally well (39% of real Esri projected exports) geoscribe prints nothing and exits =2=, and =--crs='s hard error on
+  empty input turns that into a loud pipeline failure — verified end to end.
+  Remove this entry once read.
+- [ ] [[file:multi-geometry-columns.org][multi-geometry-columns.org]] — carry
+  a second GeoParquet geometry column through the IR (=Feature::extra_geometries=)
+  instead of rejecting it; text-fallback for every other target format.
+  Scoping only.
+- [ ] [[file:streaming-progress.org][streaming-progress.org]] — thread a
+  throttled progress callback through each reader/writer so =--progress= can
+  report live percentage on large files, not just per-stage. Not implemented.
+- [ ] [[file:compression-encoders.org][compression-encoders.org]] — close the
+  read/write asymmetry in =compress/=; DEFLATE first (real consumer: a
+  compressed, not just stored, =.kmz= writer), LZ4/ZSTD encoders deferred
+  behind it. Scoping only.
+- [ ] [[file:arbitrary-geoparquet.org::*OPEN QUESTIONS][arbitrary-geoparquet.org — Brotli codec]] —
+  last unimplemented Parquet compression codec (LZO/Hadoop-framed-LZ4 are
+  edge cases; Brotli is the real gap).
+- [ ] [[file:arbitrary-geoparquet.org::*7. Nested/repeated (list-valued) columns][arbitrary-geoparquet.org — list of structs / nested list]] —
+  milestone 7 decodes a single-level list of scalars; a list of structs or a
+  list nested inside another list still hard-rejects.
+- [ ] [[file:spatial-index.org::*OPEN QUESTIONS][spatial-index.org — default =--rtree=?]] —
+  whether GeoPackage's R*Tree extension should flip on by default now that
+  =rtreecheck()=/GDAL validation cover the from-scratch node format.
+- [ ] [[file:../project.org::Raster formats][project.org — raster format support]] —
+  a second IR (coverage/grid model) beside the feature IR; further-out, not
+  yet scoped into its own plan file.

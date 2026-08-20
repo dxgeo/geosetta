@@ -69,7 +69,7 @@ pub use crs::{Crs, NamedCrs, WGS84_CRS_CODE};
 pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection};
 pub use format::Format;
-pub use native::{FgbColumnNative, FgbNative, Native, NativePayload};
+pub use native::{FgbColumnNative, FgbNative, Native, NativePayload, ParquetNative};
 pub use geometry::{Bbox, Geometry, Position};
 // `schema` is crate-internal (its column materialization is a writer detail),
 // but `FieldDecl` is not: it is a public field of `FeatureCollection`, and a

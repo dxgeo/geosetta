@@ -8,17 +8,24 @@ Orientation doc for an agent picking up the fidelity work started 2026-08-20.
 Same role =geoscribe/handoff.org= plays for the CRS work: read this, then the
 plans it points at.
 
-*M1 and M2 are done; M3 has begun (FlatGeobuf).* Implemented: the natives
-mechanism (=src/native.rs=) and the GeoJSON spoke, plus both of D1's modelled
-fields -- =FeatureCollection::name= and the column schema (=FieldDecl= on
-=FeatureCollection::schema=, populated and honoured by the Shapefile and
-FlatGeobuf spokes). *M4 is also done* -- =FieldDecl= gained a declared type
-and closed defects 1, 2 and 5 -- and so is =edit-composability.org='s live bug
-1. 500 tests pass (=cargo test -p geosetta=: 455 lib, 44 integration, 1 doc),
-clippy clean. The other six readers pass =native: None=; *all four declaring
-spokes now carry a column declaration* (FlatGeobuf, Shapefile, GeoPackage,
-GeoParquet), and a declaration dropped to a format without a slot still
-*warns*. See
+*M1, M2 and M4 are done. M3 is half done: three of six spokes.*
+
+- *The mechanism* -- =src/native.rs=, the opaque format-tagged =Native=
+  channel, and D1's two modelled fields (=FeatureCollection::name=, the column
+  schema on =FeatureCollection::schema=).
+- *Spokes with natives:* GeoJSON, FlatGeobuf, GeoParquet. *Still to do:*
+  GeoPackage, CSV, WKT, KML, Shapefile -- their readers pass =native: None=.
+- *M4, declared column types* -- =crate::DeclType= on =FieldDecl=, closing
+  defects 1, 2 and 5. *All four declaring spokes* carry a declaration
+  (FlatGeobuf, Shapefile, GeoPackage, GeoParquet); a declaration dropped to a
+  format with no slot still *warns*.
+- *=edit-composability.org='s live bug 1* -- the GeoPackage edit loop that
+  duplicated layers -- is fixed.
+- *Defect 3 is the only defect left*, and it travels with the GeoPackage
+  container (M3b).
+
+503 tests pass (=cargo test -p geosetta=: 458 lib, 44 integration, 1 doc),
+clippy clean. See
 [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
 § STATUS for the precise line between done and not.
 
@@ -59,12 +66,17 @@ edited; see § WHAT CHANGED IN EXISTING DOCS.
 ** THE SEQUENCING, WHICH IS FORCED
 This is the one thing spread across two plans and worth having in one place:
 
+*Free-standing, not in the chain:* =spatial-index.org= milestone E --
+GeoParquet's covering bbox column, handed over from M3's GeoParquet spoke
+because it is a D4 rebuild-if-present index rather than a native. Ship it any
+time. *Not started.*
+
 #+begin_src text
   M4  FieldDecl gains a declared type         [DONE]
       defect 1 (fgb nulls)                    [DONE]
       defect 2 (gpkg booleans)                [DONE]
-      defect 5 (type narrowed to IR's 4)      [DONE for fgb/gpkg/shp;
-            |                                  GeoParquet with its M3 spoke]
+      defect 5 (type narrowed to IR's 4)      [DONE, all four spokes]
+            |
   M1 inventory + fixtures  [DONE]
             |
   M2  Native channel in the IR + GeoJSON spoke        [DONE]
@@ -73,7 +85,8 @@ This is the one thing spread across two plans and worth having in one place:
             |
   M3  remaining single-collection spokes
       FlatGeobuf                                  [DONE]
-      gpkg / parquet / csv / wkt / kml / shp      [not started]
+      GeoParquet                                  [DONE]
+      gpkg / csv / wkt / kml / shp                [not started]
             |
   M3b GeoPackage container   M3c KMZ container
             |
@@ -90,9 +103,14 @@ phrased honestly" -- *that argument was withdrawn* and should not be
 resurrected; a statement of current fact is perfectly sayable. The decision
 rests on the duplicated inventory pass alone.
 
-** THE NINE DECISIONS
+** THE DECISIONS
 Each is recorded in full, with rejected alternatives, in the plan that owns it.
-One line each so you know what has already been settled:
+One line each so you know what has already been settled.
+
+/This was "THE NINE DECISIONS" and stopped being nine on 2026-08-20. Rows
+10--15 are M4's and the GeoParquet spoke's; the section is an index of what is
+settled, so it grows rather than freezing at the count it happened to start
+with./
 
 | # | decision | where |
 |---+----------+-------|
@@ -105,15 +123,22 @@ One line each so you know what has already been settled:
 | 6 | Warning-scope question consolidated and *blocked on M1* | =lossy-conversion-warnings.org= § OPEN QUESTION |
 | 7 | In-place: fix identity loss first, atomic writes second; gpkg append stays | =edit-composability.org= D4 |
 | 8/9 | =--print-crs= one-pass and multi-layer piping both *closed* | =edit-composability.org= § OPEN QUESTIONS |
+| 10 | =FieldDecl= gains a *declared type*, in each spoke's vocabulary rather than the hub's four | =same-format-fidelity.org= D1 / M4 |
+| 11 | Precedence: the declaration wins where the data is *silent*, the data wins where it *contradicts* | § Five defects, defect 2; =FieldDecl::type_for= |
+| 12 | A FlatGeobuf omitted cell reads back as *null* -- the unset-vs-null "fork" was measured away | § Five defects, defect 1 |
+| 13 | =created_by= is *not* a native: it names the writer, and geosetta is the writer | § MILESTONES, M3 GeoParquet |
+| 14 | An opaque member can also be *derived*: =ARROW:schema= is replayed only while the columns match | § MILESTONES, M3 GeoParquet |
+| 15 | GeoParquet's =covering= is an *index*, not a native -- rebuilt if present, and handed over | =spatial-index.org= milestone E |
 
 *Three later rulings extended D1*, all worth knowing before you design
-anything. The third is scoped but *not yet built* -- =FieldDecl= gains the
-column's *declared type* (M4), which is what lets an all-null FlatGeobuf
-column keep it, a GeoPackage =BOOLEAN= survive its reader, and a =DateTime=
-stop returning as =String= (defect 5). *Its vocabulary is an open question*,
-deliberately: the IR's own four column types are measurably too narrow, so M4
-opens by deciding how far the IR follows each format's. The first two:
-collection =name= and the *column schema* (=width=/=precision=/=scale=/
+anything, and *all three now implemented*. The third is =FieldDecl='s
+*declared type* (M4) -- what lets an all-null FlatGeobuf column keep its type,
+a GeoPackage =BOOLEAN= survive its reader, and a =DateTime= stop returning as
+=String= (defect 5). Its vocabulary was the open question M4 opened by
+settling: the IR's own four column types are measurably too narrow, so
+=crate::DeclType= names sixteen, every one drawn from some spoke's own on-disk
+vocabulary rather than invented for symmetry. The first two: collection =name=
+and the *column schema* (=width=/=precision=/=scale=/
 =nullable=/=unique=/=primary_key=) are **modelled in the IR**, not carried as
 opaque natives. The reason is D5 -- a native does not cross a pipe, so only a
 modelled field lets an external tool widen a declaration mid-flight alongside
@@ -122,8 +147,10 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
 
 ** WHAT IS BUILT
 - *The inventory*, all nine spokes, every entry marked /measured/ or /code/.
-- *The natives mechanism and the GeoJSON spoke* -- see § STATUS in the
-  fidelity plan for exactly what that covers.
+- *The natives mechanism and three spokes* -- GeoJSON (=id=, foreign members
+  at three levels), FlatGeobuf (header/=Crs=/per-column descriptive members
+  plus the header name) and GeoParquet (every =key_value_metadata= entry
+  beside =geo=, plus =geo.orientation=). See § STATUS in the fidelity plan.
 - *The modelled column schema*, end to end for three spokes: a =.dbf= field's
   declared width survives =shp -> fgb -> shp= intact, and a middle stage can
   widen it. Losing a declaration to a target that does not carry one now warns.
@@ -144,13 +171,24 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
   declaring spokes carry one as of M4, so =Format::carries_column_schema= has
   stopped shrinking and the four remaining =false= answers (GeoJSON, CSV, WKT,
   KML) are permanent -- those formats have no slot.
+- *GeoParquet's =covering= bbox column*, the one member the GeoParquet spoke
+  left unhandled -- a file with a spatial index goes in and one without comes
+  out, silently. Now owned by =plans/spatial-index.org= *milestone E*, which
+  already owns the same D4 "rebuild it when the source had one" pattern for
+  FlatGeobuf's and GeoPackage's indexes. Blocked on the writer's flat schema:
+  it has never emitted a nested struct column.
 - *Defect 3* -- the only entry left in § LIVE BUGS. Note that section's
   numbering is *not* the plan's "five defects"; see its own note.
 - The exhaustive-match fixture registry (D6) and any warning work.
 - The format-check deletion, which is sequenced last.
 
-** LIVE BUGS FOUND, NOT FIXED
-Ordered by how likely they are to bite a real user.
+** BUGS FOUND -- ONE STILL LIVE
+/Renamed 2026-08-20: this was "LIVE BUGS FOUND, NOT FIXED" when five of its
+six entries were live. Five are now struck through and fixed; **entry 3 is the
+only one left**. The fixed entries stay because each records how it was
+measured and what the fix turned on./
+
+Ordered by how likely they were to bite a real user.
 
 *The list positions below are reading order, not defect numbers.* The canonical
 numbering is =same-format-fidelity.org= § Five defects, and each entry names
@@ -175,7 +213,7 @@ things. /Reconciled 2026-08-20./
    delete silently became a no-op. Pinned by
    =an_edit_loop_that_deletes_a_feature_does_not_duplicate_the_layer=, which
    asserts on the surviving rows rather than the table name.
-2. ~~*Shapefile narrows the schema.*~~ Also not one of the four -- it is the
+2. ~~*Shapefile narrows the schema.*~~ Also not one of the five -- it is the
    inventory's own finding, M1 § 3. *FIXED 2026-08-20* by D1's column
    schema. An 80-character =.dbf= field used to return sized to today's longest
    value; it now returns 80. Verified through a FlatGeobuf transit, which is
@@ -222,9 +260,7 @@ things. /Reconciled 2026-08-20./
 group in the sequencing diagram, and *all three shipped together as M4* on
 2026-08-20, which is what their shared fix required. What remains in this
 section is *defect 3* alone (entry 3), and it travels with the GeoPackage
-container (M3b).
-*Defect 3* is entry (3) and travels with the GeoPackage container (M3b).
-*Defect 4* is not in this list because it is done: it was the FlatGeobuf
+container (M3b). *Defect 4* is not in this list because it is done: it was the FlatGeobuf
 header's hardcoded =geosetta= name, retired with the FlatGeobuf spoke.
 
 ** WHAT CHANGED IN EXISTING DOCS
@@ -232,6 +268,29 @@ Listed explicitly because they were written before this work was committed.
 /Now that it is committed, =git log= is the better source where the two
 disagree -- see § THE ONE REAL GAP, whose "no commits" claim was itself an
 error and is retracted there./
+
+/Newest first./
+
+*The GeoParquet spoke, 2026-08-20 -- code.* =ParquetNative= carries every
+=key_value_metadata= entry beside =geo= (=ARROW:schema=, =gdal:metadata=,
+anything else a producer wrote) plus =geo.orientation=; verified on real
+=ogr2ogr= output and read back by *both GDAL and DuckDB*. 503 tests (from
+500). Two rulings came out of it, both in the plan's M3 entry: *=created_by=
+is not a native* (it names the application that wrote the file, and geosetta
+did -- the mirror image of defect 4, where FlatGeobuf's =name= was the
+*layer's* identity and had to be carried), and *an opaque member can also be
+derived*, which is why =ARROW:schema= is replayed only while the column names
+still match.
+
+*The =covering= handover, same day -- documentation only.* The one GeoParquet
+member the spoke left unhandled turned out to have *no owner*: =envelope.org=
+pointed at =arbitrary-geoparquet.org= milestone 6, but that milestone is
+geometry variation and its covering work (3c) is the *read* side, already
+done. Writing one is now =spatial-index.org= *milestone E*, beside the
+FlatGeobuf and GeoPackage indexes it shares a D4 rule with. Two stale claims
+fell out: that plan said "GeoParquet -- no index structure" (written before
+GeoParquet 1.1) and =plans/README.org= marked it *DONE*. Both corrected, and
+it is now in =plans/todo.org= where remaining work is actually looked for.
 
 *The FlatGeobuf review pass, 2026-08-20 -- documentation only, no code.* The
 spoke was re-verified rather than taken on trust (487 tests, clippy clean, 27
@@ -249,8 +308,8 @@ GeoPackage DDL type parsing, boolean recovery and type emission; Shapefile
 pre-existing bug* -- an unsigned column above =i32::MAX= was being read back
 negative, because Parquet has no unsigned physical type and the annotation was
 never applied; the GeoPackage reader setting =fc.name=. 500 tests (from 487),
-clippy clean, and =tests/perf.rs= gained the sparse =wide_table=
-counterpart. Three surprises are recorded in the plan's M4 entry -- the one
+clippy clean, and =tests/perf.rs= gained the sparse =wide_table= counterpart
+/before/ the change that needed it. Three surprises are recorded in the plan's M4 entry -- the one
 worth repeating here is that *an absent FlatGeobuf properties vector is not
 "no properties"*: an all-null row encodes as an empty blob the writer omits,
 so the reader has to decode against the header columns even when there is no
@@ -291,7 +350,9 @@ each measured against real =ogr2ogr= output rather than argued:
 - =plans/spatial-index.org= -- its =--rtree=-by-default question *narrowed*,
   not answered: D4 decided only that an index is rebuilt when the source had
   one. Whether a file that never had one should get one is still that plan's
-  call.
+  call. *Later (2026-08-20) it also gained milestone E*, GeoParquet's covering
+  column, handed over from M3's GeoParquet spoke -- see the change-log entry
+  above.
 - =plans/README.org=, =plans/todo.org= -- indexed the new documents; README
   entries placed in dependency order (fidelity → inventory → output →
   edit-composability).
@@ -308,6 +369,35 @@ each measured against real =ogr2ogr= output rather than argued:
   -- *mechanical only*: =native: None= at each construction site. No behaviour
   change in any of them.
 - =tests/crs_external.rs= -- one construction site, mechanical.
+
+*M4, the declared column type* (2026-08-20) -- the widest of these passes,
+touching every declaring spoke:
+- =src/schema.rs= -- =DeclType= (sixteen variants), =FieldDecl::ty=,
+  =FieldDecl::type_for= (the precedence rule), =Column::declared_type=.
+- =src/flatgeobuf/{reader,writer}.rs= -- null cells materialized,
+  =Column.type= kept, and =encode_properties= switched to the *on-disk* type
+  (a column written =SHORT= stores two bytes; writing eight would
+  desynchronise every value after it in the row).
+- =src/sqlite.rs= -- =parse_columns= now returns each column's declared DDL
+  type; =Table::column_types=.
+- =src/geopackage/{reader,writer}.rs= -- declared type read and emitted,
+  booleans recovered.
+- =src/shapefile/dbf.rs= -- =L=/=D= field types, and the =D= write arm they
+  needed.
+- =src/parquet/{reader,writer,types,geo}.rs= -- =converted_type= annotations
+  both ways, =INT32=/=FLOAT= physical encoding the writer had never emitted,
+  ISO-to-epoch parsing to invert the reader's =format_timestamp=, and the
+  unsigned-mask fix.
+- =src/format.rs= -- =carries_column_schema= gained =Gpkg= and =Parquet=.
+- =src/convert.rs=, =tests/perf.rs= -- tests, and the sparse benchmark.
+
+*The GeoParquet spoke, fifth* (2026-08-20): =src/native.rs=
+(=ParquetNative=), =src/lib.rs= (re-export), =src/parquet/reader.rs= (collect
+every =key_value_metadata= entry beside =geo=, plus =geo_orientation=),
+=src/parquet/geo.rs= (=metadata= takes an orientation), =src/parquet/writer.rs=
+(=replayable_metadata= and its =ARROW:schema= gate), =src/convert.rs= (attach
+and replay). Three new tests. *Left undone deliberately:* =covering=, which
+needs nested-struct writing the writer cannot do -- see the plan's M3 entry.
 
 *The FlatGeobuf spoke, third* (see § STATUS in the fidelity plan):
 =src/native.rs= (=FgbNative=/=FgbColumnNative=), =src/lib.rs= (re-exports),
@@ -378,9 +468,13 @@ committed to. *Always run =git= from =geosetta/= itself*, and check
 level up would sweep in =basin/=, =hen/=, =sphere2/= and a =.venv=.
 
 The fidelity work described in this handoff /was/ uncommitted while it was
-being done, which is what made the error plausible. It is committed now, so
-§ WHAT CHANGED IN EXISTING DOCS is no longer the only substitute for a diff --
-prefer =git log= / =git show= over that section where the two disagree.
+being done, which is what made the error plausible. Most of it is committed
+now -- =4e29eea= (the mechanism, column schema and FlatGeobuf spoke) and
+=e27163c= (M4 plus live bug 1) -- so § WHAT CHANGED IN EXISTING DOCS is no
+longer the only substitute for a diff; prefer =git log= / =git show= where the
+two disagree. *The GeoParquet spoke and the =covering= handover are not yet
+committed* at the time of writing, so for those the change log above is still
+the only record.
 
 ** OPEN QUESTIONS WORTH KNOWING
 Not blockers, but they will come up:

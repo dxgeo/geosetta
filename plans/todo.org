@@ -63,6 +63,12 @@ check it off and remove it once the item ships or is shelved.
 - [ ] [[file:arbitrary-geoparquet.org::*7. Nested/repeated (list-valued) columns][arbitrary-geoparquet.org — list of structs / nested list]] —
   milestone 7 decodes a single-level list of scalars; a list of structs or a
   list nested inside another list still hard-rejects.
+- [ ] [[file:spatial-index.org::*E. GeoParquet covering-bbox column (write)][spatial-index.org — GeoParquet covering-bbox column]] —
+  GeoParquet 1.1's per-row bbox index. This crate reads one and cannot write
+  one, so a file with an index goes in and one without comes out, silently.
+  Blocked on the Parquet writer's flat schema — it has never emitted a nested
+  struct column, though the reader already understands nesting. Handed over
+  from =same-format-fidelity.org='s GeoParquet spoke (2026-08-20).
 - [ ] [[file:spatial-index.org::*OPEN QUESTIONS][spatial-index.org — default =--rtree=?]] —
   whether GeoPackage's R*Tree extension should flip on by default now that
   =rtreecheck()=/GDAL validation cover the from-scratch node format.

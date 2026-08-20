@@ -145,8 +145,15 @@ fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
     }
 
     let type_names: Vec<String> = types.into_iter().collect();
-    let geo = parquet::geo_metadata(&type_names, &bbox, fc.crs.as_ref());
-    parquet::write_geoparquet(&columns, &geometry, &geo)
+    // The source's own file-level metadata, replayed only into its own format.
+    let native = fc.native.as_ref().and_then(|n| match n.payload_for(Format::Parquet) {
+        Some(crate::native::NativePayload::Parquet(p)) => Some(p),
+        _ => None,
+    });
+    let geo =
+        parquet::geo_metadata(&type_names, &bbox, fc.crs.as_ref(), native.and_then(|n| n.orientation.as_deref()));
+    let names: Vec<&str> = columns.iter().map(|c| c.name.as_str()).collect();
+    parquet::write_geoparquet(&columns, &geometry, &geo, native, &names)
 }
 
 /// GeoParquet's own `geometry_types` dimensionality suffix: `" Z"`, `" M"`,
@@ -240,12 +247,18 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
             feature.properties.push((Rc::clone(&key), value));
         }
     }
+    let native = parsed.native;
     Ok(FeatureCollection {
         features,
         crs: parsed.crs,
         name: None,
         schema,
-        native: None,
+        native: (!native.is_empty()).then(|| {
+            crate::native::Native::new(
+                Format::Parquet,
+                crate::native::NativePayload::Parquet(native),
+            )
+        }),
     })
 }
 
@@ -1771,4 +1784,82 @@ mod tests {
         }
     }
 
+    // --- M3: the GeoParquet spoke's natives ---------------------------------
+
+    fn parquet_native(fc: &FeatureCollection) -> &crate::native::ParquetNative {
+        match fc.native.as_ref().and_then(|n| n.payload_for(Format::Parquet)) {
+            Some(crate::native::NativePayload::Parquet(p)) => p,
+            _ => panic!("expected a GeoParquet native"),
+        }
+    }
+
+    /// The invariant for this spoke: real `ogr2ogr` output carries three
+    /// `key_value_metadata` entries and geosetta read exactly one, so a
+    /// GeoParquet rewritten by this crate used to lose `ARROW:schema` (what the
+    /// whole Arrow ecosystem reads) and `gdal:metadata` outright.
+    #[test]
+    fn geoparquet_carries_its_file_metadata_through_its_own_format() {
+        let source = parquet_to_features(include_bytes!(
+            "../tests/fixtures/gdal_covering_bbox.parquet"
+        ))
+        .unwrap();
+        let keys: Vec<&str> =
+            parquet_native(&source).key_value.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(keys.contains(&"ARROW:schema"), "{keys:?}");
+        assert!(keys.contains(&"gdal:metadata"), "{keys:?}");
+
+        let back = parquet_to_features(&features_to_parquet(&source)).unwrap();
+        assert_eq!(parquet_native(&back).key_value, parquet_native(&source).key_value);
+        // `orientation` rides in the `geo` object rather than beside it, and is
+        // the one member of that object this crate had never read.
+        assert_eq!(parquet_native(&back).orientation, parquet_native(&source).orientation);
+    }
+
+    /// `ARROW:schema` restates the file's own column types, so it is the one
+    /// carried key that can go *stale*. An Arrow reader trusts it over the
+    /// Parquet schema, so replaying it into a file whose columns a middle stage
+    /// changed would hand back types the file does not have — D4's rule against
+    /// replaying derived data, applied to the only derived key.
+    #[test]
+    fn a_stale_arrow_schema_is_dropped_once_the_columns_change() {
+        let source = parquet_to_features(include_bytes!(
+            "../tests/fixtures/gdal_covering_bbox.parquet"
+        ))
+        .unwrap();
+        assert!(
+            parquet_native(&source).key_value.iter().any(|(k, _)| k == "ARROW:schema"),
+            "the fixture must carry one for this test to mean anything"
+        );
+
+        // What a middle stage does: add a column the source never had.
+        let mut edited = source.clone();
+        for f in &mut edited.features {
+            f.properties.push((Rc::from("added"), json::JsonValue::Bool(true)));
+        }
+
+        let back = parquet_to_features(&features_to_parquet(&edited)).unwrap();
+        let keys: Vec<&str> =
+            parquet_native(&back).key_value.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(!keys.contains(&"ARROW:schema"), "a stale schema was replayed: {keys:?}");
+        // The opaque key is not schema-derived, so it still travels.
+        assert!(keys.contains(&"gdal:metadata"), "{keys:?}");
+    }
+
+    /// The tag check, for the newest payload: a GeoParquet native must be
+    /// invisible to every other writer. Asserted as byte-identity against the
+    /// same collection with no native at all.
+    #[test]
+    fn a_geoparquet_native_is_inert_in_another_format() {
+        let source = parquet_to_features(include_bytes!(
+            "../tests/fixtures/gdal_covering_bbox.parquet"
+        ))
+        .unwrap();
+        let mut stripped = source.clone();
+        stripped.native = None;
+        assert_eq!(
+            crate::flatgeobuf::write(&source),
+            crate::flatgeobuf::write(&stripped),
+            "a GeoParquet payload changed FlatGeobuf output"
+        );
+    }
 }

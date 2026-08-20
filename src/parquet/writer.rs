@@ -12,6 +12,7 @@
 //! so each page body is `[u32 len][RLE definition levels][PLAIN values]`.
 
 use super::geo::GEOMETRY_COLUMN;
+use crate::native::ParquetNative;
 use crate::schema::{Cell, Column, ColumnType, DeclType};
 use crate::compress::snappy;
 use super::thrift::{ct, CompactWriter};
@@ -53,6 +54,8 @@ pub fn write_geoparquet(
     columns: &[Column],
     geometry: &[Option<Vec<u8>>],
     geo_metadata: &str,
+    native: Option<&ParquetNative>,
+    column_names: &[&str],
 ) -> Vec<u8> {
     let num_rows = geometry.len() as i64;
 
@@ -69,7 +72,8 @@ pub fn write_geoparquet(
     }
 
     let total_byte_size: i64 = infos.iter().map(|c| c.uncompressed_size).sum();
-    let footer = build_file_metadata(&infos, num_rows, total_byte_size, geo_metadata);
+    let footer =
+        build_file_metadata(&infos, num_rows, total_byte_size, geo_metadata, native, column_names);
 
     file.extend_from_slice(&footer);
     file.extend_from_slice(&(footer.len() as u32).to_le_bytes());
@@ -371,6 +375,8 @@ fn build_file_metadata(
     num_rows: i64,
     total_byte_size: i64,
     geo_metadata: &str,
+    native: Option<&ParquetNative>,
+    column_names: &[&str],
 ) -> Vec<u8> {
     let prepared = &infos; // alias for readability
     let mut w = CompactWriter::new();
@@ -427,16 +433,50 @@ fn build_file_metadata(
     w.field_i64(3, num_rows);
     w.struct_end(); // RowGroup
 
-    // key_value_metadata: the GeoParquet "geo" entry.
-    w.field_list(5, ct::STRUCT, 1);
+    // key_value_metadata: the GeoParquet "geo" entry, plus whatever the source
+    // carried beside it.
+    let carried = replayable_metadata(native, column_names);
+    w.field_list(5, ct::STRUCT, 1 + carried.len());
     w.struct_begin();
     w.field_string(1, "geo");
     w.field_string(2, geo_metadata);
     w.struct_end();
+    for (k, v) in carried {
+        w.struct_begin();
+        w.field_string(1, k);
+        w.field_string(2, v);
+        w.struct_end();
+    }
 
+    // `created_by` names the application that wrote *this* file, and geosetta
+    // did — so it is written fresh rather than replayed from the source. Same
+    // reasoning as the `geo` metadata's `version`.
     w.field_string(6, "geosetta");
     w.struct_end(); // FileMetaData
     w.into_bytes()
+}
+
+/// The source's `key_value_metadata` entries that may still be written.
+///
+/// Most are opaque and always replayable. A key that *restates the file's own
+/// schema* — `ARROW:schema` — is only replayed while the property columns are
+/// unchanged: an Arrow reader trusts it over the Parquet schema, so replaying
+/// a stale one into a file whose columns a middle stage edited would hand back
+/// types the file does not have. D4's rule against replaying derived data,
+/// applied to the one carried key that is derived.
+fn replayable_metadata<'a>(
+    native: Option<&'a ParquetNative>,
+    column_names: &[&str],
+) -> Vec<(&'a str, &'a str)> {
+    let Some(native) = native else { return Vec::new() };
+    let columns_match = native.columns.len() == column_names.len()
+        && native.columns.iter().zip(column_names).all(|(a, b)| a == b);
+    native
+        .key_value
+        .iter()
+        .filter(|(k, _)| columns_match || !ParquetNative::schema_derived(k))
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect()
 }
 
 /// The annotation decided when the column was prepared. Geometry is raw WKB
@@ -517,7 +557,7 @@ mod tests {
     fn file_has_magic_bookends() {
         let cols: Vec<Column> = Vec::new();
         let geom = vec![Some(vec![0x01, 0x02])];
-        let out = write_geoparquet(&cols, &geom, "{}");
+        let out = write_geoparquet(&cols, &geom, "{}", None, &[]);
         assert_eq!(&out[..4], MAGIC);
         assert_eq!(&out[out.len() - 4..], MAGIC);
         // 4-byte length precedes the trailing magic.

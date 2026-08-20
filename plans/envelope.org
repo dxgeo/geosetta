@@ -238,8 +238,11 @@ out of this path. What *would* be lossy is emitting a *wrong* envelope, which
 - *FlatGeobuf's =NodeItem= bbox* (=src/spatial.rs=) -- XY-only by the format's
   own definition, feeding the packed Hilbert R-tree. Nothing here requires
   touching it, and it must *not* become Z/M-aware: the index is 2D.
-- *GeoParquet's covering-bbox column* -- tracked separately
-  (=arbitrary-geoparquet.org= milestone 6 / =zm-geometry.org= M8).
+- *GeoParquet's covering-bbox column* -- tracked separately. /Pointer
+  corrected 2026-08-20:/ the *write* side is =spatial-index.org= milestone E
+  (=arbitrary-geoparquet.org= 3c is the *read* side and is done; its milestone
+  6 is geometry variation, not this). =zm-geometry.org= M8 still holds the
+  dimensionality question -- the covering struct is 2D-only.
 
 ** DESIGN
 

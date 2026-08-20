@@ -93,6 +93,51 @@ pub enum NativePayload {
     /// level only — FlatGeobuf's per-*feature* unmodelled surface is the
     /// `Feature.columns` schema override, which nothing observed emits.
     FlatGeobuf(FgbNative),
+    /// GeoParquet file-level metadata with no IR slot. Collection level only.
+    Parquet(ParquetNative),
+}
+
+/// A GeoParquet file's unmodelled metadata: the `key_value_metadata` entries
+/// beside `geo`, and the `geo` members this crate does not model.
+///
+/// Two file-level members are *deliberately absent*, both for the reason the
+/// inventory already gives for `version`: they describe **the file geosetta is
+/// writing**, not the one it read. `created_by` names the application that
+/// wrote the file, and geosetta did; `version` states the GeoParquet version
+/// of the document it just produced. Replaying either would make the output
+/// claim something untrue about itself.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ParquetNative {
+    /// `key_value_metadata` entries other than `geo`, in file order —
+    /// `ARROW:schema`, `gdal:metadata`, and anything else a producer wrote.
+    /// `geo` is excluded because geosetta regenerates it from the geometry it
+    /// actually wrote.
+    pub key_value: Vec<(String, String)>,
+    /// The primary geometry column's `orientation` member inside `geo`.
+    /// Present in real `ogr2ogr` output (`"counterclockwise"`), and never read
+    /// or written before this spoke.
+    pub orientation: Option<String>,
+    /// The property column names this metadata was read alongside, in order.
+    ///
+    /// Not itself a recovered member — it is the *validity check* for
+    /// [`Self::schema_derived`] keys. `ARROW:schema` restates the file's own
+    /// column types, so replaying it into a file whose columns have changed
+    /// would leave an Arrow reader with a schema contradicting the Parquet
+    /// one. D4 forbids replaying derived data blindly; this records just
+    /// enough to tell whether it is still true.
+    pub columns: Vec<String>,
+}
+
+impl ParquetNative {
+    /// Whether `key` restates the file's own schema, and so may only be
+    /// replayed while the columns still match.
+    pub fn schema_derived(key: &str) -> bool {
+        key == "ARROW:schema"
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.key_value.is_empty() && self.orientation.is_none()
+    }
 }
 
 /// The FlatGeobuf header's descriptive members, plus the two sub-tables' —

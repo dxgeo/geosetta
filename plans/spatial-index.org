@@ -12,9 +12,13 @@ primitives once and reuse them:
 - *FlatGeobuf* — its spatial index *is* a packed Hilbert R-tree. We currently
   write index-less files (=index_node_size = 0=) and skip the index on read.
   Writing it makes our FGB spatially queryable by GDAL / QGIS.
-- *GeoParquet* — no index structure, but *Hilbert row ordering* clusters nearby
-  features so row-group bbox stats prune well (and spatially-close rows compress
-  better). The =geo= metadata bbox we already emit is the coarse version.
+- *GeoParquet* — *this entry was written before GeoParquet 1.1 and is no longer
+  the whole story* (corrected 2026-08-20). Hilbert row ordering still clusters
+  nearby features so row-group bbox stats prune well, and the =geo= metadata
+  bbox we emit is the coarse version. But 1.1 *does* define an index structure:
+  the =covering= bbox column, a per-row =struct(xmin,ymin,xmax,ymax)= beside
+  the geometry, which GDAL writes and this crate reads but cannot write — see
+  milestone E.
 - *GeoPackage* — has an optional RTree extension (SQLite's R*Tree) enabling
   =rtree_...= spatial queries. Hardest of the three (see milestone D).
 - *General* — Hilbert-sorting features improves locality (smaller bboxes, better
@@ -101,6 +105,36 @@ an opt-in =--rtree= flag (index-less GPKG is valid, so it stays the default):
   round-trips (the virtual table's =rootpage 0= is skipped, shadow tables aren't
   in =gpkg_contents=).
 
+*** E. GeoParquet covering-bbox column (write) — *NOT STARTED*
+GeoParquet 1.1's =covering= member points at a per-row bbox struct
+(=geometry_bbox= with =xmin=/=ymin=/=xmax=/=ymax= children) that readers use to
+prune without decoding WKB. Real =ogr2ogr= output carries one;
+=tests/fixtures/gdal_covering_bbox.parquet= is that file.
+
+*Where this came from.* It is the one GeoParquet member left unhandled by
+=same-format-fidelity.org='s M3 spoke, and it landed here because it is *not a
+natives question*: under D4 it is /derived-capability/ — never replayed
+verbatim, but *rebuilt when the source had one*, exactly like FlatGeobuf's
+R-tree (milestone B) and GeoPackage's (milestone D). This plan already owns
+that pattern for the other two spokes; it should own the third.
+
+*Status today, measured:* the reader parses the covering column's paths and
+uses them **only to exclude those columns from properties**
+(=parquet/reader.rs=), then discards them. So a GeoParquet with an index goes
+in and one without comes out — exit 0, no warning, and the schema loses five
+entries (=geometry_bbox= plus its four children).
+
+*The blocker, and it is real.* Writing one means emitting a *nested struct
+column*, and =parquet/writer.rs='s schema is one flat level of optional leaves:
+every column is a top-level `SchemaElement` with no group nodes and definition
+levels of 0 or 1. The read side already understands nesting
+(=arbitrary-geoparquet.org= 3c taught it definition levels through OPTIONAL
+ancestors); the write side has never needed it. That asymmetry is the work.
+
+*Sizing:* a small feature, not a spoke — one group node, four required leaves,
+and the =covering= member in the =geo= metadata. Values come free from the
+=Bbox= this crate already folds per geometry.
+
 ** CONTROL / DEFAULTS
 - FGB with an index *requires* Hilbert-ordered features, so enabling the index
   reorders features. Decide: write the index (and thus reorder) by default for
@@ -108,6 +142,10 @@ an opt-in =--rtree= flag (index-less GPKG is valid, so it stays the default):
   changes feature/row order, which is observable — a flag is safer; a sensible
   default is "index FGB, leave others as-is."
 - Parquet/GPKG reordering should be opt-in since it changes row order.
+- *The covering column (E) is not a reordering question* and should follow D4
+  rather than this section's opt-in stance: rebuild it when the source had one,
+  leave it absent when it did not. That is the same rule milestones B and D
+  settled on, and it needs no flag.
 
 ** TESTING
 - Hilbert unit tests (known mappings, bijection on a small grid).

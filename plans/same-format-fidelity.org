@@ -26,17 +26,16 @@ Cross-format drops of a declaration now *warn*
 (=FeatureCollection::schema_drop_warning=), because reading a member the crate
 then discards is precisely what =lossy-conversion-warnings.org= governs.
 
-*500 tests pass* as of M4, and =cargo clippy --all-targets= is clean. That
-figure is the whole of =cargo test -p geosetta= -- 455 lib, 44 integration, 1
+*503 tests pass* as of the GeoParquet spoke, and =cargo clippy --all-targets= is clean. That
+figure is the whole of =cargo test -p geosetta= -- 458 lib, 44 integration, 1
 doc -- recorded that way because an earlier bare "482" left the next reader
 unable to tell which suites it counted, and so unable to tell drift from a
 different denominator.
 
-*M3 in progress:* the *FlatGeobuf* spoke is done (natives, the header name,
-and defect 4 with it). Still to do: GeoPackage, GeoParquet, CSV, WKT, KML, and
-Shapefile's remaining *natives*, then both containers (M3b/M3c), defect 3, and
-the exhaustive-match fixture registry (M5/D6). The six remaining readers still
-pass =native: None=.
+*M3 in progress:* the *FlatGeobuf* and *GeoParquet* spokes are done. Still to
+do: GeoPackage, CSV, WKT, KML, and Shapefile's remaining *natives*, then both
+containers (M3b/M3c), defect 3, and the exhaustive-match fixture registry
+(M5/D6). Five readers still pass =native: None=.
 
 *M4 is done (2026-08-20), and it closed three defects rather than two.*
 =FieldDecl= gained a declared *type* in a vocabulary wide enough for the
@@ -868,7 +867,38 @@ travels with D1's =name= modelling.
   =ogrinfo= on our own output*, so widening the header vtable from 11 fields to
   14 did not break the reference implementation.
 
-  Two things this spoke settled that the plan had not:
+  *GeoParquet: done 2026-08-20.* =ParquetNative= carries every
+  =key_value_metadata= entry beside =geo= (=ARROW:schema=, =gdal:metadata=,
+  anything else a producer wrote) plus the primary column's
+  =geo.orientation=. Verified on real =ogr2ogr= output and *read back by both
+  GDAL and DuckDB*.
+
+  Two things this spoke settled:
+  1. *=created_by= is not a native, and neither is =version=.* Both describe
+     *the file geosetta is writing*, not the one it read. Replaying either
+     would make the output claim something untrue about itself -- the same
+     reasoning the inventory already applied to =version=, now generalised.
+     This is the mirror image of defect 4: FlatGeobuf's =name= was the
+     *layer's* identity and had to be carried; =created_by= is the *writer's*
+     identity and must not be.
+  2. *An opaque member can also be derived, and then it needs a gate.*
+     =ARROW:schema= restates the file's own column types and Arrow readers
+     trust it over the Parquet schema, so replaying a stale one is worse than
+     dropping it. =ParquetNative= records the column names it was read beside
+     and drops that key alone when they stop matching. D4 split members into
+     opaque/identity/derived as if the classes were exclusive; this one is
+     opaque *and* derived, and the resolution is a validity check rather than
+     a reclassification.
+
+  *Not done, and it is not a natives question:* =covering=, GeoParquet's bbox
+  index. D4 says rebuild a derived-capability when the source had one, and
+  rebuilding this means writing a *nested struct column*, which the writer
+  cannot do at all -- its schema is one flat level of optional leaves. A
+  self-contained piece of work, sized like a small feature rather than a spoke,
+  and *owned by* [[file:spatial-index.org][spatial-index.org]] *milestone E* --
+  it belongs with the other two spokes' indexes, not with the natives.
+
+  Two things the FlatGeobuf spoke settled that the plan had not:
   1. *The =Crs= extras are opaque natives, not IR.* =crs_name= is populated in
      every =ogr2ogr=-written file observed, so it is not a theoretical slot,
      but =NamedCrs= models an *identity* and a *definition* and a

@@ -49,7 +49,12 @@ const GEOPARQUET_VERSION: &str = "1.1.0";
 /// (DuckDB, GDAL) resolve the code to the full definition. Only when there is no
 /// authority+code *and* no PROJJSON is the CRS omitted, since there is then
 /// nothing GeoParquet can express.
-pub fn metadata(geometry_types: &[String], bbox: &Bbox, crs: Option<&Crs>) -> String {
+pub fn metadata(
+    geometry_types: &[String],
+    bbox: &Bbox,
+    crs: Option<&Crs>,
+    orientation: Option<&str>,
+) -> String {
     let mut s = String::new();
     s.push_str("{\"version\":\"");
     s.push_str(GEOPARQUET_VERSION);
@@ -57,7 +62,16 @@ pub fn metadata(geometry_types: &[String], bbox: &Bbox, crs: Option<&Crs>) -> St
     s.push_str(GEOMETRY_COLUMN);
     s.push_str("\",\"columns\":{\"");
     s.push_str(GEOMETRY_COLUMN);
-    s.push_str("\":{\"encoding\":\"WKB\",\"geometry_types\":[");
+    s.push_str("\":{\"encoding\":\"WKB\"");
+    // The source's ring-winding convention, replayed verbatim when it had one
+    // (opaque — the IR does not model orientation). Placed before
+    // `geometry_types` so member order matches real `ogr2ogr` output.
+    if let Some(o) = orientation {
+        s.push_str(",\"orientation\":\"");
+        s.push_str(o);
+        s.push('"');
+    }
+    s.push_str(",\"geometry_types\":[");
     for (i, t) in geometry_types.iter().enumerate() {
         if i > 0 {
             s.push(',');
@@ -207,7 +221,7 @@ mod tests {
         let mut bbox = Bbox::empty();
         bbox.add(Position::new(1.0, 2.0));
         bbox.add(Position::new(3.0, 4.5));
-        let json = metadata(&["Point".to_string()], &bbox, Some(&Crs::Wgs84));
+        let json = metadata(&["Point".to_string()], &bbox, Some(&Crs::Wgs84), None);
         assert!(json.contains("\"encoding\":\"WKB\""));
         assert!(json.contains("\"primary_column\":\"geometry\""));
         assert!(json.contains("\"geometry_types\":[\"Point\"]"));
@@ -221,7 +235,7 @@ mod tests {
         let mut bbox = Bbox::empty();
         bbox.add(Position::with_z(0.0, 0.0, 0.0));
         bbox.add(Position::with_z(20.0, 10.0, 10.0));
-        let json = metadata(&["LineString Z".to_string()], &bbox, None);
+        let json = metadata(&["LineString Z".to_string()], &bbox, None, None);
         // All mins, then all maxes — the layout real GDAL output was checked
         // against, and *not* GPB's per-dimension pairing.
         assert!(json.contains("\"bbox\":[0,0,0,20,10,10]"), "{json}");
@@ -234,7 +248,7 @@ mod tests {
         let mut bbox = Bbox::empty();
         bbox.add(Position::with_m(1.0, 2.0, 100.0));
         bbox.add(Position::with_m(3.0, 4.0, 200.0));
-        let json = metadata(&["LineString M".to_string()], &bbox, None);
+        let json = metadata(&["LineString M".to_string()], &bbox, None, None);
         assert!(json.contains("\"bbox\":[1,2,3,4]"), "{json}");
         assert!(!json.contains("100"), "M leaked into the bbox: {json}");
     }
@@ -260,6 +274,7 @@ mod tests {
             &["LineString".to_string(), "LineString Z".to_string()],
             &bbox,
             None,
+            None,
         );
         assert!(json.contains("\"bbox\":[0,0,50,110,110,60]"), "{json}");
 
@@ -276,7 +291,7 @@ mod tests {
 
     #[test]
     fn omits_empty_bbox() {
-        let json = metadata(&[], &Bbox::empty(), None);
+        let json = metadata(&[], &Bbox::empty(), None, None);
         assert!(!json.contains("bbox"));
         assert!(json.contains("\"geometry_types\":[]"));
     }
@@ -291,7 +306,7 @@ mod tests {
             wkt: None,
             projjson: Some(projjson.into()),
         });
-        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs), None);
         assert!(json.contains("\"crs\":{\"type\":\"ProjectedCRS\""));
 
         // Round-trips back to an equivalent Crs, with the id lifted out.
@@ -355,7 +370,7 @@ mod tests {
              {{\"geometry\":{{\"crs\":{projjson}}}}}}}"
         );
         let crs = parse_crs(&geo).unwrap();
-        let rewritten = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        let rewritten = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs), None);
         assert!(
             rewritten.contains(projjson),
             "definition was restyled: {rewritten}"
@@ -380,7 +395,7 @@ mod tests {
 
     #[test]
     fn absent_crs_parses_as_wgs84() {
-        let json = metadata(&[], &Bbox::empty(), None);
+        let json = metadata(&[], &Bbox::empty(), None, None);
         assert_eq!(parse_crs(&json), Some(Crs::Wgs84));
     }
 
@@ -397,7 +412,7 @@ mod tests {
             wkt: None,
             projjson: None,
         });
-        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs), None);
         assert!(json.contains("\"crs\":{\"id\":{\"authority\":\"CUSTOM\",\"code\":\"GRID-1\"}}"), "{json}");
 
         match parse_crs(&json).unwrap() {
@@ -424,7 +439,7 @@ mod tests {
             wkt: Some("GEOGCRS[\"GDA2020\"]".into()),
             projjson: None,
         });
-        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        let json = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs), None);
         assert!(json.contains("\"crs\":{\"id\":{\"authority\":\"EPSG\",\"code\":7844}}"));
 
         match parse_crs(&json).unwrap() {
@@ -447,7 +462,7 @@ mod tests {
             wkt: Some("GEOGCRS[\"something\"]".into()),
             projjson: None,
         });
-        let json = metadata(&[], &Bbox::empty(), Some(&crs));
+        let json = metadata(&[], &Bbox::empty(), Some(&crs), None);
         assert!(!json.contains("crs"));
     }
 }

@@ -414,9 +414,9 @@ gdal:metadata
 =reader.rs:279--296= pulls only ="geo"=; the rest hit =_ => r.skip(ty)?=.
 | key                    | class  | note |
 |------------------------+--------+------|
-| =ARROW:schema=         | opaque | field types, nullability, per-field metadata -- what the Arrow ecosystem reads |
-| =gdal:metadata=        | opaque | GDAL's own layer metadata |
-| =created_by=           | identity | file-metadata struct field 6, skipped |
+| =ARROW:schema=         | opaque | *carried 2026-08-20*, but gated -- see below |
+| =gdal:metadata=        | opaque | *carried 2026-08-20* |
+| =created_by=           | identity | *deliberately not carried* -- it names the application that wrote the file, and geosetta did |
 | column statistics      | derived-information | |
 | row-group / page layout| derived-capability | physical layout; affects read speed only |
 
@@ -443,7 +443,7 @@ Geosetta round-tripped it to this:
 | =encoding=      | yes       | --    | WKB and the native logical type both handled |
 | =geometry_types=| yes       | --    | recomputed |
 | =bbox=          | yes       | derived-information | recomputed; =fmt_num= renormalises the digits |
-| =orientation=   | *no*      | opaque | present in real GDAL output; never read, never written |
+| =orientation=   | *carried 2026-08-20* | opaque | present in real GDAL output; was never read, never written |
 | =covering=      | *no*      | derived-capability | read as =covering_paths= *only to exclude* those columns (=reader.rs:86--91=), then discarded |
 | =edges=         | n/a       | --    | /unverified/ -- see the null result below |
 | =epoch=         | n/a       | --    | /unverified/ -- same |
@@ -459,6 +459,32 @@ Exit 0, no warning. The reader's own comment calls the covering "a
 spatial-pruning optimization, not a [property]", which is precisely D4's
 *derived-capability*: rebuilt when the source had one. Geosetta already folds
 the =Bbox= it would need.
+
+*** GeoParquet spoke -- DONE 2026-08-20
+=ParquetNative= (=src/native.rs=) carries every =key_value_metadata= entry
+beside =geo=, plus the primary column's =geo.orientation=. /Measured/ on
+=gdal_covering_bbox.parquet=, real =ogr2ogr= output: all three keys come back,
+=orientation= survives inside the regenerated =geo= object, and *both GDAL and
+DuckDB read the result*.
+
+*One carried key is gated, and the gate is the interesting part.*
+=ARROW:schema= is *not* like the others: it restates the file's own column
+types, and an Arrow reader trusts it over the Parquet schema. Replaying a
+stale one into a file whose columns a middle stage changed would hand back
+types the file does not have -- D4's rule against replaying derived data,
+except this member is opaque *and* derived at once. So =ParquetNative= records
+the property column names it was read beside, and =replayable_metadata= drops
+=ARROW:schema= (only) when they no longer match. Opaque keys like
+=gdal:metadata= travel unconditionally.
+
+*Still not carried: =covering=.* It is /derived-capability/ under D4 -- rebuilt
+when the source had one -- and rebuilding it means *writing a nested struct
+column*, which this writer cannot do at all (its schema is one flat level of
+optional leaves). That is a self-contained piece of work, not a natives
+question, and it is the last GeoParquet entry in this inventory. *Owned by*
+[[file:spatial-index.org][spatial-index.org]] *milestone E*, which already
+holds the same D4 rebuild-if-present rule for FlatGeobuf's and GeoPackage's
+indexes.
 
 *=version= is deliberately not preserved, and that is correct.* DuckDB writes
 =1.0.0=; geosetta always writes =1.1.0= (=geo.rs:14=). That is not a loss --

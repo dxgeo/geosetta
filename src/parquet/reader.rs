@@ -34,6 +34,7 @@
 use super::geo::GEOMETRY_COLUMN;
 use super::thrift::{ct, CompactReader, Field};
 use super::types::{codec, converted, encoding, page, ptype, repetition};
+use crate::native::ParquetNative;
 use crate::schema::DeclType;
 use crate::compress::{gzip, lz4, snappy, zstd};
 use crate::error::{Error, Result};
@@ -65,6 +66,8 @@ pub struct GeoParquet {
     pub geometry: Vec<Option<Vec<u8>>>,
     /// The CRS recovered from the `geo` metadata, carried through unchanged.
     pub crs: Option<crate::crs::Crs>,
+    /// File-level metadata with no IR slot, for a same-format write to replay.
+    pub native: ParquetNative,
 }
 
 /// A Parquet leaf's declared type, from its physical type plus any
@@ -209,11 +212,16 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
     if !has_geometry {
         geometry = vec![None; num_rows];
     }
+    let mut native = meta.native;
+    // Recorded now that the property set is known, so a writer can tell
+    // whether a schema-restating key (`ARROW:schema`) is still true.
+    native.columns = properties.iter().map(|p| p.name.clone()).collect();
     Ok(GeoParquet {
         num_rows,
         properties,
         geometry,
         crs: meta.crs,
+        native,
     })
 }
 
@@ -231,6 +239,11 @@ struct Meta {
     /// still need the schema-tree walk below to decode correctly) but
     /// excluded from `properties` in `read_geoparquet`.
     covering_paths: Vec<Vec<String>>,
+    /// `key_value_metadata` entries other than `geo`, in file order, and the
+    /// primary column's `geo.orientation` — everything at file level this
+    /// reader recovers but the IR has nowhere to put. See
+    /// [`crate::ParquetNative`].
+    native: ParquetNative,
     /// Every geometry column name declared in the `geo` metadata's `columns`
     /// object (see `geo_geometry_columns`) — a superset of `geometry_column`
     /// (the primary one) when a writer emits more than one. Used only to
@@ -311,6 +324,7 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
     let mut geo_primary_found = false;
     let mut crs: Option<crate::crs::Crs> = None;
     let mut covering_paths: Vec<Vec<String>> = Vec::new();
+    let mut native = ParquetNative::default();
     let mut geo_geometry_columns: Vec<String> = Vec::new();
     // The flat, pre-order SchemaElement list — a tree in disguise (see
     // `flatten_schema`), not one entry per column.
@@ -340,16 +354,23 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
                     let (_elem, len) = r.read_list_header()?;
                     for _ in 0..len {
                         let (k, v) = parse_key_value(&mut r)?;
-                        if k == "geo"
-                            && let Some(geo) = v.as_deref()
-                        {
-                            if let Some(pc) = primary_column(geo) {
-                                geometry_column = pc;
-                                geo_primary_found = true;
+                        if k == "geo" {
+                            if let Some(geo) = v.as_deref() {
+                                if let Some(pc) = primary_column(geo) {
+                                    geometry_column = pc.clone();
+                                    geo_primary_found = true;
+                                }
+                                crs = super::geo::parse_crs(geo);
+                                covering_paths = covering_bbox_paths(geo);
+                                geo_geometry_columns = self::geo_geometry_columns(geo);
+                                native.orientation = geo_orientation(geo, &geometry_column);
                             }
-                            crs = super::geo::parse_crs(geo);
-                            covering_paths = covering_bbox_paths(geo);
-                            geo_geometry_columns = self::geo_geometry_columns(geo);
+                        } else if let Some(v) = v {
+                            // Everything else is carried verbatim: `ARROW:schema`,
+                            // `gdal:metadata`, and whatever else a producer wrote.
+                            // `geo` is excluded because geosetta regenerates it
+                            // from the geometry it actually wrote.
+                            native.key_value.push((k, v));
                         }
                     }
                 }
@@ -424,6 +445,7 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
         crs,
         covering_paths,
         geo_geometry_columns,
+        native,
     })
 }
 
@@ -794,6 +816,21 @@ fn parse_key_value(r: &mut CompactReader) -> Result<(String, Option<String>)> {
 }
 
 /// Extract `primary_column` from the GeoParquet `geo` metadata JSON.
+/// The named column's `orientation` inside the `geo` metadata.
+///
+/// Real `ogr2ogr` output carries `"counterclockwise"` here and this crate has
+/// never read it. Opaque: it states a ring-winding convention the IR does not
+/// model, so it is replayed verbatim or not at all.
+fn geo_orientation(geo: &str, column: &str) -> Option<String> {
+    json::parse(geo)
+        .ok()?
+        .get("columns")?
+        .get(column)?
+        .get("orientation")
+        .and_then(JsonValue::as_str)
+        .map(String::from)
+}
+
 fn primary_column(geo: &str) -> Option<String> {
     json::parse(geo)
         .ok()?

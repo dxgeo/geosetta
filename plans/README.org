@@ -58,7 +58,11 @@ why, not to implement the spec's table from symmetry.
 - [[file:spatial-index.org][spatial-index.org]] :: Spatial ordering and indexing
   — shared per-feature bbox + Hilbert curve primitives, the FlatGeobuf packed
   Hilbert R-tree on write, optional GeoParquet Hilbert clustering, and the
-  GeoPackage R*Tree extension (=--rtree=). *DONE.*
+  GeoPackage R*Tree extension (=--rtree=). *Milestones A–D DONE; E open* —
+  GeoParquet 1.1's =covering= bbox column, which this crate reads and cannot
+  write, handed over from =same-format-fidelity.org='s GeoParquet spoke
+  (2026-08-20) because it is a D4 rebuild-if-present index like the other two,
+  not a native.
 - [[file:streaming-progress.org][streaming-progress.org]] :: Intra-stage progress
   — thread an optional, throttled progress callback through each reader/writer so
   =--progress= can show a live percentage on large files (the current flag only
@@ -324,9 +328,10 @@ why, not to implement the spec's table from symmetry.
   *KMZ is a second container spoke* -- a =.kmz= is a zip and geosetta writes
   =doc.kml= alone, so icons and overlays are dropped and the surviving KML
   keeps its dangling references. GeoParquet, measured against a real =ogr2ogr=
-  file, drops two of three =key_value_metadata= keys (=ARROW:schema=,
+  file, dropped two of three =key_value_metadata= keys (=ARROW:schema=,
   =gdal:metadata=), =orientation=, and the whole =covering= bbox index with its
-  five schema entries.
+  five schema entries — *the first three are carried as of 2026-08-20*; the
+  =covering= column moved to =spatial-index.org= milestone E.
 - [[file:same-format-output.org][same-format-output.org]] :: Drop the
   =args.from == out.format= rejection in =main.rs=, so a user can write the
   format they read -- =--crs= relabelling, =--sort-hilbert=, =--envelope= and a

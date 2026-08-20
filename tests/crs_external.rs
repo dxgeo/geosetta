@@ -1,6 +1,7 @@
-//! End-to-end coverage for the two flags that let a CRS geosetta cannot resolve
-//! be resolved by something else: `--print-crs-code` (report the source's
-//! authority code) and `--crs` (accept the definition that came back).
+//! End-to-end coverage for the flags that let a CRS geosetta cannot resolve be
+//! resolved by something else: `--print-crs-code` (report the source's authority
+//! code), `--print-crs` (report the definition text it recorded), and `--crs`
+//! (accept the definition that came back).
 //!
 //! The pair exists because geosetta *labels* CRS and never resolves or
 //! reprojects: it carries whatever identity a format recorded, and when a source
@@ -34,8 +35,35 @@ const GDA2020_WKT1: &str = r#"GEOGCS["GDA2020",DATUM["Geocentric_Datum_of_Austra
 
 const GDA2020_PROJJSON: &str = r#"{"type":"GeographicCRS","name":"GDA2020","datum":{"type":"GeodeticReferenceFrame","name":"Geocentric Datum of Australia 2020","ellipsoid":{"name":"GRS 1980","semi_major_axis":6378137,"inverse_flattening":298.257222101}},"coordinate_system":{"subtype":"ellipsoidal","axis":[{"name":"Geodetic latitude","abbreviation":"Lat","direction":"north","unit":"degree"},{"name":"Geodetic longitude","abbreviation":"Lon","direction":"east","unit":"degree"}]},"id":{"authority":"EPSG","code":7844}}"#;
 
+/// A temp directory private to the *calling test*.
+///
+/// This used to key on `std::process::id()` alone, giving one directory per
+/// test binary rather than per test. Every test here writes its fixtures by a
+/// fixed name — 13 of them call [`write_code_only_fgb`], which always writes
+/// `code_only.fgb` — so under libtest's default thread-per-test parallelism
+/// they raced on the same paths, one test truncating a file another was about
+/// to read. It failed roughly one run in twelve, which is exactly often enough
+/// to be dismissed as noise.
+///
+/// libtest names each worker thread after the test it runs, so that name both
+/// isolates the directories and keeps them recognizable when a failing test
+/// leaves something worth inspecting. The counter is the `--test-threads=1`
+/// fallback, where every test shares the thread named `main` (harmless there —
+/// nothing runs concurrently — but distinct directories still keep one test's
+/// leftovers from being mistaken for another's).
 fn tmp_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("geosetta-crs-external-{}", std::process::id()));
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let label = match std::thread::current().name() {
+        Some(name) if name != "main" => name.replace("::", "-"),
+        _ => format!(
+            "seq{}",
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ),
+    };
+    let dir = std::env::temp_dir().join(format!(
+        "geosetta-crs-external-{}-{label}",
+        std::process::id()
+    ));
     std::fs::create_dir_all(&dir).unwrap();
     dir
 }
@@ -73,6 +101,26 @@ struct Run {
     stdout: String,
     stderr: String,
     ok: bool,
+}
+
+impl Run {
+    /// Every warning geosetta emits goes through `main.rs`'s `print_warnings`,
+    /// which prefixes `warning: ` and prints one per line — so a warning is a
+    /// *line starting with* that prefix, not merely the word appearing
+    /// somewhere in stderr.
+    ///
+    /// The distinction is not pedantic: stderr also carries the informational
+    /// `wrote <path> (N bytes)` line, so a plain `stderr.contains("warning")`
+    /// also fires on any output path with "warning" in it — which is exactly
+    /// what happened once [`tmp_dir`] started naming directories after the
+    /// calling test, one of which is
+    /// `crs_override_silences_the_unresolvable_geoparquet_warning`.
+    fn warnings(&self) -> Vec<&str> {
+        self.stderr
+            .lines()
+            .filter(|l| l.starts_with("warning: "))
+            .collect()
+    }
 }
 
 fn run(args: &[&str], stdin: Option<&str>) -> Run {
@@ -163,7 +211,7 @@ fn prints_one_line_per_distinct_layer_crs() {
         ("b".to_string(), point_fc(Some(epsg_3857))),
         ("c".to_string(), point_fc(Some(code_only_crs()))),
     ];
-    std::fs::write(&path, geosetta::geopackage::write_layers(None, &layers, false).unwrap())
+    std::fs::write(&path, geosetta::geopackage::write_layers(None, &layers, false, false).unwrap())
         .unwrap();
 
     let r = run(&[path.to_str().unwrap(), "--print-crs-code"], None);
@@ -174,6 +222,459 @@ fn prints_one_line_per_distinct_layer_crs() {
     let r = run(&[path.to_str().unwrap(), "--print-crs-code", "--layer", "b"], None);
     assert!(r.ok, "{}", r.stderr);
     assert_eq!(r.stdout, "EPSG:3857\n");
+}
+
+// ===========================================================================
+// --print-crs
+// ===========================================================================
+
+/// A CRS carrying a *definition* and no authority code — the case
+/// `--print-crs-code` structurally cannot report and this flag exists for. The
+/// body is pretty-printed on purpose: verbatim has to mean the source's own
+/// formatting, not a shape that happens to survive a re-serialization.
+const ID_LESS_PROJJSON: &str = r#"{
+  "type": "GeographicCRS",
+  "name": "Some Unregistered Datum",
+  "datum": {
+    "type": "GeodeticReferenceFrame",
+    "name": "Some Unregistered Datum",
+    "ellipsoid": { "name": "GRS 1980", "semi_major_axis": 6378137, "inverse_flattening": 298.257222101 }
+  }
+}"#;
+
+fn projjson_only_crs() -> Crs {
+    Crs::Named(NamedCrs {
+        authority: None,
+        code: None,
+        wkt: None,
+        projjson: Some(ID_LESS_PROJJSON.to_string()),
+    })
+}
+
+/// Two id-less WKT definitions, for the GeoPackage cases. GeoPackage records a
+/// CRS as WKT in its `gpkg_spatial_ref_sys` table, so a PROJJSON fixture would
+/// be translated on the way in and the test would be asserting on the
+/// crosswalk's output rather than on what `--print-crs` does with it.
+const ID_LESS_WKT_A: &str = r#"GEOGCS["Datum A",DATUM["Datum A",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#;
+const ID_LESS_WKT_B: &str = r#"GEOGCS["Datum B",DATUM["Datum B",SPHEROID["Clarke 1866",6378206.4,294.9786982]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]]"#;
+
+fn wkt_only_crs(wkt: &str) -> Crs {
+    Crs::Named(NamedCrs {
+        authority: None,
+        code: None,
+        wkt: Some(wkt.to_string()),
+        projjson: None,
+    })
+}
+
+/// Write a GeoParquet whose `geo` metadata carries `ID_LESS_PROJJSON` — the
+/// input the whole cross-repo pipeline is built around. No such file has been
+/// confirmed to exist in the wild (PROJ and GDAL always emit a root `id`), so it
+/// is constructed here; see `plans/crs-definition-output.org` § OPEN QUESTIONS.
+fn write_id_less_parquet(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("id_less.parquet");
+    let bytes =
+        geosetta::write_features(Format::Parquet, &point_fc(Some(projjson_only_crs()))).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    path
+}
+
+#[test]
+fn prints_the_definition_body_a_source_recorded() {
+    let dir = tmp_dir();
+    let path = write_id_less_parquet(&dir);
+
+    let r = run(&[path.to_str().unwrap(), "--print-crs"], None);
+    assert!(r.ok, "{}", r.stderr);
+    // Byte-for-byte, plus exactly one trailing newline: no re-indenting, no
+    // re-ordering, no compaction.
+    assert_eq!(r.stdout, format!("{ID_LESS_PROJJSON}\n"));
+}
+
+#[test]
+fn the_definition_survives_a_round_trip_through_the_crs_override() {
+    // The verbatim contract's real test: what --print-crs emits, fed back
+    // through --crs on the same source, must convert to the same bytes as not
+    // passing --crs at all. If the flag reformatted anything, this diverges.
+    let dir = tmp_dir();
+    let path = write_id_less_parquet(&dir);
+    let src = path.to_str().unwrap();
+
+    let printed = run(&[src, "--print-crs"], None);
+    assert!(printed.ok, "{}", printed.stderr);
+
+    let plain = dir.join("plain.fgb");
+    assert!(run(&[src, plain.to_str().unwrap()], None).ok);
+
+    let round_tripped = dir.join("round_tripped.fgb");
+    let r = run(
+        &[src, round_tripped.to_str().unwrap(), "--crs", "-"],
+        Some(&printed.stdout),
+    );
+    assert!(r.ok, "{}", r.stderr);
+
+    assert_eq!(
+        std::fs::read(&plain).unwrap(),
+        std::fs::read(&round_tripped).unwrap(),
+        "piping --print-crs into --crs - must be a no-op",
+    );
+}
+
+#[test]
+fn a_shapefile_prj_prints_as_its_own_bytes() {
+    // The sharpest check available on "verbatim": a `.prj` is loose WKT text on
+    // disk, so the flag's stdout can be compared against the file itself rather
+    // than against something geosetta also produced.
+    let prj = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/duckdb_crs_pt.prj"
+    );
+    let shp = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/duckdb_crs_pt.shp"
+    );
+
+    let r = run(&[shp, "--print-crs"], None);
+    assert!(r.ok, "{}", r.stderr);
+    let on_disk = std::fs::read_to_string(prj).unwrap();
+    assert_eq!(r.stdout, format!("{}\n", on_disk.trim_end()));
+}
+
+// The dialect-precedence rule (PROJJSON wins when a source carries both) has no
+// end-to-end test here on purpose: no reader can produce that state. GeoParquet
+// records PROJJSON only, FlatGeobuf and GeoPackage record WKT only, and a
+// Shapefile `.prj` is WKT text on disk — so a `NamedCrs` holding both dialects
+// is reachable only by constructing one. It is asserted directly as a unit test
+// on `Crs::definition_body`, which is where the rule lives.
+
+#[test]
+fn a_geopackage_synthetic_id_is_not_reported_as_a_code() {
+    // GeoPackage cannot store a CRS without an `srs_id`, so a WKT-only CRS is
+    // written with organization NONE and an invented one. Round-tripping through
+    // a `.gpkg` must not turn "no identity" into a code a resolver will choke on:
+    // `--print-crs-code` reports nothing, and `--print-crs` — which can actually
+    // help here — reports the definition.
+    //
+    // Without this the documented two-flag partition inverts for GeoPackage
+    // alone: the code flag would *succeed* with `NONE:100000`, so a script
+    // trying the code first would fail on it instead of falling through.
+    let dir = tmp_dir();
+    let path = dir.join("wkt_only.gpkg");
+    let layers = vec![("a".to_string(), point_fc(Some(wkt_only_crs(ID_LESS_WKT_A))))];
+    std::fs::write(
+        &path,
+        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+    )
+    .unwrap();
+    let src = path.to_str().unwrap();
+
+    let r = run(&[src, "--print-crs-code"], None);
+    assert!(!r.ok, "a synthetic id is not an identity to report");
+    assert!(
+        r.stdout.is_empty(),
+        "and nothing may reach stdout: {:?}",
+        r.stdout
+    );
+
+    let r = run(&[src, "--print-crs"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{ID_LESS_WKT_A}\n"));
+}
+
+#[test]
+fn a_geopackage_with_a_real_code_still_reports_it() {
+    // The guard is for the placeholder authority only.
+    let dir = tmp_dir();
+    let path = dir.join("real_code.gpkg");
+    let layers = vec![("a".to_string(), point_fc(Some(code_only_crs())))];
+    std::fs::write(
+        &path,
+        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+    )
+    .unwrap();
+
+    let r = run(&[path.to_str().unwrap(), "--print-crs-code"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "EPSG:7844\n");
+}
+
+#[test]
+fn a_code_only_source_reports_nothing_and_names_the_other_flag() {
+    // The complement of `reports_nothing_for_an_id_less_definition`: there the
+    // code flag had nothing to say and this one would; here it is reversed. The
+    // pair is what makes the two flags a usable diagnostic partition.
+    let dir = tmp_dir();
+    let fgb = write_code_only_fgb(&dir);
+
+    let r = run(&[fgb.to_str().unwrap(), "--print-crs"], None);
+    assert!(!r.ok, "a source with no definition text must exit nonzero");
+    assert!(
+        r.stdout.is_empty(),
+        "stdout must stay clean: {:?}",
+        r.stdout
+    );
+    assert!(r.stderr.contains("--print-crs-code"), "{}", r.stderr);
+
+    // And that flag does work on this input, which is the point of naming it.
+    let r = run(&[fgb.to_str().unwrap(), "--print-crs-code"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "EPSG:7844\n");
+}
+
+#[test]
+fn a_wgs84_source_reports_nothing_here_but_a_code_there() {
+    // The two flags disagree about a GeoJSON source, and correctly: its spec
+    // fixes it at WGS 84, so there is a real identity to report and no text to
+    // quote. A nonzero exit here is not "this file is broken".
+    let dir = tmp_dir();
+    let path = dir.join("wgs84.geojson");
+    std::fs::write(
+        &path,
+        geosetta::write_features(Format::GeoJson, &point_fc(Some(Crs::Wgs84))).unwrap(),
+    )
+    .unwrap();
+    let src = path.to_str().unwrap();
+
+    let r = run(&[src, "--print-crs"], None);
+    assert!(!r.ok);
+    assert!(r.stdout.is_empty(), "{:?}", r.stdout);
+    assert!(r.stderr.contains("implicit WGS 84 default"), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("OGC:CRS84"),
+        "names the code that does work: {}",
+        r.stderr
+    );
+
+    let r = run(&[src, "--print-crs-code"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, "OGC:CRS84\n");
+}
+
+#[test]
+fn more_than_one_distinct_definition_is_an_error_naming_the_layers() {
+    // A code is guaranteed single-line, so --print-crs-code can print one per
+    // line. A definition body is not, so there is no delimiter to invent here:
+    // error, and point at the flag that resolves it.
+    let dir = tmp_dir();
+    let path = dir.join("mixed.gpkg");
+    let layers = vec![
+        ("a".to_string(), point_fc(Some(wkt_only_crs(ID_LESS_WKT_A)))),
+        ("b".to_string(), point_fc(Some(wkt_only_crs(ID_LESS_WKT_B)))),
+    ];
+    std::fs::write(
+        &path,
+        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+    )
+    .unwrap();
+    let src = path.to_str().unwrap();
+
+    let r = run(&[src, "--print-crs"], None);
+    assert!(!r.ok, "a mixed file must fail rather than pick one");
+    assert!(r.stdout.is_empty(), "no partial output: {:?}", r.stdout);
+    assert!(r.stderr.contains("--layer"), "{}", r.stderr);
+    assert!(
+        r.stderr.contains("\"a\"") && r.stderr.contains("\"b\""),
+        "names them: {}",
+        r.stderr
+    );
+
+    // --layer is the escape hatch, and it prints the one layer's body verbatim.
+    let r = run(&[src, "--print-crs", "--layer", "a"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{ID_LESS_WKT_A}\n"));
+}
+
+#[test]
+fn layers_sharing_one_definition_print_it_once() {
+    // De-duplication, not concatenation: the ordinary case of a multi-layer file
+    // whose layers agree still yields exactly one definition.
+    let dir = tmp_dir();
+    let path = dir.join("uniform.gpkg");
+    let layers = vec![
+        ("a".to_string(), point_fc(Some(wkt_only_crs(ID_LESS_WKT_A)))),
+        ("b".to_string(), point_fc(Some(wkt_only_crs(ID_LESS_WKT_A)))),
+        ("c".to_string(), point_fc(Some(wkt_only_crs(ID_LESS_WKT_A)))),
+    ];
+    std::fs::write(
+        &path,
+        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+    )
+    .unwrap();
+
+    let r = run(&[path.to_str().unwrap(), "--print-crs"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{ID_LESS_WKT_A}\n"));
+}
+
+#[test]
+fn print_crs_reads_a_piped_source_from_stdin() {
+    // `-` plus --from, same as every other mode: the flag is a reader like any
+    // other and must not require a path on disk.
+    let bytes =
+        geosetta::write_features(Format::Parquet, &point_fc(Some(projjson_only_crs()))).unwrap();
+    let dir = tmp_dir();
+    let path = dir.join("piped.parquet");
+    std::fs::write(&path, &bytes).unwrap();
+
+    let mut cmd = Command::new(GEOSETTA);
+    cmd.args(["-", "--print-crs", "--from", "parquet"])
+        .stdin(Stdio::from(std::fs::File::open(&path).unwrap()))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let out = cmd.spawn().expect("spawn").wait_with_output().expect("run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        format!("{ID_LESS_PROJJSON}\n")
+    );
+}
+
+#[test]
+fn a_flatgeobuf_wkt_definition_prints_verbatim() {
+    // Per-format coverage: FlatGeobuf records a CRS as WKT, so it exercises the
+    // other dialect through the same flag. (GeoPackage's WKT path is covered by
+    // the multi-layer cases below; GeoParquet's PROJJSON and a Shapefile `.prj`
+    // are covered above.)
+    let dir = tmp_dir();
+    let path = dir.join("wkt_only.fgb");
+    let fc = point_fc(Some(wkt_only_crs(ID_LESS_WKT_A)));
+    std::fs::write(
+        &path,
+        geosetta::write_features(Format::FlatGeobuf, &fc).unwrap(),
+    )
+    .unwrap();
+
+    let r = run(&[path.to_str().unwrap(), "--print-crs"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{ID_LESS_WKT_A}\n"));
+}
+
+// ===========================================================================
+// --escape
+// ===========================================================================
+
+/// The crafted WKT from `stdout-security.org` finding 1 — an OSC title-bar
+/// spoofing sequence (`ESC ] 0 ; PWNED BEL`) inside a CRS name, which is the
+/// input `gdalsrsinfo` was checked against and reproduced byte-for-byte. The
+/// tab and the newline are here on purpose: they must survive `--escape` while
+/// everything around them is rendered.
+const HOSTILE_WKT: &str =
+    "GEOGCS[\"EVIL\u{1b}]0;PWNED\u{7}NAME\",\n\tDATUM[\"D\",SPHEROID[\"S\",6378137,298.26]]]";
+
+fn write_hostile_fgb(dir: &std::path::Path) -> std::path::PathBuf {
+    let path = dir.join("hostile.fgb");
+    let fc = point_fc(Some(wkt_only_crs(HOSTILE_WKT)));
+    std::fs::write(
+        &path,
+        geosetta::write_features(Format::FlatGeobuf, &fc).unwrap(),
+    )
+    .unwrap();
+    path
+}
+
+#[test]
+fn without_escape_the_hostile_bytes_reach_stdout_unchanged() {
+    // The finding-1 regression test, and the decision it records: verbatim is
+    // unconditional, matching GDAL's own CLI tools on this exact input. If this
+    // ever starts passing only because something filtered the bytes, the
+    // round-trip contract has been broken silently.
+    let dir = tmp_dir();
+    let path = write_hostile_fgb(&dir);
+
+    let r = run(&[path.to_str().unwrap(), "--print-crs"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(r.stdout, format!("{HOSTILE_WKT}\n"));
+    assert!(r.stdout.contains('\u{1b}'), "the ESC byte must survive");
+    assert!(r.stdout.contains('\u{7}'), "the BEL byte must survive");
+}
+
+#[test]
+fn escape_renders_the_hostile_bytes_readable_instead() {
+    // Same input, opt-in flag: the escape sequence is shown rather than obeyed.
+    let dir = tmp_dir();
+    let path = write_hostile_fgb(&dir);
+
+    let r = run(&[path.to_str().unwrap(), "--print-crs", "--escape"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(
+        r.stdout.contains("^["),
+        "ESC must render as ^[: {:?}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("^G"),
+        "BEL must render as ^G: {:?}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains('\u{1b}'),
+        "no raw ESC may remain: {:?}",
+        r.stdout
+    );
+    assert!(
+        !r.stdout.contains('\u{7}'),
+        "no raw BEL may remain: {:?}",
+        r.stdout
+    );
+
+    // Tab and newline pass through, so the definition stays readable as a
+    // definition rather than becoming one escaped line.
+    assert!(
+        r.stdout.contains('\t'),
+        "the tab must survive: {:?}",
+        r.stdout
+    );
+    assert_eq!(
+        r.stdout.lines().count(),
+        2,
+        "the interior newline must survive"
+    );
+}
+
+#[test]
+fn escape_renders_del_and_high_bit_bytes() {
+    // The other two notations, end to end: `^?` for DEL and `M-` for a byte with
+    // the high bit set (here the two bytes of `é`).
+    let dir = tmp_dir();
+    let wkt = "GEOGCS[\"R\u{e9}union\u{7f}\",DATUM[\"D\"]]";
+    let path = dir.join("high_bit.fgb");
+    let fc = point_fc(Some(wkt_only_crs(wkt)));
+    std::fs::write(
+        &path,
+        geosetta::write_features(Format::FlatGeobuf, &fc).unwrap(),
+    )
+    .unwrap();
+
+    let r = run(&[path.to_str().unwrap(), "--print-crs", "--escape"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert!(
+        r.stdout.contains("^?"),
+        "DEL must render as ^?: {:?}",
+        r.stdout
+    );
+    assert!(
+        r.stdout.contains("M-CM-)"),
+        "é must render in M- notation: {:?}",
+        r.stdout
+    );
+}
+
+#[test]
+fn escape_changes_nothing_about_which_definition_is_reported() {
+    // It is a rendering pass, not a selection rule: the same source that has
+    // nothing to report still reports nothing, with the same exit and message.
+    let dir = tmp_dir();
+    let fgb = write_code_only_fgb(&dir);
+
+    let plain = run(&[fgb.to_str().unwrap(), "--print-crs"], None);
+    let escaped = run(&[fgb.to_str().unwrap(), "--print-crs", "--escape"], None);
+    assert!(!plain.ok && !escaped.ok);
+    assert_eq!(plain.stdout, escaped.stdout, "both empty");
+    assert_eq!(plain.stderr, escaped.stderr, "same message");
 }
 
 // ===========================================================================
@@ -225,7 +726,7 @@ fn crs_override_silences_the_unresolvable_geoparquet_warning() {
         None,
     );
     assert!(r.ok, "{}", r.stderr);
-    assert!(!r.stderr.contains("warning"), "no loss left to warn about: {}", r.stderr);
+    assert!(r.warnings().is_empty(), "no loss left to warn about: {:?}", r.warnings());
 
     // And the definition really is in the file, not just accepted at the door.
     let bytes = std::fs::read(&out).unwrap();
@@ -262,7 +763,7 @@ fn crs_override_applies_to_every_geopackage_layer_and_says_so() {
         ("a".to_string(), point_fc(Some(code_only_crs()))),
         ("b".to_string(), point_fc(Some(epsg_3857))),
     ];
-    std::fs::write(&src, geosetta::geopackage::write_layers(None, &layers, false).unwrap())
+    std::fs::write(&src, geosetta::geopackage::write_layers(None, &layers, false, false).unwrap())
         .unwrap();
     let wkt_path = dir.join("gda2020.wkt");
     std::fs::write(&wkt_path, GDA2020_WKT1).unwrap();
@@ -291,7 +792,7 @@ fn crs_override_applies_to_every_geopackage_layer_and_says_so() {
     // relabel and got exactly it.
     let single = dir.join("single_src.gpkg");
     let one = vec![("a".to_string(), point_fc(Some(code_only_crs())))];
-    std::fs::write(&single, geosetta::geopackage::write_layers(None, &one, false).unwrap())
+    std::fs::write(&single, geosetta::geopackage::write_layers(None, &one, false, false).unwrap())
         .unwrap();
     let r = run(
         &[
@@ -370,7 +871,213 @@ fn composes_with_an_external_resolver_over_a_pipe() {
     assert!(r.ok, "{}", r.stderr);
     let prj = std::fs::read_to_string(dir.join("piped.prj")).unwrap();
     assert!(prj.contains("GDA2020"), "{prj}");
-    assert!(!r.stderr.contains("warning"), "the gap should be closed: {}", r.stderr);
+    assert!(r.warnings().is_empty(), "the gap should be closed: {:?}", r.warnings());
+}
+
+// ===========================================================================
+// The cross-repo pipeline: --print-crs -> geoscribe --identify -> --crs -
+// ===========================================================================
+// The case `--print-crs` was built for. `--print-crs-code` cannot help with an
+// id-less definition (there is no code to report), and `geoscribe --identify`
+// cannot reach one buried in a container — so this flag is the join between
+// them. Gated on `geoscribe` being installed, exactly like the `projinfo` case
+// above: nothing in geosetta knows this tool's name, and these tests are the
+// only place in the crate that does.
+
+/// Where to find `geoscribe`, or `None` when it is not available.
+///
+/// Prefers the sibling binary in this build's own output directory — the two
+/// crates share a workspace, so `cargo test --workspace` has just built the
+/// exact code these tests are meant to exercise, and testing against a
+/// separately-installed copy would silently check the wrong version. Falls back
+/// to `PATH` so the check still works when geosetta is built standalone (it is
+/// published to crates.io on its own, where no sibling exists), and skips when
+/// neither is there, exactly like the `projinfo` case above.
+fn geoscribe_bin() -> Option<std::path::PathBuf> {
+    let mut p = std::env::current_exe().ok()?;
+    p.pop();
+    if p.ends_with("deps") {
+        p.pop();
+    }
+    let sibling = p.join("geoscribe");
+    if sibling.exists() {
+        return Some(sibling);
+    }
+    match Command::new("geoscribe").arg("--help").output() {
+        Ok(_) => Some("geoscribe".into()),
+        Err(_) => {
+            eprintln!("skipping: geoscribe is neither built in this workspace nor on PATH");
+            None
+        }
+    }
+}
+
+/// Run `geoscribe` over `stdin_text`, returning `(stdout, exit code)`.
+fn geoscribe(args: &[&str], stdin_text: &str) -> (String, i32) {
+    let mut child = Command::new(geoscribe_bin().expect("geoscribe available"))
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn geoscribe");
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(stdin_text.as_bytes())
+        .unwrap();
+    drop(child.stdin.take());
+    let out = child.wait_with_output().expect("run geoscribe");
+    (
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        out.status.code().unwrap_or(-1),
+    )
+}
+
+#[test]
+fn the_full_three_stage_pipeline_identifies_and_reinstalls_a_crs() {
+    // An id-less Esri `.prj`: no AUTHORITY node anywhere, so `--print-crs-code`
+    // reports nothing and only the definition body can be resolved. geoscribe
+    // recovers the identity by name, validated against the WKT's own ellipsoid,
+    // and hands back the authoritative definition, which `--crs -` installs.
+    if geoscribe_bin().is_none() {
+        return;
+    }
+    let dir = tmp_dir();
+    let shp = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/duckdb_crs_pt.shp"
+    );
+
+    // Stage 1.
+    let printed = run(&[shp, "--print-crs"], None);
+    assert!(printed.ok, "{}", printed.stderr);
+    assert!(printed.stdout.starts_with("GEOGCS["), "{}", printed.stdout);
+
+    // Stage 2 — the tool geosetta never runs itself.
+    let (definition, status) = geoscribe(&["--identify", "--projjson"], &printed.stdout);
+    assert_eq!(status, 0, "geoscribe could not identify: {definition}");
+    assert!(
+        definition.contains("\"type\""),
+        "expected PROJJSON: {definition}"
+    );
+
+    // Stage 3.
+    let out = dir.join("piped.parquet");
+    let r = run(
+        &[shp, out.to_str().unwrap(), "--crs", "-"],
+        Some(&definition),
+    );
+    assert!(r.ok, "{}", r.stderr);
+
+    // And the identity actually landed: the recovered definition carries an id,
+    // so the written GeoParquet reports a code the source never had.
+    let r = run(&[out.to_str().unwrap(), "--print-crs-code"], None);
+    assert!(r.ok, "{}", r.stderr);
+    assert_eq!(
+        r.stdout, "OGC:CRS84\n",
+        "the .prj is an Esri WGS 84 spelling"
+    );
+}
+
+#[test]
+fn an_ambiguous_identification_fails_the_pipeline_loudly() {
+    // geoscribe refuses to pick between equally-supported candidates: exit 2,
+    // nothing on stdout. That empty stdout must hit geosetta's hard error on an
+    // empty `--crs` rather than being read as "no override" and silently
+    // producing a file with the wrong CRS.
+    if geoscribe_bin().is_none() {
+        return;
+    }
+    // Several real CRSes share this name and ellipsoid (EPSG:6339, ESRI:102057).
+    let ambiguous = r#"PROJCS["NAD_1983_2011_UTM_Zone_10N",GEOGCS["GCS_NAD_1983_2011",DATUM["D_NAD_1983_2011",SPHEROID["GRS_1980",6378137.0,298.257222101]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],PARAMETER["False_Easting",500000.0],PARAMETER["False_Northing",0.0],PARAMETER["Central_Meridian",-123.0],PARAMETER["Scale_Factor",0.9996],PARAMETER["Latitude_Of_Origin",0.0],UNIT["Meter",1.0]]"#;
+
+    let (definition, status) = geoscribe(&["--identify", "--projjson"], ambiguous);
+    assert_eq!(status, 2, "expected the ambiguous exit");
+    assert!(
+        definition.is_empty(),
+        "and nothing on stdout: {definition:?}"
+    );
+
+    let dir = tmp_dir();
+    let shp = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/duckdb_crs_pt.shp"
+    );
+    let out = dir.join("should_not_exist.parquet");
+    let r = run(
+        &[shp, out.to_str().unwrap(), "--crs", "-"],
+        Some(&definition),
+    );
+    assert!(
+        !r.ok,
+        "an empty override must fail, not be treated as no override"
+    );
+    assert!(!out.exists(), "and nothing may be written");
+}
+
+#[test]
+fn the_pipeline_carries_an_id_less_geoparquet_definition() {
+    // The GeoParquet half of the same loop, and the reason both plans said
+    // neither was useful alone. This was `#[ignore]`d until
+    // `geoscribe/plans/projjson-identify.org` landed on 2026-08-19: geoscribe
+    // sniffed no dialect and ran its WKT tokenizer over the JSON. Both halves
+    // now exist, so the loop closes.
+    if geoscribe_bin().is_none() {
+        return;
+    }
+    let dir = tmp_dir();
+
+    // Build the input the way one actually comes to exist, rather than by hand:
+    // convert an Esri Shapefile. Its `.prj` has no AUTHORITY node, so there is no
+    // id for `Crs::from_authority_code` to lift, and the PROJJSON geosetta writes
+    // into `geo` carries none either. `write_id_less_parquet`'s fixture is no use
+    // here — its CRS name is invented, so it is correctly unidentifiable, which
+    // is the right shape for testing `--print-crs` and the wrong one for testing
+    // the loop.
+    let shp = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/duckdb_crs_pt.shp"
+    );
+    let src_path = dir.join("id_less_from_shapefile.parquet");
+    let src = src_path.to_str().unwrap();
+    assert!(run(&[shp, src], None).ok);
+
+    // Precondition, and the finding this test rests on: the file really is
+    // id-less, so `--print-crs-code` has nothing to report and only the
+    // definition body can be resolved.
+    let code = run(&[src, "--print-crs-code"], None);
+    assert!(
+        !code.ok && code.stdout.is_empty(),
+        "expected an id-less file: {:?}",
+        code.stdout
+    );
+
+    let printed = run(&[src, "--print-crs"], None);
+    assert!(printed.ok, "{}", printed.stderr);
+    assert!(
+        printed.stdout.starts_with('{'),
+        "expected PROJJSON: {}",
+        printed.stdout
+    );
+
+    let (definition, status) = geoscribe(&["--identify", "--projjson"], &printed.stdout);
+    assert_eq!(status, 0, "geoscribe could not identify the PROJJSON");
+
+    // FlatGeobuf, not Parquet: geosetta refuses a same-format conversion, and the
+    // point here is the CRS crossing a format boundary intact anyway.
+    let out = dir.join("identified.fgb");
+    let r = run(
+        &[src, out.to_str().unwrap(), "--crs", "-"],
+        Some(&definition),
+    );
+    assert!(r.ok, "{}", r.stderr);
+
+    // The loop closed: the output now reports an identity the input never had.
+    let code = run(&[out.to_str().unwrap(), "--print-crs-code"], None);
+    assert!(code.ok, "{}", code.stderr);
+    assert_eq!(code.stdout, "OGC:CRS84\n");
 }
 
 // ===========================================================================

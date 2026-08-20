@@ -115,6 +115,9 @@ Not hypothetical — found while scoping this plan:
   envelope byte counts (=reader.rs:202-208=). Once WKB itself carries Z/M,
   GeoPackage inherits it with no format-specific code — the same "no new CRS
   code needed" story Shapefile's =.prj= had for R2 name recovery.
+  /Still accurate as the default;/ =flags: 0x01= is what the writer emits
+  unless =--envelope= is passed, which [[file:envelope.org][envelope.org]]
+  added later on top of the Z/M-aware =Bbox= this milestone made possible.
 - *CSV (WKT column)* inherits whatever the WKT codec does; no separate work.
 
 ** DESIGN
@@ -409,15 +412,22 @@ here happened to produce — but indicator 2 (XYZ) is now real-fixture-backed
 rather than spec-only.
 
 Optionally *emitting* a Z-range envelope (the spec allows it; the writer
-always chooses "no envelope") remains a non-goal *for this milestone*, but
-is no longer a closed question: per a 2026-08-17 user decision, envelope
-computation is scoped as its own plan in the =geoscribe= sibling crate —
-=geoscribe/plans/envelope-computation.org= — under a broader charter that
-=geoscribe= owns any metadata =geosetta= must *compute* rather than simply
-carry through from a source (the same shape CRS resolution already has).
-See that plan for the design and open questions (feature-flag naming,
-default-on vs. opt-in, and the charter/identity implications of broadening
-=geoscribe= past "CRS registry").
+always chose "no envelope") was a non-goal *for this milestone*. It has since
+shipped as [[file:envelope.org][envelope.org]], *in this crate*: =Bbox= now
+folds the Z and M that =Position= was already handing it, and the opt-in
+=--envelope= flag writes a GPB envelope whose bytes match GDAL's ordinate for
+ordinate. The writer still defaults to "no envelope", so this milestone's
+output is unchanged unless the flag is passed.
+
+/Corrected 2026-08-18:/ this paragraph previously pointed at
+=geoscribe/plans/envelope-computation.org=, per a 2026-08-17 decision that
+=geoscribe= owns any metadata =geosetta= must compute rather than carry
+through. That plan is retired and its work moved here. The reason is worth
+keeping next to M5, since M5 is where the gap was found: the "geosetta must
+derive this" premise was wrong — =Bbox=/=Geometry::bbox()= already existed and
+=convert.rs= already wrote GeoParquet's =geo= bbox from them. What M1 actually
+left behind is narrower and local: =Bbox::add= takes a whole =Position=, Z and
+M included, and keeps only X and Y.
 
 Full suite: =cargo test= 324 passed (321 baseline + 3)/4 ignored;
 =--features crs-registry= 338 passed (335 baseline + 3)/6 ignored; clippy

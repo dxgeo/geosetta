@@ -29,11 +29,14 @@ const WGS84_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\
 /// Upsert `new_layers` into an existing GeoPackage (or a fresh one if `existing`
 /// is `None`), returning the complete file. Layers of the same name are
 /// replaced. With `rtree`, every layer gets a SQLite R*Tree spatial index (the
-/// opt-in GeoPackage RTree extension).
+/// opt-in GeoPackage RTree extension). With `envelope`, every geometry blob
+/// carries a cached GPB envelope (see `gpb_envelope`); without it the blobs
+/// are byte-identical to what this writer has always produced.
 pub fn write_layers(
     existing: Option<&[u8]>,
     new_layers: &[(String, FeatureCollection)],
     rtree: bool,
+    envelope: bool,
 ) -> Result<Vec<u8>> {
     let mut layers: Vec<(String, FeatureCollection)> = match existing {
         Some(bytes) => read_layers(bytes)?,
@@ -43,10 +46,10 @@ pub fn write_layers(
         layers.retain(|(n, _)| n != name);
         layers.push((name.clone(), fc.clone()));
     }
-    build(&layers, rtree)
+    build(&layers, rtree, envelope)
 }
 
-fn build(layers: &[(String, FeatureCollection)], rtree: bool) -> Result<Vec<u8>> {
+fn build(layers: &[(String, FeatureCollection)], rtree: bool, envelope: bool) -> Result<Vec<u8>> {
     // Resolve every layer's srs_id up front (registering any non-default SRS),
     // so gpkg_contents, gpkg_geometry_columns, and each geometry blob all agree.
     let srs = resolve_srs(layers);
@@ -68,7 +71,7 @@ fn build(layers: &[(String, FeatureCollection)], rtree: bool) -> Result<Vec<u8>>
         specs.push(extensions_table(extension_rows));
     }
     for ((name, fc), &srs_id) in layers.iter().zip(&srs.per_layer) {
-        specs.push(feature_table(name, fc, srs_id));
+        specs.push(feature_table(name, fc, srs_id, envelope));
     }
 
     // The spatial indexes (shadow tables) and their virtual-table + trigger
@@ -191,7 +194,10 @@ fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
                             Some(SrsReg {
                                 srs_id,
                                 name: format!("srs {srs_id}"),
-                                organization: n.authority.clone().unwrap_or_else(|| "NONE".into()),
+                                organization: n
+                                    .authority
+                                    .clone()
+                                    .unwrap_or_else(|| crate::crs::SYNTHETIC_AUTHORITY.into()),
                                 organization_coordsys_id: numeric_code.unwrap_or(srs_id),
                                 definition,
                             }),
@@ -304,7 +310,7 @@ fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64
     }
 }
 
-fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64) -> TableSpec {
+fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64, envelope: bool) -> TableSpec {
     let columns = infer_columns(&fc.features);
 
     // DDL: fid (rowid), geom, then one column per property.
@@ -322,7 +328,7 @@ fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64) -> TableSpec {
             let mut values = Vec::with_capacity(columns.len() + 2);
             values.push(Value::Null); // fid, carried by the rowid
             values.push(match &feat.geometry {
-                Some(g) => Value::Blob(gpkg_geometry(g, srs_id)),
+                Some(g) => Value::Blob(gpkg_geometry(g, srs_id, envelope)),
                 None => Value::Null,
             });
             for col in &columns {
@@ -339,17 +345,84 @@ fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64) -> TableSpec {
     }
 }
 
-/// GeoPackage Binary: an 8-byte header ("GP", version, flags, LE srs_id, no
-/// envelope) wrapping standard WKB.
-fn gpkg_geometry(g: &Geometry, srs_id: i64) -> Vec<u8> {
+/// GeoPackage Binary: an 8-byte header ("GP", version, flags, LE srs_id),
+/// optionally followed by a cached envelope, wrapping standard WKB.
+///
+/// With `envelope` false the header is exactly what it always was — flags
+/// `0x01`, envelope indicator 0, no envelope bytes — so default output is
+/// unchanged byte for byte.
+fn gpkg_geometry(g: &Geometry, srs_id: i64, envelope: bool) -> Vec<u8> {
+    let env = if envelope { gpb_envelope(g) } else { None };
+    let (indicator, env_bytes) = match &env {
+        Some((i, b)) => (*i, b.as_slice()),
+        None => (0u8, &[][..]),
+    };
     let wkb = to_wkb(g);
-    let mut out = Vec::with_capacity(8 + wkb.len());
+    let mut out = Vec::with_capacity(8 + env_bytes.len() + wkb.len());
     out.extend_from_slice(b"GP");
     out.push(0); // version
-    out.push(0x01); // flags: little-endian header ints, no envelope
+    // flags: bit 0 = little-endian header ints, bits 1-3 = envelope indicator.
+    out.push(0x01 | (indicator << 1));
     out.extend_from_slice(&(srs_id as i32).to_le_bytes());
+    out.extend_from_slice(env_bytes);
     out.extend_from_slice(&wkb);
     out
+}
+
+/// GPB §2.1.3's cached envelope: an indicator code plus a little-endian `f64`
+/// sequence, or `None` for a geometry with no coordinates (indicator 0).
+///
+/// The layout is min/max *pairs per dimension* — `minx, maxx, miny, maxy`, then
+/// `minz, maxz` for indicator 2 — **not** all mins followed by all maxes.
+/// Confirmed by hand-decoding real `ogr2ogr -f GPKG` output rather than read
+/// off the spec: `tests/fixtures/gdal_linestring_2d.gpkg` (indicator 1, 32
+/// bytes) and `gdal_linestring_z.gpkg` (indicator 2, 48 bytes).
+///
+/// **The envelope stops at Z: only indicators 1 and 2 are produced, never 3
+/// (XYM) or 4 (XYZM), even for an M-bearing geometry.** Two reasons, the first
+/// of which is the real one.
+///
+/// *An envelope is a spatial bound, and M is not a spatial dimension.* The
+/// envelope exists to accelerate spatial queries, and it is genuinely used for
+/// that: with a deliberately falsified envelope, `ogrinfo -spat 0 0 25 15`
+/// returns **zero** features for a geometry that plainly intersects the filter
+/// box — GDAL trusts the cache over the coordinates. But a spatial filter is
+/// over X/Y (and conceivably Z); M is a linear-referencing measure (mile
+/// markers, timestamps), with no query to accelerate. GeoPackage's own RTree is
+/// strictly 2D for the same reason. Indicators 3 and 4 exist in the spec's
+/// table for completeness, not because anything consumes them.
+///
+/// *And nothing produces them to check against.* GDAL 3.13.2 emits indicator 1
+/// for `LINESTRING M` and indicator 2 for `LINESTRING ZM` — the latter caching
+/// the *Z* range, not M. Verified across eight geometry families (LineString,
+/// Polygon, MultiLineString, MultiPoint, Point, GeometryCollection,
+/// CircularString, in M and ZM forms); no creation option or `OGR_GPKG_*`
+/// config switch changes it. So an XYM/XYZM byte order could only be *assumed*
+/// symmetric with XYZ's, which `plans/envelope.org` explicitly forbids — and
+/// given the filter behaviour above, a wrongly-encoded envelope silently drops
+/// real query hits. A missing envelope only costs speed.
+///
+/// GDAL's *reader* does accept indicators 3 and 4 (it skips the bytes), so
+/// emitting them would not break readers — it simply would not buy anything,
+/// at the cost of a layout no reference implementation could confirm.
+fn gpb_envelope(g: &Geometry) -> Option<(u8, Vec<u8>)> {
+    let b = g.bbox();
+    if b.is_empty() {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(48);
+    for v in [b.min_x, b.max_x, b.min_y, b.max_y] {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+    let indicator = match b.z {
+        Some((lo, hi)) => {
+            buf.extend_from_slice(&lo.to_le_bytes());
+            buf.extend_from_slice(&hi.to_le_bytes());
+            2
+        }
+        None => 1,
+    };
+    Some((indicator, buf))
 }
 
 fn bbox(fc: &FeatureCollection) -> (Value, Value, Value, Value) {
@@ -427,7 +500,7 @@ mod tests {
                 ],
             },
         ]);
-        let bytes = write_layers(None, &[("places".into(), layer)], false).unwrap();
+        let bytes = write_layers(None, &[("places".into(), layer)], false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
 
         assert_eq!(back.len(), 1);
@@ -451,7 +524,7 @@ mod tests {
             geometry: Some(Geometry::Point(Position::with_zm(1.0, 2.0, 3.0, 4.0))),
             properties: vec![],
         }]);
-        let bytes = write_layers(None, &[("places".into(), layer)], false).unwrap();
+        let bytes = write_layers(None, &[("places".into(), layer)], false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(
             back[0].1.features[0].geometry,
@@ -459,6 +532,211 @@ mod tests {
         );
     }
 
+    // --- GPB envelope (plans/envelope.org V2/V3) -----------------------------
+    //
+    // Layout facts here are confirmed against real `ogr2ogr -f GPKG` output
+    // (GDAL 3.13.2 / PROJ 9.8.1), not read off the spec — see `gpb_envelope`.
+
+    /// Pull the GPB header pieces out of the first geometry blob in the file:
+    /// the flags byte, the envelope indicator, and the envelope's decoded
+    /// doubles. Scans every table rather than taking a name, so it works
+    /// unchanged on our own output and on GDAL fixtures whose layer names
+    /// differ.
+    fn gpb_parts(bytes: &[u8]) -> (u8, u8, Vec<f64>) {
+        use crate::sqlite::Database;
+        let db = Database::open(bytes).unwrap();
+        let blob = db
+            .tables()
+            .unwrap()
+            .iter()
+            .filter_map(|t| db.read_rows(t).ok())
+            .flatten()
+            .find_map(|row| {
+                row.iter().find_map(|c| match c {
+                    crate::sqlite::Value::Blob(b) if b.starts_with(b"GP") => Some(b.clone()),
+                    _ => None,
+                })
+            })
+            .expect("a GPB geometry blob");
+        let flags = blob[3];
+        let indicator = (flags >> 1) & 0x07;
+        let len = match indicator {
+            0 => 0,
+            1 => 32,
+            2 | 3 => 48,
+            4 => 64,
+            _ => panic!("invalid envelope indicator {indicator}"),
+        };
+        let doubles = blob[8..8 + len]
+            .chunks_exact(8)
+            .map(|c| f64::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        (flags, indicator, doubles)
+    }
+
+    fn linestring(ps: Vec<Position>) -> Option<Geometry> {
+        Some(Geometry::LineString(ps))
+    }
+
+    #[test]
+    fn without_the_flag_output_is_byte_identical_to_before() {
+        // The envelope is opt-in precisely so the default path does not move.
+        // Same layer, written twice: `--envelope` off must reproduce the
+        // historical header exactly (flags 0x01, indicator 0, no bytes).
+        let layer = fc(vec![Feature {
+            geometry: linestring(vec![Position::new(0.0, 0.0), Position::new(20.0, 10.0)]),
+            properties: vec![],
+        }]);
+        let plain = write_layers(None, &[("l".into(), layer)], false, false).unwrap();
+        let (flags, indicator, env) = gpb_parts(&plain);
+        assert_eq!(flags, 0x01);
+        assert_eq!(indicator, 0);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn envelope_flag_writes_indicator_1_for_2d() {
+        let layer = fc(vec![Feature {
+            geometry: linestring(vec![
+                Position::new(0.0, 0.0),
+                Position::new(10.0, 10.0),
+                Position::new(20.0, 5.0),
+            ]),
+            properties: vec![],
+        }]);
+        let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+        let (flags, indicator, env) = gpb_parts(&bytes);
+        assert_eq!(flags, 0x03, "bit 0 little-endian + indicator 1 in bits 1-3");
+        assert_eq!(indicator, 1);
+        // min/max PAIRS PER DIMENSION, not all-mins-then-all-maxes.
+        assert_eq!(env, vec![0.0, 20.0, 0.0, 10.0]);
+    }
+
+    #[test]
+    fn envelope_flag_writes_indicator_2_for_z() {
+        let layer = fc(vec![Feature {
+            geometry: linestring(vec![
+                Position::with_z(0.0, 0.0, 0.0),
+                Position::with_z(10.0, 10.0, 10.0),
+                Position::with_z(20.0, 5.0, 3.0),
+            ]),
+            properties: vec![],
+        }]);
+        let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+        let (flags, indicator, env) = gpb_parts(&bytes);
+        assert_eq!(flags, 0x05);
+        assert_eq!(indicator, 2);
+        assert_eq!(env, vec![0.0, 20.0, 0.0, 10.0, 0.0, 10.0]);
+    }
+
+    #[test]
+    fn m_is_never_encoded_in_the_envelope_matching_gdal() {
+        // The envelope is a *spatial* bound, and M is not a spatial dimension —
+        // there is no "filter by M" for it to accelerate, which is why GDAL
+        // stops at Z and why GeoPackage's own RTree is 2D. Verified across
+        // eight geometry families with real `ogr2ogr`: `LINESTRING M` gets
+        // indicator 1, `LINESTRING ZM` gets indicator 2 caching the *Z* range.
+        // See `gpb_envelope` for the full rationale.
+        let m_only = fc(vec![Feature {
+            geometry: linestring(vec![
+                Position::with_m(0.0, 0.0, 10.0),
+                Position::with_m(20.0, 10.0, 30.0),
+            ]),
+            properties: vec![],
+        }]);
+        let bytes = write_layers(None, &[("l".into(), m_only)], false, true).unwrap();
+        let (_, indicator, env) = gpb_parts(&bytes);
+        assert_eq!(
+            indicator, 1,
+            "M alone must not promote the envelope past XY"
+        );
+        assert_eq!(env, vec![0.0, 20.0, 0.0, 10.0]);
+
+        let zm = fc(vec![Feature {
+            geometry: linestring(vec![
+                Position::with_zm(0.0, 0.0, 1.0, 10.0),
+                Position::with_zm(20.0, 10.0, 3.0, 30.0),
+            ]),
+            properties: vec![],
+        }]);
+        let bytes = write_layers(None, &[("l".into(), zm)], false, true).unwrap();
+        let (_, indicator, env) = gpb_parts(&bytes);
+        assert_eq!(indicator, 2, "ZM tracks Z only, exactly as GDAL does");
+        assert_eq!(
+            env,
+            vec![0.0, 20.0, 0.0, 10.0, 1.0, 3.0],
+            "the Z range, not the M range"
+        );
+    }
+
+    #[test]
+    fn an_empty_geometry_gets_no_envelope_even_with_the_flag() {
+        // Nothing to bound: indicator 0, as if the flag were off. GDAL declines
+        // an envelope for a degenerate case too (it writes none for a `Point`).
+        let layer = fc(vec![Feature {
+            geometry: linestring(vec![]),
+            properties: vec![],
+        }]);
+        let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+        let (flags, indicator, env) = gpb_parts(&bytes);
+        assert_eq!(flags, 0x01);
+        assert_eq!(indicator, 0);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn our_own_envelope_bearing_output_reads_back() {
+        // `strip_gpkg_header` skips whichever envelope size the flags byte
+        // declares. It has always been exercised by GDAL's files; this proves
+        // it against our own, for both indicator sizes.
+        for geom in [
+            linestring(vec![Position::new(0.0, 0.0), Position::new(20.0, 10.0)]),
+            linestring(vec![
+                Position::with_z(0.0, 0.0, 1.0),
+                Position::with_z(20.0, 10.0, 9.0),
+            ]),
+        ] {
+            let layer = fc(vec![Feature {
+                geometry: geom.clone(),
+                properties: vec![],
+            }]);
+            let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+            let back = read_layers(&bytes).unwrap();
+            assert_eq!(back[0].1.features[0].geometry, geom);
+        }
+    }
+
+    #[test]
+    fn envelope_bytes_match_gdals_on_the_same_geometry() {
+        // The V3 oracle: read a real `ogr2ogr` GeoPackage, rewrite it through
+        // our writer with envelopes on, and require the envelope we compute to
+        // equal the one GDAL computed — numerically, ordinate for ordinate.
+        // A *missing* envelope is only a lost optimization; a *wrong* one is a
+        // correctness bug, which is what this catches.
+        for (name, fixture) in [
+            (
+                "2d",
+                &include_bytes!("../../tests/fixtures/gdal_linestring_2d.gpkg")[..],
+            ),
+            (
+                "z",
+                &include_bytes!("../../tests/fixtures/gdal_linestring_z.gpkg")[..],
+            ),
+        ] {
+            let (_, gdal_indicator, gdal_env) = gpb_parts(fixture);
+            assert_ne!(
+                gdal_indicator, 0,
+                "{name}: fixture must actually carry an envelope"
+            );
+
+            let layers = read_layers(fixture).unwrap();
+            let ours = write_layers(None, &layers, false, true).unwrap();
+            let (_, our_indicator, our_env) = gpb_parts(&ours);
+
+            assert_eq!(our_indicator, gdal_indicator, "{name}: indicator");
+            assert_eq!(our_env, gdal_env, "{name}: envelope ordinates");
+        }
+    }
 
     #[test]
     fn rtree_index_is_emitted_and_round_trips() {
@@ -467,7 +745,7 @@ mod tests {
         let feats: Vec<Feature> = (0..120)
             .map(|i| Feature { geometry: point(i as f64, (i % 7) as f64), properties: vec![] })
             .collect();
-        let bytes = write_layers(None, &[("grid".into(), fc(feats))], true).unwrap();
+        let bytes = write_layers(None, &[("grid".into(), fc(feats))], true, false).unwrap();
 
         // The virtual table, its shadow tables, and gpkg_extensions are present.
         use crate::sqlite::Database;
@@ -490,7 +768,7 @@ mod tests {
     fn wgs84_layer_round_trips_as_wgs84() {
         let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
         layer.crs = Some(Crs::Wgs84);
-        let bytes = write_layers(None, &[("p".into(), layer)], false).unwrap();
+        let bytes = write_layers(None, &[("p".into(), layer)], false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(back[0].1.crs, Some(Crs::Wgs84));
     }
@@ -500,7 +778,7 @@ mod tests {
         // CSV/WKT-style input with no CRS lands on the "undefined" SRS and reads
         // back as no CRS, not a mislabeled 4326.
         let layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
-        let bytes = write_layers(None, &[("p".into(), layer)], false).unwrap();
+        let bytes = write_layers(None, &[("p".into(), layer)], false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(back[0].1.crs, None);
     }
@@ -515,7 +793,7 @@ mod tests {
             wkt: Some("PROJCS[\"WGS 84 / Pseudo-Mercator\"]".into()),
             projjson: None,
         }));
-        let bytes = write_layers(None, &[("web".into(), layer)], false).unwrap();
+        let bytes = write_layers(None, &[("web".into(), layer)], false, false).unwrap();
 
         // A valid, integrity-checkable GeoPackage that DuckDB/GDAL can open.
         use crate::sqlite::Database;
@@ -546,7 +824,7 @@ mod tests {
             wkt: Some("PROJCS[\"RGF93 Lambert 93\"]".into()),
             projjson: None,
         }));
-        let bytes = write_layers(None, &[("fr".into(), layer)], false).unwrap();
+        let bytes = write_layers(None, &[("fr".into(), layer)], false, false).unwrap();
 
         use crate::sqlite::Database;
         assert!(Database::open(&bytes).is_ok());
@@ -581,7 +859,7 @@ mod tests {
             wkt: None,
             projjson: Some(pj.into()),
         }));
-        let bytes = write_layers(None, &[("custom".into(), layer)], false).unwrap();
+        let bytes = write_layers(None, &[("custom".into(), layer)], false, false).unwrap();
 
         use crate::sqlite::Database;
         assert!(Database::open(&bytes).is_ok());
@@ -615,8 +893,8 @@ mod tests {
             Feature { geometry: point(2.0, 2.0), properties: vec![] },
         ]);
 
-        let g1 = write_layers(None, &[("a".into(), a)], false).unwrap();
-        let g2 = write_layers(Some(&g1), &[("b".into(), b)], false).unwrap();
+        let g1 = write_layers(None, &[("a".into(), a)], false, false).unwrap();
+        let g2 = write_layers(Some(&g1), &[("b".into(), b)], false, false).unwrap();
         let layers = read_layers(&g2).unwrap();
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().any(|(n, _)| n == "a"));
@@ -624,7 +902,7 @@ mod tests {
 
         // Upsert "a" with three features -> still two layers, "a" replaced.
         let a2 = fc(vec![Feature { geometry: point(9.0, 9.0), properties: vec![] }; 3]);
-        let g3 = write_layers(Some(&g2), &[("a".into(), a2)], false).unwrap();
+        let g3 = write_layers(Some(&g2), &[("a".into(), a2)], false, false).unwrap();
         let layers = read_layers(&g3).unwrap();
         assert_eq!(layers.len(), 2);
         assert_eq!(layers.iter().find(|(n, _)| n == "a").unwrap().1.features.len(), 3);

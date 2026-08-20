@@ -5,6 +5,35 @@
 Design notes, one self-contained plan per file, ordered by dependency. Most are
 implemented — each entry says so; the few marked /scoping only/ are not.
 
+** Sourcing a fixture from a real tool
+Written down because it keeps recurring — Shapefile, GeoParquet, GeoPackage and
+Z/M work each rediscovered it from zero. Every wire-format detail in this crate
+is confirmed against real tool output before it is implemented, never inferred
+from the spec alone, and this is the shape that confirmation takes:
+
+1. *Try the obvious case.* Ask the tool (=ogr2ogr=, =projinfo=, DuckDB) to
+   produce the thing you want a fixture for.
+2. *When you get nothing, find out why before retrying.* A null result is
+   information, not a dead end. GDAL writes no GeoPackage envelope for a
+   degenerate =POINT= bbox but does for a =LINESTRING=; a fixture built on the
+   point would have "passed" while exercising nothing.
+3. *Retry with a shape that avoids the degeneracy*, and record in the fixture's
+   test comment *why that shape* — otherwise the next person simplifies it back
+   to a point.
+4. *Hand-decode the actual bytes and cross-check them* against what the geometry
+   should be, before trusting the file. Every layout claim in this crate traces
+   to a decode someone did, not to a spec paragraph.
+
+*A null result can be the finding.* If no tool will produce the artifact at all,
+that is worth more than a fixture: it usually means nothing consumes it either,
+and shipping a from-spec guess would be unverifiable. =envelope.org= is the
+worked example — GeoPackage's spec defines XYM and XYZM envelope indicators,
+but GDAL emits neither across eight geometry families, under any creation
+option or config switch. The right response was to stop at Z and write down
+why, not to implement the spec's table from symmetry.
+
+** Plan index
+
 - [[file:reverse-roundtrip.org][reverse-roundtrip.org]] :: GeoParquet → GeoJSON,
   reading back Geosetta's *own* output. The reader skeleton (thrift reader,
   footer parsing, single-page PLAIN/RLE decode, WKB decode, GeoJSON serialize).
@@ -206,3 +235,71 @@ implemented — each entry says so; the few marked /scoping only/ are not.
   [[file:arbitrary-geoparquet.org][arbitrary-geoparquet.org]]'s milestone
   6b, whose reject-with-error behavior becomes this plan's read-side
   detection step.
+- [[file:crs-definition-output.org][crs-definition-output.org]] :: A
+  =--print-crs= flag printing the CRS *definition body* the source recorded,
+  verbatim — the missing sibling of =--print-crs-code=, which reports the
+  identity and so deliberately reports nothing for an id-less CRS. Without it
+  the report-resolve-supply loop has a hole exactly where =geoscribe
+  --identify= was built to help: a Shapefile =.prj= is loose WKT on disk and
+  needs no help, but every other format buries its CRS in a container that
+  =--identify= cannot open. Two flags, not three — a code+body composite would
+  be valid input to no tool, violating
+  [[file:crs-external-resolution.org][crs-external-resolution.org]]'s
+  § TOOL AGNOSTICISM, and carries no information the body alone doesn't. Never
+  translates (a dialect option would be a translation request, and the
+  crosswalk is what the crate is trying to stop leaning on). *Extends
+  crs-external-resolution.org*; adds no dependency and spawns nothing.
+  *DONE* (0.25.0, 2026-08-19), together with its other half
+  =geoscribe/plans/projjson-identify.org= — neither was useful alone, so they
+  landed as one item. The verbatim contract needed a reader change to be true at
+  all (=NamedCrs.projjson= had been storing a *re-serialized* definition, not the
+  source's bytes); =--escape= ships as the opt-in =cat -v=-alike for reading an
+  untrusted file at a terminal; and a GeoPackage's placeholder =NONE= authority
+  is no longer reported as an identity, since geosetta invents it.
+- [[file:envelope.org][envelope.org]] :: Extend =Bbox= to fold Z and M -- it
+  already receives them on every =Position= and discards them -- then emit a
+  GeoPackage GPB envelope from the writer, which hardcodes "no envelope" today,
+  so an envelope-bearing source =.gpkg= stops losing it on a round trip. Takes
+  over =geoscribe/plans/envelope-computation.org=, retired 2026-08-18: this
+  crate already owns the fold (=convert.rs:129= writes GeoParquet's =geo= bbox
+  from it), and with no dependency edges between the three crates it could not
+  have called a sibling's version anyway. Carries that plan's empirically
+  confirmed GPB layout forward. Excludes envelopes *under reprojection*, which
+  is a different problem and belongs to =nazca/plans/transform-bounds.org=.
+  *DONE (V1--V4, 0.25.0)* -- =Bbox= folds Z/M, and an opt-in =--envelope= flag writes
+  the GPB envelope, matching GDAL's bytes ordinate for ordinate. The design
+  question it settled: the envelope *stops at Z*. An envelope is a spatial
+  bound and M is a linear-referencing measure, so indicators 3 (XYM) and 4
+  (XYZM) have no query to accelerate, and GDAL never emits them under any of
+  eight geometry families. That matters because GDAL *trusts* the cached
+  envelope on the spatial-filter path -- a falsified one makes =ogrinfo -spat=
+  drop a feature that really intersects -- so an unverified byte layout would
+  lose query results silently. V4 closed the plan: GeoParquet's =geo= =bbox=
+  now switches to the spec's six-element 3D form
+  (=[minx,miny,minz,maxx,maxy,maxz]= -- all mins then all maxes, *not* GPB's
+  per-dimension pairing) whenever the data carries Z, the same length switch
+  GDAL makes. The file-level =bbox= turned out to be load-bearing the same way
+  the GPB envelope is, and on *mixed* 2D/3D input geosetta deliberately
+  diverges from GDAL: GDAL promotes 2D geometry to Z=0 on write yet folds
+  =minz= from the originally-3D features alone, leaving a bbox that misses the
+  zeros it wrote. Geosetta does not promote, so folding real Zs only is exact
+  here; the invariant -- the bbox Z range must cover every Z actually written
+  -- is pinned by a test that would fail if a future writer started promoting.
+- [[file:same-format-output.org][same-format-output.org]] :: Drop the
+  =args.from == out.format= rejection in =main.rs=, so a user can write the
+  format they read -- =--crs= relabelling, =--sort-hilbert=, =--envelope= and a
+  plain normalising re-encode are all unreachable today for the format the user
+  already has. Prompted by the scope change in
+  [[file:../../architecture.org][architecture.org]]: geosetta is the
+  ecosystem's only reader/writer, so it stands at *both* ends of every pipeline
+  and the transit format colliding with the endpoint format is ordinary rather
+  than exotic. =gpkg= → =gpkg= already bypasses the check (=run= returns before
+  it) and works in place today, so the crate already holds the counterexample.
+  The deletion is one line; the plan is about what a same-format run *promises*
+  -- =ogr2ogr= preserves feature =id=, both =bbox=es and the collection =name=
+  across a GeoJSON round trip and geosetta keeps none of the four, and on a
+  same-format run the target is the source's own format, so "it couldn't hold
+  it" is no longer a defence for dropping them silently. Also restores the
+  in-place guard the format check had been providing by accident (=ogr2ogr=
+  refuses same-file too; geosetta's =gpkg= path currently allows it).
+  *Scoping only.*

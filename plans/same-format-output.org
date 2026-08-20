@@ -1,0 +1,352 @@
+#+TITLE: Plan: Same-Format Output
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Same-Format Output
+
+** STATUS -- scoping only (2026-08-19). Nothing implemented.
+=src/main.rs:97= rejects any conversion whose input and output formats match:
+
+#+begin_src rust
+if args.from == out.format {
+    return Err(Error::Usage(format!(
+        "input and output are the same format ({:?}); nothing to convert",
+        args.from
+    )));
+}
+#+end_src
+
+This plan removes that rejection. The deletion is one line; *the deletion is
+not the work.* What needs deciding is what a same-format run promises, because
+geosetta's round trip through the feature IR is measurably lossier than the
+reference implementation's, and on a same-format run that loss has no excuse
+left (§ THE FIDELITY PROBLEM).
+
+** WHY
+
+*** The scope changed under it
+The check dates from when the only reason to run geosetta was to translate
+between formats, so "the formats match" really did mean "nothing to do". That
+premise is gone twice over:
+
+1. *Geosetta accumulated operations that are not translation.* =--crs=,
+   =--sort-hilbert=, =--rtree=, =--envelope=, =--layer= all act on the IR or on
+   the writer, and not one of them depends on the formats differing. The check
+   makes them unreachable for the format the user already has.
+2. *Geosetta is now the ecosystem's only reader/writer of spatial formats*
+   ([[file:../../architecture.org][../../architecture.org]] § THE COMPOSITION
+   MODEL). Under composition route (b) -- stdin/stdout piping -- geosetta is
+   the stage at *both ends* of every pipeline, with a sibling tool in the
+   middle. The endpoint format is chosen by the user's data and the transit
+   format by what the middle tool speaks, so the two colliding is ordinary,
+   not exotic. =nazca='s own documented pipeline (=nazca/project.org:129=)
+   pipes WKT: =geosetta in.geojson - --to wkt | nazca --to ... | geosetta -
+   out.fgb --from wkt=. Give that same pipeline a WKT-native user, and stage
+   one is =geosetta in.wkt - --to wkt= -- refused.
+
+*** The workaround is lossier than the operation
+The case that makes this urgent is =--crs= relabelling, because there the
+detour costs more than the thing it stands in for. Assigning a CRS to a
+FlatGeobuf without changing its format:
+
+#+begin_src text
+geosetta roads.fgb labelled.fgb --crs gda2020.wkt      # refused today
+#+end_src
+
+The only route open is through some other format and back, which pays two
+extra full re-encodes and hands the user a live footgun in the choice of
+transit format -- via GeoJSON it drops every M ordinate (=Format::supports_m=)
+and the CRS text it was invoked to install. Geosetta warns about both, which
+is the point: *the workaround for a relabel triggers loss warnings that the
+relabel itself would not.*
+
+*** The crate already contains the counterexample
+GeoPackage is exempt from the check by construction. =run= matches
+=(_, Format::Gpkg)= and =(Format::Gpkg, _)= and returns *before* reaching it,
+so =run_geopackage_write= carries an explicit same-format branch:
+
+#+begin_src rust
+// gpkg -> gpkg: carry over all input layers (optionally one via --layer).
+#+end_src
+
+Verified against the built binary: =geosetta b.gpkg b.gpkg= exits 0 today,
+rewrites the file in place, and =ogrinfo= reads the result back cleanly. So
+same-format output is not a thing geosetta declines to do on principle -- it
+already does it, for the most structurally complicated format it supports, and
+refuses it for the eight simpler ones. The check is an artifact of which code
+path was written first, not a decision.
+
+(=Kml= and =Kmz= are distinct =Format= variants, so =.kml= → =.kmz= slips past
+the check too. Another sign the line it draws is not the line anyone meant.)
+
+** WHAT THE VERIFICATION FOUND
+Per =plans/README.org= § Sourcing a fixture from a real tool, checked against
+GDAL 3.13.2's =ogr2ogr= before designing anything. The reference implementation
+draws a line here -- just not the one geosetta draws.
+
+*** ogr2ogr allows same format, and refuses same file
+#+begin_src text
+$ ogr2ogr -f GeoJSON out.geojson in.geojson
+$ echo $?
+0
+
+$ ogr2ogr -f GeoJSON ip.geojson ip.geojson
+ERROR 1: Source and destination datasets must be different in non-update mode.
+$ echo $?
+1
+#+end_src
+The input file was left byte-identical by the refused run. Two separate
+questions, answered separately: *the format matching is fine; the path matching
+is not.* Geosetta currently gets both backwards -- it refuses the format case
+outright, and permits the path case on the one route that reaches it (=gpkg=
+in place, above, which GDAL would refuse).
+
+*** Geosetta's round trip drops what the format demonstrably holds
+Same input file through both tools. =ogr2ogr= preserves the collection =name=,
+the collection =bbox=, the feature =id= and the feature =bbox=:
+
+#+begin_src text
+{"type":"FeatureCollection","name":"roads","bbox":[ 0, 0, 10, 10 ],
+ "features":[{"type":"Feature","id":42,"properties":{"n":"a"},
+ "bbox":[0.0,0.0,10.0,10.0],"geometry":{...}}]}
+#+end_src
+
+Geosetta keeps none of the four:
+
+#+begin_src text
+{"type":"FeatureCollection","features":[{"type":"Feature",
+ "geometry":{"type":"LineString","coordinates":[[0,0],[10,10]]},
+ "properties":{"n":"a"}}]}
+#+end_src
+
+Which is exactly what the reader promises -- =stream_feature=
+(=src/geojson/mod.rs:165=): "=geometry= is parsed typed; =properties= stay
+arbitrary JSON; every other member (=type=, =id=, =bbox=, …) is skipped." The
+IR is =geometry + properties + crs= (=src/feature.rs=) and nothing else, so
+anything a format records outside those three is discarded at read time, in
+silence.
+
+** THE FIDELITY PROBLEM
+This is the part that needs a decision, and the reason this plan is longer than
+its diff.
+
+On a *cross-format* run, dropping a GeoJSON feature =id= has a defence: the
+target may have no slot for it, and geosetta's standing answer to a capability
+gap is a warning driven by what the target can record
+(=Crs::downgrade_warning=, =FeatureCollection::m_downgrade_warning=; see
+[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]).
+
+On a *same-format* run that defence evaporates. The target is the source's own
+format; it provably can record the member, because the source did. So
+=geosetta roads.geojson clean.geojson= would silently return a file missing
+data the input had, with no capability gap to point at. Under the crate's
+standing rule -- *any silent data drop on conversion must warn* -- shipping the
+deletion alone ships a bug.
+
+Note the asymmetry this exposes: the gap is not created by this change, it is
+merely made indefensible by it. A =.geojson= → =.fgb= run drops the same =id=
+today and says nothing.
+
+*** The rule the warning should follow
+Warn when *the source recorded something the IR does not model, and the target
+format could have recorded it.* Both halves matter:
+- The first half keys off what the *reader* discarded, which is where the loss
+  actually happens. It falls out correctly for formats with nothing to lose:
+  =read_wkt_lines= recovers geometry only, so a WKT source has no unmodelled
+  members and =geosetta a.wkt b.wkt= warns about nothing -- even though the WKT
+  *writer* emits geometry alone and would drop every property it were handed.
+- The second half keeps the existing capability logic intact, so a cross-format
+  run to a target that genuinely cannot hold the member stays silent-or-warned
+  by the same reasoning it uses now.
+For a same-format run the target is the source, so the second half is always
+satisfied and the warning reduces to the first.
+
+*** Implementation shape
+Per-format constant listing what the reader discards -- a
+=Format::unmodelled_members() -> &'static [&'static str]=, empty for formats
+with none. A same-format run with a non-empty list warns once, naming the
+members. Cheap, precise enough to be actionable, and it fails safe: a new
+format spoke that forgets to fill it in warns about nothing, which is the
+current behaviour, not a regression.
+
+Deliberately *not* proposed: detecting per-file whether a given input actually
+carried an =id=. That means threading a "what did I skip" channel out of every
+reader, which is a much larger change for a warning that is already correct at
+format granularity and only over-fires (it says "ids are not preserved" on a
+file that happened to have none).
+
+** SCOPE
+
+*** In
+- Delete the =args.from == out.format= rejection in =run= (=src/main.rs:97=).
+- The same-format run uses the identical read → IR → write pipeline as every
+  other run; no new branch, no fast path (§ DECISIONS D2).
+- A per-format inventory of members the reader discards, and a warning that
+  fires on same-format runs (§ THE FIDELITY PROBLEM).
+- A guard against input and output naming the same file, replacing the one the
+  format check was incidentally providing (§ DECISIONS D4). Includes bringing
+  the =gpkg= path, which permits it today, in line.
+- Documentation that currently states the restriction as a fact:
+  =src/main.rs='s module doc, =tests/crs_external.rs:993--994= ("a
+  pass-through stage isn't a thing you can build" -- becomes false),
+  =README.md=, =project.org=.
+
+*** Out
+- *Byte-preserving pass-through.* Not a re-encode that happens to be faithful
+  -- an actual copy. That is =cp=, and geosetta claiming it would be pretending
+  to work it isn't doing (D2).
+- *Closing the fidelity gap itself* -- teaching the IR to carry feature =id=,
+  collection =bbox=, foreign members. That is a real want, it is what would
+  make same-format output genuinely round-trip clean, and it is a separate plan
+  with its own effect on all nine spokes. This one warns about the gap; it does
+  not close it.
+- *Atomic writes* (temp file + rename). Related to D4 and would change the
+  answer there, but it is a crate-wide I/O discipline, not this change.
+- *In-place =--crs= without a rewrite.* Editing a =.prj= or a =gpkg_spatial_ref_sys=
+  row in place, leaving the rest of the file untouched. Legitimate ask, entirely
+  different mechanism.
+
+** DECISIONS
+
+*** D1 -- delete the check outright; do not replace it with a narrower gate
+The obvious refinement is to permit same-format only when some transforming
+flag is present (=--crs=, =--sort-hilbert=, =--rtree=, =--envelope=,
+=--layer=), so a bare =geosetta a.fgb b.fgb= still errors as pointless.
+Rejected, for two reasons:
+
+1. *Its premise is the same false one.* A bare same-format run is not a no-op:
+   it re-encodes through the IR, which normalises the file (canonical
+   ordering, geosetta's own encoding choices) and validates it end to end --
+   a parse failure is the finding. That is a real use, and it is precisely
+   what a pipeline stage does.
+2. *It goes stale silently.* The gate is a list that every future flag must be
+   added to, and the failure mode of forgetting is a flag that mysteriously
+   cannot be used on the format the user has. The check we are deleting was one
+   line and wrong; its replacement would be a maintained list that is wrong
+   intermittently.
+
+The user-facing question "why did that do nothing?" is better answered by the
+run reporting what it did (=--progress=, and the unconditional =wrote … (N
+bytes)= line) than by refusing to run.
+
+*** D2 -- same format is a re-encode, never a copy
+No fast path that streams input bytes to output when the formats match. It
+would skip =--crs=, skip the warnings, skip =--sort-hilbert=, and make the
+output contingent on whether the formats happened to match -- reintroducing
+exactly the format-pair coupling this plan removes, just inverted. One
+pipeline, always. The cost is that same-format output is not byte-preserving,
+which § THE FIDELITY PROBLEM handles by saying so out loud rather than by
+special-casing.
+
+*** D3 -- the warning ships with the deletion, not after it
+Sequencing matters here. M1 alone (delete the check) is a working feature that
+silently drops data, which the crate's own convention forbids
+([[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]). The
+inventory in M2 is small -- nine constants -- so there is no real pressure to
+split them, and every reason not to.
+
+*** D4 -- refuse input and output resolving to the same file
+Adopted from =ogr2ogr=, whose refusal is quoted in § WHAT THE VERIFICATION
+FOUND. Geosetta's happy path survives it today (=read_bytes= completes before
+=write_bytes=; the shapefile reader loads all siblings before the writer opens
+any), which is why the =gpkg= in-place run works. The hazard is the unhappy
+path: =std::fs::write= truncates first, so any write-side error after that
+point has destroyed the only copy, and =write_shapefile_to_path= writes *four*
+files in sequence -- a failure at =.dbf= leaves a =.shp= from the new data, a
+=.dbf= from neither, and no original to retry from. The crate has no atomic
+write to fall back on.
+
+Worth stating plainly: *the format check has been serving as an accidental
+in-place guard.* Same format almost always meant same extension, so
+=geosetta a.fgb a.fgb= was refused for the wrong reason and is newly reachable
+the moment the check goes. Removing one guard without noticing it was load
+bearing is how this change would go wrong.
+
+Mechanics: compare canonicalised paths, since =a.fgb= and =./a.fgb= are the
+same file and a symlink pair is too; the output usually does not exist yet, so
+canonicalise its *parent* and join the filename. =-= is never same-file
+(stdin and stdout are different streams even into the same terminal). Shapefile
+compares by *stem* across =.shp/.shx/.dbf/.prj=, since the collision is over a
+file set, not one path.
+
+This changes existing =gpkg= behaviour, which is the correct outcome -- the
+current permissiveness is unreviewed, inconsistent with the reference tool,
+and rests on the append path reading the output before overwriting it, which
+is luck rather than design.
+
+*** D5 -- =--layer= on a same-format GeoPackage needs nothing
+=run_geopackage_write='s =--layer= narrowing already works on the =gpkg= →
+=gpkg= path. Listed only so it is not re-derived: this plan does not touch it.
+
+** MILESTONES
+- *M1* -- delete the check; the plain convert path handles same-format runs
+  with no new branch. Tests for each single-buffer format, plus the
+  stdin/stdout pass-through stage (=geosetta - - --from fgb --to fgb=).
+- *M2* -- =Format::unmodelled_members= for all nine variants, and the
+  same-format warning. Needs one pass per spoke reading what each reader
+  actually skips; =geojson= is known (=id=, =bbox=, foreign members, and the
+  collection's own =name=/=bbox=), the rest are not yet enumerated. Ships with
+  M1 (D3).
+- *M3* -- the same-file guard, including the =gpkg= path's behaviour change,
+  and the shapefile stem comparison.
+- *M4* -- documentation: =main.rs= module doc, the =crs_external.rs= comment,
+  =README.md=, =project.org=. The =crs_external.rs= one is not cosmetic -- it
+  currently explains a design constraint that will no longer exist.
+
+** TESTING
+- Each format to itself, asserting the output re-reads to an equal
+  =FeatureCollection= -- the IR-level round trip, which is the property that is
+  actually true. Not byte equality with the input: D2 says that is not promised,
+  and the =geojson= evidence above shows it is not delivered.
+- =--crs= on a same-format run installs the definition and the output carries
+  it. This is the motivating case; it should read back through
+  =--print-crs=.
+- =--sort-hilbert= on =parquet= → =parquet= reorders features. Confirms the
+  "not a no-op" claim in D1 concretely.
+- The warning fires on =geojson= → =geojson= (naming =id=/=bbox=) and stays
+  silent on =wkt= → =wkt= (nothing unmodelled to lose) -- the two halves of the
+  § THE FIDELITY PROBLEM rule.
+- No *spurious* warning: =downgrade_warning= and =m_downgrade_warning= must
+  both return =None= when target == source for a format carrying CRS and M
+  (=fgb= → =fgb= with a non-WGS 84, M-bearing collection). If either fires,
+  the capability logic has a bug that only same-format runs expose.
+- Same-file refusal for a single-buffer format, for a shapefile stem, and for
+  =gpkg= (the behaviour change) -- each asserting the input is *left intact*,
+  the way the =ogr2ogr= check was made.
+- The existing =tests/crs_external.rs= pipeline test keeps passing; its comment
+  changes but its assertions do not.
+
+** OPEN QUESTIONS
+- *Should the same-format warning be =--quiet=-suppressible only, or should it
+  have its own opt-out?* It follows the crate's existing convention (=--quiet=
+  covers every warning) by default, but this one may fire on every run of a
+  normalising pipeline stage, which is the case for a targeted escape hatch. Do
+  not invent one until someone is actually annoyed by it.
+- *Does the same-format warning belong on cross-format runs too?* The loss is
+  identical there and equally silent (§ THE FIDELITY PROBLEM's asymmetry note).
+  The argument for holding the line at same-format is that the target's
+  incapacity is a genuine defence and the message would have to be hedged into
+  uselessness; the argument against is that a =.geojson= → =.fgb= user losing
+  their =id=s is no happier for the hedge. Deferred to whichever plan closes
+  the gap rather than describes it.
+- *Should atomic writes make D4 unnecessary?* Temp-file-plus-rename would make
+  in-place safe rather than merely refused, and it is strictly better UX. It is
+  also a crate-wide change touching every write path including shapefile's
+  four-file set. If it lands, revisit D4 -- but the refusal is the right
+  interim, since it matches the reference tool and cannot lose data.
+
+** DEPENDS ON / RELATED
+- [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] --
+  supplies the standing rule (§ THE FIDELITY PROBLEM) and the mechanism the
+  M2 warning plugs into.
+- [[file:crs-external-resolution.org][crs-external-resolution.org]] /
+  [[file:crs-definition-output.org][crs-definition-output.org]] -- =--crs= is
+  the motivating operation, and =--print-crs= is how the test reads the result
+  back.
+- [[file:geopackage.org][geopackage.org]] -- the existing same-format path, and
+  the one behaviour change in M3.
+- [[file:../../architecture.org][../../architecture.org]] § THE COMPOSITION
+  MODEL -- why geosetta stands at both ends of every pipeline, which is what
+  makes transit and endpoint formats collide routinely.
+- =nazca/project.org:129= -- the WKT-transit pipeline whose WKT-native case is
+  blocked today.

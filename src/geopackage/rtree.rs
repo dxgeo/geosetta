@@ -365,7 +365,7 @@ mod tests {
     fn rounds_boxes_outward() {
         // 0.1 has no exact f32/f64 representation; the outward-rounded box must
         // still bracket the f64 value.
-        let b = Bbox { min_x: 0.1, min_y: 0.1, max_x: 0.1, max_y: 0.1 };
+        let b = Bbox { min_x: 0.1, min_y: 0.1, max_x: 0.1, max_y: 0.1, z: None, m: None };
         let [minx, maxx, miny, maxy] = round_out(&b);
         assert!((minx as f64) <= 0.1 && (maxx as f64) >= 0.1);
         assert!((miny as f64) <= 0.1 && (maxy as f64) >= 0.1);

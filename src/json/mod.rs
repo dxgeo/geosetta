@@ -3,6 +3,6 @@
 mod parser;
 mod value;
 
-pub use parser::parse;
 pub(crate) use parser::Parser;
+pub use parser::{parse, raw_at};
 pub use value::{escape_into, JsonValue};

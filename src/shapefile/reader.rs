@@ -35,7 +35,13 @@ pub fn read(shp: &[u8], dbf_bytes: &[u8], prj: Option<&str>, cpg: Option<&str>) 
     }
 
     let mut fc = FeatureCollection::new(features);
-    if let Some(wkt) = prj {
+    // The definition is the `.prj`'s text; the newline a writer may have framed
+    // it with is not part of it. Trimming here is the same rule
+    // `crate::json::raw_at` applies to a PROJJSON definition nested in `geo`
+    // metadata, so both dialects reach `NamedCrs` as the source's own bytes and
+    // nothing else — which is what lets `--print-crs` add exactly one trailing
+    // newline. A `.prj` holding only whitespace records no definition at all.
+    if let Some(wkt) = prj.map(str::trim).filter(|w| !w.is_empty()) {
         fc.crs = Some(Crs::from_authority_code(None, None, Some(wkt.to_string()), None));
     }
     Ok(fc)
@@ -53,6 +59,42 @@ mod tests {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![("name".into(), crate::json::JsonValue::String("a".into()))],
         }])
+    }
+
+    /// A minimal valid `.shp`/`.dbf` pair, for tests that only care about `.prj`.
+    fn shp_and_dbf() -> (Vec<u8>, Vec<u8>) {
+        let encoded = writer::write(&one_point_fc()).unwrap();
+        (encoded.shp, encoded.dbf)
+    }
+
+    #[test]
+    fn a_prj_reaches_the_ir_as_its_own_bytes_without_its_framing() {
+        // A `.prj` written with a trailing newline records the same definition
+        // as one written without; the newline is the file's framing, not the
+        // CRS's text. Storing it would make `--print-crs` emit two.
+        let (shp, dbf) = shp_and_dbf();
+        let wkt = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",\
+                   SPHEROID[\"WGS_1984\",6378137.0,298.257223563]]]";
+        for framed in [wkt.to_string(), format!("{wkt}\n"), format!("\n{wkt}\r\n")] {
+            let back = read(&shp, &dbf, Some(&framed), None).unwrap();
+            match back.crs {
+                Some(Crs::Named(n)) => assert_eq!(n.wkt.as_deref(), Some(wkt), "for {framed:?}"),
+                other => panic!("expected Named, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_blank_prj_records_no_crs_rather_than_an_empty_definition() {
+        // Otherwise the IR carries a definition that is the empty string, and
+        // "nothing to report" becomes indistinguishable from "reported nothing".
+        let (shp, dbf) = shp_and_dbf();
+        for blank in ["", "   ", "\n\t\n"] {
+            assert!(
+                read(&shp, &dbf, Some(blank), None).unwrap().crs.is_none(),
+                "for {blank:?}"
+            );
+        }
     }
 
     #[test]

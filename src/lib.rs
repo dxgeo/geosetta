@@ -64,7 +64,7 @@ pub(crate) mod zip;
 
 // The curated entry points most callers want, hoisted to the crate root.
 pub use convert::{convert, read_features, reorder_hilbert, write_features};
-pub use crs::{Crs, NamedCrs};
+pub use crs::{Crs, NamedCrs, WGS84_CRS_CODE};
 pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection};
 pub use format::Format;

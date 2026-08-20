@@ -208,12 +208,26 @@ impl Geometry {
 }
 
 /// An axis-aligned bounding box accumulated across geometries.
+///
+/// X and Y are always tracked. Z and M are tracked *only when some position
+/// carries them* — see [`Bbox::z`]/[`Bbox::m`] — which is what makes this
+/// usable for GeoPackage's dimension-specific envelope (`plans/envelope.org`)
+/// without disturbing the XY-only consumers (the Hilbert ordering and the
+/// FlatGeobuf/GeoPackage R-tree indexes, which are 2D by definition).
 #[derive(Debug, Clone, Copy)]
 pub struct Bbox {
     pub min_x: f64,
     pub min_y: f64,
     pub max_x: f64,
     pub max_y: f64,
+    /// `(min, max)` Z across every position that carried one, or `None` if
+    /// none did. Mixed input (some positions 3D, some 2D) folds in whichever
+    /// positions have a Z rather than erroring — matching the WKB codec's
+    /// "fall back gracefully, never panic" posture for the same case.
+    pub z: Option<(f64, f64)>,
+    /// `(min, max)` M across every position that carried one, or `None`.
+    /// Same mixed-input rule as [`Bbox::z`].
+    pub m: Option<(f64, f64)>,
 }
 
 impl Bbox {
@@ -224,18 +238,34 @@ impl Bbox {
             min_y: f64::INFINITY,
             max_x: f64::NEG_INFINITY,
             max_y: f64::NEG_INFINITY,
+            z: None,
+            m: None,
         }
     }
 
-    /// Grow the box to include `p`.
+    /// Grow the box to include `p`, in every ordinate `p` actually carries.
     pub fn add(&mut self, p: Position) {
         self.min_x = self.min_x.min(p.x);
         self.min_y = self.min_y.min(p.y);
         self.max_x = self.max_x.max(p.x);
         self.max_y = self.max_y.max(p.y);
+        if let Some(z) = p.z {
+            self.z = Some(match self.z {
+                Some((lo, hi)) => (lo.min(z), hi.max(z)),
+                None => (z, z),
+            });
+        }
+        if let Some(m) = p.m {
+            self.m = Some(match self.m {
+                Some((lo, hi)) => (lo.min(m), hi.max(m)),
+                None => (m, m),
+            });
+        }
     }
 
     /// True until at least one point has been added.
+    ///
+    /// Judged on X/Y alone: a box with no Z is not empty, it is 2D.
     pub fn is_empty(&self) -> bool {
         self.min_x > self.max_x
     }
@@ -244,6 +274,86 @@ impl Bbox {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- Bbox: Z/M folding (plans/envelope.org V1) ---------------------------
+    //
+    // `Bbox::add` has always taken a whole `Position`, so since zm-geometry.org's
+    // M1 it has been handed Z and M and thrown them away. These pin down what it
+    // keeps now.
+
+    #[test]
+    fn bbox_of_2d_positions_has_no_z_or_m() {
+        let mut b = Bbox::empty();
+        b.add(Position::new(1.0, 2.0));
+        b.add(Position::new(5.0, -3.0));
+        assert_eq!((b.min_x, b.max_x, b.min_y, b.max_y), (1.0, 5.0, -3.0, 2.0));
+        assert_eq!(b.z, None);
+        assert_eq!(b.m, None);
+    }
+
+    #[test]
+    fn bbox_folds_z_and_m_independently() {
+        let mut b = Bbox::empty();
+        b.add(Position::with_zm(0.0, 0.0, 10.0, 100.0));
+        b.add(Position::with_zm(1.0, 1.0, -4.0, 250.0));
+        assert_eq!(b.z, Some((-4.0, 10.0)));
+        assert_eq!(b.m, Some((100.0, 250.0)));
+    }
+
+    #[test]
+    fn bbox_tracks_z_only_or_m_only() {
+        let mut z = Bbox::empty();
+        z.add(Position::with_z(0.0, 0.0, 7.0));
+        assert_eq!(z.z, Some((7.0, 7.0)));
+        assert_eq!(z.m, None, "a Z-only position must not invent an M range");
+
+        let mut m = Bbox::empty();
+        m.add(Position::with_m(0.0, 0.0, 7.0));
+        assert_eq!(m.m, Some((7.0, 7.0)));
+        assert_eq!(m.z, None, "an M-only position must not invent a Z range");
+    }
+
+    #[test]
+    fn bbox_mixed_dimensionality_folds_whichever_ordinates_are_present() {
+        // Some positions 3D, some 2D — fold the ones that have a Z rather than
+        // erroring or discarding, matching the WKB codec's "fall back
+        // gracefully, never panic" posture for the same case.
+        let mut b = Bbox::empty();
+        b.add(Position::new(0.0, 0.0));
+        b.add(Position::with_z(10.0, 10.0, 5.0));
+        b.add(Position::new(20.0, 20.0));
+        b.add(Position::with_z(30.0, 30.0, -5.0));
+        assert_eq!((b.min_x, b.max_x), (0.0, 30.0));
+        assert_eq!(b.z, Some((-5.0, 5.0)));
+        assert_eq!(b.m, None);
+    }
+
+    #[test]
+    fn an_empty_bbox_stays_empty_and_a_2d_one_does_not() {
+        let empty = Bbox::empty();
+        assert!(empty.is_empty());
+        assert_eq!(empty.z, None);
+
+        // Emptiness is judged on X/Y alone: a box with no Z is 2D, not empty.
+        let mut flat = Bbox::empty();
+        flat.add(Position::new(1.0, 1.0));
+        assert!(!flat.is_empty());
+        assert_eq!(flat.z, None);
+    }
+
+    #[test]
+    fn geometry_bbox_folds_z_through_the_whole_tree() {
+        // `extend_bbox` walks every variant; confirm Z survives the nesting,
+        // not just a bare Point.
+        let g = Geometry::MultiPolygon(vec![vec![vec![
+            Position::with_z(0.0, 0.0, 1.0),
+            Position::with_z(4.0, 4.0, 9.0),
+            Position::with_z(0.0, 4.0, 5.0),
+        ]]]);
+        let b = g.bbox();
+        assert_eq!((b.min_x, b.max_x, b.min_y, b.max_y), (0.0, 4.0, 0.0, 4.0));
+        assert_eq!(b.z, Some((1.0, 9.0)));
+    }
 
     // A negate-both-ordinates stand-in for a real reprojection: cheap to
     // verify every position was actually visited (and none double-visited).

@@ -8,21 +8,26 @@ Live list of what's open right now — not the full historical plan index (see
 DONE included). Each entry is just a link to its real plan/section for detail;
 check it off and remove it once the item ships or is shelved.
 
-- [X] *Cross-repo:* =geoscribe/plans/wkt-identify.org= — *DONE, in geoscribe.*
-  =geoscribe --identify= identifies an id-less =.prj= by name + ellipsoid
-  validation and emits a definition, so the capability lost with
-  =crs-registry='s removal is back through =--crs= composition. Geosetta needed
-  *zero* changes, as predicted. One thing worth knowing on this side: where
-  several CRSes fit a =.prj= equally well (39% of real Esri projected exports) geoscribe prints nothing and exits =2=, and =--crs='s hard error on
-  empty input turns that into a loud pipeline failure — verified end to end.
-  Remove this entry once read.
+- [ ] [[file:same-format-output.org][same-format-output.org]] — drop the
+  =args.from == out.format= rejection so a user can write the format they read.
+  Geosetta is now the ecosystem's only reader/writer, so it stands at *both*
+  ends of every pipeline and the transit format colliding with the endpoint
+  format is ordinary. =gpkg= → =gpkg= already works (it returns before the
+  check), so the crate already contains the counterexample. The real work is
+  fidelity, not the deletion: geosetta's round trip drops what =ogr2ogr=
+  keeps (feature =id=, both =bbox=es, collection =name=), and on a same-format
+  run "the target can't hold it" is no longer a defence — so a warning ships
+  with it. Also restores the in-place guard the format check was accidentally
+  providing. Scoping only.
 - [ ] [[file:multi-geometry-columns.org][multi-geometry-columns.org]] — carry
   a second GeoParquet geometry column through the IR (=Feature::extra_geometries=)
   instead of rejecting it; text-fallback for every other target format.
   Scoping only.
 - [ ] [[file:streaming-progress.org][streaming-progress.org]] — thread a
   throttled progress callback through each reader/writer so =--progress= can
-  report live percentage on large files, not just per-stage. Not implemented.
+  report live percentage on large files. The flag itself already ships and
+  reports *per-stage*; what is unimplemented is the *intra-stage* percentage
+  this plan is about.
 - [ ] [[file:compression-encoders.org][compression-encoders.org]] — close the
   read/write asymmetry in =compress/=; DEFLATE first (real consumer: a
   compressed, not just stored, =.kmz= writer), LZ4/ZSTD encoders deferred

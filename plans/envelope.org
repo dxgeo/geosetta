@@ -1,0 +1,350 @@
+#+TITLE: Plan: Z/M-Aware Envelopes and the GeoPackage Envelope Gap
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Z/M-Aware Envelopes and the GeoPackage Envelope Gap
+
+** STATUS -- V1-V4 DONE (0.25.0), 2026-08-19.
+Implemented and verified end to end:
+- *V1* -- =Bbox= gained =z: Option<(f64, f64)>= and =m: Option<(f64, f64)>=;
+  =add= folds each ordinate a =Position= actually carries
+  (=src/geometry/mod.rs=). The four XY fields and their meaning are unchanged,
+  so =spatial.rs=, =hilbert_order= and both R-tree paths were untouched -- one
+  struct literal in an =rtree.rs= test needed the two new fields, and nothing
+  else in the crate moved.
+- *V2* -- =gpb_envelope= + an opt-in =--envelope= CLI flag threaded through
+  =write_layers=/=build=/=feature_table=/=gpkg_geometry=
+  (=src/geopackage/writer.rs=, =src/cli.rs=, =src/main.rs=). Off by default,
+  matching =--rtree=/=--sort-hilbert=; a test asserts the default path still
+  emits flags =0x01=, indicator =0=, no envelope bytes.
+- *V3* -- our envelope matches GDAL's *numerically, ordinate for ordinate*, on
+  the same geometry, for both indicator sizes.
+
+*Finding that settled the design: the envelope stops at Z. Indicators 3 (XYM)
+and 4 (XYZM) are never emitted.* This began as the plan's "confirm the
+XYM/XYZM byte order against real tool output rather than assume symmetry with
+XYZ" instruction and ended somewhere better -- a reason not to want them.
+
+*The semantic reason (the real one).* An envelope is a *spatial* bound whose
+job is to accelerate spatial queries. M is a linear-referencing measure -- mile
+markers, timestamps, chainage -- not a spatial axis, so there is no query for
+an M range to accelerate. GeoPackage's own RTree is strictly 2D for the same
+reason. Indicators 3 and 4 are in the spec's table for completeness, not
+because a consumer exists.
+
+*The empirical reason.* GDAL 3.13.2 never emits 3 or 4 under any input tried:
+- =LINESTRING M=, =MULTIPOINT M= → indicator 1 (XY only).
+- =LINESTRING ZM=, =POLYGON ZM=, =MULTILINESTRING ZM=,
+  =GEOMETRYCOLLECTION ZM=, =CIRCULARSTRING ZM= → indicator 2, caching the *Z*
+  range and discarding M.
+- =POINT ZM= → indicator 0 (degenerate bbox, no envelope at all).
+Swept across those eight geometry families with real =ogr2ogr=. No layer- or
+dataset-creation option controls it (=ogrinfo --format GPKG=), and no
+=OGR_GPKG_*= config switch relates to envelopes (checked against the shipped
+=libgdal= strings; the GPKG ones cover rtree, SRS checks, integrity and
+threading).
+
+*Why this matters more than "no oracle available": a wrong envelope silently
+loses query results.* GDAL trusts the cache over the coordinates on the filter
+path. With a deliberately falsified envelope written into an otherwise valid
+file, =ogrinfo -al -spat 0 0 25 15= returns *zero* features for a geometry that
+plainly intersects the box; the same file with a correct envelope returns one.
+(Plain =ogrinfo -al= with no filter still reports the true extent and geometry,
+so the falsification is invisible until someone filters.) A *missing* envelope
+only costs speed -- which is the § WHY argument for why dropping one is not a
+lossy conversion. A *wrongly encoded* one is exactly the wrong-direction data
+loss this project's verification discipline exists to prevent.
+
+For completeness: GDAL's *reader* does accept indicators 3 and 4 without error
+(it skips the declared byte count, as geosetta's =strip_gpkg_header= does), so
+emitting them would not break readers. It would simply buy nothing, in a layout
+no reference implementation could confirm.
+
+Recorded at =gpb_envelope=. Revisit only if a writer that emits 3/4 turns up.
+
+*New fixture*: =tests/fixtures/gdal_linestring_2d.gpkg= (real =ogr2ogr=
+output, indicator 1, 32 bytes, envelope =(0,20, 0,10)=) -- the XY oracle, which
+did not exist before; the committed fixtures only covered Z and ZM.
+
+*External verification beyond the test suite*: a =--envelope= file written by
+the CLI passes SQLite's =integrity_check=, is read back correctly by =ogrinfo=
+(=LINESTRING Z (0 0 0,10 10 10,20 5 3)=, extent =(0,0)-(20,10)=), and
+round-trips back through geosetta unchanged.
+
+- *V4* -- GeoParquet's =geo= =bbox= now switches to the spec's six-element 3D
+  form whenever any position carried a Z (=src/parquet/geo.rs=). Order confirmed
+  empirically against GDAL 3.13.2's Parquet driver, *not* inferred from the 2D
+  case:
+
+  #+begin_example
+  [minx, miny, minz, maxx, maxy, maxz]     (all mins, then all maxes)
+  #+end_example
+
+  Note this is *not* GPB's per-dimension =minx,maxx,miny,maxy,minz,maxz=
+  pairing from V2/V3 -- the two formats order their envelopes differently, which
+  is exactly why the plan forbade inferring one from the other.
+
+*Findings that settled V4.*
+
+*1. The file-level =geo= bbox is load-bearing, exactly like GPB's envelope.*
+GDAL *trusts* it over the coordinates: a file with a deliberately falsified
+bbox returns *zero* features from =ogrinfo -spat= for a geometry that plainly
+intersects the filter box. Same failure mode as V3's GPKG finding, so the same
+discipline applies -- a wrong bbox silently loses query results, while a
+missing one costs only speed. Measured on 400k linestrings (15 MB): a
+whole-file skip on a non-matching query runs 106 ms against 148 ms with no
+bbox at all, and the skip's value grows with file size and remote storage.
+
+*2. Emitting six elements is what GDAL does, and length is not uniform.*
+Sweeping GDAL's own Parquet output: a pure-2D file gets a four-element bbox, a
+file containing any Z gets six. Varying the length by file *is* the ecosystem
+behavior, so matching it introduces no incompatibility a reader would not
+already hit against GDAL. Verified GDAL genuinely switches on the six-element
+form rather than assuming four: with =bbox=[0,0,0,110,110,60]=, a reader taking
+the first four elements as =[minx,miny,maxx,maxy]= would compute the degenerate
+box =(0,0)-(0,110)= and drop a feature at x in [100,110]; GDAL returns it.
+DuckDB reads the six-element form without complaint. A reader that *does*
+hardcode four would misparse =minz= as =maxx=, always shrinking the box, so the
+failure is always a silent false negative -- worth knowing, but it is a
+pre-existing hazard of GDAL-written 3D GeoParquet, not one this creates.
+
+*3. The Z elements are inert for querying.* Falsifying only the Z range
+(=9000..9001= over true XY) changes no query result in GDAL or DuckDB, and
+=ogrinfo= reports a 2D extent regardless. Nothing prunes on Z -- GDAL's own
+covering-bbox column is 2D-only (=struct(xmin,ymin,xmax,ymax)= floats). So the
+mixed-dimensionality choice below is a question of honesty, not performance:
+three candidate encodings of the same mixed collection returned identical hits,
+identical misses, identical row counts, and no reader errors.
+
+*4. Mixed dimensionality: fold real Zs only -- a deliberate divergence from
+GDAL's model, and the reason it is safe here.* On input mixing 2D and 3D
+features, GDAL *promotes* the 2D geometry on write (=LINESTRING (0 0, 10 10)=
+becomes =LINESTRING Z (0 0 0, 10 10 0)=) but folds its =minz= from the
+originally-3D features alone, writing =minz=50= over data whose real Z range is
+=0..60=. *GDAL's bbox therefore does not cover the Z values GDAL itself just
+wrote* -- and it errs small, the dangerous direction.
+
+Geosetta does not promote: a 2D geometry stays 2D WKB through a GeoParquet
+write, confirmed by two independent readers (a geosetta round trip returns
+=[[0,0],[10,10]]=, and DuckDB reads =LINESTRING (0 0, 10 10)= beside
+=LINESTRING Z (...)=). Folding only real Zs is therefore *exact* for our files,
+and our emitted bytes match GDAL's on the same input while being correct about
+the file's contents where GDAL's are not.
+
+The rule to keep, phrased as an invariant rather than a preference, because a
+future writer change is what would break it:
+
+#+begin_quote
+The bbox Z range must cover every Z ordinate actually written to the file.
+#+end_quote
+
+A too-large range costs only speed; a too-small one makes a trusting reader
+drop matching rows. If geosetta ever gains promote-on-write, folding real Zs
+only becomes too small and the fold must widen to include the synthesized 0 --
+=mixed_dimensionality_bbox_covers_every_z_actually_written= asserts the
+invariant directly, so that change trips a test rather than reproducing GDAL's
+bug silently.
+
+*M stays out, for a spec reason this time.* V3 kept M out of the GPB envelope
+on semantic and empirical grounds; here GeoParquet's =bbox= has no M form at
+all, so the question does not arise. Dropping it stays outside the
+lossy-conversion rule for the reason already given in this plan: an envelope is
+a derived cache, recomputable from the geometry beside it.
+
+*Verification against real tools*: geosetta's bbox is numerically identical to
+GDAL's on the same input for all three shapes -- pure 3D =[0,0,0,20,10,10]=,
+pure 2D =[0,0,10,10]=, mixed =[0,0,50,110,110,60]=. Geosetta's 3D output reads
+back correctly in =ogrinfo= (=-spat= hits and misses all correct), in DuckDB
+(=LINESTRING Z (0 0 0, 10 10 10)=), and round-trips through geosetta with Z
+intact.
+
+Test count: 413 lib tests pass; clippy clean.
+
+** ORIGINAL PLAN
+Supersedes =geoscribe/plans/envelope-computation.org=, which planned this work
+in =geoscribe= behind a new =Coord=/=Envelope= pair. That placement is
+retired (user decision, 2026-08-18): it duplicated a type this crate already
+exports, and with no dependency edges between the three crates
+([[file:../../architecture.org][architecture.org]]) =geosetta= could not have
+called it in any case. The dimension semantics and the GPB byte-layout
+findings from that plan are carried over here verbatim; only the home changed.
+
+** WHY
+
+*** This crate already computes envelopes -- in a format writer
+The retired plan framed the envelope as "a value =geosetta= doesn't have and
+must derive." That was wrong on the facts. The fold already exists, is already
+public, and is already load-bearing in a spoke's write path:
+
+- =Bbox= (=src/geometry/mod.rs:212=) with =empty=/=add=/=is_empty=, plus
+  =Geometry::bbox()= and =Geometry::extend_bbox()= (=:81=/=:88=), all exported
+  from =lib.rs:71=.
+- =convert.rs:129= folds a dataset-level =Bbox= across every feature and writes
+  it into *GeoParquet's =geo= metadata* via =parquet::geo_metadata=.
+- =convert.rs:30= builds a per-feature =Vec<Bbox>= for =--sort-hilbert=;
+  =spatial.rs= does the same for the FlatGeobuf packed R-tree.
+
+So the question was never "should this crate compute envelopes" -- it does,
+and will keep doing so for features that ship today. The real gap is narrower.
+
+*** The actual gap: =Bbox= is XY-only, and the GPKG writer emits none
+Two independent shortfalls, both small:
+
+1. *=Bbox= discards Z and M it is already handed.* Since =zm-geometry.org='s
+   M1, =Position= carries =z: Option<f64>= and =m: Option<f64>=, and
+   =Bbox::add(&mut self, p: Position)= takes a whole =Position= -- so the
+   ordinates arrive at the fold today and are dropped on the floor. The struct
+   has four =f64= fields and no Z/M slots to put them in.
+2. *The GeoPackage writer never emits an envelope.* GPB (GeoPackage §2.1.3)
+   carries an *optional* per-geometry envelope in one of four dimension-
+   specific forms (XY/XYZ/XYM/XYZM = 32/48/48/64 bytes), selected by a 3-bit
+   indicator in the flags byte. =gpkg_geometry= (=geopackage/writer.rs:342=)
+   hardcodes =flags = 0x01= -- indicator =0=, no envelope -- unconditionally.
+   The reader (=strip_gpkg_header=, =geopackage/reader.rs:196-210=) uses the
+   indicator only to compute how many bytes to *skip*; the min/max values are
+   never parsed into numbers.
+
+Net effect, confirmed against a real =ogr2ogr -f GPKG= fixture committed at
+=tests/fixtures/gdal_linestring_z.gpkg=: an envelope-bearing source =.gpkg=
+loses its envelope on any round trip through this crate.
+
+*** Is the drop a lossy conversion that must warn?
+*No, and this is the one place the standing rule needs an explicit exemption
+rather than an application.* The project rule is that any silent drop of
+something a source recorded warns on stderr. An envelope is different in kind
+from the data that rule protects: it is a *derived cache*, recomputable exactly
+from the geometry that sits beside it in the same file, so a target without one
+has lost no information -- only a query optimization. Contrast a dropped Z
+ordinate or a dropped CRS, neither of which can be reconstructed from what
+remains.
+
+Stated here so a later reader does not "fix" the missing warning: the absence
+of an envelope is not a lossy conversion, and =downgrade_warning= should stay
+out of this path. What *would* be lossy is emitting a *wrong* envelope, which
+§ TESTING guards against.
+
+** SCOPE
+- Extend =Bbox= to fold Z and M when present, without disturbing its existing
+  XY consumers.
+- Serialize a computed envelope into GPB's indicator + byte layout in the
+  GeoPackage writer, behind an opt-in flag.
+
+*Out of scope*, so a later sweep isn't implied:
+- *Envelopes under reprojection.* Transforming a bbox is not folding one --
+  the reprojection of the corners is not the bbox of the reprojection, because
+  projections curve. That belongs to the reprojection crate and is planned at
+  =nazca/plans/transform-bounds.org=. Nothing here should grow a =transform=
+  parameter.
+- *FlatGeobuf's =NodeItem= bbox* (=src/spatial.rs=) -- XY-only by the format's
+  own definition, feeding the packed Hilbert R-tree. Nothing here requires
+  touching it, and it must *not* become Z/M-aware: the index is 2D.
+- *GeoParquet's covering-bbox column* -- tracked separately
+  (=arbitrary-geoparquet.org= milestone 6 / =zm-geometry.org= M8).
+
+** DESIGN
+
+*** Extend =Bbox= in place; do not add a second envelope type
+=Bbox= gains four optional fields beside its existing four:
+
+#+begin_src rust
+pub struct Bbox {
+    pub min_x: f64,          // unchanged
+    pub min_y: f64,
+    pub max_x: f64,
+    pub max_y: f64,
+    pub z: Option<(f64, f64)>,   // (min, max), None until a Z is seen
+    pub m: Option<(f64, f64)>,   // (min, max), None until an M is seen
+}
+#+end_src
+
+Existing field names and their meaning are untouched, so =spatial.rs=,
+=hilbert_order=, and the FlatGeobuf/R-tree paths compile and behave exactly as
+before -- they simply ignore the new fields. =add= grows a fold per optional
+ordinate; the whole change is on the order of eight lines in a function that
+already receives the data.
+
+Rejected: a separate =Envelope= type alongside =Bbox= (the retired plan's
+shape). It would mean two folds over the same coordinates and two types
+meaning nearly the same thing, with the per-format choice of which to use
+becoming a standing question. There is one bounding box; it should have one
+type.
+
+*** Mixed dimensionality folds, never errors
+Carried over from the retired plan, unchanged: =z= and =m= are =Some= when *at
+least one* coordinate carried that ordinate -- not only when all of them did.
+A collection mixing =POINT(1 2)= and =POINT Z(3 4 5)= yields a Z range of
+=(5, 5)=. This matches the WKB codec's existing "fall back gracefully, never
+panic" posture for the same edge case (=geometry/wkb.rs=, M2) and is what the
+GPB indicator needs anyway: the writer must pick one indicator for the
+geometry it is about to write, and "some coordinate has a Z" is exactly the
+condition under which XYZ is the right code.
+
+*** GPB serialization stays in the GeoPackage writer
+The indicator code (0--4) and the byte layout are GeoPackage spec details with
+no bearing on any other format; they belong with the rest of GPB's header
+concerns in =geopackage/writer.rs=. =Bbox= stays dimension-neutral and format-
+ignorant; the writer decides what a present =z=/=m= means for its own encoding.
+
+Layout for the XYZ case, confirmed by hand-decoding the real
+=gdal_linestring_z.gpkg= fixture -- min/max *pairs per dimension*, not
+interleaved:
+#+begin_example
+minx, maxx, miny, maxy, minz, maxz     (indicator 2, 48 bytes, little-endian f64)
+#+end_example
+
+*** Opt-in, not default-on
+Matches the existing precedent for every other size/query optimization in this
+crate (=--rtree=, =--sort-hilbert= are both opt-in), and keeps default output
+byte-stable for anyone diffing it. =zm-geometry.org='s M5 called emitting an
+envelope "a non-goal -- size/query optimization, not a correctness
+requirement"; that framing is still right, and having the computation available
+does not by itself argue for spending bytes on it by default.
+
+** MILESTONES
+- *V1* [DONE] -- =Bbox= gains =z=/=m=; =add= folds them. Pure unit tests over
+  synthetic positions: 2D-only, Z-only, M-only, ZM, empty input, and the
+  mixed-dimensionality case. Verify the existing XY consumers are untouched
+  (=--sort-hilbert= and =--rtree= output unchanged, byte for byte).
+- *V2* [DONE] -- GeoPackage writer: an opt-in flag, indicator selection from the
+  computed =Bbox=, and the little-endian double sequence in GPB's order.
+  Indicator =0= when the flag is off or the geometry is empty.
+- *V3* [DONE] -- Verify against the fixture already in hand: read
+  =tests/fixtures/gdal_linestring_z.gpkg=, rewrite it through the new path, and
+  confirm the re-emitted envelope bytes match GDAL's *numerically*. This is the
+  test that catches a wrong envelope, which -- unlike a missing one -- is a
+  real correctness bug.
+  *Before shipping XYM/XYZM specifically*: confirm their byte order against
+  real tool output the same way the XYZ case was. Do not assume symmetry with
+  XYZ's =minx,maxx,miny,maxy,minz,maxz= pattern.
+- *V4 (separate decision, not required by the above)* [DONE] -- GeoParquet's
+  =geo= =bbox= gains the spec's six-element 3D form whenever a Z is present.
+  The empirical check this milestone demanded was run before implementing and
+  is recorded in full under § STATUS: element order confirmed against GDAL,
+  the six-element form shown to be GDAL's own behavior, the Z elements shown
+  inert for querying, and the mixed-dimensionality rule settled as a deliberate
+  divergence from GDAL's promote-to-zero model.
+
+** TESTING
+- V4: three unit tests over =parquet::geo::metadata= --
+  =writes_six_element_bbox_when_z_is_present= (the element order),
+  =m_never_reaches_the_bbox= (M-carrying input still writes four elements), and
+  =mixed_dimensionality_bbox_covers_every_z_actually_written=, which asserts the
+  § STATUS invariant against the positions themselves rather than against
+  literal numbers, so a future promote-on-write would fail it.
+- V1: pure logic, synthetic coordinates, no fixture needed.
+- V3: =tests/fixtures/gdal_linestring_z.gpkg= is the committed real-world
+  oracle for XYZ (indicator =2=, values =(0,20,0,10,0,10)=, already hand-decoded
+  and documented in =geopackage/reader.rs='s own test). XYM/XYZM need their own
+  fixtures, sourced the same way -- and note *why* that one is a =LineString=:
+  =ogr2ogr= writes no envelope for a degenerate =POINT= bbox, so a point
+  fixture silently exercises nothing. Pick a non-degenerate geometry.
+
+** DEPENDS ON / RELATED
+- =zm-geometry.org= M1 (=Position= carries =z=/=m=) -- already DONE; it is what
+  makes V1 an eight-line change rather than a signature change.
+- =zm-geometry.org= M5 (GeoPackage) -- where the envelope-drop finding
+  originated.
+- =nazca/plans/transform-bounds.org= -- the reprojection-side envelope problem
+  deliberately excluded from § SCOPE above.
+- =geoscribe/plans/envelope-computation.org= -- retired predecessor; kept for
+  its reasoning trail, not to be implemented there.

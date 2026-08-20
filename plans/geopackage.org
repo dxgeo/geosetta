@@ -90,6 +90,11 @@ The geometry blob is a small header (magic "GP", version, flags with an envelope
 =geometry/wkb.rs=. So geometry is essentially free: read/skip the header, reuse
 =from_wkb= / =to_wkb=, emit the header on write.
 
+/Since then:/ the header's *optional* envelope — skipped on read from the
+start, and hardcoded to "none" on write — is now emitted behind the opt-in
+=--envelope= flag. See [[file:envelope.org][envelope.org]], which also records
+why it stops at Z rather than using the spec's XYM/XYZM indicators.
+
 *** 5. Layer-aware CLI / pipeline
 GPKG does not fit the pure =convert(from, to, bytes) -> bytes= shape:
 - Write needs the *output path* (to check existence and read the existing file)

@@ -1,6 +1,6 @@
 [package]
 name = "geosetta"
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 description = "Convert between open vector geospatial formats (GeoJSON, GeoParquet, FlatGeobuf, GeoPackage, Shapefile, KML/KMZ, CSV, WKT), carrying Z/M ordinates and CRS labels through. Warns on stderr whenever a conversion would drop something the target format cannot represent. Dependency-free, standard library only."
 license = "MIT"

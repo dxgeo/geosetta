@@ -1,0 +1,581 @@
+#+TITLE: Plan: Print the CRS Definition Body (`--print-crs`)
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Print the CRS Definition Body
+
+** STATUS -- IMPLEMENTED (0.25.0), 2026-08-19
+Adds two flags, =--print-crs= and its opt-in =--escape=, alongside the existing
+=--print-crs-code=. No new dependency, no process spawning, no translation --
+=--print-crs= prints the CRS definition text the source recorded, verbatim, and
+nothing else.
+
+Companion plan on the other side of the boundary:
+=geoscribe/plans/projjson-identify.org=, which teaches =geoscribe --identify= to
+read the PROJJSON this flag will most often emit. Neither plan was useful alone
+for the GeoParquet case (see § THE GAP), so both landed together.
+
+Two things this plan did not anticipate, both recorded below. The verbatim
+contract was *unachievable as scoped* -- =NamedCrs.projjson= stored a
+re-serialized definition, not the source's bytes -- so it needed a reader change
+first (§ DECISIONS, milestone 0). And a GeoPackage's placeholder =NONE=
+authority was being reported as an identity, which inverted the two flags'
+partition for that format alone (§ Failure mode).
+
+** WHY
+[[file:crs-external-resolution.org][crs-external-resolution.org]] built the
+report-resolve-supply loop: =--print-crs-code= reports an unresolved identity,
+any external tool resolves it, =--crs <path|->= accepts the result. Its
+§ CROSS-REPO FOLLOW-UP was then closed by =geoscribe --identify=, which handles
+the *id-less* case the code-reporting flag structurally cannot:
+
+#+begin_src sh
+geoscribe --identify --projjson parcels.prj \
+  | geosetta parcels.shp parcels.parquet --crs -
+#+end_src
+
+That works because a Shapefile =.prj= is *already loose WKT text on disk*.
+=geoscribe= opens the file itself and never needs geosetta at all.
+
+*** THE GAP
+Every other format keeps its CRS *inside* a container. A GeoParquet file's
+id-less CRS lives in the =geo= metadata as PROJJSON; a FlatGeobuf's or
+GeoPackage's lives in a header field or an =srs= table row. Point =geoscribe
+--identify= at the container and it fails in =String::from_utf8= before parsing
+anything -- the user sees "stream did not contain valid UTF-8", which is
+accurate and useless.
+
+Geosetta already reads and parses that CRS -- =parquet::geo::parse_crs=
+(=src/parquet/geo.rs:121=) hands it to =crs_from_projjson_value=, and it sits in
+=NamedCrs.projjson= (=src/crs.rs:58=) fully intact. It is simply never printed.
+=--print-crs-code= reports the *identity* and, for an id-less definition,
+deliberately reports nothing at all (=main.rs:243=, empty stdout + nonzero).
+
+So the loop has a hole exactly where =--identify= was built to help: the one
+tool that can identify an id-less definition cannot reach the definition, and
+the one tool holding the definition will not emit it.
+
+** DESIGN
+*** One flag, printing the body verbatim
+=geosetta <input> --print-crs [--escape] [--from FMT] [--layer NAME]=
+
+A third =Mode= variant, mirroring =Mode::PrintCrsCode= in every structural
+respect: no output path, no format, mutually exclusive with =--crs= (an override
+is an *input* to conversion; there is nothing to convert here), diagnostic only.
+
+Output is the definition text the source recorded, byte-for-byte, plus one
+trailing newline. Geosetta does not reformat, re-indent, re-order, or re-dialect
+it.
+
+*** REJECTED: a third "full definition" flag
+The shape first considered was three flags -- =--print-crs= (code *and* body),
+=--print-crs-code=, =--print-crs-body=. Rejected on two independent grounds.
+
+*It carries no information the body alone does not.* A definition either records
+its id inline (WKT's =AUTHORITY=/=ID= node, PROJJSON's =id= member) or it does
+not. When it does, printing the code alongside duplicates text already in the
+body -- and geosetta's own =Crs::from_authority_code= *lifts* that inline id into
+=NamedCrs.authority=/=code= precisely because it is the same fact. When it does
+not, there is no code to print. The composite is redundant or half-empty in
+every case; there is no input for which it is richer.
+
+*It would be valid input to nothing.* § TOOL AGNOSTICISM in
+[[file:crs-external-resolution.org][crs-external-resolution.org]] is a hard
+constraint, and the operative half of it is that each flag's stdout is directly
+consumable, unmodified, by tools that know nothing about geosetta:
+
+| flag               | stdout            | feeds                                            |
+|--------------------+-------------------+--------------------------------------------------|
+| =--print-crs-code= | =EPSG:7844=       | =geoscribe EPSG:7844=, =projinfo=, =gdalsrsinfo=  |
+| =--print-crs=      | WKT or PROJJSON   | =geoscribe --identify=, =--crs -=, =projinfo @f=  |
+| a code+body composite | ---            | *nothing* -- a geosetta-invented wrapper         |
+
+The composite would oblige every consumer to learn a geosetta framing format and
+split it back apart, which inverts the dependency direction this whole
+architecture was built to avoid. The same objection answers "just print
+everything and let the receiver parse it": the receivers are =geoscribe
+--identify= and =--crs -=, both of which take a bare definition today.
+
+With the composite gone, =-body= has nothing left to disambiguate against, so
+the two-flag pair is =--print-crs= / =--print-crs-code= -- "print the CRS" and
+"print the CRS's code", each self-documenting against the other.
+
+*** REJECTED: dialect selection (=--print-crs=wkt|projjson=)
+Asking for a dialect the source did not record is a *translation* request, and
+translation on this path is exactly what the crate is trying to stop leaning on.
+=crs/wkt_projjson.rs='s crosswalk is documented (=crs-external-resolution.org=
+§ STATUS) as getting Esri-flavor NAD83/NAD27 outright wrong and WGS 84 right only
+~70% of the time. Printing verbatim means geosetta never has to be right about a
+conversion here -- and the tool on the other end of the pipe has an authoritative
+registry, which is the whole reason it is on the other end of the pipe.
+
+The consumer's cost is one byte of sniffing: first non-whitespace ={= means
+PROJJSON, anything else is WKT. =geoscribe/plans/projjson-identify.org= § SNIFF
+specifies it.
+
+*** Which field wins when both are set
+=NamedCrs.wkt= and =NamedCrs.projjson= are independently optional and a source
+can record both. *PROJJSON wins*, as a stated rule rather than incidental field
+order, for two reasons: it is the strictly less ambiguous of the two (no
+WKT1-vs-WKT2 dialect question, no Esri-flavor spelling problem), and it is the
+form =geoscribe='s JSON parser already handles.
+
+Document the rule in the flag's help text and in =print_crs='s doc comment, so a
+reader does not have to infer it from a =match= arm.
+
+*Implementation note (2026-08-19): no reader can currently produce this state.*
+GeoParquet records PROJJSON only; FlatGeobuf and GeoPackage record WKT only
+(=NamedCrs::structural_wkt= translates on the way *out*, so a PROJJSON-carrying
+IR reaches a =.gpkg= as WKT and comes back as WKT); a Shapefile =.prj= is WKT
+text on disk. So a =NamedCrs= holding both dialects is reachable only by
+constructing one, and § TESTING's "both fields set → PROJJSON, asserted
+directly" is a unit test on =Crs::definition_body= rather than a CLI one --
+which is what "asserted directly" should have meant. The rule stays: it is the
+answer for whichever reader fills both first, and stating it now is cheaper
+than discovering the =match= arm's order was load-bearing later.
+
+This also sharpens the multi-layer fixtures: a GeoPackage test has to use WKT,
+or it asserts on the PROJJSON→WKT crosswalk's output rather than on anything
+=--print-crs= did.
+
+*** Failure mode: mirror =--print-crs-code= exactly
+No recorded definition body → *empty stdout, nonzero exit*, message on stderr
+naming the input and pointing at the other flag. This preserves the existing
+contract that empty stdout plus a nonzero exit means "there was genuinely
+nothing to report" (=main.rs:215-219=).
+
+The pipeline is therefore *one unconditional command*, whichever kind of CRS the
+file turns out to carry:
+
+#+begin_src sh
+geosetta f.parquet --print-crs | geoscribe --identify --projjson
+#+end_src
+
+**Rewritten 2026-08-19; the earlier two-branch form was wrong, not merely
+redundant.** It read:
+
+#+begin_src sh
+# DO NOT USE -- kept only to explain why.
+code=$(geosetta f.parquet --print-crs-code 2>/dev/null) \
+  && geoscribe "$code" --projjson \
+  || geosetta f.parquet --print-crs | geoscribe --identify --projjson
+#+end_src
+
+Two independent problems, either of which is enough to retire it.
+
+*It asks the shell a question the tool answers.* § Closed 2026-08-18 settled
+option (a): =--identify= uses an inline id when the definition carries one, so
+the trusted-id path is taken automatically and the fallback has nothing left to
+do. A user piping a file's CRS does not know in advance whether it has an id,
+which is exactly why the conditional does not belong in their shell.
+
+*And on GeoPackage it takes the wrong branch* (found 2026-08-19). GeoPackage
+cannot store a CRS without an =srs_id=, so =geopackage::writer= gives a
+WKT-only CRS the organization =NONE= and a synthetic id from
+=SYNTHETIC_SRS_BASE=. Before the fix below, =--print-crs-code= *succeeded* on
+such a file with =NONE:100000=; the =&&= branch was taken, =geoscribe= failed on
+a code geosetta had invented, and the =||= fallback -- which identifies the
+file correctly -- never ran. A conditional keyed on exit status is only as good
+as the exit statuses, and this one was reporting an identity that did not exist.
+
+That second problem is fixed at the source rather than in the snippet:
+[[file:../src/crs.rs][=NamedCrs::authority_code=]] now treats the placeholder
+authority =NONE= as absent, so a synthesized pair is never reported as a
+resolvable identity and such a file lands in the id-less bucket where
+=--print-crs= serves it. The stored fields are untouched, so a GeoPackage still
+round-trips its synthetic id. The flags do now partition cleanly -- but the
+single-branch pipeline above is still the recommended form, because it needs no
+partition at all.
+
+*** Multi-layer GeoPackage -- the one genuinely new problem
+=--print-crs-code= prints one code per line, de-duplicated in layer order. That
+works *only* because a code is guaranteed single-line. A definition body is not:
+pretty-printed PROJJSON is routinely multi-line, and nothing forbids a
+multi-line WKT.
+
+So: when the selected layers carry more than one *distinct* CRS, error out and
+tell the user to narrow with =--layer=. Do not invent a record delimiter, do not
+print the first, do not concatenate. One distinct CRS across many layers prints
+once, as today.
+
+This is the only place the new flag's shape genuinely diverges from the existing
+one, and it is worth being blunt about in the error text -- the user's next
+action is a single flag away.
+
+** DECISIONS
+*** A WGS 84 source has no body, and =--print-crs= says so
+=Crs::Wgs84= is fieldless by design. =--print-crs-code= prints =OGC:CRS84= for it
+and exits 0, and § DECISIONS in
+[[file:crs-external-resolution.org][crs-external-resolution.org]] argued that at
+length: a nonzero exit must mean "there is no identity here", and for a GeoJSON
+that is simply false.
+
+=--print-crs= is the opposite case and takes the opposite answer: there is no
+recorded definition *text*, so it exits nonzero with empty stdout. Synthesizing
+one was rejected -- geosetta has no registry and does not invent definitions;
+that is what the tool on the other end of the pipe is for. The stderr message
+should name the flag that *does* work here, since =OGC:CRS84= resolves trivially:
+
+#+begin_example
+"f.geojson": no CRS definition body to print -- the source's CRS is the format's
+implicit WGS 84 default, which it records no definition for. Use
+--print-crs-code (prints OGC:CRS84) and resolve that instead.
+#+end_example
+
+That the two flags disagree on this input is correct, not an inconsistency:
+=--print-crs-code= answers "what is this?", =--print-crs= answers "what did the
+file literally say?", and for WGS 84 the file said nothing.
+
+*** The verbatim contract needed a reader change, and has one (2026-08-19)
+Scoping this flag assumed =NamedCrs.projjson= already held what the source
+wrote. It did not. =crs_from_projjson_value= stored =crs.to_json_string()= --
+this crate's own *compact* serializer -- so a GeoParquet definition reached the
+IR re-printed: indentation gone, member spacing gone, =6378137.0= and =2.98e2=
+respelled by Rust's =f64= =Display=. § CONTRACTS' "byte-identical to the
+definition text the source recorded" was unachievable on the format this plan
+exists to serve, and the § TESTING round-trip would have passed anyway, since
+a re-print is still *semantically* the same definition. Only the Shapefile
+=.prj= case was genuinely verbatim, and only because that reader happens to
+store the file's text directly.
+
+Fixed at the source rather than papered over in =print_crs=, because the
+guarantee belongs to the IR: =crate::json::raw_at= returns the *source slice*
+of a value at a path, so =parquet::geo::parse_crs= now reads the =id= from the
+parse and takes the definition itself as the bytes out of =geo=. The parsed
+value is no longer the definition's storage form anywhere. Framing whitespace
+is excluded and interior whitespace preserved, so the slice is the value as
+written and nothing else -- and =.prj= reading was trimmed to the same rule, so
+both dialects reach =NamedCrs= as the definition alone. That is what lets
+§ CONTRACTS' "modulo the single trailing newline" be exactly one newline.
+
+Landed ahead of milestone 1 with its own tests (=json/parser.rs=,
+=parquet/geo.rs=, =crs.rs=, =shapefile/reader.rs=); the flag itself is still
+unimplemented. The § TESTING bullet asserting =--print-crs= on a Shapefile
+matches the =.prj='s own bytes stays as written -- it is now a check on
+behavior that exists rather than an aspiration.
+
+*** No new dependency, no subprocess -- unchanged
+The no-silent-exec decision (2026-08-17, § SUPERSEDED PLAN) governs here
+identically. This flag makes geosetta a better *pipe participant*; it does not
+make geosetta a caller. Every stage stays visible in the user's own command line.
+
+*** Terminal escape sequences in verbatim output: accepted, not filtered
+=stdout-security.org= finding 1 flagged that verbatim output means an
+attacker-controlled =name= field (or any string inside the WKT/PROJJSON body)
+reaches the terminal unfiltered -- title-bar spoofing, cursor manipulation, on
+a crafted input file. Two options were on the table: accept it (=cat='s
+tradeoff) or escape conditionally on =isatty(stdout)= (=ls=/=less='s tradeoff).
+
+Decision: accept it. =--print-crs= stays raw always, in every context.
+
+This was checked against real prior art rather than decided from precedent
+alone. A WKT file with an OSC title-bar-spoofing sequence
+(=\033]0;PWNED\007=) embedded in a =GEOGCRS= name, run through =gdalsrsinfo -o
+wkt2= (GDAL 3.13.2 / PROJ 9.8.1), reproduces the escape byte-for-byte in its
+output with no filtering and no =isatty= check:
+
+#+begin_example
+GEOGCRS["EVIL^[]0;PWNED^GNAME",
+    DATUM["World Geodetic System 1984", ...
+#+end_example
+
+GDAL's CLI tools are the closest analog to what =--print-crs= is doing -- same
+domain (CRS text), same audience, same verbatim-dump behavior -- and they take
+the =cat= position unconditionally. That settles which side of the Unix split
+(§ PRIOR ART in =stdout-security.org=) this flag belongs on: a "dumb pipe"
+tool, not an "interactive display" tool. The round-trip contract
+(§ CONTRACTS: piping =--print-crs= into =--crs -= must be a no-op) already
+argued for this; an =isatty= branch would mean the escaped and raw forms are
+different byte sequences, and nothing guarantees a script exercised
+interactively for debugging behaves like the same script piped in production.
+=cat= makes that same argument and has for decades, and the tool this crate is
+most directly a peer of, on this exact input, makes it too.
+
+Filenames in stderr messages (=stdout-security.org= finding 4) ride on the
+same decision, for the same reason: also raw by default.
+
+**** =--escape=: an opt-in flag, not a default, not a pipe-elsewhere punt
+=cat= doesn't stop at "raw always" -- it ships =-v= for the human who wants
+protection, off by default so it never taxes the pipeline case. =--print-crs=
+takes the same shape as a second, independent flag rather than leaving it to
+"go pipe through =cat -v= yourself": =--print-crs= is the one place geosetta
+prints attacker-controlled bytes at all, so the protection belongs next to the
+flag that creates the exposure, not delegated to a tool the user has to know
+to reach for.
+
+=--escape= is valid only alongside =--print-crs= (a =cli.rs= conflict rule,
+same shape as =--print-crs='s existing conflicts) and changes nothing about
+*which* bytes are read or reported -- only how the ones that would act on a
+terminal are rendered:
+
+- Off (default): unchanged from above -- fully raw, byte-for-byte, verbatim
+  contract intact.
+- On: every C0 control byte except tab (=0x09=) and newline (=0x0A=) is
+  rendered visibly instead of passed through -- =^= followed by the byte
+  XOR'd with =0x40= (so =ESC 0x1B= prints as =^[=, matching the escape
+  sequence from the empirical test above), =DEL 0x7F= as =^?=, and any byte
+  with the high bit set as =M-= followed by the same notation applied to the
+  low 7 bits. This is an original, from-scratch implementation -- it is not
+  ported from, or checked against, any =cat= source. =cat -v='s *output* on
+  the finding-1 test file (§ above) is the reference for what the rendering
+  should look like, the same way an external tool's man page or observed
+  behavior is a spec, not a codebase to read: match what it prints, not how
+  it gets there.
+
+Tab and newline stay untouched because pretty-printed WKT/PROJJSON is
+routinely multi-line and indented (§ DESIGN) -- escaping those would make
+=--escape= mangle the normal, non-adversarial case for every input, not just
+the crafted ones.
+
+*This breaks the verbatim contract by design, and only when passed.*
+=--escape='s output is for a human eyeballing a suspicious file at a
+terminal -- the exact case finding 1's attack scenario describes -- not for
+piping. =--print-crs --escape | geoscribe --identify= is not a supported
+shape and does not need to round-trip; a reader who wants the pipeline
+behavior simply does not pass the flag. § CONTRACTS records this split below.
+
+*** ESCAPE MATCHES =cat -v= IN THE C LOCALE (2026-08-19)
+§ DECISIONS specifies the high-bit rule as "=M-= followed by the same notation
+applied to the low 7 bits", and names =cat -v='s *output* as the reference. The
+implementation matches it byte-for-byte on the finding-1 file -- verified by
+diffing against =cat -v= directly, not by reading any =cat= source.
+
+One thing the check turned up, worth recording because it will otherwise look
+like a bug: *=cat -v= is locale-dependent on macOS.* Under a UTF-8 locale, BSD
+=cat= passes valid multibyte through untouched (=Réunion= stays =Réunion=);
+under =LC_ALL=C= it renders =RM-CM-)union=, which is what this implementation
+does unconditionally. So the reference comparison has to fix the locale, and
+anyone eyeballing an accented CRS name will see =M-= sequences where their
+shell's =cat -v= shows the accent.
+
+That is the right behavior here and the spec is unchanged: the flag's job is
+"show me every byte that is not plain ASCII", and making output depend on the
+environment is the same mistake § DECISIONS already rejected in refusing an
+=isatty= branch -- a script exercised interactively must not print differently
+in production. It is another reason the flag is display-only and never the
+default. Noted in =escape_control_bytes='s doc comment and asserted in its unit
+tests.
+
+** CONTRACTS
+- *Verbatim*: without =--escape=, stdout is byte-identical to the definition
+  text the source recorded, modulo the single trailing newline.
+  Round-tripping =--print-crs= into =--crs -= on the same file must be a
+  no-op.
+- *=--escape= is display-only and opt-in.* Off by default, changes rendering
+  of control bytes only (never which text is reported), and explicitly does
+  not preserve round-trip identity -- it exists for a human at a terminal, not
+  a pipeline stage.
+- *Empty stdout + nonzero = nothing to report.* Never a partial, never a
+  placeholder, never a synthesized definition.
+- *Never translates.* The dialect on stdout is whichever the source recorded.
+- *One CRS per invocation.* More than one distinct CRS among the selected layers
+  is an error, not a delimited stream.
+- *Diagnostic only.* Converts nothing, writes no output file, rejects =--crs=.
+
+** MILESTONES
+0. *Done (2026-08-19)*: verbatim capture in the readers -- =crate::json::raw_at=,
+   =parse_crs=, =parse_native_geometry_crs=, =from_definition_text=, and =.prj=
+   trimming (§ DECISIONS). Everything below now has a byte-exact definition to
+   print; before it, milestone 2 could not have honored § CONTRACTS.
+1. *Done (2026-08-19)*: =Mode::PrintCrs= in =cli.rs= + arg-conflict rules
+   (=--crs=, output path), matching =Mode::PrintCrsCode='s existing conflict
+   tests in =cli.rs=. The two printing flags were also made mutually exclusive
+   -- both write to stdout, so asking for both has no answer to give -- and
+   every conflict message now names the flag actually passed rather than its
+   sibling.
+2. *Done (2026-08-19)*: =print_crs= in =main.rs=, alongside =print_crs_code=:
+   same GeoPackage fan-out (factored into =read_crs_sources=, so the two
+   diagnostics cannot drift on which layers are in scope), PROJJSON-before-WKT
+   selection (=Crs::definition_body=, which states the rule where it lives),
+   distinct-CRS check naming the offending layers, and both failure messages.
+   The known limitation is recorded in =print_crs='s doc comment, per
+   § OPEN QUESTIONS.
+3. *Done (2026-08-19)*: =--escape= -- =cli.rs= conflict rule (valid only with
+   =--print-crs=) and the =cat -v=-style rendering pass over =print_crs='s
+   output (§ DECISIONS). See § ESCAPE MATCHES =cat -v= IN THE C LOCALE below
+   for the one thing the empirical check turned up.
+4. *Done (2026-08-19)*: every § TESTING item is covered, with nothing gated or
+   ignored. Both three-stage pipes run against the real =geoscribe= binary --
+   the WKT one (=.prj= -> =--print-crs= -> =--identify --projjson= -> =--crs -=)
+   and, once =geoscribe/plans/projjson-identify.org= landed the same day, the
+   *GeoParquet* one. The ambiguity-composition case uses a genuinely ambiguous
+   input rather than a simulated empty stdin.
+
+   The GeoParquet pipeline test builds its input by *converting an Esri
+   Shapefile* rather than hand-rolling a fixture -- see § Closed 2026-08-19 on
+   why such a file exists at all -- and asserts the precondition explicitly
+   (=--print-crs-code= reports nothing) so it cannot quietly stop testing the
+   id-less case. The tests locate =geoscribe= in the workspace's own build
+   output first and fall back to =PATH=, so =cargo test --workspace= exercises
+   the code just built rather than whatever happens to be installed, while a
+   standalone geosetta build still skips cleanly.
+5. *Done (2026-08-19)*: usage text + =README= pipeline example. The
+   =geoscribe --identify= stage is shown but not privileged -- =projinfo
+   -o PROJJSON -q @file= appears in the same USAGE block, and the prose says
+   plainly that =gdalsrsinfo= reads the same stdout. =--escape= is documented as
+   the terminal-safe option, with the round-trip caveat stated rather than
+   implied.
+
+   Every command added to the =README= was run before it was written down: all
+   four (=--print-crs=, =--print-crs --escape=, the three-stage pipe, and the
+   =projinfo @file= alternative) execute against
+   =tests/fixtures/duckdb_crs_pt.shp= converted to GeoParquet, and the
+   =geoscribe= README's example output is the binary's real output pasted back.
+
+   Also updated beyond the milestone's letter, because the change made them
+   wrong: § ROADMAP's "restoring it properly belongs in geoscribe" (it now
+   does), =geoscribe='s own =README= (=--identify= was described as WKT-only)
+   and its =src/lib.rs= header, and three broken rustdoc intra-doc links -- two
+   of mine, plus a pre-existing one in =geopackage/writer.rs= that was failing
+   =cargo doc --workspace= outright.
+
+** TESTING
+Extend =tests/crs_external.rs=, which already covers the =--crs= /
+=--print-crs-code= pair end to end.
+
+- *Round-trip identity*: =--print-crs= output fed back through =--crs -= on the
+  same source produces a byte-identical conversion. This is the verbatim
+  contract's real test.
+- *Per-format coverage*: GeoParquet (PROJJSON), GeoPackage and FlatGeobuf (WKT),
+  Shapefile (=.prj= WKT -- and its output must match the =.prj= file's own bytes,
+  which is a sharp check on "verbatim").
+- *Both fields set* → PROJJSON, asserted directly rather than incidentally.
+- *Nothing to report*: a code-only source, and a WGS 84 source, each exit nonzero
+  with empty stdout and a stderr message naming =--print-crs-code=.
+- *Multi-layer GeoPackage*: two layers with different CRSes errors and names
+  =--layer=; two layers sharing one CRS prints it once.
+- *=--escape=*: a definition body containing =ESC=, =DEL=, and a high-bit byte
+  renders as =^[=, =^?=, and =M-<...>= respectively; tab and newline in a
+  pretty-printed PROJJSON body pass through untouched; without the flag the
+  same input reproduces the raw bytes (the finding-1 regression test --
+  literally the crafted WKT used to check =gdalsrsinfo=, § DECISIONS).
+  =--escape= without =--print-crs= is a =cli.rs= conflict-rule test, not a
+  runtime one.
+- *The full three-stage pipe*, against the real =geoscribe= binary, once
+  =geoscribe/plans/projjson-identify.org= lands -- an id-less GeoParquet through
+  =--print-crs= → =--identify --projjson= → =--crs -=. Gated on =geoscribe= being
+  on =PATH=, like the existing =projinfo= case.
+- *Ambiguity composes*: when =geoscribe= exits 2 with empty stdout, the pipe must
+  fail loudly at geosetta's existing empty-=--crs= hard error
+  (=an_empty_override_is_rejected_rather_than_treated_as_no_override=), not
+  silently no-op.
+
+** OPEN QUESTIONS
+*** Open
+Nothing.
+
+*** Closed 2026-08-19
+- *Should FlatGeobuf/GeoPackage id-less WKT flow through this too? -- yes, and
+  it needs no fixture of its own.* Three reasons, and the question turned up a
+  bug worth more than the fixture would have been.
+
+  *There is nothing format-specific left to test.* =--print-crs= reads
+  =Crs::definition_body=, three lines that see only a =NamedCrs=; every format
+  has collapsed into the same IR before the flag runs. A checked-in =.fgb= or
+  =.gpkg= would be testing whether the *reader* recovers WKT, which each
+  reader's own tests already cover. The behavior is covered end to end anyway,
+  by fixtures built in-test at milestone 4 --
+  =a_flatgeobuf_wkt_definition_prints_verbatim= for FlatGeobuf, and the two
+  multi-layer cases for GeoPackage, all on id-less WKT.
+
+  *The "do such files exist" half is answered for FlatGeobuf*, by the same route
+  that answered it for GeoParquet: =geosetta x.shp x.fgb= from an Esri
+  Shapefile produces one, and =--print-crs-code= on the result reports nothing
+  and exits 1. So there is no file to go hunting for and none to check in --
+  it is one conversion away, which is how the cross-repo pipeline test builds
+  its input.
+
+  *GeoPackage's half is answered the other way, and that is the finding.* A
+  GeoPackage *cannot* be id-less: =gpkg_spatial_ref_sys= requires an =srs_id=
+  on every row, so a WKT-only CRS is written with organization =NONE= and a
+  synthetic id. That made =--print-crs-code= report =NONE:100000= -- a code
+  geosetta invented, that no registry can match, presented as an identity. See
+  § Failure mode for what it broke and how it is fixed. Recording that
+  asymmetry is worth more to a future reader than a fixture: the two WKT
+  formats behave differently here, and only one of them can produce the input
+  this plan is about.
+
+- *Is there a real id-less GeoParquet file? -- yes, and this crate makes one.*
+  The 2026-08-18 entry below downgraded this to a caveat on the reasoning that
+  PROJ/GDAL/=projinfo= always emit a root =id=. True, and beside the point:
+  *geosetta* is also a writer. Converting an Esri Shapefile to GeoParquet emits
+  PROJJSON with no root =id=, because an Esri =.prj= has no =AUTHORITY= node for
+  =Crs::from_authority_code= to lift and =crs/wkt_projjson.rs= does not invent
+  one. Verified with =tests/fixtures/duckdb_crs_pt.shp=: the resulting
+  =.parquet= reports nothing from =--print-crs-code= (exit 1) and its full
+  id-less definition from =--print-crs=.
+
+  What this changes: § MILESTONES' recorded limitation narrows. The
+  single-CRS GeoParquet path is now exercised against a file a real toolchain
+  produces, not only a constructed one, and the cross-repo end-to-end test can
+  be built from a Shapefile with no hand-rolled fixture. The multi-layer and
+  dialect-precedence caveats stand unchanged (GeoPackage records WKT, and no
+  reader fills both dialects -- § DESIGN).
+- *Naming: =--print-crs=, not =--print-crs-def=.* The short name goes to the
+  fuller thing. The definition body *is* the CRS; the code is a reference to
+  it -- =Crs::from_authority_code= (=src/crs.rs:99=) lifts the code *out of*
+  the body -- so =--print-crs-code= is a narrowing of =--print-crs=, and the
+  longer flag naming the more specific output is the ordinary convention. This
+  is the same argument § REJECTED already made in deriving the two-flag pair.
+
+  Three things settled it against =-def=. *It would leave the most natural
+  spelling unclaimed*: =--print-crs= is the first thing a user types, and under
+  =-def= it hits =unknown option= (=src/cli.rs:130=) -- a namespace hole
+  exactly where the obvious name goes. *"def" is itself ambiguous in this
+  domain*: definition, default, deferred -- and "default CRS" is a live concept
+  in this very plan (§ DECISIONS on GeoJSON's implicit WGS 84 default, the case
+  where =--print-crs= prints nothing), so =--print-crs-def= reads plausibly as
+  "print the CRS default". That is a *worse* misread than the vague one =-def=
+  was meant to prevent, because it is semantically coherent rather than merely
+  underspecified. *And the misread it protects against is cheap*: ask for the
+  code and get a WKT blob, or ask for the body and get =EPSG:7844= -- both fail
+  visibly and instantly, costing one re-run. Three characters on every
+  invocation forever is the wrong trade against that.
+
+  No parser hazard either way: =cli.rs='s arg loop is an exact
+  =match arg.as_str()= with no prefix abbreviation, so =--print-crs= and
+  =--print-crs-code= coexist unambiguously. The choice was readability alone.
+
+*** Closed 2026-08-18
+- *Does =geoscribe --identify= absorb the inline-id case? -- yes.* Settled as
+  option (a) in =geoscribe/plans/projjson-identify.org= § DECISIONS. The
+  two-branch shell fallback in § Failure mode collapses into one unconditional
+  pipe, and =--print-crs= becomes the only geosetta-side flag this pipeline
+  needs. =--identify= reports on stderr which evidence it used (trusted inline
+  id vs. ellipsoid-validated name match); stdout is unchanged, so nothing about
+  this flag's contract moves. Document the pipeline in its single-branch form.
+- *Is there a real id-less GeoParquet file? -- downgraded from a precondition
+  to a caveat.* Still unconfirmed, and the evidence says it will probably stay
+  that way: PROJ/GDAL/=projinfo= always emit a root =id=, and this crate's own
+  =parquet::geo::parse_crs= (=src/parquet/geo.rs:121=) maps an absent or null
+  =crs= to =Crs::Wgs84=, so the ordinary "no CRS" case is the WGS 84 case
+  handled in § DECISIONS -- not an id-less definition at all.
+
+  It does not gate the flag. =--print-crs='s justification does not actually
+  rest on that file: it closes an obvious asymmetry in the diagnostic pair
+  (=--print-crs-code= reports the identity, nothing reports the body) and it is
+  the producing half of the round-trip contract. Both stand on their own. What
+  the missing file genuinely leaves unvalidated is narrower -- the multi-layer
+  and field-precedence decisions above are checked against constructed fixtures
+  only. Record that as a known limitation at milestone 2 rather than blocking
+  on an input that may not exist.
+
+*** Settled
+- The flag is =--print-crs=, not =--print-crs-def= (§ Closed 2026-08-19).
+- FlatGeobuf and GeoPackage need no fixtures of their own; a placeholder =NONE=
+  authority is not an identity to report (§ Closed 2026-08-19).
+- =--escape= renders high-bit bytes unconditionally, matching =cat -v= in the C
+  locale rather than a UTF-8 one (§ ESCAPE MATCHES, 2026-08-19).
+- The IR stores definitions verbatim; the readers were fixed to actually do
+  so rather than the contract being softened (§ DECISIONS, 2026-08-19).
+- The pipeline is single-branch: =--identify= absorbs the inline-id case
+  (§ Closed 2026-08-18).
+- A real id-less GeoParquet file is a caveat, not a precondition
+  (§ Closed 2026-08-18).
+- Three flags → two (§ REJECTED: a third "full definition" flag).
+- Verbatim, never translated (§ REJECTED: dialect selection).
+- WGS 84 exits nonzero here while =--print-crs-code= exits 0 (§ DECISIONS).
+- Multi-layer is an error, not a delimited stream (§ DESIGN).
+- Terminal escape sequences: default output stays raw and unfiltered,
+  matching GDAL's own CLI tools on this exact input; protection is opt-in via
+  =--escape=, a =cat -v=-alike, rather than an =isatty= default (§ DECISIONS).

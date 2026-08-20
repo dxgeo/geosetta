@@ -74,12 +74,13 @@ fn main() {
 fn run() -> Result<()> {
     let args = cli::parse(std::env::args())?;
 
-    // `--print-crs-code` reads a source and reports on it: no output, no
-    // conversion. It returns before every write-side path below, GeoPackage's
-    // included (that container's multi-layer read has its own answer for what
-    // to report — see `print_crs_code`).
+    // The `--print-crs*` flags read a source and report on it: no output, no
+    // conversion. They return before every write-side path below, GeoPackage's
+    // included (that container's multi-layer read has its own answer for what to
+    // report — see `print_crs_code` and `print_crs`).
     let out = match &args.mode {
         cli::Mode::PrintCrsCode => return print_crs_code(&args),
+        cli::Mode::PrintCrs => return print_crs(&args),
         cli::Mode::Convert { output, to } => Output { path: output, format: *to },
     };
 
@@ -214,26 +215,16 @@ fn apply_crs_override(layers: &mut [(String, FeatureCollection)], crs: &Crs) -> 
 /// yields exactly one line for a `$(...)` substitution, and `--layer` narrows
 /// anything else. Empty stdout with a nonzero exit means there was genuinely
 /// nothing to report — no CRS at all, or one with no authority code (an id-less
-/// WKT). Note that a GeoJSON or KML source is *not* that case: its spec fixes it
-/// at WGS 84, so it has a real identity that simply isn't written in the file
-/// (see `Crs::authority_code`).
+/// WKT, or a GeoPackage's placeholder `NONE` id, which
+/// [`Crs::authority_code`] declines to report because geosetta invented it).
+/// Note that a GeoJSON or KML source is *not* that case: its spec fixes it at
+/// WGS 84, so it has a real identity that simply isn't written in the file (see
+/// `Crs::authority_code`).
 fn print_crs_code(args: &cli::Args) -> Result<()> {
-    let sources: Vec<FeatureCollection> = if args.from == Format::Gpkg {
-        let input = read_bytes(&args.input)?;
-        let mut layers = geopackage::read_layers(&input)?;
-        if let Some(name) = &args.layer {
-            layers.retain(|(n, _)| n == name);
-            if layers.is_empty() {
-                return Err(Error::Usage(format!("no layer named \"{name}\"")));
-            }
-        }
-        layers.into_iter().map(|(_, fc)| fc).collect()
-    } else {
-        vec![read_input(args)?]
-    };
+    let sources = read_crs_sources(args)?;
 
     let mut codes: Vec<String> = Vec::new();
-    for fc in &sources {
+    for (_, fc) in &sources {
         if let Some(code) = fc.crs.as_ref().and_then(Crs::authority_code)
             && !codes.contains(&code)
         {
@@ -243,8 +234,9 @@ fn print_crs_code(args: &cli::Args) -> Result<()> {
     if codes.is_empty() {
         return Err(Error::Usage(format!(
             "{}: no CRS authority code to report — the source carries no CRS, or one with no \
-             authority and code (an id-less WKT definition). Supply a definition with --crs \
-             instead of asking for a code to resolve.",
+             authority and code (an id-less WKT definition, or a GeoPackage's placeholder \
+             NONE id). Use --print-crs to print the definition itself, or supply one with \
+             --crs, instead of asking for a code to resolve.",
             io_label(&args.input, "stdin"),
         )));
     }
@@ -252,6 +244,192 @@ fn print_crs_code(args: &cli::Args) -> Result<()> {
         println!("{code}");
     }
     Ok(())
+}
+
+/// The collections a `--print-crs*` diagnostic should report on, each paired
+/// with its layer name when the source has them.
+///
+/// GeoPackage is the only multi-layer container, so it fans out (narrowed by
+/// `--layer`, which errors rather than silently reporting nothing when the name
+/// matches no layer); every other format is one collection, tagged `None`. Both
+/// diagnostics read exactly this set, so neither can drift from the other on
+/// which layers are in scope.
+fn read_crs_sources(args: &cli::Args) -> Result<Vec<(Option<String>, FeatureCollection)>> {
+    if args.from != Format::Gpkg {
+        return Ok(vec![(None, read_input(args)?)]);
+    }
+    let input = read_bytes(&args.input)?;
+    let mut layers = geopackage::read_layers(&input)?;
+    if let Some(name) = &args.layer {
+        layers.retain(|(n, _)| n == name);
+        if layers.is_empty() {
+            return Err(Error::Usage(format!("no layer named \"{name}\"")));
+        }
+    }
+    Ok(layers
+        .into_iter()
+        .map(|(name, fc)| (Some(name), fc))
+        .collect())
+}
+
+/// `--print-crs`: write the CRS *definition text* the source recorded to stdout,
+/// verbatim, and exit without converting anything.
+///
+/// The companion to `print_crs_code`, and its complement: that flag reports the
+/// source's *identity* so an external tool can resolve it, which structurally
+/// cannot work for a definition carrying no authority code. This one hands over
+/// the definition itself, which is exactly what a name-recovery tool needs
+/// (`geoscribe --identify`, `projinfo @file`) — closing the case where the tool
+/// that could identify an id-less definition could not reach it.
+///
+/// Output is byte-identical to what the source recorded, plus one trailing
+/// newline: geosetta does not reformat, re-indent, re-order, or re-dialect a
+/// definition it never interprets, so piping this into `--crs -` on the same
+/// file is a no-op. **PROJJSON wins when a source carries both dialects** — see
+/// [`Crs::definition_body`], which states the rule and why.
+///
+/// Empty stdout with a nonzero exit means there was genuinely nothing to print,
+/// the same contract `print_crs_code` keeps. Note that the two flags disagree
+/// about a GeoJSON or KML source, and correctly: its spec fixes it at WGS 84, so
+/// it has an identity to report but recorded no text to quote.
+///
+/// Unlike a code, a definition body can span multiple lines, so more than one
+/// distinct definition among the selected layers is an error rather than a
+/// delimited stream — there is no record separator geosetta could invent that a
+/// receiver would already know how to split on.
+///
+/// Known limitation, per `plans/crs-definition-output.org`: the multi-layer and
+/// dialect-precedence paths are exercised against constructed fixtures only. No
+/// real-world file carrying an id-less definition has been confirmed to exist
+/// (PROJ/GDAL always emit a root `id`), so the shape of one is reasoned about
+/// rather than observed.
+fn print_crs(args: &cli::Args) -> Result<()> {
+    let sources = read_crs_sources(args)?;
+
+    // Distinct definitions in layer order, each tagged with the first layer that
+    // carried it, so the multi-CRS error can name what to pass to `--layer`.
+    let mut bodies: Vec<(&str, Option<&str>)> = Vec::new();
+    for (layer, fc) in &sources {
+        if let Some(body) = fc.crs.as_ref().and_then(Crs::definition_body)
+            && !bodies.iter().any(|(seen, _)| *seen == body)
+        {
+            bodies.push((body, layer.as_deref()));
+        }
+    }
+
+    match bodies.as_slice() {
+        [] => Err(nothing_to_print(args, &sources)),
+        [(body, _)] => {
+            if args.escape {
+                println!("{}", escape_control_bytes(body));
+            } else {
+                println!("{body}");
+            }
+            Ok(())
+        }
+        many => Err(Error::Usage(format!(
+            "{}: the selected layers carry {} different CRS definitions, and a definition \
+             body can span several lines — there is no unambiguous way to print more than \
+             one. Narrow to a single layer with --layer ({}).",
+            io_label(&args.input, "stdin"),
+            many.len(),
+            many.iter()
+                .filter_map(|(_, layer)| *layer)
+                .map(|l| format!("\"{l}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ))),
+    }
+}
+
+/// Render the bytes that would act on a terminal so they are read instead of
+/// obeyed — `--escape`, and only `--escape`.
+///
+/// A definition body is arbitrary content from an arbitrary input file, so a
+/// crafted `name` can carry ANSI/OSC sequences that a terminal interprets:
+/// title-bar spoofing, cursor manipulation. `--print-crs` prints raw anyway by
+/// default, which is the same call `cat` and GDAL's own CLI tools make and what
+/// the round-trip contract requires (see
+/// `plans/crs-definition-output.org` § DECISIONS). This is the opt-in escape
+/// hatch for the other case: a human eyeballing a file they do not trust.
+///
+/// The notation is `cat -v`'s, matched against its observed *output* rather
+/// than ported from any implementation of it:
+///
+/// - C0 controls become `^` plus the byte XOR `0x40`, so `ESC` (`0x1B`) reads
+///   as `^[` and `BEL` (`0x07`) as `^G`.
+/// - `DEL` (`0x7F`) becomes `^?`.
+/// - A byte with the high bit set becomes `M-` plus the same notation applied
+///   to its low seven bits.
+///
+/// **Tab and newline pass through untouched.** Pretty-printed WKT and PROJJSON
+/// are routinely multi-line and indented, so escaping those would mangle every
+/// ordinary input rather than only the crafted ones — which would make the flag
+/// useless for the very case it exists to serve.
+///
+/// One consequence worth knowing: this is byte-oriented, like `cat -v`, so a
+/// non-ASCII character in a legitimate CRS name (`Réunion`, `Bogotá` — EPSG is
+/// full of them) renders as `M-` sequences too. That is correct for a flag whose
+/// job is "show me every byte that is not plain ASCII", and it is another reason
+/// this is display-only and never the default.
+fn escape_control_bytes(text: &str) -> String {
+    /// `b` in caret notation, for a byte already known to need it.
+    fn caret(b: u8, out: &mut String) {
+        if b == 0x7F {
+            out.push_str("^?");
+        } else {
+            out.push('^');
+            out.push((b ^ 0x40) as char);
+        }
+    }
+
+    let mut out = String::with_capacity(text.len());
+    for &b in text.as_bytes() {
+        match b {
+            // The two whitespace bytes a definition legitimately contains.
+            b'\t' | b'\n' => out.push(b as char),
+            0x00..=0x1F | 0x7F => caret(b, &mut out),
+            0x80.. => {
+                out.push_str("M-");
+                let low = b & 0x7F;
+                match low {
+                    0x00..=0x1F | 0x7F => caret(low, &mut out),
+                    _ => out.push(low as char),
+                }
+            }
+            _ => out.push(b as char),
+        }
+    }
+    out
+}
+
+/// The error for a `--print-crs` that found no definition text, which is two
+/// genuinely different situations and says which.
+///
+/// A source whose CRS is the format's implicit WGS 84 default recorded no
+/// definition *because the format never writes one* — `--print-crs-code` reports
+/// `OGC:CRS84` for it and exits 0, and that code resolves trivially, so the
+/// message sends the user there rather than implying the file is deficient.
+/// Anything else — no CRS at all, or an authority and code with no definition
+/// text beside it — is the ordinary "nothing to report" case.
+fn nothing_to_print(args: &cli::Args, sources: &[(Option<String>, FeatureCollection)]) -> Error {
+    let label = io_label(&args.input, "stdin");
+    if sources
+        .iter()
+        .any(|(_, fc)| fc.crs.as_ref() == Some(&Crs::Wgs84))
+    {
+        return Error::Usage(format!(
+            "{label}: no CRS definition body to print — the source's CRS is the format's \
+             implicit WGS 84 default, which it records no definition for. Use \
+             --print-crs-code (prints {}) and resolve that instead.",
+            geosetta::WGS84_CRS_CODE,
+        ));
+    }
+    Error::Usage(format!(
+        "{label}: no CRS definition body to print — the source carries no CRS, or carries \
+         only an authority and code with no definition text beside it. Use --print-crs-code \
+         to report the code and resolve that instead."
+    ))
 }
 
 /// Read the input into the Feature IR. Shapefile is multi-file, so its
@@ -476,9 +654,11 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
     if args.progress {
         let verb = if existing.is_some() { "appending to" } else { "writing" };
         let idx = if args.rtree { " (+rtree index)" } else { "" };
-        eprintln!("{verb} {}{idx}...", io_label(out.path, "stdout"));
+        let env = if args.envelope { " (+envelopes)" } else { "" };
+        eprintln!("{verb} {}{idx}{env}...", io_label(out.path, "stdout"));
     }
-    let bytes = geopackage::write_layers(existing.as_deref(), &new_layers, args.rtree)?;
+    let bytes =
+        geopackage::write_layers(existing.as_deref(), &new_layers, args.rtree, args.envelope)?;
     write_bytes(out.path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", io_label(out.path, "stdout"), bytes.len());
     Ok(())
@@ -549,4 +729,53 @@ fn layer_stem(path: &str) -> String {
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "layer".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn escape_renders_the_bytes_that_would_act_on_a_terminal() {
+        // The three notations, on the sequence `stdout-security.org` finding 1
+        // actually used: an OSC title-bar spoof (ESC + BEL) inside a CRS name.
+        assert_eq!(
+            escape_control_bytes("GEOGCRS[\"EVIL\u{1b}]0;PWNED\u{7}NAME\"]"),
+            "GEOGCRS[\"EVIL^[]0;PWNED^GNAME\"]"
+        );
+        // Both ends of the C0 range, and DEL, which is not in it.
+        assert_eq!(escape_control_bytes("\u{0}\u{1}\u{1f}\u{7f}"), "^@^A^_^?");
+    }
+
+    #[test]
+    fn escape_leaves_tab_and_newline_alone() {
+        // Pretty-printed WKT and PROJJSON are routinely multi-line and indented,
+        // so escaping these would mangle every ordinary input rather than only
+        // the crafted ones.
+        let pretty = "{\n\t\"type\": \"GeographicCRS\",\n\t\"name\": \"WGS 84\"\n}";
+        assert_eq!(escape_control_bytes(pretty), pretty);
+        // But a carriage return is neither, and does move a terminal's cursor.
+        assert_eq!(escape_control_bytes("a\rb"), "a^Mb");
+    }
+
+    #[test]
+    fn escape_renders_high_bit_bytes_in_m_notation() {
+        // Byte-oriented, like `cat -v` in the C locale: `é` is two high-bit
+        // bytes (0xC3 0xA9) and reads as `M-C M-)`. Verified against
+        // `LC_ALL=C cat -v` directly, which is the reference this matches —
+        // macOS's own `cat -v` under a UTF-8 locale passes valid multibyte
+        // through instead, so a reader comparing the two must fix the locale.
+        assert_eq!(escape_control_bytes("Réunion"), "RM-CM-)union");
+        // The two notations compose when a high-bit byte's low seven bits are
+        // themselves a control byte: U+0080 encodes as `C2 80`, and `80 & 7F`
+        // is NUL, so the second byte reads `M-` + `^@`.
+        assert_eq!(escape_control_bytes("\u{80}"), "M-BM-^@");
+    }
+
+    #[test]
+    fn escape_is_the_identity_on_ordinary_definition_text() {
+        // The overwhelmingly common case must cost nothing and change nothing.
+        let wkt = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]]]"#;
+        assert_eq!(escape_control_bytes(wkt), wkt);
+    }
 }

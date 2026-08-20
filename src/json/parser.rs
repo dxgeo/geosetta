@@ -19,6 +19,26 @@ pub fn parse(input: &str) -> Result<JsonValue> {
     Ok(value)
 }
 
+/// The verbatim source text of the value at `path` — the exact bytes `input`
+/// recorded, never a re-serialization of a parsed tree.
+///
+/// `path` is a chain of object keys descending from the document root; an
+/// empty path selects the root value itself. Whitespace *around* the value is
+/// excluded and whitespace *inside* it is preserved, so the slice is precisely
+/// the value as written: indentation, member order, and number spelling all
+/// survive. `Ok(None)` means the path is absent, or crosses something that
+/// isn't an object — a normal outcome, not a parse failure.
+///
+/// This exists because some values have to be carried through byte-for-byte
+/// rather than round-tripped. A CRS definition is the case that forced it (see
+/// [`crate::crs::NamedCrs::projjson`]): re-serializing it would restyle text
+/// this crate promises to pass through untouched, and geosetta has no business
+/// reformatting a definition it never interprets.
+pub fn raw_at<'a>(input: &'a str, path: &[&str]) -> Result<Option<&'a str>> {
+    let mut p = Parser::new(input);
+    Ok(p.raw_span(path)?.map(|(start, end)| &input[start..end]))
+}
+
 /// A streaming JSON cursor. Exposed within the crate so specialized readers
 /// (e.g. the GeoJSON reader) can drive it directly — parsing structure by hand
 /// and dipping into [`Parser::parse_value`] only where arbitrary JSON is needed
@@ -105,6 +125,49 @@ impl<'a> Parser<'a> {
             Some(b'-') | Some(b'0'..=b'9') => self.parse_number(),
             Some(_) => Err(self.err("unexpected character")),
             None => Err(self.err("unexpected end of input")),
+        }
+    }
+
+    /// Byte range of the value at `path`, consuming only as much input as
+    /// locating it requires — the engine behind [`raw_at`], which see.
+    ///
+    /// Mirrors [`Parser::parse_object`]'s member loop deliberately rather than
+    /// reusing it: the point is to *not* build a [`JsonValue`], so members off
+    /// the path are skipped rather than materialized, and the one on the path
+    /// is measured rather than kept.
+    fn raw_span(&mut self, path: &[&str]) -> Result<Option<(usize, usize)>> {
+        self.skip_ws();
+        let Some((key, rest)) = path.split_first() else {
+            let start = self.pos;
+            self.parse_value()?;
+            return Ok(Some((start, self.pos)));
+        };
+        if self.peek() != Some(b'{') {
+            return Ok(None);
+        }
+        self.pos += 1;
+        self.skip_ws();
+        if self.peek() == Some(b'}') {
+            return Ok(None);
+        }
+        loop {
+            self.skip_ws();
+            if self.peek() != Some(b'"') {
+                return Err(self.err("expected string key"));
+            }
+            let found = self.parse_string()?;
+            self.skip_ws();
+            self.expect(b':')?;
+            if found == *key {
+                return self.raw_span(rest);
+            }
+            self.skip_value()?;
+            self.skip_ws();
+            match self.bump() {
+                Some(b',') => continue,
+                Some(b'}') => return Ok(None),
+                _ => return Err(self.err("expected ',' or '}'")),
+            }
         }
     }
 
@@ -317,6 +380,88 @@ mod tests {
             }
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn raw_at_returns_the_source_bytes_not_a_reprint() {
+        // The whole point: a pretty-printed value comes back with its own
+        // whitespace and number spelling intact, which `to_json_string` — a
+        // compact serializer — could never reproduce.
+        let doc = "{\n  \"crs\": {\n    \"name\": \"WGS 84\",\n    \"a\": 6378137.0\n  }\n}";
+        let raw = raw_at(doc, &["crs"]).unwrap().unwrap();
+        assert_eq!(
+            raw,
+            "{\n    \"name\": \"WGS 84\",\n    \"a\": 6378137.0\n  }"
+        );
+        assert_ne!(
+            raw,
+            parse(doc).unwrap().get("crs").unwrap().to_json_string()
+        );
+    }
+
+    #[test]
+    fn raw_at_excludes_the_whitespace_framing_a_value() {
+        // Whitespace *around* the value is not part of it; whitespace *inside*
+        // it is. An empty path measures the document's root value, which is how
+        // a caller holding a standalone definition trims it exactly.
+        assert_eq!(
+            raw_at("  { \"a\" : 1 }  ", &[]).unwrap().unwrap(),
+            "{ \"a\" : 1 }"
+        );
+        assert_eq!(
+            raw_at(r#"{"a":   [1, 2]   }"#, &["a"]).unwrap().unwrap(),
+            "[1, 2]"
+        );
+        assert_eq!(raw_at("\n\t\"bare\"\n", &[]).unwrap().unwrap(), "\"bare\"");
+    }
+
+    #[test]
+    fn raw_at_descends_a_path_and_skips_what_is_off_it() {
+        // Members before, between, and after the sought key are skipped whole,
+        // including ones that contain the key at another depth.
+        let doc =
+            r#"{"x":{"crs":"decoy"},"columns":{"geometry":{"enc":"WKB","crs":{"id":7}}},"z":[1]}"#;
+        let raw = raw_at(doc, &["columns", "geometry", "crs"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw, r#"{"id":7}"#);
+    }
+
+    #[test]
+    fn raw_at_reports_an_absent_path_rather_than_failing() {
+        // A missing key, an empty object, and a path that runs into a non-object
+        // are all "not there" — a normal answer, distinct from malformed input.
+        let doc = r#"{"a":{"b":1},"c":[]}"#;
+        assert_eq!(raw_at(doc, &["nope"]).unwrap(), None);
+        assert_eq!(raw_at(doc, &["a", "nope"]).unwrap(), None);
+        assert_eq!(
+            raw_at(doc, &["c", "b"]).unwrap(),
+            None,
+            "an array is not an object"
+        );
+        assert_eq!(
+            raw_at(doc, &["a", "b", "deeper"]).unwrap(),
+            None,
+            "a number is not an object"
+        );
+        assert_eq!(raw_at("{}", &["a"]).unwrap(), None);
+        assert!(
+            raw_at("{oops}", &["a"]).is_err(),
+            "malformed is an error, not None"
+        );
+    }
+
+    #[test]
+    fn raw_at_agrees_with_get_on_a_duplicated_key() {
+        // `JsonValue::get` takes the first match, so the slice must too, or the
+        // id lifted from the parsed value would describe different bytes than
+        // the ones stored beside it.
+        let doc = r#"{"crs":{"first":1},"crs":{"second":2}}"#;
+        assert_eq!(raw_at(doc, &["crs"]).unwrap().unwrap(), r#"{"first":1}"#);
+        assert_eq!(
+            parse(doc).unwrap().get("crs").unwrap().to_json_string(),
+            r#"{"first":1}"#
+        );
     }
 
     #[test]

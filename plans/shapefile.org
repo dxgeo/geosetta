@@ -230,20 +230,60 @@ but inverted: GPKG is "1 file → N layers," Shapefile is "N files → 1 layer."
   itself (=crs.rs='s =downgrade_warning=/=rich_format_name=, =cli.rs=) — adding
   the variant means updating all of them; the compiler will find every site.
 
-** CRS INTEGRATION — this *is* =crs-registry.org='s R4
-Once this reader exists:
-- R2's geographic name-recovery (already shipped, validated at 327/431 = 76%
-  resolved / *zero wrong* on a 431-fixture bulk oracle of real ESRI geographic
-  CRSes) works on real =.prj= text with *zero new CRS code* — it activates the
-  moment =.prj= bytes reach =Crs::from_authority_code=.
-- *Projected* Esri =.prj= recovery — deferred when R2 was originally scoped,
-  pending real fixtures to measure it against — shipped 2026-08-12:
-  =resolve_projected_by_name= in =crs/registry.rs=, validated by a
-  =tests/fixtures/esri_projected_wkt1.tsv= bulk oracle (all 2,274 native ESRI
-  projected CRSes in =proj.db=) at 2185/2274 (96%) resolved, zero wrong. See
-  =crs-registry.org='s R2 for the full writeup.
-- =.prj= *writing* is a new consumer of R1's =registry::def_wkt=, which has
-  existed since R1 but had no caller until this spoke.
+** CRS INTEGRATION — this *was* =crs-registry.org='s R4
+*Rewritten 2026-08-19. As scoped, this section described the embedded registry
+this crate no longer has* — =crs-registry= and its sibling-crate dependency were
+removed in 0.24.0, taking =crs/registry.rs= with them. What it said had shipped
+is now history, kept below because the *numbers* are still the best measurement
+of what name recovery from Esri =.prj= text is worth, and because the capability
+did not die — it moved.
+
+What this spoke actually does with a CRS today:
+
+- *Reading* a =.prj= is verbatim and registry-free. =shapefile/reader.rs= trims
+  the file's framing whitespace and hands the text to
+  =Crs::from_authority_code=, which lifts an inline =AUTHORITY=/=ID= node when
+  the WKT has one and otherwise carries the definition through untouched. An
+  Esri =.prj= has no such node, so it arrives as a =NamedCrs= with a =wkt= and
+  no code — which is exactly the input the identification story below is for.
+- *Writing* a =.prj= no longer consults a registry either. =prj_wkt= prefers the
+  source's own verbatim WKT (including one supplied with =--crs=), falling back
+  to a structural PROJJSON→WKT translation (=NamedCrs::structural_wkt=) for a
+  PROJJSON-only source. R1's =registry::def_wkt=, named here as this spoke's
+  first consumer, no longer exists.
+- *Name recovery lives in =geoscribe= now*, reached over a pipe rather than
+  linked in (=geoscribe/plans/wkt-identify.org=, and
+  =geoscribe/plans/projjson-identify.org= for the other dialect). It is
+  strictly better than what R2 shipped: it validates every name match against
+  the definition's own ellipsoid, and where several real CRSes fit equally well
+  it reports *all* of them instead of taking the first in name order.
+
+*** The R2 measurements, as history
+Both oracles were run against this spoke's own fixtures, which is why they were
+recorded here; the fixtures moved to =geoscribe/tests/fixtures/= with the
+capability.
+
+| corpus                              | R2 answered            | geoscribe today                              |
+|-------------------------------------+------------------------+----------------------------------------------|
+| 431 real ESRI *geographic* =.prj=   | 327/431 (76%)          | 321 unique + 110 ambiguous, *0 unidentified* |
+| 2,274 real ESRI *projected* =.prj=  | 2196/2274 (97%)        | 1383 unique + 891 ambiguous, *0 unidentified* |
+
+*The projected figure was 2185 here until 2026-08-19; it is 2196.* Re-measuring
+R2's own rule against the same fixtures (=geoscribe='s =geosetta_0_23_pick=, a
+faithful reimplementation kept for exactly this comparison) answers 2196. The
+missing 11 are the ones =crs-registry.org= R1 documents as hitting a =projinfo
+--identify= gap — real answers that the *oracle* could not confirm, not answers
+R2 declined to give. 2185 was the oracle-confirmed count and 2196 is the
+answered count; this table wants the second, and said the first.
+
+Two things the comparison still hides. R2's "answered" counted a *pick* — it
+took the first candidate in =NAMES= order, so a large share were one of several
+equally-supported CRSes chosen by sort order (109 geographic and 890 projected,
+measured by =geoscribe='s census over these same fixtures). And geoscribe's
+zero-unidentified column is newer than the move: until 2026-08-19 it declined on
+104 geographic and 78 projected fixtures, because the shared ellipsoid extractor
+could read neither spheres nor non-metre axes. Both rules were *zero wrong*
+throughout, which was always the bar that mattered.
 
 ** SUGGESTED ORDER (read-first, mirrors every prior spoke)
 1. =.dbf= reader (simplest — no endianness gotchas; testable in isolation

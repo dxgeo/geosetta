@@ -24,7 +24,7 @@ Design priorities for the project, in order. Geosetta aims to be:
 - Dependency-free
 
 ** STATUS
-Current version: *0.24.0*.
+Current version: *0.25.0*.
 
 Eight formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -33,7 +33,11 @@ every other automatically — no per-pair code. Any input converts to any output
 validated against DuckDB / GDAL.
 
 - *GeoJSON* (read + write)
-- *GeoParquet* (read + write; reads common foreign files — see below)
+- *GeoParquet* (read + write; reads common foreign files — see below). The
+  =geo= metadata's =bbox= is written in the spec's six-element 3D form
+  (=[minx,miny,minz,maxx,maxy,maxz]=) whenever the data carries Z, and the 2D
+  four-element form otherwise — matching GDAL's own bytes, with one *deliberate
+  divergence* on mixed 2D/3D input (see below).
 - *FlatGeobuf* (read + write) on a from-scratch FlatBuffers reader and builder;
   written with a *packed Hilbert R-tree* spatial index (GDAL bbox queries work)
 - *CSV* with a WKT geometry column (read + write), types lightly inferred
@@ -45,7 +49,10 @@ validated against DuckDB / GDAL.
   output passes SQLite's =integrity_check= and is read by GDAL. An opt-in
   =--rtree= flag also writes the GeoPackage RTree extension (SQLite's R*Tree
   virtual table, built from scratch); the index passes =rtreecheck()= and
-  answers GDAL/DuckDB bbox queries.
+  answers GDAL/DuckDB bbox queries. A second opt-in flag, =--envelope=, caches
+  each geometry's bounding box in the GPB header (the format's optional
+  per-geometry envelope), matching GDAL's own bytes ordinate for ordinate —
+  see [[file:plans/envelope.org][plans/envelope.org]].
 - *Shapefile* (read + write) — the first multi-file spoke: sibling
   =.shp=/=.shx=/=.dbf=/=.prj=(/=.cpg=) files sharing a basename. A from-scratch
   mixed-endian =.shp=/=.shx= geometry codec (with real ring classification —
@@ -137,6 +144,26 @@ are reported as clear errors and tracked in
 multiple geometry columns specifically,
 [[file:plans/multi-geometry-columns.org][plans/multi-geometry-columns.org]]).
 
+*A deliberate divergence from GDAL: mixed 2D/3D collections.* On input mixing
+2D and 3D features, GDAL *promotes* the 2D geometries on write —
+=LINESTRING (0 0, 10 10)= is stored as =LINESTRING Z (0 0 0, 10 10 0)= — while
+folding its =geo= =bbox='s =minz= from the originally-3D features alone. The
+result is a bbox that does not cover the Z values GDAL itself just wrote, and
+it errs *small*, which is the direction that costs query results: GDAL trusts
+the =bbox= over the coordinates, so a too-small one makes =ogrinfo -spat=
+silently drop features that really intersect.
+
+Geosetta does not promote. A 2D geometry stays 2D through a GeoParquet write,
+so folding the Z range from the positions that actually carry a Z is *exact*
+for our files. The emitted bytes match GDAL's on the same input; what differs
+is that ours describe the file's real contents. The invariant we hold to is
+that the bbox Z range must cover every Z ordinate actually written — a
+too-large range only costs speed, a too-small one loses rows — and a unit test
+asserts it against the positions rather than against literal numbers, so
+introducing promote-on-write would fail the test rather than silently inherit
+GDAL's bug. Reasoning and the full empirical trail:
+[[file:plans/envelope.org][plans/envelope.org]].
+
 ** IMPLEMENTATION
 Language: Rust (edition 2024). Every wire format is implemented from its
 specification rather than pulled from a crate:
@@ -173,7 +200,9 @@ specification rather than pulled from a crate:
   from =gpkg_contents=, GeoPackage Binary geometry wrapping WKB, and
   create-or-append (upsert) writes. =geopackage/rtree.rs= builds the opt-in RTree
   extension: a packed R*Tree in SQLite's node blob format, its shadow tables,
-  and the maintenance triggers
+  and the maintenance triggers. =writer.rs='s =gpb_envelope= emits the GPB
+  header's optional per-geometry envelope under =--envelope=
+  ([[file:plans/envelope.org][plans/envelope.org]])
 - =compress/= :: format-agnostic =bytes -> bytes= codecs implemented from spec —
   Snappy, GZIP/DEFLATE (RFC 1951/1952), ZSTD (RFC 8878, FSE + Huffman +
   sequences), and LZ4 block. Not Parquet-specific, so reusable by future formats
@@ -215,6 +244,7 @@ geosetta input.gpkg    out/ --to geojson # multi-layer GeoPackage -> one file pe
 geosetta roads.geojson data.gpkg        # create data.gpkg with layer "roads"
 geosetta rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
 geosetta roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
+geosetta roads.geojson data.gpkg --envelope # …caching each geometry's bbox in its GPB header
 geosetta big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
 geosetta big.geojson   big.parquet --progress      # report each stage on stderr
 geosetta aus.gpkg      aus.geojson --quiet         # silence lossy-conversion warnings (on by default)
@@ -282,7 +312,11 @@ produce in practice (see STATUS). The next steps, in rough priority:
   primitives, the FlatGeobuf packed R-tree, the opt-in =--sort-hilbert= row
   clustering, and the opt-in =--rtree= GeoPackage R*Tree extension (scoped in
   [[file:plans/spatial-index.org][plans/spatial-index.org]]). Whether =--rtree=
-  should be the default is the one open question there.
+  should be the default is the one open question there. Alongside it,
+  =--envelope= caches each geometry's own bbox in its GPB header
+  ([[file:plans/envelope.org][plans/envelope.org]]) — a per-geometry cache
+  rather than an index, and opt-in for the same reason: it is a
+  size/query optimization, not a correctness requirement.
 - *More format spokes* — Shapefile and KML/KMZ are both done (see above),
   scoped in [[file:plans/kml.org][plans/kml.org]]. The next classic candidate
   is a further-out consideration, not yet scoped.
@@ -389,7 +423,7 @@ US-survey-foot case, each at 100%) and real =ogrinfo= reading a Geosetta-written
 =.prj= end to end
 ([[file:plans/projjson-to-wkt.org][plans/projjson-to-wkt.org]]).
 
-*** External CRS resolution: =--print-crs-code= and =--crs= (implemented, 0.24.0)
+*** External CRS resolution: =--print-crs-code=, =--print-crs=, and =--crs= (implemented; the printing pair completed 2026-08-19)
 Structural translation alone can't resolve every CRS — a source may carry only a
 bare authority code, with no definition to translate into the target's dialect.
 Geosetta's answer is not to embed a copy of PROJ's registry but to *compose*:
@@ -399,9 +433,22 @@ Geosetta's answer is not to embed a copy of PROJ's registry but to *compose*:
   source *has* an identity, never only when geosetta judges resolution to be
   needed, because a flag whose output is meant to be piped has to be
   predictable. Empty stdout and a nonzero exit mean there was genuinely nothing
-  to report: no CRS at all, or a definition with no id in it. A GeoJSON or KML
-  source is *not* that case — its spec fixes it at WGS 84, so it has a real
-  identity that simply isn't written in the file, and it reports =OGC:CRS84=.
+  to report: no CRS at all, a definition with no id in it, or a GeoPackage's
+  placeholder =NONE= id (that container must give every CRS an =srs_id=, so
+  geosetta invents one for a WKT-only CRS — reporting it would hand a resolver a
+  code geosetta made up). A GeoJSON or KML source is *not* that case — its spec
+  fixes it at WGS 84, so it has a real identity that simply isn't written in the
+  file, and it reports =OGC:CRS84=.
+- =geosetta <input> --print-crs= reports the CRS *definition body* the source
+  recorded — the sibling flag, for the case the one above structurally cannot
+  serve. Output is the source's own bytes, verbatim, plus one newline: no
+  re-indenting, no re-ordering, no translating between WKT and PROJJSON, so
+  piping it into =--crs -= on the same file is a no-op by construction. PROJJSON
+  wins if a source somehow carries both. Because that output is a file's own
+  bytes, a crafted CRS name can carry terminal escape sequences; geosetta prints
+  them raw as =cat= and GDAL's CLI tools do, and =--escape= is the opt-in
+  =cat -v=-alike for reading an untrusted file at a terminal (display-only, not
+  round-trip safe).
 - =geosetta <input> <output> --crs <path|->= reads WKT (either dialect) or
   PROJJSON and installs it as the output CRS. Dialect is sniffed on the first
   non-whitespace byte; the identity is lifted exactly as a reader would lift it,
@@ -442,8 +489,8 @@ the two cases want different tools:
   id at all): =--print-crs-code= has nothing to report here, so the pipeline
   above does not apply — the CRS has to be *identified* from its name and
   structure first, which is weaker evidence than an id. =geoscribe --identify=
-  does exactly that (validating the name against the WKT's own ellipsoid), and
-  its output is a definition, so it pipes straight in:
+  does exactly that (validating the name against the definition's own
+  ellipsoid), and its output is a definition, so it pipes straight in:
 
   #+begin_src sh
   geoscribe --identify --projjson parcels.prj \
@@ -456,8 +503,27 @@ the two cases want different tools:
   the pipeline fails loudly instead of writing a mislabeled file. Run
   =geoscribe --identify --all= to see the candidates and choose. =projinfo
   --identify= serves the same role with confidence percentages if you prefer to
-  adjudicate by eye. Geosetta needed no changes for any of this — =--crs=
-  already takes arbitrary text; see
+  adjudicate by eye.
+
+  A =.prj= needed no geosetta change at all — it is loose WKT on disk, so
+  =geoscribe= opens it directly and =--crs= already took arbitrary text. *Every
+  other format does*, because it keeps its CRS inside a container no resolver
+  can open: point =--identify= at a =.parquet= and it fails on the bytes, not
+  the CRS. That is what =--print-crs= exists for, and with it the loop is one
+  unconditional command whether or not the definition carries an id
+  (=geoscribe --identify= uses one when present and says on stderr which
+  evidence it used):
+
+  #+begin_src sh
+  geosetta parcels.parquet --print-crs \
+    | geoscribe --identify --projjson \
+    | geosetta parcels.parquet parcels.fgb --crs -
+  #+end_src
+
+  Such a file is not hypothetical: converting an Esri Shapefile to GeoParquet
+  produces one, since there is no id to lift and the crosswalk does not invent
+  one. See
+  [[file:plans/crs-definition-output.org][plans/crs-definition-output.org]] and
   [[file:plans/crs-external-resolution.org::*CROSS-REPO FOLLOW-UP][§ CROSS-REPO FOLLOW-UP]].
 
 *** Reprojection composability (implemented)

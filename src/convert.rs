@@ -834,7 +834,7 @@ mod tests {
             wkt: Some("PROJCS[\"Web Mercator\"]".into()),
             projjson: None,
         }));
-        let gpkg = crate::geopackage::write_layers(None, &[("l".into(), src)], false).unwrap();
+        let gpkg = crate::geopackage::write_layers(None, &[("l".into(), src)], false, false).unwrap();
         let layers = crate::geopackage::read_layers(&gpkg).unwrap();
         let fgb = flatgeobuf::write(&layers[0].1);
         let back = flatgeobuf::read(&fgb).unwrap();

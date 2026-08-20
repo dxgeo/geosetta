@@ -4,7 +4,7 @@
 //! See the GeoParquet specification: it records the version, the primary
 //! geometry column, and per-column encoding / geometry types / bbox.
 
-use crate::crs::{crs_from_projjson_value, Crs};
+use crate::crs::{crs_from_projjson, crs_from_projjson_text, Crs};
 use crate::geometry::Bbox;
 use crate::json::JsonValue;
 
@@ -16,7 +16,26 @@ const GEOPARQUET_VERSION: &str = "1.1.0";
 /// Render the `geo` metadata JSON.
 ///
 /// `geometry_types` is the sorted, de-duplicated set of geometry type names
-/// present; `bbox` is included only when non-empty. `crs` is written as the
+/// present; `bbox` is included only when non-empty.
+///
+/// The `bbox` is written in GeoParquet's 3D form —
+/// `[minx, miny, minz, maxx, maxy, maxz]`, all mins then all maxes — whenever
+/// any position carried a Z, and in the 2D four-element form otherwise. That
+/// length switch matches what GDAL writes. M is never included: GeoParquet's
+/// bbox has no M form, and an envelope bounds *space*, not a linear-referencing
+/// measure (see `plans/envelope.org`).
+///
+/// The Z range covers only positions that actually carried a Z, which is
+/// [`Bbox`]'s standing mixed-dimensionality rule. On mixed input this
+/// deliberately differs from GDAL, which promotes 2D geometries to Z=0 on write
+/// but folds its `minz` from the originally-3D features alone — leaving a bbox
+/// that does not cover the Z=0 values it just wrote. Geosetta preserves 2D
+/// geometry as 2D, so folding real Zs only is exact here. The invariant to hold
+/// on to, whichever way a future writer goes, is that the Z range must cover
+/// every Z ordinate actually written: a too-large bbox costs only speed, while
+/// a too-small one makes a trusting reader silently drop matching rows.
+///
+/// `crs` is written as the
 /// GeoParquet `crs` member (a PROJJSON object): it is *omitted* for the default
 /// (`Crs::Wgs84`/`None`), which GeoParquet reads as OGC:CRS84, and emitted
 /// verbatim when the source carried PROJJSON.
@@ -53,10 +72,21 @@ pub fn metadata(geometry_types: &[String], bbox: &Bbox, crs: Option<&Crs>) -> St
         s.push_str(&fmt_num(bbox.min_x));
         s.push(',');
         s.push_str(&fmt_num(bbox.min_y));
+        // The 3D form interleaves: all mins, then all maxes. Verified against
+        // real GDAL output, not inferred from the 2D case — and deliberately
+        // *not* GPB's per-dimension `minx,maxx,miny,maxy,minz,maxz` pairing.
+        if let Some((min_z, _)) = bbox.z {
+            s.push(',');
+            s.push_str(&fmt_num(min_z));
+        }
         s.push(',');
         s.push_str(&fmt_num(bbox.max_x));
         s.push(',');
         s.push_str(&fmt_num(bbox.max_y));
+        if let Some((_, max_z)) = bbox.z {
+            s.push(',');
+            s.push_str(&fmt_num(max_z));
+        }
         s.push(']');
     }
     if let Some(Crs::Named(named)) = crs
@@ -125,7 +155,20 @@ pub fn parse_crs(geo: &str) -> Option<Crs> {
     match column.get("crs") {
         // Absent or explicit null → the GeoParquet default, OGC:CRS84.
         None | Some(JsonValue::Null) => Some(Crs::Wgs84),
-        Some(crs) => Some(crs_from_projjson_value(crs)),
+        // The parsed value supplies the `id`; the definition itself is sliced
+        // straight out of `geo` so it survives byte-for-byte. `raw_at` walks
+        // the same path the navigation above did and so finds the same value —
+        // the fallback exists only so a disagreement would cost formatting
+        // rather than the whole CRS.
+        Some(crs) => {
+            let raw = crate::json::raw_at(geo, &["columns", primary, "crs"])
+                .ok()
+                .flatten();
+            Some(match raw {
+                Some(raw) => crs_from_projjson(crs, raw),
+                None => crs_from_projjson(crs, &crs.to_json_string()),
+            })
+        }
     }
 }
 
@@ -141,7 +184,7 @@ pub fn parse_crs(geo: &str) -> Option<Crs> {
 pub fn parse_native_geometry_crs(crs_projjson: Option<&str>) -> Option<Crs> {
     match crs_projjson {
         None => Some(Crs::Wgs84),
-        Some(s) => crate::json::parse(s).ok().map(|v| crs_from_projjson_value(&v)),
+        Some(s) => crs_from_projjson_text(s).ok(),
     }
 }
 
@@ -174,6 +217,64 @@ mod tests {
     }
 
     #[test]
+    fn writes_six_element_bbox_when_z_is_present() {
+        let mut bbox = Bbox::empty();
+        bbox.add(Position::with_z(0.0, 0.0, 0.0));
+        bbox.add(Position::with_z(20.0, 10.0, 10.0));
+        let json = metadata(&["LineString Z".to_string()], &bbox, None);
+        // All mins, then all maxes — the layout real GDAL output was checked
+        // against, and *not* GPB's per-dimension pairing.
+        assert!(json.contains("\"bbox\":[0,0,0,20,10,10]"), "{json}");
+    }
+
+    #[test]
+    fn m_never_reaches_the_bbox() {
+        // GeoParquet's bbox has no M form at all, so an M-carrying collection
+        // still writes the plain 2D four-element box.
+        let mut bbox = Bbox::empty();
+        bbox.add(Position::with_m(1.0, 2.0, 100.0));
+        bbox.add(Position::with_m(3.0, 4.0, 200.0));
+        let json = metadata(&["LineString M".to_string()], &bbox, None);
+        assert!(json.contains("\"bbox\":[1,2,3,4]"), "{json}");
+        assert!(!json.contains("100"), "M leaked into the bbox: {json}");
+    }
+
+    #[test]
+    fn mixed_dimensionality_bbox_covers_every_z_actually_written() {
+        // The invariant, asserted as an invariant rather than as literal
+        // numbers: the Z range must contain every Z ordinate in the data. This
+        // is what makes folding real Zs only (rather than GDAL's promote-to-0)
+        // safe, and it is what would trip if a future writer started promoting
+        // 2D geometry to Z=0 without widening the fold to match.
+        let positions = [
+            Position::new(0.0, 0.0),
+            Position::new(10.0, 10.0),
+            Position::with_z(100.0, 100.0, 50.0),
+            Position::with_z(110.0, 110.0, 60.0),
+        ];
+        let mut bbox = Bbox::empty();
+        for p in positions {
+            bbox.add(p);
+        }
+        let json = metadata(
+            &["LineString".to_string(), "LineString Z".to_string()],
+            &bbox,
+            None,
+        );
+        assert!(json.contains("\"bbox\":[0,0,50,110,110,60]"), "{json}");
+
+        let (min_z, max_z) = bbox.z.expect("some position carried a Z");
+        for p in positions {
+            if let Some(z) = p.z {
+                assert!(
+                    z >= min_z && z <= max_z,
+                    "z {z} escapes the written bbox range {min_z}..{max_z}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn omits_empty_bbox() {
         let json = metadata(&[], &Bbox::empty(), None);
         assert!(!json.contains("bbox"));
@@ -200,6 +301,79 @@ mod tests {
                 assert_eq!(n.code.as_deref(), Some("3857"));
                 assert!(n.projjson.is_some());
             }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_pretty_printed_definition_survives_byte_for_byte() {
+        // The verbatim contract, and the reason `parse_crs` slices `geo` rather
+        // than re-printing the parsed value: this crate's serializer is compact,
+        // so a round trip through it would silently reformat a definition
+        // geosetta never interprets and has no business restyling.
+        let projjson = "{\n  \"type\": \"GeographicCRS\",\n  \"name\": \"GDA2020\",\n  \
+                        \"id\": {\n    \"authority\": \"EPSG\",\n    \"code\": 7844\n  }\n}";
+        let geo = format!(
+            "{{\"version\":\"1.1.0\",\"primary_column\":\"geometry\",\"columns\":\
+             {{\"geometry\":{{\"encoding\":\"WKB\",\"crs\":{projjson}}}}}}}"
+        );
+        match parse_crs(&geo).unwrap() {
+            Crs::Named(n) => {
+                assert_eq!(n.projjson.as_deref(), Some(projjson), "not byte-identical");
+                // The id is still lifted from the parse — verbatim storage does
+                // not cost the identity.
+                assert_eq!(n.authority.as_deref(), Some("EPSG"));
+                assert_eq!(n.code.as_deref(), Some("7844"));
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_definitions_own_spelling_of_its_numbers_survives() {
+        // Number formatting is where a re-print diverges most quietly: `6378137.0`
+        // and `1e2` both parse to an f64 whose `Display` spells it differently.
+        // Verbatim means the file's spelling, not Rust's.
+        let projjson = r#"{"type":"GeographicCRS","a":6378137.0,"rf":2.982572e2}"#;
+        let geo = format!(
+            "{{\"version\":\"1.1.0\",\"primary_column\":\"geometry\",\"columns\":\
+             {{\"geometry\":{{\"crs\":{projjson}}}}}}}"
+        );
+        match parse_crs(&geo).unwrap() {
+            Crs::Named(n) => assert_eq!(n.projjson.as_deref(), Some(projjson)),
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_verbatim_definition_re_emits_unchanged_through_the_writer() {
+        // Read → write is a no-op on the definition text, which is what makes
+        // a geosetta-to-geosetta GeoParquet round trip lossless on the CRS.
+        let projjson = "{\n  \"type\": \"ProjectedCRS\",\n  \"name\": \"custom\"\n}";
+        let geo = format!(
+            "{{\"version\":\"1.1.0\",\"primary_column\":\"geometry\",\"columns\":\
+             {{\"geometry\":{{\"crs\":{projjson}}}}}}}"
+        );
+        let crs = parse_crs(&geo).unwrap();
+        let rewritten = metadata(&["Point".to_string()], &Bbox::empty(), Some(&crs));
+        assert!(
+            rewritten.contains(projjson),
+            "definition was restyled: {rewritten}"
+        );
+        assert_eq!(
+            parse_crs(&rewritten),
+            Some(crs),
+            "and it survives a second pass"
+        );
+    }
+
+    #[test]
+    fn the_native_logical_type_keeps_its_definition_verbatim_too() {
+        // The other PROJJSON entry point: here the field already *is* the
+        // definition text, so verbatim costs nothing but must still be honored.
+        let projjson = "{\n  \"type\": \"GeographicCRS\",\n  \"name\": \"WGS 84 / custom\"\n}";
+        match parse_native_geometry_crs(Some(projjson)).unwrap() {
+            Crs::Named(n) => assert_eq!(n.projjson.as_deref(), Some(projjson)),
             other => panic!("expected Named, got {other:?}"),
         }
     }

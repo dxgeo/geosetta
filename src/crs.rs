@@ -65,7 +65,10 @@ pub struct NamedCrs {
     pub code: Option<String>,
     /// Verbatim WKT (WKT1 or WKT2) definition, if the source recorded one.
     pub wkt: Option<String>,
-    /// Verbatim PROJJSON definition, if the source recorded one.
+    /// Verbatim PROJJSON definition, if the source recorded one — the source's
+    /// own bytes, not a re-serialization: indentation, member order, and number
+    /// spelling all survive, since geosetta never interprets a definition and
+    /// so has no business restyling one. `--print-crs` rests on this.
     pub projjson: Option<String>,
 }
 
@@ -80,6 +83,15 @@ pub struct NamedCrs {
 /// and [`Crs::from_authority_code`]'s id lift collapses it straight back to
 /// [`Crs::Wgs84`].
 pub const WGS84_CRS_CODE: &str = "OGC:CRS84";
+
+/// The organization name a format writes when a CRS has no real authority —
+/// GeoPackage's `gpkg_spatial_ref_sys` convention, and what
+/// `geopackage::writer` emits alongside a synthetic `srs_id`.
+///
+/// It is a placeholder, not an authority: no registry has ever issued a code
+/// under it. [`NamedCrs::authority_code`] treats it as absent so a synthesized
+/// pair is never reported as a resolvable identity.
+pub(crate) const SYNTHETIC_AUTHORITY: &str = "NONE";
 
 impl Crs {
     /// Interpret an authority + code as a [`Crs`], collapsing the well-known
@@ -150,7 +162,7 @@ impl Crs {
             None => Err(Error::Usage(
                 "--crs: the CRS definition is empty; expected WKT or PROJJSON text".into(),
             )),
-            Some(b'{') => Ok(crs_from_projjson_value(&crate::json::parse(text)?)),
+            Some(b'{') => crs_from_projjson_text(text),
             Some(_) if is_crs_wkt(text) => {
                 Ok(Crs::from_authority_code(None, None, Some(text.to_string()), None))
             }
@@ -182,6 +194,35 @@ impl Crs {
         match self {
             Crs::Wgs84 => Some(WGS84_CRS_CODE.to_string()),
             Crs::Named(n) => n.authority_code().map(|(a, c)| format!("{a}:{c}")),
+        }
+    }
+
+    /// The CRS *definition text* this source recorded, verbatim — what
+    /// `--print-crs` writes to stdout, and `None` when there is nothing recorded
+    /// to write.
+    ///
+    /// **PROJJSON wins when a source carries both.** A stated rule rather than
+    /// incidental field order: it is the strictly less ambiguous of the two (no
+    /// WKT1-vs-WKT2 dialect question, no Esri-flavor spelling problem), and it
+    /// is the form the recovery tools on the other end of a pipe parse most
+    /// readily.
+    ///
+    /// [`Crs::Wgs84`] returns `None`, which is the opposite answer
+    /// [`Crs::authority_code`] gives it — deliberately. That variant is
+    /// fieldless because the formats that imply it write no definition at all,
+    /// so there is a real identity to report (`OGC:CRS84`) and no text to quote.
+    /// Synthesizing one would mean inventing a definition, and geosetta has no
+    /// registry and no business inventing one; the tool on the other end of the
+    /// pipe is what has both. `--print-crs-code` answers "what is this?" and
+    /// `--print-crs` answers "what did the file literally say?" — for WGS 84 the
+    /// file said nothing.
+    ///
+    /// The returned text is the source's own bytes (see [`NamedCrs::projjson`]),
+    /// so a caller may hand it onward unmodified.
+    pub fn definition_body(&self) -> Option<&str> {
+        match self {
+            Crs::Wgs84 => None,
+            Crs::Named(n) => n.projjson.as_deref().or(n.wkt.as_deref()),
         }
     }
 
@@ -335,8 +376,28 @@ impl NamedCrs {
     /// external resolver. Unlike `label`, which produces prose for
     /// warnings (`code 3857`, `the source CRS`), this is a contract: `None`
     /// rather than a partial answer.
+    ///
+    /// **A `NONE` authority is not an identity.** GeoPackage's
+    /// `gpkg_spatial_ref_sys` requires an `srs_id` on every row, so a CRS that
+    /// arrives with only a WKT definition still has to be given one to be
+    /// written at all — `geopackage::writer` records organization `NONE` and a
+    /// synthetic id (`SYNTHETIC_SRS_BASE`, 100000 upward). Reading that file
+    /// back recovers the pair verbatim, and reporting `NONE:100000` to a
+    /// resolver would hand it a code no registry can ever match, because
+    /// geosetta invented it.
+    ///
+    /// So it reads as absent here, which puts such a CRS in the same bucket as
+    /// an id-less WKT: nothing for `--print-crs-code`, and the definition body
+    /// for `--print-crs`, which is the flag that actually helps. The *fields*
+    /// are untouched — the writers still round-trip the synthetic id through a
+    /// GeoPackage — since this is about what may be reported as an identity,
+    /// not about what is stored.
     pub fn authority_code(&self) -> Option<(&str, &str)> {
-        Some((self.authority.as_deref()?, self.code.as_deref()?))
+        let authority = self.authority.as_deref()?;
+        if authority.eq_ignore_ascii_case(SYNTHETIC_AUTHORITY) {
+            return None;
+        }
+        Some((authority, self.code.as_deref()?))
     }
 
     /// Whether GeoParquet can record this CRS *resolvably*. It speaks PROJJSON,
@@ -402,14 +463,36 @@ impl NamedCrs {
 /// and in the native `GEOMETRY` logical type) and by
 /// [`Crs::from_definition_text`], so a `--crs` override and a file's own CRS
 /// recover their identity by one rule rather than two.
-pub(crate) fn crs_from_projjson_value(crs: &JsonValue) -> Crs {
+///
+/// `raw` is the definition's own source text, which becomes
+/// [`NamedCrs::projjson`] untouched — *not* `crs.to_json_string()`. The parsed
+/// value is read for the `id` and nothing else. Splitting the two is what makes
+/// the stored definition byte-identical to what the source wrote: this crate's
+/// serializer is compact, so re-printing a pretty-printed definition would
+/// silently strip its formatting, and `--print-crs` promises the opposite.
+pub(crate) fn crs_from_projjson(crs: &JsonValue, raw: &str) -> Crs {
     let id = crs.get("id");
     let authority = id
         .and_then(|i| i.get("authority"))
         .and_then(JsonValue::as_str)
         .map(String::from);
     let code = id.and_then(|i| i.get("code")).and_then(json_code_as_string);
-    Crs::from_authority_code(authority, code, None, Some(crs.to_json_string()))
+    Crs::from_authority_code(authority, code, None, Some(raw.to_string()))
+}
+
+/// Recover a [`Crs`] from PROJJSON *text* — the shape every caller that already
+/// holds the definition as a standalone string wants (a `--crs` override, the
+/// Parquet `GEOMETRY` logical type's own `crs` field).
+///
+/// The stored definition is the input's own bytes, less any whitespace framing
+/// it, rather than a re-print of the parse: [`crate::json::raw_at`] with an
+/// empty path measures the root value exactly. Callers whose PROJJSON is nested
+/// inside a larger document pass the enclosing text and a path to
+/// [`crate::json::raw_at`] themselves, then use [`crs_from_projjson`].
+pub(crate) fn crs_from_projjson_text(text: &str) -> Result<Crs> {
+    let value = crate::json::parse(text)?;
+    let raw = crate::json::raw_at(text, &[])?.unwrap_or(text);
+    Ok(crs_from_projjson(&value, raw))
 }
 
 /// A PROJJSON `id.code` value read back as a string, whichever JSON type it
@@ -641,6 +724,119 @@ mod tests {
             Crs::Named(n) => {
                 assert_eq!(n.authority_code(), Some(("EPSG", "7844")));
                 assert!(n.projjson.is_some() && n.wkt.is_none());
+            }
+            other => panic!("expected Named, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_synthetic_none_authority_is_not_reported_as_an_identity() {
+        // GeoPackage must put *some* srs_id on every row, so a WKT-only CRS gets
+        // organization NONE and an invented id. Reporting that pair would hand a
+        // resolver a code geosetta made up, which no registry can ever match.
+        let synthetic = Crs::Named(NamedCrs {
+            authority: Some(SYNTHETIC_AUTHORITY.into()),
+            code: Some("100000".into()),
+            wkt: Some("GEOGCS[\"Datum A\"]".into()),
+            projjson: None,
+        });
+        assert_eq!(
+            synthetic.authority_code(),
+            None,
+            "not a resolvable identity"
+        );
+        // The definition body is what actually helps here, and it is still there.
+        assert_eq!(synthetic.definition_body(), Some("GEOGCS[\"Datum A\"]"));
+
+        // Spelling is not the point; the placeholder is.
+        let lowercase = Crs::Named(NamedCrs {
+            authority: Some("none".into()),
+            code: Some("100000".into()),
+            ..Default::default()
+        });
+        assert_eq!(lowercase.authority_code(), None);
+    }
+
+    #[test]
+    fn a_real_authority_is_still_reported() {
+        // The change must not reach anything but the placeholder.
+        let real = Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some("7844".into()),
+            ..Default::default()
+        });
+        assert_eq!(real.authority_code().as_deref(), Some("EPSG:7844"));
+        // And the fields themselves are untouched, so writers still round-trip
+        // a synthetic id through a GeoPackage.
+        let synthetic = NamedCrs {
+            authority: Some(SYNTHETIC_AUTHORITY.into()),
+            code: Some("100000".into()),
+            ..Default::default()
+        };
+        assert_eq!(synthetic.authority.as_deref(), Some("NONE"));
+        assert_eq!(synthetic.code.as_deref(), Some("100000"));
+    }
+
+    #[test]
+    fn definition_body_prefers_projjson_when_both_dialects_are_present() {
+        // A stated rule, not incidental field order: PROJJSON is the less
+        // ambiguous dialect (no WKT1-vs-WKT2 question, no Esri spelling problem)
+        // and the form the recovery tools downstream parse.
+        //
+        // Asserted here rather than through the CLI because no reader produces
+        // this state — GeoParquet records PROJJSON only, FlatGeobuf/GeoPackage
+        // and a Shapefile `.prj` record WKT only. The rule still has to hold for
+        // whatever fills both next, which is exactly what a unit test is for.
+        let both = Crs::Named(NamedCrs {
+            authority: None,
+            code: None,
+            wkt: Some("GEOGCS[\"D\"]".into()),
+            projjson: Some(r#"{"type":"GeographicCRS","name":"D"}"#.into()),
+        });
+        assert_eq!(
+            both.definition_body(),
+            Some(r#"{"type":"GeographicCRS","name":"D"}"#)
+        );
+    }
+
+    #[test]
+    fn definition_body_falls_back_to_wkt_and_reports_nothing_when_there_is_none() {
+        let wkt_only = Crs::Named(NamedCrs {
+            wkt: Some("GEOGCS[\"D\"]".into()),
+            ..Default::default()
+        });
+        assert_eq!(wkt_only.definition_body(), Some("GEOGCS[\"D\"]"));
+
+        // A code is an identity, not a definition: `--print-crs-code` answers
+        // for this input and `--print-crs` correctly has nothing to say.
+        let code_only = Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some("7844".into()),
+            ..Default::default()
+        });
+        assert_eq!(code_only.definition_body(), None);
+        assert_eq!(code_only.authority_code().as_deref(), Some("EPSG:7844"));
+
+        // And WGS 84 is the deliberate disagreement between the two flags: a
+        // real identity, no recorded text.
+        assert_eq!(Crs::Wgs84.definition_body(), None);
+        assert_eq!(Crs::Wgs84.authority_code().as_deref(), Some(WGS84_CRS_CODE));
+    }
+
+    #[test]
+    fn an_override_keeps_the_definition_the_user_supplied() {
+        // `--crs` text is stored as the user wrote it, framing whitespace aside:
+        // the whole point of the flag is that geosetta accepts a definition some
+        // other tool produced and passes it on without an opinion. Piping a
+        // pretty-printed definition in and getting a compacted one out would be
+        // geosetta editing a definition it never interprets.
+        let pretty = "{\n  \"type\": \"GeographicCRS\",\n  \"name\": \"GDA2020\",\n  \
+                      \"id\": {\n    \"authority\": \"EPSG\",\n    \"code\": 7844\n  }\n}";
+        let padded = format!("\n  {pretty}\n\n");
+        match Crs::from_definition_text(&padded).unwrap() {
+            Crs::Named(n) => {
+                assert_eq!(n.projjson.as_deref(), Some(pretty), "not byte-identical");
+                assert_eq!(n.authority_code(), Some(("EPSG", "7844")));
             }
             other => panic!("expected Named, got {other:?}"),
         }

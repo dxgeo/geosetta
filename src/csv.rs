@@ -52,6 +52,7 @@ pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
         features.push(Feature {
             geometry,
             properties,
+            native: None,
         });
     }
     Ok(FeatureCollection::new(features))
@@ -211,6 +212,7 @@ mod tests {
                         ("name".into(), JsonValue::String("x".into())),
                         ("n".into(), JsonValue::Number { value: 3.0, is_int: true }),
                     ],
+                    native: None,
                 },
                 Feature {
                     geometry: Some(Geometry::Polygon(vec![vec![
@@ -223,6 +225,7 @@ mod tests {
                         ("name".into(), JsonValue::String("y".into())),
                         ("n".into(), JsonValue::Null),
                     ],
+                    native: None,
                 },
             ]);
         let bytes = write(&fc);

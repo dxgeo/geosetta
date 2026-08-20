@@ -1,0 +1,553 @@
+#+TITLE: Inventory: What Each Reader Discards
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Inventory: What Each Reader Discards
+
+** STATUS -- M1's inventory half, complete (2026-08-20)
+All nine spokes inventoried and both caveats closed (2026-08-20). What remains
+is not inventory: a fixture hunt for GeoParquet's =edges=/=epoch=, and the
+hostile fixture per spoke that is M1's other half (§ NOT YET DONE). This is the artifact
+[[file:same-format-fidelity.org][same-format-fidelity.org]] M1 exists to
+produce, and it is also what
+[[file:same-format-output.org][same-format-output.org]] M2 and
+[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] § OPEN
+QUESTION are both blocked on -- hence its own file rather than a section inside
+one of them.
+
+*It is a reference document, not a plan.* No decisions live here; each entry
+records what a reader drops and which class it falls in, so the three plans
+above can be settled against something enumerated instead of imagined.
+
+** METHOD
+Per =plans/README.org= § Sourcing a fixture from a real tool. Each entry is
+marked with how it was established, because the confidence differs:
+- /measured/ -- run against the release binary, output in this file.
+- /code/ -- read from the reader/writer source, with a =file:line=.
+- /unverified/ -- believed from the format spec, *not* yet confirmed against a
+  real producer. Treat as a question, not a finding.
+
+** THE CLASSES
+From =same-format-fidelity.org= D4. Every member gets exactly one:
+- *opaque* -- carry verbatim, understood by nothing.
+- *identity* -- carry verbatim; names and ids that travel with their subject.
+- *derived* -- never replayed. Split by risk: /derived-information/ (a stale
+  one is dangerous) is *recomputed*; /derived-capability/ (a missing one is
+  merely slower) is *rebuilt when the source had it*.
+
+** A FINDING THAT PRECEDES THE TABLE -- two spokes are containers, not one
+=same-format-fidelity.org= § THE DOMAIN OF THE RULE was written about
+GeoPackage. *KMZ is a container on identical terms*, and nobody had said so.
+
+A =.kmz= is a zip that may carry icons, overlays and referenced imagery beside
+its =doc.kml=. Geosetta writes exactly one entry /(measured)/:
+
+#+begin_src text
+$ geosetta src.geojson made.kmz && unzip -l made.kmz
+   doc.kml
+#+end_src
+
+So a source =.kmz= carrying =files/icon.png= loses it, and the surviving
+=doc.kml= keeps its now-dangling reference. Under container scope this is the
+same obligation as =gpkg='s, at a fraction of the cost -- a zip's other entries
+are already bytes, and =src/zip.rs= already reads the archive. *It should get
+its own milestone beside M3b rather than being absorbed into the KML spoke*,
+because the KML spoke is about an XML document and this is about an archive.
+
+** THE INVENTORY
+
+*** GeoJSON -- /code/, =geojson/mod.rs:165=
+The only spoke whose inventory was already known; confirmed and extended.
+
+| member                      | level      | class    |
+|-----------------------------+------------+----------|
+| =id=                        | feature    | identity |
+| =bbox=                      | feature    | derived-information |
+| any foreign member          | feature    | opaque   |
+| =name=                      | collection | identity |
+| =bbox=                      | collection | derived-information |
+| =crs= (pre-RFC 7946)        | collection | identity |
+| any foreign member          | collection | opaque   |
+| any foreign member          | geometry   | opaque   |
+
+=stream_feature='s =_ => p.skip_value()?= arm is the whole mechanism: every key
+that is not =geometry= or =properties= is skipped. The same catch-all exists in
+=stream_geometry= (=mod.rs:242=), so a *geometry-level* foreign member is
+dropped too -- rarer, and not previously listed anywhere.
+
+*** CSV -- /measured/
+CSV has no metadata to lose, which is why =same-format-output.org= reasoned it
+had nothing unmodelled. That reasoning was about *members*. The loss is the
+*lexeme*: the reader infers a type per cell and discards the text it inferred
+from, and the inference is not reversible.
+
+#+begin_src text
+$ cat t.csv
+zip,big,money,flag,geometry
+007,12345678901234567890,1.50,TRUE,"POINT (1 2)"
+
+$ geosetta t.csv - --to fgb | geosetta - - --from fgb --to csv
+zip,big,money,flag,geometry
+7,12345678901234567000,1.5,true,POINT (1 2)
+#+end_src
+
+Four losses in one row, all silent:
+- =007= → =7=. Leading zeros are *data* in this domain -- ZIP, FIPS, census
+  tract, phone.
+- =12345678901234567890= → =12345678901234567000=. Beyond =i64=, so it went
+  through an =f64= and lost precision. This one is a wrong number, not a
+  reformat.
+- =1.50= → =1.5=, =TRUE= → =true=. Reformatting, but a same-format run promised
+  not to.
+
+*Class: opaque, per cell* -- but this is the one entry where the natives
+channel is probably the wrong tool. *A cheaper fix exists and should be
+considered first: infer a type only when re-rendering reproduces the input
+exactly* (=render(parse(s)) == s=), and keep the cell as a string otherwise.
+That resolves all four cases with no payload, no per-cell allocation, and no
+IR change -- and it fails safe, since an un-inferred cell is still a correct
+string property.
+
+*** WKT -- /measured/
+Same lexeme story, plus one hard gap.
+
+| input                       | returns                | note |
+|-----------------------------+------------------------+------|
+| =POINT (1.50 2.00)=         | =POINT (1.5 2)=        | lexeme |
+| =POINT (1e2 3E-1)=          | =POINT (100 0.3)=      | lexeme, notation |
+| =linestring z (...)=        | =LINESTRING Z (...)=   | case; canonical, arguably fine |
+| =MULTIPOINT ((1 2), (3 4))= | =MULTIPOINT (1 2, 3 4)=| dialect form |
+| =POINT EMPTY=               | *rejected*             | see below |
+
+=POINT EMPTY= does not round-trip -- it fails to parse at all:
+
+#+begin_src text
+$ geosetta pr.wkt - --to geojson
+geosetta: conversion error: wkt: expected '('
+#+end_src
+
+*This is the refusal carve-out working as designed* (=same-format-fidelity.org=
+§ A refusal honours the rule): no silent loss, because no run. But =EMPTY= is
+standard OGC WKT, so it is a real capability gap, and one file containing one
+=EMPTY= geometry makes the whole conversion fail. /Unverified/: which real
+producers emit it, and how often. Source a fixture before deciding whether to
+support or keep refusing.
+
+The =MULTIPOINT= row is the interesting one for the invariant: both forms are
+valid WKT and geosetta normalises to the bare one. Under a strict reading that
+is a same-format loss; under a reasonable one it is canonicalisation. *It needs
+a ruling* -- see § QUESTIONS THIS RAISES.
+
+*** FlatGeobuf -- /code/, =flatgeobuf/reader.rs=
+The largest inventory, because FGB's header is rich and the reader defines
+constants for five fields out of fourteen.
+
+=mod header= declares =GEOMETRY_TYPE(2)=, =COLUMNS(7)=, =FEATURES_COUNT(8)=,
+=INDEX_NODE_SIZE(9)=, =CRS(10)=. Everything else in the table is not read:
+
+| field                   | class    | note |
+|-------------------------+----------+------|
+| =name(0)=               | identity | *fixed 2026-08-20* -- modelled as =fc.name=; the writer's =geosetta= constant is gone (defect 4) |
+| =envelope(1)=           | derived-information | writer recomputes it already |
+| =title(11)=             | opaque   | *carried 2026-08-20* |
+| =description(12)=       | opaque   | *carried 2026-08-20* |
+| =metadata(13)=          | opaque   | *carried 2026-08-20*; the one real tools populate |
+| =has_t(5)= / =has_tm(6)=| --       | the T dimension; unmodelled by the IR entirely |
+
+*** FlatGeobuf spoke -- DONE 2026-08-20
+=FgbNative= (=src/native.rs=) carries the header's =title=/=description=/
+=metadata=, the =Crs= sub-table's =name=/=description=/=code_string=, and each
+column's =title=/=description=/=metadata=; =fc.name= models the header name.
+/Measured/ on =gdal_hostile.fgb=, which is real =ogr2ogr= output: reading it
+recovers =name = "cities"=, =metadata = {"GPKG_METADATA_ITEM_1":"<lineage>
+surveyed 2019</lineage>"}= and =crs.name = "WGS 84"=; rewriting it puts all
+three back, and *=ogrinfo= reads the result and reports the same three*, so the
+vtable widening (=header::NUM_FIELDS= 11 → 14) did not break compatibility with
+the reference implementation.
+
+*One member deliberately not carried:* =Feature.columns(2)=, FlatGeobuf's
+per-feature schema override. No observed tool emits one, and it is a *schema*
+rather than a description -- if it ever needs support it belongs with
+=FieldDecl=, not in the native.
+
+*A trap for whoever does the next spoke.* =build_crs= used to open with
+=match crs?=, which returns early when the collection has no CRS. That silently
+dropped the whole =Crs= sub-table -- *including the natives inside it* -- for a
+file whose only CRS content was a name. A test caught it; the fix is that the
+natives count toward "is there anything worth recording".
+
+The nested tables lose more, and this is the part that was not anticipated:
+- *=Crs=*: reader knows =org(0)=, =code(1)=, =wkt(4)=. Discards =name(2)=
+  (identity), =description(3)= (opaque), =code_string(5)= (identity -- the
+  alphanumeric-code case =NamedCrs.code= exists for).
+- *=Column=*: reader knows =name(0)= and =type(1)=. Discards =title=,
+  =description=, =width=, =precision=, =scale=, =nullable=, =unique=,
+  =primary_key=, =metadata= -- *nine fields of per-column schema*. A
+  FlatGeobuf written by a tool that populates them round-trips through geosetta
+  as a bare name/type pair.
+
+  *Six of the nine are now modelled, not opaque* (2026-08-20): =width=,
+  =precision=, =scale=, =nullable=, =unique=, =primary_key= become first-class
+  IR under =same-format-fidelity.org= D1. =title=, =description= and =metadata=
+  stay opaque natives.
+
+  *Implemented 2026-08-20.* Both sides: =reader.rs= =read_decl= fills
+  =FeatureCollection::schema= from slots 4--9, =writer.rs= =write_decl= puts
+  them back. The slot indices were *hand-decoded from real =ogr2ogr= output*
+  rather than read off the schema file, and the decode is worth recording
+  because it is not what the field names suggest:
+
+  | =.dbf= declaration | FlatGeobuf slots written by GDAL |
+  |--------------------+----------------------------------|
+  | =String (80.0)=    | =width(4) = 80=, nothing else    |
+  | =Real (23.15)=     | =precision(5) = 23=, =scale(6) = 15=, *no =width=* |
+  | =NOT NULL UNIQUE=  | =nullable(7) = 0=, =unique(8) = 1= |
+
+  So a *numeric* field's length is a =precision=, not a =width= -- OGR's
+  "width" and FlatGeobuf's =width= are different things for numbers, and
+  =FieldDecl= follows FlatGeobuf's vocabulary because it is the only one of the
+  four spokes that names all six. Also /measured/: GDAL writes =width: 0= for a
+  GeoPackage =TEXT= column, so *zero means undeclared*, not a zero-wide field;
+  reading it as a declaration would pin every downstream field to width 0.
+
+  *This is the load-bearing entry in the whole inventory*, and it did not look
+  like it. Because a native cannot cross a pipe (D5), FlatGeobuf's =Column=
+  table is the *only* place a schema declaration can survive a transit and be
+  edited by a middle stage -- which is what lets
+  =geosetta a.shp - --to fgb | tool | geosetta - b.shp --from fgb= widen a
+  =.dbf= field alongside the value that outgrew it. Every other route either
+  loses the declaration or cannot be reached by an external tool.
+
+Plus the null cell (defect 1), which is a reader bug rather than an unmodelled
+member: the column survives in the header and the value is encoded by omission.
+
+*Except that its second half /is/ an unmodelled member* /(found 2026-08-20,
+reviewing defect 1 -- see =same-format-fidelity.org= § Five defects)./
+Restoring the cell is the reader bug; keeping the column's *declared type* is
+not, because =FieldDecl= has no type field and =infer_columns= defaults an
+all-null column to =String=. So =Column.type(1)= belongs in this inventory
+after all, alongside slots 4--9 -- a *tenth* discarded =Column= field, missed
+because the reader visibly /does/ read it (to decode values) and only drops it
+when a column has no values left to describe. It is the same missing
+affordance as GeoPackage's unread =BOOLEAN= declaration, which is why the two
+defects now ship together.
+
+*And nested objects are stringified* /(measured while building the fixtures)/.
+A GeoJSON property =nested: {"deep":[1,2,{"k":"v"}]}= comes back through FGB as
+the *string* ="{\"deep\":[1,2,{\"k\":\"v\"}]}"=. FGB's column types are
+scalar (=Bool=/=Int64=/=Double=/=String=), so a structured value has nowhere to
+go but a string -- and the reader does not parse it back. Class: opaque, and it
+is the same lexeme problem as CSV once more, since the re-parse is what is
+missing rather than the storage. GeoPackage keeps such values as JSON text too;
+GeoParquet keeps them structured.
+
+*** GeoPackage -- /measured/ + /code/
+Two levels, and decision 2a put both in scope.
+
+*Layer level:*
+| member                                   | class    | note |
+|------------------------------------------+----------+------|
+| declared column type (=BOOLEAN=)          | *modelled* | defect 2; =geopackage/reader.rs= reads storage class, never the declaration. *Reclassified opaque -> modelled 2026-08-20*: it wants a declared type on =FieldDecl=, the same affordance FlatGeobuf's =Column.type(1)= needs |
+| =gpkg_contents.identifier= / =description=| identity | |
+| =gpkg_data_columns= / constraints         | opaque   | |
+
+*Container level* /(measured)/ -- a =.gpkg= with two layers, a user table,
+dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
+| content                          | survives? | class |
+|----------------------------------+-----------+-------|
+| feature layers                   | yes       | -- |
+| =side_notes= (plain user table)  | *no*      | opaque |
+| =gpkg_metadata= / =_reference=   | *no*      | opaque |
+| =gpkg_extensions=                | *no*      | opaque |
+| =gpkg_data_columns= (+constraints)| *no*     | opaque |
+| =gpkg_ogr_contents=              | *no*      | derived-capability |
+| R*Tree tables + triggers (8)     | *no*      | derived-capability |
+| =gpkg_tile_matrix= / =_set=      | *no*      | the § collision -- raster |
+| =gpkg_contents= bboxes           | yes       | derived-information, recomputed correctly |
+
+=--rtree= rebuilds the indexes for every layer and the result passes
+=rtreecheck()= /(measured)/, so the derived-capability half needs a trigger,
+not machinery.
+
+*** KML / KMZ -- /code/, traced; =kml/reader.rs=
+Upgraded from /unverified/ to /code/ by tracing the reader rather than listing
+the spec. The trace found more than the spec list had, because the loss is
+*structural*: =placemark_to_feature= (=reader.rs:66=) reads exactly three
+children -- =<name>=, =<description>=, =<ExtendedData>= -- plus the one
+geometry child =parse_geometry= recognises. It never enumerates the rest, so
+every other element is dropped *by construction*, not by an omission someone
+could patch.
+
+*On a =Placemark=* -- all opaque unless noted:
+=<Style>= / =<StyleMap>= / =styleUrl=, =<Schema>= (=reader.rs:91=,
+=SchemaData='s companion is not chased), =<altitudeMode>= (already in
+=lossy-conversion-warnings.org= § OPEN CANDIDATES), =<TimeStamp>= /
+=<TimeSpan>=, =<Region>= / =<LookAt>= / =<Camera>=, =<visibility>=, =<open>=,
+=<Snippet>=.
+
+*Above the Placemark, and this is the part the spec list missed.*
+=collect_placemarks= (=reader.rs:52=) descends the tree looking for
+=Placemark= and nothing else, so *whole KML features vanish rather than
+degrade*:
+| element                         | class    | note |
+|---------------------------------+----------+------|
+| =<GroundOverlay>=               | opaque   | a *georeferenced image* -- disappears entirely |
+| =<ScreenOverlay>=               | opaque   | |
+| =<NetworkLink>=                 | opaque   | |
+| =<Document>= / =<Folder>= nesting| identity| flattened deliberately (=reader.rs:49=) |
+| document-level =<name>= / =<description>= | identity | the collection's own name |
+
+*A geometry geosetta does not recognise silently yields a feature with no
+geometry.* =parse_geometry= matches =Point=, =LineString=, =Polygon=,
+=MultiGeometry= and returns =None= otherwise -- so a =Placemark= holding a
+=<Model>= or a =gx:Track= still becomes a =Feature=, with =geometry: None= and
+no warning. That is a *silent* drop rather than a refusal, so unlike WKT's
+=POINT EMPTY= it does not get the carve-out's protection. /Unverified/ whether
+=gx:Track= is common enough to matter; =<Model>= is rare.
+
+Plus the type coercion: every property becomes a string /(measured)/ -- =7= →
+="7"=, =true= → ="true"=, =null= → ="="=. The CSV lexeme problem from the other
+direction.
+
+*KMZ additionally loses every zip entry but =doc.kml=* -- see § A FINDING THAT
+PRECEDES THE TABLE.
+
+*** Shapefile -- /measured/ against a real ogr2ogr shapefile
+Round-tripped an =ogr2ogr=-written =.shp= through =geosetta src.shp mid.fgb=
+then =geosetta mid.fgb out.shp= (the direct path is still refused). The write
+side is re-derivation throughout, and one of the losses is the most
+consequential in this whole document.
+
+*Field widths collapse to fit the current data:*
+| field    | source        | after   |
+|----------+---------------+---------|
+| =name=   | String (80.0) | String (1.0) |
+| =price=  | Real (24.15)  | Real (8.6)   |
+| =geometry=| String (80.0)| String (11.0)|
+
+*A declared width is a schema contract, not a description of the current
+rows.* An 80-character name field that comes back 1 character wide still holds
+today's data and cannot hold tomorrow's -- appending a second feature with a
+longer name no longer fits. Nothing warns. Of everything in this inventory this
+is the entry most likely to break a user's downstream workflow rather than
+merely annoy them.
+
+The mechanism was =dbf.rs:318--356=: =len= is =max()= over the *actual
+formatted values*, and =Double= carried a hardcoded =const DECIMALS: usize = 6=,
+so =Real (24.15)= became =Real (8.6)= and the value =1.50= was re-rendered
+=1.500000=. The same lexeme problem as CSV, arriving through a schema.
+
+**** FIXED 2026-08-20 -- for the Shapefile and FlatGeobuf routes
+=dbf::read_schema= now recovers the declarations into
+=FeatureCollection::schema= and =dbf_field= widens to them rather than
+re-deriving. Re-measured on =tests/fixtures/gdal_hostile.shp= (=ogr2ogr='s own
+output, declaring =String (80.0)= against values 6 and 10 bytes long, so the 80
+cannot have come from the rows):
+
+| route                              | =name=        | =price=      |
+|------------------------------------+---------------+--------------|
+| source                             | String (80.0) | Real (24.15) |
+| =shp -> fgb -> shp=                | String (80.0) | Real (24.15) |
+| =shp -> geojson -> shp=            | String (10.0) | Real (9.6)   |
+| =shp -> gpkg -> shp=               | String (10.0) | Real (9.6)   |
+
+All /measured/ via =ogrinfo -so=. The FGB row is better than =ogr2ogr='s own,
+which reformats =24.15= to =23.15= on the same hop.
+
+*Two rules the writer follows, and the second is not obvious.* The declaration
+is a *floor, never a ceiling* -- a declared 80 beats a data-derived 1, but a
+data-derived 120 beats a declared 80. Obeying a too-narrow declaration would
+truncate a value a middle stage had just lengthened, which is the failure a
+"declared minimum" D4 class was once proposed to prevent; =declared_or= is that
+prevention, in one line, without a fourth class.
+
+*The two remaining rows are M3, not a defect in this work.* GeoJSON and
+GeoPackage have nowhere to put a declaration *yet* -- GeoJSON genuinely has no
+slot for one, GeoPackage does (=TEXT(80)=) and gets one with M3b. Until then a
+=.dbf= width crossing either is a cross-format loss, and an *unwarned* one; see
+=lossy-conversion-warnings.org= § OWED WARNING.
+
+| member                        | class    | note |
+|-------------------------------+----------+------|
+| =.dbf= field =width=          | *modelled* | *done 2026-08-20*: read into =FeatureCollection::schema=, honoured on write |
+| =.dbf= field =decimals=       | *modelled* | *done 2026-08-20*: a declared =scale= replaces the hardcoded 6 |
+| =.cpg= declared codepage      | identity | *not written at all* -- see below |
+| =.shx= index                  | derived-capability | regenerated correctly |
+| header M/Z ranges             | derived-information | |
+| =.sbn= / =.sbx= / =.qix=      | derived-capability | not read or written |
+| deleted-record flag           | --       | =dbf.rs:32=; records dropped, correct |
+
+*=.cpg= is not emitted -- but the reference tool does not emit one either.*
+The =Encoded= struct (=shapefile/writer.rs:20--22=) produces =.shp=, =.shx=,
+=.dbf= and an optional =.prj=; there is no =.cpg= field, and a source carrying
+=src.cpg= = =UTF-8= produced =out.shp out.shx out.dbf= and nothing else
+/(measured)/. The reader *does* honour a =.cpg= (=encoding_from_cpg=,
+=dbf.rs:52=), so it is a one-sided gap, and without one a reader falls back to
+the DBF language-driver byte =dbf.rs:4= calls "unreliable in practice".
+
+*Priority note, added after checking:* =ogr2ogr= behaves identically -- it read
+the same =src.cpg= and wrote =og.shp og.shx og.dbf= /(measured)/. So this is a
+real loss under the invariant but *not* geosetta being unusually careless, and
+it should rank below the width narrowing above, which the reference tool does
+not share.
+
+*Not all bad news:* =dbf::write= already emits warnings for over-long values
+and names (=writer.rs:23--24=), so the truncation half of Shapefile's lossiness
+follows the crate's rule today. It is the *widening* half -- the schema
+narrowing above -- that was silent, and is now carried rather than warned
+about, which is the better fix.
+
+*** GeoParquet -- /measured/ against real GDAL and DuckDB output
+Measured on =tests/fixtures/gdal_covering_bbox.parquet=, a real =ogr2ogr=
+product already in the tree, plus a DuckDB-spatial file written for this pass.
+
+*File level -- =key_value_metadata=.* Real GDAL output carries *three* keys;
+geosetta reads one:
+
+#+begin_src text
+$ duckdb -c "SELECT decode(key) FROM parquet_kv_metadata('gdal_covering_bbox.parquet')"
+geo
+ARROW:schema
+gdal:metadata
+#+end_src
+
+=reader.rs:279--296= pulls only ="geo"=; the rest hit =_ => r.skip(ty)?=.
+| key                    | class  | note |
+|------------------------+--------+------|
+| =ARROW:schema=         | opaque | field types, nullability, per-field metadata -- what the Arrow ecosystem reads |
+| =gdal:metadata=        | opaque | GDAL's own layer metadata |
+| =created_by=           | identity | file-metadata struct field 6, skipped |
+| column statistics      | derived-information | |
+| row-group / page layout| derived-capability | physical layout; affects read speed only |
+
+*Inside the ="geo"= object.* GDAL wrote this:
+
+#+begin_src json
+{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{
+ "encoding":"WKB","bbox":[...],
+ "covering":{"bbox":{"xmin":["geometry_bbox","xmin"], ...}},
+ "orientation":"counterclockwise","geometry_types":["Point"]}}}
+#+end_src
+
+Geosetta round-tripped it to this:
+
+#+begin_src json
+{"version":"1.1.0","primary_column":"geometry","columns":{"geometry":{
+ "encoding":"WKB","geometry_types":["Point"],"bbox":[...]}}}
+#+end_src
+
+| member          | survives? | class | note |
+|-----------------+-----------+-------+------|
+| =version=       | rewritten | --    | *not a loss* -- see below |
+| =primary_column=| yes       | --    | |
+| =encoding=      | yes       | --    | WKB and the native logical type both handled |
+| =geometry_types=| yes       | --    | recomputed |
+| =bbox=          | yes       | derived-information | recomputed; =fmt_num= renormalises the digits |
+| =orientation=   | *no*      | opaque | present in real GDAL output; never read, never written |
+| =covering=      | *no*      | derived-capability | read as =covering_paths= *only to exclude* those columns (=reader.rs:86--91=), then discarded |
+| =edges=         | n/a       | --    | /unverified/ -- see the null result below |
+| =epoch=         | n/a       | --    | /unverified/ -- same |
+
+*And the covering column itself goes with it.* The schema loses five entries:
+
+#+begin_src text
+before: schema  name  height  geometry  geometry_bbox  xmin  ymin  xmax  ymax
+after:  schema  name  height  geometry
+#+end_src
+
+Exit 0, no warning. The reader's own comment calls the covering "a
+spatial-pruning optimization, not a [property]", which is precisely D4's
+*derived-capability*: rebuilt when the source had one. Geosetta already folds
+the =Bbox= it would need.
+
+*=version= is deliberately not preserved, and that is correct.* DuckDB writes
+=1.0.0=; geosetta always writes =1.1.0= (=geo.rs:14=). That is not a loss --
+the member describes *the file geosetta just wrote*, which genuinely is a 1.1.0
+document. Recorded so it is not "fixed" into a bug by someone reading this
+table quickly.
+
+*Null result on =edges= and =epoch=.* Per =plans/README.org=, a null result is
+information. Neither GDAL 3.13.2 nor DuckDB-spatial emitted either member in
+any file produced for this pass, so no fixture exists to build against and a
+from-spec implementation would be unverifiable.
+
+*But do not close it the way =envelope.org= closed the GPKG XYM indicators.*
+There the null result meant nothing consumes them either. Here the likely
+producers -- geography-typed exports from BigQuery/Snowflake-style engines --
+simply were not available to test, and =edges= is not decorative:
+=edges: "spherical"= means the segments between vertices are great-circle arcs,
+so reading one and writing geosetta's default (planar, by omission) would
+*restate the geometry's meaning* while preserving every coordinate. That is
+the GeoJSON-relabel failure mode, which the crate already warns about. It
+belongs on the fixture hunt, not in the closed pile.
+
+** QUESTIONS THIS RAISES
+Not decisions -- things the inventory surfaced that the plans do not currently
+answer.
+
+1. *Is canonicalisation a loss?* =MULTIPOINT ((1 2))= → =MULTIPOINT (1 2)=,
+   =linestring= → =LINESTRING=, KML property order. Both forms are valid and
+   mean the same thing. A strict reading of the invariant forbids it; a
+   reasonable one does not. The answer decides whether the lexeme problem is
+   two bugs (CSV, WKT numbers) or a whole class.
+2. *Does the T dimension exist?* FlatGeobuf has =has_t=/=has_tm=; the IR has
+   =x, y, z, m=. If a real producer emits T, the invariant says geosetta must
+   refuse the file rather than drop the dimension. /Unverified/ that any does.
+3. *Should derived-capability sidecars be rebuilt for Shapefile too?* D4's rule
+   was written for GeoPackage's R*Tree. =.sbn=/=.qix= are the same shape, and
+   geosetta does not read or write them at all today.
+4. *Does =edges: "spherical"= need a refusal rather than a warning?* If a
+   producer is found, geosetta reading spherical geometry and writing its
+   planar default does not drop a member -- it *restates what the coordinates
+   mean*, which is the GeoJSON-relabel failure mode. Under the invariant that
+   argues for the refusal carve-out, not a native. Blocked on the fixture.
+5. ~~*Is a narrowed schema a data loss or a schema loss?*~~ *Answered
+   2026-08-20: a loss, and the fix is modelling rather than a native.* Column
+   =width=/=precision=/=scale= (and =nullable=/=unique=/=primary_key=) become
+   first-class IR under =same-format-fidelity.org= D1's exception, beside
+   collection =name= -- four formats have real slots for them. The deciding
+   argument was D5: a native cannot cross a pipe, so only a *modelled* field
+   lets an external tool widen a declaration mid-flight alongside the value it
+   lengthened. =ogr2ogr= preserves =String (80.0)= and =Real (24.15)= exactly,
+   confirming the reference treats the declaration as information.
+   *Implemented 2026-08-20* for the Shapefile and FlatGeobuf spokes -- see
+   § Shapefile → FIXED for the re-measurement, and note that the =shp -> fgb
+   -> shp= route now preserves the declaration *better than =ogr2ogr= does*,
+   which reformats =24.15= to =23.15= on the same hop.
+6. ~~*An unrecognised KML geometry yields a feature with no geometry,
+   silently.*~~ *Answered 2026-08-20: warn and emit.* Name the element on
+   stderr, keep the feature with =geometry: null=. Refusing was rejected --
+   the =POINT EMPTY= parallel is weak, since WKT refuses because its *parser*
+   cannot handle the syntax (incidental) whereas KML returns =None= by design,
+   and one =<Model>= should not kill a 10,000-feature file. Note GDAL is
+   *silent* here /(measured)/, so this is geosetta being deliberately stricter
+   than the reference -- as it already is on M-drop and CRS relabel.
+7. *KMZ's sidecars have no obvious owner.* They are not the KML spoke's (that
+   is a document) and not =zip.rs='s (that is a codec). § A FINDING argues for
+   their own milestone; nothing in the plans currently holds them.
+
+** NOT YET DONE
+- *A fixture for GeoParquet's =edges= / =epoch=*, which no available tool
+  emits. The one item here that is a *hunt* rather than a read -- and the one
+  with a semantic rather than cosmetic consequence.
+- ~~*Shapefile's write side*~~ -- *done 2026-08-20*, measured; all three are
+  re-derived or dropped.
+- ~~*The /unverified/ KML elements*~~ -- *done 2026-08-20*, traced from the
+  reader. The trace was worth doing: it found =<GroundOverlay>= and the
+  unrecognised-geometry case, neither of which the spec list had.
+- *A hostile fixture per spoke*, which is the other half of M1 and what
+  =same-format-fidelity.org= D6's exhaustive-match registry will consume.
+
+** RELATED
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] -- M1's owner;
+  D4 supplies the classes and § Five defects overlaps this list at four points.
+- [[file:same-format-output.org][same-format-output.org]] -- M2's
+  =Format::unmodelled_members= was to be built from this; under the sequencing
+  decision it is superseded by the natives channel, but the enumeration is the
+  same one.
+- [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] --
+  § OPEN QUESTION is blocked on this file, and its answer may differ per class:
+  an *identity* member has a plausible claim to a cross-format warning, an
+  *opaque* one almost none.
+- [[file:edit-composability.org][edit-composability.org]] -- its § Four silent
+  property drops is the subset of this inventory that a pipeline hits twice.

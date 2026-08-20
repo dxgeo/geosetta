@@ -121,6 +121,27 @@ own naturally-typed functions; only the boilerplate around them is shared.
   spec, so the user finds out at conversion time, not by diffing output.
 - FlatGeobuf/GeoPackage silently substituting a dropped/synthetic id for an
   alphanumeric authority code (=crs.rs=, this pass).
+- *A source's column schema dropped on the way to a target that does not
+  carry it* -- =FeatureCollection::schema_drop_warning=, added 2026-08-20 with
+  the modelled column schema (=same-format-fidelity.org= D1). Mechanism 1, one
+  line in =collect_conversion_warnings=.
+
+  *This is a gap this rule created and then closed in the same pass*, which is
+  worth naming because it is the shape future spoke work will keep producing:
+  before the declarations were *read*, nothing was dropped, because nothing was
+  recovered. Raising the IR ceiling turns a member the crate never knew about
+  into a member it knowingly discards, and the second is exactly what this rule
+  governs. Expect the same the next time a spoke starts modelling something.
+
+  Two things it deliberately does. It is *silent when the source declared
+  nothing*, which is every GeoJSON/CSV/WKT/KML input and so the overwhelming
+  majority of runs -- the noise test in § THE RULE. And its predicate,
+  =Format::carries_column_schema=, is a statement about *this crate's
+  implementation*, not about the formats' specs, unlike =supports_m= beside it:
+  GeoPackage and GeoParquet both have somewhere to put a declaration and
+  neither is wired up, so both warn today and must move when M3/M3b lands. The
+  doc comment says so, so the two reasons a target can appear in that list do
+  not blur together.
 
 ** OPEN CANDIDATES -- known, not yet warned, lower priority
 Found while scoping this doc; not fixed in this pass because each is a
@@ -141,6 +162,86 @@ next pass through this area doesn't have to rediscover them:
   per =zm-geometry.org='s M7 follow-up) and =MultiPatch=(31) (never
   modeled, no =Geometry= variant exists to decode into) — not conversion
   losses in the sense this rule covers.
+
+** OWED WARNING -- a WKT-bearing CRS written to GeoParquet loses its dialect
+/Added 2026-08-20, decided./ Reclassified in from
+[[file:same-format-fidelity.org][same-format-fidelity.org]], which had it filed
+as a round-trip-fidelity defect until the file was actually checked.
+
+*The loss.* GeoParquet's only CRS channel is PROJJSON. Writing a collection
+whose CRS carries WKT text converts it and *discards the original*:
+
+#+begin_src text
+$ geosetta base.fgb x.parquet          # base.fgb's CRS is verbatim WKT2
+wrote x.parquet (2063 bytes)           # silent
+$ grep -c PROJCRS x.parquet
+0
+#+end_src
+
+Convert that GeoParquet onward to any WKT-dialect target and the definition
+comes back as *WKT1*, because =projjson_to_wkt= renders WKT1 by construction --
+which is the deliberate, documented choice of
+[[file:projjson-to-wkt.org][projjson-to-wkt.org]] § Output dialect, not a bug:
+=NamedCrs.wkt= is a single slot that FlatGeobuf, GeoPackage and Shapefile's
+=.prj= all read as WKT1/ESRI text.
+
+*Why it is owed a warning.* This is the ordinary shape this rule already
+covers -- a capability gap in the target -- and it belongs with
+=Crs::downgrade_warning='s existing per-target arms. The identity survives
+(=EPSG:28356= both sides), which is exactly why it is easy to miss and why it
+went unnoticed until an in-place edit destroyed the original it could have been
+compared against ([[file:edit-composability.org][edit-composability.org]] § THE
+IN-PLACE HAZARD).
+
+*Decided 2026-08-20: the dialect is information.* The alternative -- that the
+identity is the whole of it and a dialect change is a rendering detail -- was
+weighed and rejected, because [[file:crs-definition-output.org][crs-definition-output.org]]
+established that a definition passes through *verbatim*, and a user who
+supplied WKT2 via =--crs= and gets WKT1 back has lost the thing that contract
+promised. A third option, warning only where the text was user-supplied rather
+than synthesized from an authority code, was rejected as needing text
+provenance the IR does not track.
+
+*Shape.* A pre-write predictive check (§ mechanism 1) on the =Format::Parquet=
+arm of =Crs::downgrade_warning=, firing when the CRS carries WKT and the target
+is GeoParquet. Note it must *not* fire when the CRS reached the IR as PROJJSON
+in the first place -- there is no dialect to lose then, and a GeoParquet →
+GeoParquet run must stay silent.
+
+** OPEN QUESTION -- does the unmodelled-member warning belong on cross-format runs?
+/Consolidated here 2026-08-20./ This question was being carried in three
+places at once -- =same-format-output.org= § OPEN QUESTIONS (deferred),
+=edit-composability.org= D3, and implicitly by
+=same-format-fidelity.org='s asymmetry -- which is how one question gets two
+different answers. It lives here, because this doc owns what a *warning* must
+say; the other three link to it.
+
+*The question.* A reader discards what the IR does not model -- a GeoJSON
+feature =id=, a collection =name=, foreign members. On a *same-format* run
+that loss is indefensible and =same-format-fidelity.org= closes it outright,
+so no warning is owed. On a *cross-format* run the same members are dropped
+just as silently, and the target may or may not have been able to hold them.
+Is a warning owed there?
+
+*For:* the loss is identical and equally silent. A =.geojson= → =.fgb= user
+losing their =id=s is no happier that the target had nowhere to put them.
+
+*Against:* the target's incapacity is a genuine defence, and it is the exact
+defence this rule already accepts everywhere else (=Crs::downgrade_warning=,
+=m_downgrade_warning=). Warning anyway would either fire on almost every
+conversion -- becoming noise the way § THE RULE warns against -- or need
+hedging into uselessness.
+
+*What would settle it:* the M1 inventory in
+[[file:same-format-fidelity.org][same-format-fidelity.org]], which classifies
+every unmodelled member per spoke. Until that exists the question is being
+argued over a set nobody has enumerated. Two of the three classes may answer
+differently -- an *identity* member (=id=, =name=) has a plausible claim to a
+cross-format warning; an *opaque* one (a vendor foreign member) almost
+certainly does not, since no target but its own could ever hold it.
+
+*Do not answer it before M1.* The temptation is to settle it while writing one
+of the plans that touches it, which is what produced three copies.
 
 ** HOW TO APPLY THIS TO FUTURE WORK
 When adding a new format spoke, a new IR field, or discovering an existing

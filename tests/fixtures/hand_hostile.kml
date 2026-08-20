@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+ <Document>
+  <name>hostile document</name>
+  <description>document-level description</description>
+  <Style id="cityStyle"><IconStyle><color>ff0000ff</color></IconStyle></Style>
+  <Folder>
+   <name>nested folder</name>
+   <Placemark>
+    <name>København</name>
+    <description>with a style reference</description>
+    <styleUrl>#cityStyle</styleUrl>
+    <visibility>1</visibility>
+    <TimeStamp><when>2019-05-01T00:00:00Z</when></TimeStamp>
+    <ExtendedData>
+     <Data name="zip"><value>007</value></Data>
+     <Data name="price"><value>1.50</value></Data>
+    </ExtendedData>
+    <Point><altitudeMode>relativeToGround</altitudeMode><coordinates>12.5683,55.6761,120</coordinates></Point>
+   </Placemark>
+  </Folder>
+  <Placemark>
+   <name>modelled</name>
+   <Model><Location><longitude>8.5417</longitude><latitude>47.3769</latitude></Location></Model>
+  </Placemark>
+  <GroundOverlay>
+   <name>an overlay</name>
+   <Icon><href>files/overlay.png</href></Icon>
+   <LatLonBox><north>56</north><south>55</south><east>13</east><west>12</west></LatLonBox>
+  </GroundOverlay>
+ </Document>
+</kml>

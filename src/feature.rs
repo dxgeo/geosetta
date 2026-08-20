@@ -6,6 +6,8 @@ use crate::crs::Crs;
 use crate::format::Format;
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
+use crate::native::Native;
+use crate::schema::FieldDecl;
 use std::rc::Rc;
 
 /// A vector feature: an optional geometry plus ordered properties.
@@ -13,15 +15,21 @@ use std::rc::Rc;
 /// Property keys are `Rc<str>` rather than `String` so that a column name
 /// repeated across every row is allocated once and shared (a refcount bump per
 /// cell), not re-allocated per feature — the dominant cost on wide tables.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct Feature {
     pub geometry: Option<Geometry>,
     /// Property members, in order. Empty when there are no properties.
     pub properties: Vec<(Rc<str>, JsonValue)>,
+    /// What this feature's source recorded that the two fields above cannot
+    /// hold — a GeoJSON `id`, a foreign member — kept verbatim and tagged with
+    /// the format that produced it, so only that format's writer replays it.
+    /// `None` whenever the reader modelled everything, which is the common
+    /// case. See [`crate::native`].
+    pub native: Option<Native>,
 }
 
 /// A collection of features.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct FeatureCollection {
     pub features: Vec<Feature>,
     /// The coordinate reference system the geometries are expressed in, as
@@ -29,6 +37,37 @@ pub struct FeatureCollection {
     /// Geosetta never reprojects — this is carried through to the output
     /// unchanged (see [`crate::crs`]).
     pub crs: Option<Crs>,
+    /// The collection's own name, when the source recorded one — GeoJSON's
+    /// `name`, a FlatGeobuf header's `NAME`, a GeoPackage layer's table name,
+    /// a Shapefile's stem.
+    ///
+    /// Modelled here rather than carried as a [`Native`] because four spokes
+    /// give it a first-class slot, and because a native never crosses a process
+    /// boundary: a name that rides in the transit format's own header survives
+    /// `geosetta a.gpkg - --to fgb | tool | geosetta - a.gpkg --from fgb`,
+    /// where a payload would not. Losing it is what makes that pipeline append
+    /// a duplicate layer instead of replacing one.
+    pub name: Option<String>,
+    /// What the source declared about its property columns — widths,
+    /// precisions, `NOT NULL`, and so on — for the columns it declared
+    /// anything about. Empty when the source has no schema of its own
+    /// (GeoJSON, CSV, WKT, KML) or declared nothing.
+    ///
+    /// Modelled here for the same reason as [`Self::name`], and see
+    /// [`crate::schema::FieldDecl`] for the argument in full: four spokes give
+    /// these first-class slots, and only a modelled field can be *edited by an
+    /// external tool mid-pipeline*, which is what lets a middle stage widen a
+    /// declaration alongside the value it lengthened.
+    ///
+    /// Entries are matched to properties by exact name; one that names no
+    /// property is inert. This is a declaration *about* the data, never a
+    /// substitute for it — [`crate::schema::columns_for`] attaches these to
+    /// inferred columns, and a writer treats a declared size as a floor rather
+    /// than a ceiling.
+    pub schema: Vec<FieldDecl>,
+    /// Collection-level unmodelled content, tagged by source format — see
+    /// [`Feature::native`] and [`crate::native`].
+    pub native: Option<Native>,
 }
 
 impl FeatureCollection {
@@ -39,6 +78,9 @@ impl FeatureCollection {
         FeatureCollection {
             features,
             crs: None,
+            name: None,
+            schema: Vec::new(),
+            native: None,
         }
     }
 
@@ -67,6 +109,36 @@ impl FeatureCollection {
         Some(format!(
             "source geometry carries M (measure) values; {} has no way to represent them — \
              M will be dropped from the output.",
+            target.display_name()
+        ))
+    }
+
+    /// A warning to print when converting this collection to `target` and the
+    /// column declarations it carries would not survive, or `None` when there
+    /// are none or `target` keeps them.
+    ///
+    /// Same shape and same standing rule as [`Self::m_downgrade_warning`]: a
+    /// capability gap that silently drops information must say so. This one
+    /// only became sayable once declarations were read at all — before that
+    /// nothing was dropped because nothing was recovered — and it is the loss
+    /// most likely to matter downstream, since a re-derived schema produces a
+    /// file that holds today's rows and cannot hold tomorrow's.
+    ///
+    /// Silent whenever [`Self::schema`] is empty, which is every source that
+    /// declares nothing (GeoJSON, CSV, WKT, KML) and so the overwhelmingly
+    /// common case — the rule against warning noise in
+    /// `plans/lossy-conversion-warnings.org` § THE RULE.
+    pub fn schema_drop_warning(&self, target: Format) -> Option<String> {
+        if self.schema.is_empty() || target.carries_column_schema() {
+            return None;
+        }
+        let mut names: Vec<&str> = self.schema.iter().map(|d| d.name.as_str()).collect();
+        names.sort_unstable();
+        Some(format!(
+            "source declares a column schema (field width/precision/constraints) for {}; \
+             it is not carried to {}, so the output's schema is re-derived from the values \
+             — a field sized to hold more than it currently holds comes out narrower.",
+            names.join(", "),
             target.display_name()
         ))
     }
@@ -118,6 +190,7 @@ mod tests {
         let fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::with_m(1.0, 2.0, 5.0))),
             properties: vec![],
+            native: None,
         }]);
         for target in [Format::GeoJson, Format::Kml, Format::Kmz] {
             let w = fc.m_downgrade_warning(target).unwrap();
@@ -139,10 +212,12 @@ mod tests {
         let two_d = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
+            native: None,
         }]);
         let z_only = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))),
             properties: vec![],
+            native: None,
         }]);
         for target in [Format::GeoJson, Format::Kml, Format::Kmz] {
             assert_eq!(two_d.m_downgrade_warning(target), None);
@@ -151,11 +226,37 @@ mod tests {
     }
 
     #[test]
+    fn schema_drop_warning_fires_only_where_a_declaration_is_actually_lost() {
+        let mut fc = FeatureCollection::new(vec![]);
+        fc.schema = vec![FieldDecl { name: "name".into(), width: Some(80), ..FieldDecl::default() }];
+        for target in [Format::GeoJson, Format::Csv, Format::Wkt, Format::Kml, Format::Kmz, Format::Gpkg, Format::Parquet]
+        {
+            let w = fc.schema_drop_warning(target).unwrap();
+            assert!(w.contains("name"), "{w}");
+            assert!(w.contains(target.display_name()), "{w}");
+        }
+        // The two spokes that carry declarations stay silent.
+        for target in [Format::FlatGeobuf, Format::Shapefile] {
+            assert_eq!(fc.schema_drop_warning(target), None, "{target:?} should not warn");
+        }
+    }
+
+    #[test]
+    fn schema_drop_warning_stays_silent_when_nothing_was_declared() {
+        // The common case by a wide margin — a source with no schema of its
+        // own must not add a line to every conversion.
+        let fc = FeatureCollection::new(vec![Feature::default()]);
+        for target in [Format::GeoJson, Format::Csv, Format::Gpkg, Format::Parquet, Format::Kml] {
+            assert_eq!(fc.schema_drop_warning(target), None, "{target:?}");
+        }
+    }
+
+    #[test]
     fn for_each_position_mut_rewrites_every_feature_and_skips_geometryless_ones() {
         let mut fc = FeatureCollection::new(vec![
-            Feature { geometry: Some(Geometry::Point(Position::new(1.0, 2.0))), properties: vec![] },
-            Feature { geometry: None, properties: vec![] },
-            Feature { geometry: Some(Geometry::Point(Position::new(3.0, 4.0))), properties: vec![] },
+            Feature { geometry: Some(Geometry::Point(Position::new(1.0, 2.0))), properties: vec![], native: None },
+            Feature { geometry: None, properties: vec![], native: None },
+            Feature { geometry: Some(Geometry::Point(Position::new(3.0, 4.0))), properties: vec![], native: None },
         ]);
         fc.for_each_position_mut(|p| {
             p.x *= 10.0;
@@ -172,9 +273,10 @@ mod tests {
             Feature {
                 geometry: Some(Geometry::LineString(vec![Position::new(1.0, 2.0), Position::new(3.0, 4.0)])),
                 properties: vec![],
+                native: None,
             },
-            Feature { geometry: None, properties: vec![] },
-            Feature { geometry: Some(Geometry::Point(Position::new(5.0, 6.0))), properties: vec![] },
+            Feature { geometry: None, properties: vec![], native: None },
+            Feature { geometry: Some(Geometry::Point(Position::new(5.0, 6.0))), properties: vec![], native: None },
         ]);
         let mut run_lengths = Vec::new();
         fc.for_each_position_run_mut(|ps| {

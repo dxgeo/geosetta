@@ -1,0 +1,985 @@
+#+TITLE: Plan: Same-Format Fidelity
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Same-Format Fidelity -- The Round-Trip Invariant
+
+** STATUS -- M1 and M2 done; M3 begun (2026-08-20)
+*Implemented, the opaque half:* the mechanism itself and the GeoJSON spoke --
+=src/native.rs= (=Native=/=NativePayload= and the tag-matched =payload_for=),
+=Feature::native=, =FeatureCollection::native=. The GeoJSON reader stashes
+=id= and foreign members at collection, feature and geometry level; both
+writer paths replay them.
+
+*Implemented, the modelled half (D1's exception):* =FeatureCollection::name=,
+and the *column schema* -- =crate::FieldDecl= carrying
+=width=/=precision=/=scale=/=nullable=/=unique=/=primary_key= on
+=FeatureCollection::schema=, attached to inferred columns by
+=schema::columns_for=. Two spokes populate and honour it: Shapefile's =.dbf=
+field descriptors (=read_schema= / =dbf_field=) and FlatGeobuf's =Column= table
+slots 4--9 (=read_decl= / =write_decl=). This closes the inventory's most
+consequential entry -- =shp -> fgb -> shp= now preserves =String (80.0)= and
+=Real (24.15)= exactly, which is *better than =ogr2ogr=*, and a middle stage
+can widen a declaration mid-flight, which is the whole reason D1 modelled it.
+
+Cross-format drops of a declaration now *warn*
+(=FeatureCollection::schema_drop_warning=), because reading a member the crate
+then discards is precisely what =lossy-conversion-warnings.org= governs.
+
+*487 tests pass* as of the FlatGeobuf spoke, and =cargo clippy --all-targets=
+is clean. That figure is the whole of =cargo test -p geosetta= -- 442 lib, 44
+integration, 1 doc -- recorded that way because an earlier bare "482" left the
+next reader unable to tell which suites it counted, and so unable to tell
+drift from a different denominator.
+
+*M3 in progress:* the *FlatGeobuf* spoke is done (natives, the header name,
+and defect 4 with it). Still to do: GeoPackage, GeoParquet, CSV, WKT, KML, and
+Shapefile's remaining members, then both containers (M3b/M3c), defects 1--3,
+and the exhaustive-match fixture registry (M5/D6). The six remaining readers
+pass =native: None=, and only two of the four spokes with schema slots carry a
+declaration -- GeoPackage's column declarations and GeoParquet's =ARROW:schema=
+are still open. They lose exactly what they lost before, and no more, but now
+they say so.
+This plan proposes a standing invariant for the crate, and the one mechanism
+that can deliver it without the IR growing into a union of all nine spokes:
+
+#+begin_quote
+*Reading a format and writing the same format loses nothing.* A capability gap
+in the target is a defence for dropping data; the target being the source's own
+format is not.
+#+end_quote
+
+It is a *rule* plan, like
+[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]], not a
+feature plan. Its milestones are a mechanism and a bug list; its real output is
+a line every future spoke has to hold.
+
+It also *gates* [[file:same-format-output.org][same-format-output.org]], and
+inverts part of that plan's scope -- see § SEQUENCING.
+
+** THE RULE, STATED PRECISELY
+Two halves, and the second is what makes the first affordable:
+
+1. *Same-format runs are information-lossless.* =geosetta a.f b.f= produces a
+   file carrying everything =a.f= carried.
+2. *Cross-format runs drop only what the target genuinely cannot record*, and
+   warn when they do -- unchanged, and already the crate's rule
+   ([[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]).
+
+The asymmetry is deliberate and is the whole point. =same-format-output.org= §
+THE FIDELITY PROBLEM had already isolated the reasoning and stopped one step
+short of drawing this conclusion: on a cross-format run, dropping a GeoJSON
+=id= has a defence, because the target may have no slot for it. On a
+same-format run "the target can't hold it" is provably false -- the target *is*
+the source's format, and the source held it. This plan makes that observation
+binding.
+
+** WHY THE RULE IS RIGHT -- what the reference implementation promises
+Per =plans/README.org= § Sourcing a fixture from a real tool, checked against
+GDAL 3.13.2 before designing. The fixture was built to be as hostile as GeoJSON
+allows: a collection =name=, a collection-level *foreign member*, both
+=bbox=es, a feature =id=, a *feature-level* foreign member, a nested property
+object, and an explicit =null= property.
+
+*** Same format: GDAL loses nothing
+#+begin_src text
+$ ogr2ogr -f GeoJSON og.geojson exotic.geojson
+$ cat og.geojson
+{"type": "FeatureCollection", "name": "roads",
+ "myExtension": { "vendor": "acme", "v": 2 }, "bbox": [ 0, 0, 10, 10 ],
+ "features": [
+ {"type":"Feature","id":42,"featureForeign":"keep-me",
+  "properties":{"n":"a","nested":{"deep":[1,2,{"k":"v"}]},"nil":null},
+  "bbox":[0.0,0.0,10.0,10.0],"geometry":{...}}]}
+#+end_src
+Every member survived, including the two foreign ones GDAL has no model for.
+
+*** Cross format: GDAL drops exactly what the target cannot hold
+The same input through a GeoPackage detour and back:
+#+begin_src text
+$ ogr2ogr -f GPKG mid.gpkg exotic.geojson && ogr2ogr -f GeoJSON back.geojson mid.gpkg
+$ cat back.geojson
+{"type": "FeatureCollection", "name": "roads",
+ "myExtension": { "vendor": "acme", "v": 2 }, "bbox": [ 0, 0, 10, 10 ],
+ "features": [
+ {"type":"Feature","properties":{"n":"a","nested":{"deep":[1,2,{"k":"v"}]},
+  "nil":null},"geometry":{...}}]}
+#+end_src
+Collection-level =name=, =myExtension= and =bbox= survived; the *feature-level*
+=id=, =bbox= and =featureForeign= did not.
+
+*** The asymmetry is the mechanism showing through
+That split is the finding, and it is worth more than either result alone. GDAL
+is not modelling =featureForeign= semantically -- if it were, it would have
+carried it through the GeoPackage as easily as it carried =myExtension=.
+It is holding an *opaque, driver-keyed* blob per feature and replaying it only
+into the driver that produced it. Cross the driver boundary and the blob is
+dropped, because nothing else knows what it means.
+
+*** And the mechanism is legible on disk, not merely inferred
+The GeoPackage written during the detour above carries it in plain text, in
+=gpkg_metadata=:
+
+#+begin_src xml
+<MDI key="NATIVE_DATA">{ "name": "roads", "bbox": [ 0, 0, 10, 10 ],
+                         "myExtension": { "vendor": "acme", "v": 2 } }</MDI>
+<MDI key="NATIVE_MEDIA_TYPE">application/vnd.geo+json</MDI>
+#+end_src
+
+An opaque payload -- the source's own GeoJSON text, unparsed -- beside an
+explicit *format tag*. That is § THE MECHANISM's =Native { format, payload }=,
+already deployed, with =NATIVE_MEDIA_TYPE= doing exactly what D1's tag does.
+The feature-level natives died on the detour and the collection-level ones did
+not because only the latter had somewhere in the target to be written down.
+
+So the rule this plan proposes is not an aspiration someone might reach; it is
+what the reference tool already implements, down to the shape of the record.
+§ THE MECHANISM adopts it deliberately rather than by convergence.
+
+** WHAT "LOSSLESS" DOES NOT MEAN
+Three carve-outs, all needed for the rule to be checkable rather than
+rhetorical.
+
+*** Information, not bytes
+Byte-preserving pass-through is =cp=, and =same-format-output.org= D2 already
+rules it out: a same-format run is a re-encode through the IR, never a copy.
+Even GDAL is not byte-preserving here -- it emitted =0.0= where the input had
+=0=, and reordered the members. Equivalence is defined at the IR level plus the
+replayed natives (§ TESTING), not on the file.
+
+*** A refusal honours the rule
+Where a reader *hard-rejects* input it cannot model rather than silently
+dropping it, the invariant is satisfied -- there is no lossy run, because there
+is no run. Geosetta already does this in two places, both currently filed as
+gaps in =plans/todo.org=: GeoParquet's list-of-structs / nested-list columns,
+and a second geometry column
+([[file:multi-geometry-columns.org][multi-geometry-columns.org]]).
+
+*Name this explicitly so it is not "fixed" into a violation later.* The
+tempting next step on both is to decode what is understood and drop the rest;
+under this rule that trades a loud refusal for a silent loss, which is the
+wrong direction. If they gain support, they gain it fully or they keep
+refusing.
+
+*** The invariant binds an invocation, not a pipeline
+/Added 2026-08-20, after it caused a misfiling./ The rule covers one
+=geosetta= run whose input and output formats match. It says *nothing* about a
+sequence of runs whose net effect is a round trip.
+
+This is not pedantry; it is the distinction that decides where a bug lives.
+=edit-composability.org= § THE IN-PLACE HAZARD overwrites a =.fgb= via a
+GeoParquet transit and loses the CRS dialect. That looks like a same-format
+round trip and is not one: both hops -- =fgb= → =parquet= and =parquet= → =fgb=
+-- are cross-format, and each is entitled to drop what its target cannot hold.
+The loss is real and owed a warning, but by the *other* rule
+([[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]), and no
+amount of same-format fidelity would have prevented it.
+
+*The consequence for editing pipelines is sharp.* An external-edit loop is
+lossless end to end only when the transit format *is* the endpoint format --
+=geosetta in.fgb - --to fgb | tool | geosetta - out.fgb --from fgb=. Any other
+transit is two cross-format conversions wearing a round trip's clothing. That
+is a further, and stronger, reason
+[[file:same-format-output.org][same-format-output.org]] is a prerequisite for
+[[file:edit-composability.org][edit-composability.org]] rather than a
+convenience, and it is what D5 is really protecting.
+
+*** The IR ceiling is what is being raised, and it bounds the promise
+Until the natives channel exists, "lossless" can only mean "lossless with
+respect to the IR" -- and the IR is =geometry + properties + crs=
+(=src/feature.rs=), so =id=, =name=, both =bbox=es and every foreign member die
+at *read* time, before any writer is chosen. That is precisely the ceiling
+§ THE MECHANISM raises. It is stated here so the rule is not read as already
+satisfied by any format whose spoke happens to be tidy.
+
+** THE DOMAIN OF THE RULE
+/Decided 2026-08-20./ Two questions about what the invariant ranges over, both
+settled deliberately and one of them against the recommendation that was on the
+table. Recorded together because they compound: each widens the promise, and
+they interact at exactly one place (§ The collision).
+
+*** It binds the whole container, not just the layer
+A =.gpkg= is not a collection; it is a database holding layers, a non-spatial
+user table or two, =gpkg_metadata=, extension registrations, R*Tree indexes and
+triggers, and possibly raster tiles. The invariant covers *all of it*.
+
+*The alternative was to bind the layer* and give the container its own narrower
+promise, on the grounds that preserving arbitrary SQLite content makes geosetta
+a SQLite-preserving editor. That was recommended and *not* taken. The reasoning
+for the wider choice, recorded so it is not re-opened by whoever meets the cost:
+a user's =.gpkg= is one file, and a rule that silently exempts most of what is
+in it is not the rule this plan set out to state. "Same format loses nothing"
+that quietly means "loses nothing in the layer" is the kind of hedge § THE RULE
+exists to remove.
+
+*What it costs, plainly.* =run_geopackage_write= rewrites the whole file, so
+everything it does not model is destroyed on write -- measured, and now defect 3
+below. Satisfying the invariant means either copying unmodelled SQLite objects
+structurally (their =sqlite_master= SQL text carries triggers, views and indexes
+verbatim, which is mechanical but means the writer re-emits SQL it never parses)
+or not rewriting at all. The second is a genuine option here and would change
+the answer to the in-place question in
+[[file:edit-composability.org][edit-composability.org]] D4 as well; it is worth
+weighing on this plan rather than assumed away.
+
+*The classification still does the work.* Container content sorts into D4's
+three classes as cleanly as feature content does, which is what keeps the
+obligation bounded rather than open-ended:
+- *Derived* -- R*Tree tables and their triggers, =gpkg_ogr_contents= feature
+  counts, =gpkg_contents= bboxes. Recomputed, never replayed. =--rtree= already
+  builds the first from scratch.
+- *Identity* -- layer names, =gpkg_contents= =identifier=/=description=.
+- *Opaque* -- user tables, =gpkg_metadata=/=_reference=, =gpkg_extensions=,
+  =gpkg_data_columns= and its constraints, QGIS-style =layer_styles=, views and
+  triggers. Carried verbatim, understood by nothing.
+So the Gpkg spoke's native payload has a mechanical definition -- *every object
+in =sqlite_master= this crate did not itself write, plus every row of the
+=gpkg_*= registry tables it does not populate* -- rather than an open-ended one.
+
+*** It covers any file this crate reads without rejecting
+Not merely geosetta's own output. The weaker scope was rejected as barely
+covering the motivating case: the files users care about round-tripping were
+written by QGIS, GDAL, DuckDB and Esri, not by this crate. It is also what makes
+§ A refusal honours the rule load-bearing rather than a technicality -- under
+this scope, "we read it" *is* the promise, so a reader that cannot be faithful
+must decline instead.
+
+The cost lands on the arbitrary-GeoParquet path, where a DuckDB- or GDAL-written
+file carries key/value metadata, column statistics and row-group structure that
+the reader currently walks past. M1 must inventory those the same way it
+inventories GeoJSON's foreign members.
+
+*** The collision -- where the two decisions meet
+The two choices intersect at raster GeoPackages, and the intersection needs an
+answer M1 cannot dodge. Geosetta is vector-only, but a =.gpkg= may carry tile
+pyramids. Under *container* scope those tiles are in the domain; under *any
+readable file* scope, geosetta does not get to keep reading such a file and
+quietly drop them.
+
+So one of two things must be true, and it should be chosen rather than
+discovered: either the Gpkg reader *rejects* a file whose tile tables are
+populated (the carve-out, and cheap), or those tiles are opaque natives carried
+verbatim (faithful, and much less cheap). *Recommend rejecting*, and saying so
+in the error -- a vector tool declining a raster container is a defensible
+sentence; silently returning a =.gpkg= with the imagery gone is not.
+
+** WHAT VIOLATES THE RULE TODAY
+Two kinds. The first kind is small, confirmed, and needs no new machinery.
+
+*** Five defects that are bugs the moment the rule is adopted
+Each was measured, and each was traced to the side that is actually wrong --
+which in both of the first two is *not* the side the symptom suggests.
+
+/Was four until 2026-08-20; defect 5 was found while reviewing defect 1 and is
+the largest of them./
+
+1. *FlatGeobuf drops a null property cell.* The wire is innocent: FGB encodes
+   properties as sparse =[u16 col_index][value]= pairs
+   (=flatgeobuf/writer.rs:343=), so a null is encoded by omission and *the
+   column still stands in the header* -- confirmed by decoding the header,
+   where an all-null column is present by name. The *reader* materializes only
+   the columns a row carries, so an omitted cell returns as an absent key
+   rather than a null one.
+
+   /Re-measured and re-scoped 2026-08-20, after the FlatGeobuf spoke./ Still
+   reproduces, and it is *two* losses rather than one. The plan previously
+   called this a "one-sided fix in =flatgeobuf/reader.rs=", which names the
+   right file and understates the size.
+
+   *Loss 1 -- the cell.* A property null in *every* row has no key in any
+   feature, so =infer_columns= never sees it and the column is gone. Its
+   neighbours survive only because some other row happens to carry a value,
+   which is why this is invisible in any fixture where every column has at
+   least one value -- most of them.
+
+   *Loss 2 -- the type, and this one is not in =reader.rs='s gift.* Fix the
+   cell and an all-null column still comes back *=String=*: with no values to
+   infer from, =infer_columns= falls back to =ColumnType::String= (the
+   "columns whose values were all null default to String" line). The reader
+   /knows/ the real type -- it reads =Column.type(1)= in order to decode
+   values at all -- but [[*D1 -- opaque passthrough, never semantic modelling -- with one named exception][=FieldDecl=]]
+   models =width=/=precision=/=scale=/=nullable=/=unique=/=primary_key= and
+   *not type*, so there is nowhere in the IR to put it. /Measured/ against a
+   real =ogr2ogr= FlatGeobuf carrying an all-null =Integer= column (built from
+   a =.csv= + =.csvt=, since no GeoJSON input can declare one):
+
+   #+begin_src text
+   on disk:       cnt: Integer (0.0)
+   GDAL fgb->fgb: cnt: Integer (0.0)    preserved
+   geosetta:      column absent entirely
+   #+end_src
+
+   *The unset-vs-null question is settled, and it is not a fork.* An earlier
+   draft of this entry held that restoring an omitted cell as null diverges
+   from GDAL, which maps FGB omission to OGR /unset/ -- true of =ogrinfo='s
+   *display* convention and misleading about everything else. =ogr2ogr=
+   converting such a file to GeoJSON writes =null= for every declared column
+   in every feature, turning sparse input rectangular. More to the point,
+   *this crate already made the choice four times over* /(measured, one input
+   through each spoke)/:
+
+   | via         | result                                            |
+   |-------------+---------------------------------------------------|
+   | GeoParquet  | =null= for every column in every feature           |
+   | GeoPackage  | identical                                          |
+   | CSV         | identical                                          |
+   | Shapefile   | rectangular, =""= for strings (dBase has no null)  |
+   | FlatGeobuf  | *keys absent* -- the outlier                       |
+
+   Every rectangular spoke materializes every column for every feature, and
+   the first three are byte-identical to GDAL's own output. FlatGeobuf is
+   alone because it is the only format that is rectangular in its *header* and
+   sparse in its *rows*. And =schema::materialize= already collapses =None=
+   and =JsonValue::Null= to the same =Cell::Null=, so the IR has no /unset/ to
+   protect. Restoring the null is not a new policy; it ends an inconsistency.
+2. *GeoPackage loses booleans.* Also a reader defect, and the writer is
+   spec-correct: =geopackage/writer.rs:449= declares the column =BOOLEAN= and
+   =:459= stores 0/1, which is what the GeoPackage spec requires of SQLite.
+   The declared type is on disk and unread -- =geopackage/reader.rs= has no
+   notion of a declared column type at all, mapping storage classes straight to
+   JSON. Fix reads the declaration.
+
+   *Defects 1 and 2 are the same bug wearing two formats* /(found 2026-08-20,
+   reviewing defect 1)/. Both are *a declared column type sitting on disk,
+   unread, because the IR will not hold one*: GeoPackage declares =BOOLEAN=
+   and the reader sees only SQLite's =INTEGER= storage class; FlatGeobuf
+   declares =Integer= and the reader cannot keep it once the column has no
+   values to re-infer from. Neither closes by reading harder -- both want the
+   same affordance, a *declared type on =FieldDecl=*, which is also its
+   natural home: FlatGeobuf's =Column.type(1)= is slot 1 of the very table
+   whose slots 4--9 =FieldDecl= already models. This is a better reason for
+   M4 to ship them together than "both are free-standing", which is how they
+   were paired before anyone noticed they share a fix.
+
+   *The precedence rule that comes with it*, mirroring =declared_or=: *the
+   declaration wins where the data is silent; the data wins where it
+   contradicts.* An all-null =Integer= column returns =Integer=; a column a
+   middle stage has filled with strings is not forced back into an integer
+   and truncated. Same reasoning that made a declared width a floor and never
+   a ceiling -- a stale declaration may not destroy a value a later stage
+   produced.
+
+3. *A GeoPackage same-format run destroys most of the container.* Measured on
+   a =.gpkg= carrying two feature layers, a plain non-spatial user table,
+   dataset metadata and R*Tree indexes, run through =geosetta g2.gpkg g2.gpkg=
+   -- the one same-format path that works today, and in place:
+
+   #+begin_src text
+   before: roads  extra  side_notes  gpkg_metadata  gpkg_metadata_reference
+           gpkg_extensions  gpkg_data_columns  gpkg_ogr_contents
+           gpkg_tile_matrix(_set)  rtree_roads_geom*(4)  rtree_extra_geom*(4)
+   after:  roads  extra  gpkg_contents  gpkg_geometry_columns
+           gpkg_spatial_ref_sys
+   #+end_src
+
+   Exit 0, no warning. =ogr2ogr= on the same input kept all of it. The two
+   feature layers survive; the user's own table does not.
+
+   Unlike defects 1--3 this one *does* need the mechanism (§ THE DOMAIN OF THE
+   RULE), so it cannot ship with M4. But it is a silent data drop under the
+   rule that is *already* in effect
+   ([[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]), so
+   the warning is owed now regardless, and
+   [[file:same-format-output.org][same-format-output.org]] M3's same-file
+   refusal would independently stop the in-place form of it.
+
+4. ~~*FlatGeobuf discards the collection's name.*~~ *FIXED 2026-08-20* with the
+   FlatGeobuf spoke (M3). =flatgeobuf/writer.rs= wrote the constant string
+   =geosetta= into the header's =NAME= slot -- a first-class field the format
+   provides precisely for this -- and the reader never read it back. Now the
+   writer writes =fc.name= (and *nothing* when there is none, rather than
+   inventing one), the reader models it, and =main.rs= consults it before
+   falling back to the input's file stem.
+
+   *This does not on its own close the layer-duplication failure* in
+   [[file:edit-composability.org][edit-composability.org]] D4. /Measured after
+   the fix:/ the loop still appends a =layer= table, because the *GeoPackage*
+   reader does not set =fc.name= from the table name, so the FGB it writes has
+   no name to carry. That half lands with the GeoPackage spoke.
+5. *Every spoke narrows a declared column type to the IR's four.* /Found and
+   measured 2026-08-20, reviewing defect 1./ =schema::ColumnType= has four
+   values -- =Bool=, =Int64=, =Double=, =String= -- while FlatGeobuf's
+   =Column.type= names fourteen, GeoPackage declares SQL types, and
+   GeoParquet carries an =ARROW:schema=. A reader decodes with the real type
+   and then discards it; the writer re-infers from the *values* and emits the
+   widest member of the four that fits. The declaration is read, used, and
+   thrown away in the same pass.
+
+   /Measured/ against real =ogr2ogr= FlatGeobuf, one column each, *all rows
+   populated* -- so this is not defect 1 wearing a disguise:
+
+   | source column      | after geosetta   | after =ogr2ogr= |
+   |--------------------+------------------+-----------------|
+   | =Integer(Int16)=   | =Integer64=      | =Integer(Int16)= |
+   | =Real(Float32)=    | =Real= (float64) | =Real(Float32)= |
+   | =DateTime=         | *=String=*       | =DateTime=      |
+
+   *Why this is the largest of the five.* Defect 1 needs an all-null column to
+   show itself; this one fires on *any* file whose columns are not already
+   =Int64=/=Double=/plain =String=, which is most real =ogr2ogr= output. The
+   =DateTime= row is the one to look at twice: a temporal column returning as
+   text is a *semantic* downgrade, not a widening, and it is silent.
+
+   *It also re-scopes defect 1.* A =FieldDecl= type drawn from the IR's own
+   four values would fix neither this nor defect 1's type half -- an all-null
+   =Short= column would still return =Int64=. The declared type must carry the
+   *source's* vocabulary, not the hub's, which is a bigger question than
+   "add a field" and is why M4 now opens with an investigation rather than an
+   implementation.
+
+Defects 1--2 need no IR change and are shipping today; defect 3 needs the
+natives channel and a warning in the meantime.
+
+*A fourth candidate was reclassified out of this list, 2026-08-20.* "A verbatim
+WKT2 definition returns as WKT1 after a trip through PROJJSON" was carried here
+until it was checked against the file: the WKT2 text is *absent from the
+GeoParquet altogether* (=grep -c PROJCRS x.parquet= → 0), because GeoParquet's
+only CRS channel is PROJJSON. So nothing was mis-rendered on the way out -- the
+text was dropped on the way *in*, by a cross-format hop, and =projjson_to_wkt=
+rendering WKT1 is the documented, deliberate behaviour of
+[[file:projjson-to-wkt.org][projjson-to-wkt.org]] § Output dialect rather than a
+defect. It is a *missing cross-format warning* and now lives in
+[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]. See
+§ The invariant binds an invocation, not a pipeline for why it was misfiled --
+the mistake is instructive, not clerical.
+
+*** The structural violation: everything the IR never modelled
+The rest is the ceiling. =same-format-output.org= enumerated it for GeoJSON
+(=id=, =bbox=, foreign members, the collection's own =name=/=bbox=) and noted
+the other eight spokes are *not yet enumerated*. That enumeration is M1 here,
+and it is the same pass that plan's M2 needed for its warning -- done once, for
+the mechanism rather than for the message.
+
+** THE ARCHITECTURAL BILL -- and why the obvious approach is wrong
+The obvious way to satisfy the rule is to teach the IR the missing members:
+=Feature.id=, =FeatureCollection.name=, per-feature =bbox=. *Rejected*, and the
+reason is the one thing this plan most needs to record, because the idea will
+recur.
+
+*Semantic modelling makes the IR the union of every spoke's expressiveness.*
+The IR is shared by all nine formats. Model =id= and every one of the nine
+writers must decide what to do with it; then the next format arrives with
+=.dbf= field widths, or a Parquet row-group layout, or GeoPackage's extension
+rows, and either the IR grows again -- touching all nine spokes -- or that
+format is silently exempt from the rule. Cost grows as formats × members, in
+exactly the dimension the hub-and-spoke design exists to keep flat
+([[file:../../architecture.org][../../architecture.org]] § WHY THIS STRUCTURE
+HELPS: "whole files fit in working context").
+
+Worse, most of these members have *no cross-format meaning to model*. A =.dbf=
+field width is not a fact about a feature; it is a fact about how one format
+stores it. Promoting it to the IR asserts a generality it does not have.
+
+** THE MECHANISM -- one opaque, format-tagged channel
+Adopt GDAL's shape (§ WHY THE RULE IS RIGHT). The IR grows *one* field, not one
+per member:
+
+#+begin_src rust
+/// What a reader recovered but the IR does not model, kept verbatim and
+/// tagged with the format that produced it.
+pub struct Native {
+    pub format: Format,
+    pub payload: NativePayload,
+}
+
+// on Feature:            pub native: Option<Native>,
+// on FeatureCollection:  pub native: Option<Native>,
+#+end_src
+
+The contract, in three lines:
+- A *reader* stashes what it did not model, verbatim, tagged with its own
+  =Format=. It stashes nothing when it modelled everything -- =None= is the
+  common case.
+- A *writer* replays the payload *if and only if* =native.format == self=.
+- On a mismatch it ignores the payload and warns through the existing
+  discipline. A mismatch is not an error; it is an ordinary cross-format run.
+
+*Why the tag is load-bearing.* It is what makes the channel unable to corrupt a
+cross-format run: a GeoJSON foreign member can never leak into a FlatGeobuf
+writer, because the writer never looks at a payload that is not its own. The
+GeoPackage-detour experiment is the evidence that this is the right boundary --
+GDAL's feature-level natives died on exactly that line.
+
+*Why adding a format stays cheap.* A new spoke populates and consumes its own
+payload variant and touches no other spoke. The rule costs each format the
+knowledge of its own format, which it necessarily already has.
+
+** DECISIONS
+
+*** D1 -- opaque passthrough, never semantic modelling -- with one named exception
+§ THE ARCHITECTURAL BILL. The IR keeps meaning *only* what all nine formats
+share; everything else rides in a payload the hub never inspects.
+
+*The exception, and it is a real one: the collection's name* (decided
+2026-08-20). It earns modelling on the test D1 otherwise refuses, because four
+spokes have a *first-class slot* for it rather than a foreign-member bag --
+GeoJSON's =name=, FlatGeobuf's header =NAME=, GeoPackage's table name and
+=gpkg_contents.identifier=, and Shapefile's filename. A member that four
+independent format specs each chose to model is not a quirk of one wire format,
+which is the whole basis for keeping things out of the IR.
+
+It is also the member whose absence is *actively corrupting files today*:
+=flatgeobuf/writer.rs:181= writes the constant =geosetta= into FlatGeobuf's
+name slot, so a layer name cannot survive an FGB transit, and
+[[file:edit-composability.org][edit-composability.org]] D4 measures the
+consequence -- a GeoPackage edit loop silently duplicating its layers instead
+of replacing them.
+
+*And the column schema* -- =width=, =precision=, =scale=, =nullable=,
+=unique=, =primary_key= (decided 2026-08-20). Same test, four slots:
+Shapefile's =.dbf= field descriptor, FlatGeobuf's =Column= table, GeoPackage's
+column declarations, GeoParquet's =ARROW:schema=.
+
+The reason it *must* be modelled rather than carried opaquely is D5. A native
+does not cross a pipe, so a Shapefile-tagged width payload never reaches a
+middle stage; but a *modelled* field rides in the transit's own first-class
+slot, which means an external tool can *read and update the schema mid-flight*:
+
+#+begin_src text
+geosetta a.shp - --to fgb | tool | geosetta - b.shp --from fgb
+#+end_src
+
+The tool widens =width: 80= to =120= alongside the value it lengthened, and the
+Shapefile writer honours the declaration it was handed. No native could do
+that.
+
+*This also retires a fourth D4 class that was briefly proposed and is not
+needed.* The concern was that replaying a declared width verbatim could
+truncate data a caller had lengthened, which argued for a "declared minimum"
+class carrying =max(declared, required)=. It does not arise: a single geosetta
+invocation cannot lengthen a property value (=--sort-hilbert= reorders,
+=--crs= relabels, =--rtree=/=--envelope= build indexes, =--layer= selects), so
+a verbatim width is still valid at write time by construction. The one place it
+*can* arise -- a route (a) caller mutating between =read_features= and
+=write_features= -- is already covered: =dbf::write= truncates at a char
+boundary *and warns* (=dbf.rs:207--216=), and errors where truncation cannot
+safely paper over the loss. *D4 stays at three classes.*
+
+*=bbox= is* not *the same case*, though it looks like one: it too appears in
+several formats, but it is *derived*, so D4 recomputes rather than models it.
+
+*A third member joins the exception, 2026-08-20: the column's declared type.*
+It passes the same two tests the width did. Four spokes give it a first-class
+slot (FlatGeobuf's =Column.type(1)=, GeoPackage's column declaration,
+Shapefile's =.dbf= field type, GeoParquet's =ARROW:schema=), and it must cross
+a pipe for the same D5 reason -- a type that rode as a native would be
+invisible to the middle tool that just changed a column's values. It arrived
+by a different route than the width, though, and the route is worth recording:
+not from the inventory, but from *defects 1 and 2 turning out to need the same
+thing* (§ Five defects). An all-null FlatGeobuf column re-infers as =String=
+without it, and a GeoPackage =BOOLEAN= has nowhere to be remembered. See M4.
+
+*** D2 -- the payload is an enum, not =Box<dyn Any>=
+Forced, not chosen: =Feature= and =FeatureCollection= derive
+=Debug, Clone, PartialEq= (=src/feature.rs=), and =dyn Any= satisfies none of
+them. A small enum with one variant per format that needs a payload keeps all
+three derives, keeps the compiler enumerating the blast radius on change (the
+advantage =architecture.org= names), and costs one match arm per spoke.
+
+Payload contents are the spoke's business -- raw =JsonValue= for GeoJSON,
+whatever FlatGeobuf's unmodelled header fields want. =Rc= where cloning would
+otherwise be expensive; the IR already uses it for property keys.
+
+*** D3 -- =None= when nothing was unmodelled, so the common case costs nothing
+The channel must not add a per-feature allocation to a wide table that had no
+foreign members. A reader populates =Some= only when it actually discarded
+something. This keeps the =performance.org= wide-table benchmarks honest and
+should be asserted there, not assumed.
+
+*** D4 -- classify natives; do not replay derived data blindly
+The most dangerous thing this mechanism could do is faithfully replay a
+=bbox= that stopped being true. Three classes, and each spoke's inventory
+assigns every member to one:
+
+- *Opaque* -- foreign members, vendor extensions, =.dbf= field widths. Replay
+  verbatim. Nothing in geosetta can or should interpret them.
+- *Identity* -- feature =id=, collection =name=. Replay verbatim, and they
+  survive reordering because they travel with their feature (=--sort-hilbert=
+  permutes features, not their natives).
+- *Derived* -- never replayed, because replaying is how derived data goes
+  stale. But *what replaces it splits by risk profile*, not by derivedness
+  (decided 2026-08-20):
+  - *Derived information* -- both =bbox=es, =gpkg_contents= extents. A missing
+    extent is a real loss and a *stale* one is actively dangerous:
+    =envelope.org= records that GDAL *trusts* a cached GeoPackage envelope on
+    the spatial-filter path, so a wrong one silently drops features that really
+    intersect the query box while unfiltered reads look perfect.
+    *Always recomputed* from the geometry actually being written. Already
+    correct today -- verified that =gpkg_contents= bboxes survive a
+    =gpkg= → =gpkg= run intact.
+  - *Derived capability* -- the R*Tree and its triggers, =gpkg_ogr_contents='s
+    feature counts. Losing these costs query speed, not data, and any tool can
+    rebuild one. *Rebuilt when the source carried one*, whether or not
+    =--rtree= was passed.
+
+  The capability rule is deliberately narrower than "turn =--rtree= on by
+  default": it restores what the input had and says nothing about a file that
+  never had an index, which is
+  [[file:spatial-index.org][spatial-index.org]]'s own open question and stays
+  there. The machinery is already in place and already validated --
+  =geosetta r1.gpkg r2.gpkg --rtree= rebuilds the index for *every* layer from
+  scratch, =rtreecheck()= returns =ok= on the result, =ogrinfo= reads it back,
+  and =gpkg_extensions= is recreated to register it. What is missing is only
+  the trigger: today the source's index is destroyed unconditionally and
+  rebuilt only on request.
+
+This class matters most under
+[[file:edit-composability.org][edit-composability.org]], where the whole point
+is that a middle stage changed the geometry between read and write.
+
+*** D5 -- the natives channel does not cross the pipe
+A native payload lives in the IR, in one process. It does not survive
+=geosetta ... - | tool | geosetta - ...= unless the transit format is the same
+format *and* its own natives are replayed into the stream -- which, for a
+same-format transit, is exactly what D1's contract delivers, and is one more
+reason =same-format-output.org= is a prerequisite rather than a nicety.
+
+Stated as a decision because the alternative -- a side-channel carrying natives
+around the middle tool -- is Route 3 from =edit-composability.org= wearing a
+different hat, and is rejected for the same reason: no external tool would know
+what to do with it.
+
+*** D6 -- the rule binds new spokes, and the enforcement is the fixture registry
+/Decided 2026-08-20./ =format.rs='s module doc splits a new format's
+obligations into "the compiler catches these" and "nobody catches these." The
+fidelity obligation goes in the *first* list -- which an earlier draft doubted
+was possible.
+
+*Not* via a =Format::native_members() -> &'static [&'static str]= constant.
+That was the obvious candidate and it is a claim, not a mechanism: an impl
+returning =&[]= is simultaneously the correct answer for a spoke that genuinely
+discards nothing and the exact shape of having forgotten, so it enforces a
+*declaration about* the property rather than the property.
+
+*The mechanism is an exhaustive match in the test harness*, with no catch-all
+arm:
+
+#+begin_src rust
+fn hostile_fixture(f: Format) -> Fixture {
+    match f {
+        Format::GeoJson => ...,
+        Format::Parquet => ...,
+        // no `_ =>` arm: a new variant fails to compile the test suite
+    }
+}
+#+end_src
+
+The round-trip test iterates it and asserts real losslessness (§ TESTING). A
+new spoke cannot build the suite without supplying a fixture, and cannot pass
+without actually being faithful. The =&[]= ambiguity has nowhere to arise --
+there is no empty fixture that passes a losslessness assertion for a format
+that loses things.
+
+*This pattern also fixes a live instance of the failure mode.*
+=format.rs='s own =display_name_uses_each_format_s_own_spelling= pins all nine
+spellings from a hand-written *array literal*, so a tenth variant compiles,
+passes, and is silently uncovered -- the precise staleness D6 exists to prevent,
+already present next to the rule. It converts to the same exhaustive-match
+shape and should, in this plan rather than filed separately: leaving a working
+example of the anti-pattern beside the new rule is how the rule gets read as
+optional.
+
+** SEQUENCING -- this inverts part of =same-format-output.org=
+That plan currently scopes closing the fidelity gap *out*, and ships a warning
+describing it instead ("This one warns about the gap; it does not close it",
+D3: "the warning ships with the deletion, not after it").
+
+Under this rule that ordering is backwards, for a reason that is not a matter
+of taste: *the warning would be permanent furniture describing a bug.* The
+crate does not write pending state into user-facing text, so the message cannot
+say the loss is temporary -- it would simply assert, indefinitely, that a
+same-format run drops =id=s. That is a promise this plan exists to break.
+
+*DECIDED 2026-08-20: land the natives channel before deleting the format
+check.* Two alternatives were weighed and rejected: shipping the deletion
+first with M2's warning (fastest unblock, but =Format::unmodelled_members='s
+nine constants become dead code the moment natives replace them with real
+handling), and a hybrid shipping the deletion alongside GeoJSON-only natives
+(limits the throwaway to eight constants, but leaves eight spokes warning
+about a loss the crate has already decided is a bug). Neither pays for
+splitting the inventory pass in two.
+
+Note one argument that was *withdrawn* rather than upheld, so it is not
+re-litigated from the record: an earlier draft claimed M2's warning could not
+be phrased honestly because the crate does not write pending state into
+user-facing text. That conflates two things. "GeoJSON feature ids are not
+preserved" is a statement of current fact, not pending state, and deleting it
+later would be ordinary. The decision rests on the duplicated inventory pass,
+not on the warning being unsayable.
+=same-format-output.org='s M1 stays exactly as designed and simply follows M2
+here. Its M2 warning then narrows to what it was always meant to cover --
+genuine cross-format capability gaps -- and its § OPEN QUESTIONS entry asking
+whether the same-format warning needs its own =--quiet= escape hatch dissolves,
+because on a same-format run there is nothing left to warn about.
+
+Defects 1--2 in § Five defects are independent of all of this and should not
+wait for any of it. Defect 3 is the container, so it travels with M3b; defect 4
+travels with D1's =name= modelling.
+
+** SCOPE
+
+*** In
+- The invariant itself, as a standing rule cross-linked from
+  =lossy-conversion-warnings.org= and =format.rs='s "adding a format" doc.
+- =Native= / =NativePayload= on =Feature= and =FeatureCollection=, and the
+  tag-matched replay contract.
+- A per-spoke inventory of unmodelled members, each classified per D4. Nine
+  spokes, one pass.
+- Reader/writer support for each spoke's own payload.
+- *The GeoPackage container*, per § THE DOMAIN OF THE RULE: unmodelled
+  =sqlite_master= objects and unpopulated =gpkg_*= registry rows carried as
+  opaque natives, derived tables recomputed. The single largest piece of work
+  in this plan, and the one that most needs its own milestone.
+- Defects 1--2 in § Five defects (independently shippable); defect 3's warning
+  now and its fix with the container work (M3b); defect 4 with D1's
+  collection-name modelling.
+- *Atomic write-and-rename*, committed 2026-08-20 as the second half of
+  [[file:edit-composability.org][edit-composability.org]] D4. Sequenced after
+  the name fix, and interacting with M3b, which may stop rewriting the
+  GeoPackage wholesale.
+
+*** Out
+- *Deleting the =args.from == out.format= check.*
+  [[file:same-format-output.org][same-format-output.org]] owns it; this plan
+  gates it (§ SEQUENCING).
+- *Making natives survive a pipe.* D5.
+- *Cross-format preservation of anything.* The rule is explicitly asymmetric;
+  a cross-format run that drops a native is correct behaviour, not a gap.
+- *Raster GeoPackages.* Out by rejection rather than by exemption, if
+  § The collision's recommendation is taken -- a vector tool declines a tile
+  container instead of silently dropping the imagery.
+
+** MILESTONES
+- *M1* -- the inventory: for each of the nine spokes, what the reader discards
+  today and which D4 class each member falls in. Pure investigation, no code,
+  and it is the same pass =same-format-output.org= M2 needs.
+  *Complete, 2026-08-20.* Both halves:
+  [[file:native-inventory.org][native-inventory.org]] for the enumeration, and
+  nine hostile fixtures in =tests/fixtures/= documented by
+  =tests/fixtures/HOSTILE.org= -- the input side of the D6 registry. Four are
+  =ogr2ogr=-produced, five authored for members no tool will emit. Every one
+  was confirmed *readable by geosetta without error* before being committed; a
+  fixture the reader rejects tests nothing. Only the =edges=/=epoch= fixture
+  hunt remains outstanding, and no available tool emits either.
+
+  *The inventory half, in detail --*
+  [[file:native-inventory.org][native-inventory.org]], all nine spokes, each
+  entry marked /measured/ or /code/. What remains of M1 is the *hostile fixture
+  per spoke* that D6's registry consumes, plus one fixture hunt (GeoParquet's
+  =edges=/=epoch=, which no available tool emits).
+
+  Three structural findings the plan did not have:
+  1. *KMZ is a second container spoke*, on the same terms as GeoPackage -- a
+     =.kmz= is a zip and geosetta writes =doc.kml= alone, so icons and overlays
+     are dropped and the surviving KML keeps dangling references. Now M3c.
+  2. *CSV, WKT and Shapefile lose the lexeme, not a member*, which is a class
+     the natives channel does not obviously fit -- see that file's proposed
+     "infer only when re-rendering reproduces the input" rule, which costs no
+     payload at all.
+  3. *Shapefile silently narrows the schema*: an 80-character =.dbf= field
+     comes back 1 character wide, holding today's rows and unable to hold
+     tomorrow's. Likeliest entry in the whole inventory to break a real
+     workflow.
+- *M2* -- =Native=/=NativePayload= in the IR, the tag-matched replay contract,
+  and the GeoJSON spoke as the first implementation. GeoJSON first because its
+  inventory is the only one already known and because it is the format where
+  the loss is most visible to users.
+  *Done.* Notes from the implementation:
+  - The IR migration cost *68 construction sites*, not the ~29 the =Position=
+    migration took -- but deriving =Default= on both structs absorbed all but
+    14 in =src/= proper; the rest were test literals.
+  - =bbox= is *not* stashed, on purpose (D4): it is derived, and replaying it
+    is how an extent goes stale. Recomputing it on write is separate work, and
+    until it lands a GeoJSON round trip still loses =bbox=. A test pins the
+    intent so it is not "fixed" by stashing it.
+  - The tree writer (=to_json=, test-only) had to change in lockstep with
+    =to_geojson_string=, since one is the byte-for-byte reference model for the
+    other. Member order matters: natives sit after =type=/=name= and before
+    =features=/=geometry=, which is where GDAL puts =id= too.
+
+  *The column-schema half, added after the above.* =crate::FieldDecl= on
+  =FeatureCollection::schema=; =schema::columns_for= replaces
+  =infer_columns= at the two writer call sites that consume declarations.
+  Four notes worth carrying forward:
+  - *The slot indices were hand-decoded from real =ogr2ogr= output*, not read
+    off the schema file, and the mapping is not what the names suggest: a
+    =.dbf= =String (80.0)= lands in FlatGeobuf's =width=, but a =Real (23.15)=
+    lands in =precision=/=scale= with *no* =width= at all. OGR's "width" and
+    FlatGeobuf's =width= are different things for numbers. =FieldDecl= follows
+    FlatGeobuf's vocabulary because it is the only one of the four spokes that
+    names all six fields. Also measured: GDAL writes =width: 0= for a
+    GeoPackage =TEXT= column, so *zero means undeclared* -- reading it as a
+    declaration would pin every downstream field to width 0.
+  - *A declaration is a floor, never a ceiling* (=schema::declared_or=). A
+    declared 80 beats a data-derived 1; a data-derived 120 beats a declared 80,
+    because obeying a stale declaration would truncate a value a middle stage
+    had just lengthened. This is the one-line form of the "declared minimum"
+    D4 class that D1 considered and retired.
+  - *=FieldDecl= is re-exported at the crate root* even though =schema= is
+    =pub(crate)=. It has to be: it is a public field of =FeatureCollection=,
+    and a route (a) caller editing a schema between =read_features= and
+    =write_features= is the case the field exists for. A =pub= field of an
+    unnameable type would have made the modelled-vs-native argument moot.
+  - *Every field is =Option=*, because "declared nothing" and "declared zero"
+    are different facts and only the first may be re-derived from the data.
+
+  *Also landed here, and it is a rule this work created:* raising the IR
+  ceiling turned a member the crate never knew about into one it knowingly
+  discards, which is what =lossy-conversion-warnings.org= governs. Hence
+  =schema_drop_warning= and =Format::carries_column_schema=. Expect the same
+  the next time a spoke starts modelling something -- see that plan's § KNOWN
+  GAPS THIS RULE HAS ALREADY CLOSED.
+- *M3* -- the remaining single-collection spokes, one at a time, each with its
+  own round-trip test.
+
+  *FlatGeobuf: done 2026-08-20.* =FgbNative= carries the header's
+  =title=/=description=/=metadata=, the =Crs= sub-table's
+  =name=/=description=/=code_string=, and per-column
+  =title=/=description=/=metadata=; =fc.name= models the header name, which
+  retires *defect 4* -- the writer's hardcoded =geosetta= constant. Verified
+  against =gdal_hostile.fgb= (real =ogr2ogr= output) and *validated by
+  =ogrinfo= on our own output*, so widening the header vtable from 11 fields to
+  14 did not break the reference implementation.
+
+  Two things this spoke settled that the plan had not:
+  1. *The =Crs= extras are opaque natives, not IR.* =crs_name= is populated in
+     every =ogr2ogr=-written file observed, so it is not a theoretical slot,
+     but =NamedCrs= models an *identity* and a *definition* and a
+     human-readable name is neither. It did not earn D1's exception: only
+     FlatGeobuf and GeoPackage have a slot, which is two spokes, not four.
+  2. *Defect 4's fix is only half a fix on its own.* An FGB now writes whatever
+     name it is given and reads it back, and =main.rs= consults =fc.name=
+     before falling back to the input's file stem -- but the *GeoPackage*
+     reader still does not set =fc.name= from the table name, so the edit loop
+     in =edit-composability.org= D4 still appends a =layer= table /(measured
+     after the fix)/. Live bug 1 closes with the GeoPackage spoke, not this
+     one.
+- *M3c* -- the KMZ container: carry the archive's other entries (icons,
+  overlays, referenced imagery) rather than writing =doc.kml= alone. Same
+  obligation as M3b at a fraction of the cost -- the entries are already bytes
+  and =src/zip.rs= already reads them. Not part of the KML spoke: that is an
+  XML document, this is an archive.
+- *M3b* -- the GeoPackage container (§ THE DOMAIN OF THE RULE). Separated from
+  M3 because it is not a spoke's payload but a database's: unmodelled
+  =sqlite_master= objects carried structurally, registry rows preserved,
+  derived tables recomputed, and the raster question from § The collision
+  answered. Largest item in the plan; sequence it last, and expect it to
+  reopen whether =run_geopackage_write= should rewrite the file at all.
+- *M4* -- defects 1--2 (§ Five defects). *Independent of M1--M3b; ship
+  whenever.* Defect 3 travels with M3b; defect 4 is *done*, with M3's
+  FlatGeobuf spoke.
+
+  *Re-scoped 2026-08-20, twice in one day.* First to *defects 1--2 as one
+  piece* (they share a fix, not merely a milestone -- § Five defects, defect
+  2), then wider still when *defect 5* turned up: all three are the same
+  missing affordance, and the third is the one that sets its shape.
+
+  0. *Settle the type vocabulary* -- investigation, not code, and it comes
+     first because it is what stops =FieldDecl= being designed twice. What
+     does each of the four declaring spokes actually name? FlatGeobuf's
+     fourteen =Column.type= values are known; GeoPackage's SQL types and
+     =.dbf='s field types are small and knowable; *GeoParquet's
+     =ARROW:schema= is the risk* -- timestamps carry timezone and precision,
+     and there are decimals, lists and structs with no member of any other
+     spoke's vocabulary to map onto. Decide how far the IR follows before
+     writing the field, not after.
+  1. *=FieldDecl= gains a declared type* in whatever vocabulary (0) settles,
+     with the declared-wins-where-silent precedence rule. The load-bearing
+     step; none of the three defects closes without it.
+  2. *FlatGeobuf's reader* materializes an omitted cell as null *and* keeps
+     the declared type -- both halves of defect 1, plus its share of defect 5.
+  3. *GeoPackage's reader* reads its column declaration -- defect 2, and its
+     share of defect 5.
+
+  *Do not shrink (0) back into (1).* The temptation is to type =FieldDecl=
+  with =schema::ColumnType= because it already exists and is already threaded
+  everywhere. Measured: that fixes neither defect 5 nor defect 1's type half,
+  since an all-null =Short= would still come back =Int64=.
+
+  *One cost to measure first.* A wide *sparse* FlatGeobuf will materialize
+  =rows x cols= property pairs where it previously held only populated ones.
+  =tests/perf.rs='s =wide_table= generates *dense* rows, so it cannot catch
+  the regression -- a sparse variant is worth adding before the change lands,
+  not after. Every other rectangular spoke already pays this cost, so the
+  question is the size of the bill, not whether it is owed.
+- *M5* -- documentation and enforcement: the rule in
+  =lossy-conversion-warnings.org=, the new-spoke obligation moved to
+  =format.rs='s *compiler-caught* list with the fixture-registry pattern named,
+  =README.md=, and the conversion of
+  =display_name_uses_each_format_s_own_spelling= off its array literal (D6).
+
+** TESTING
+- *The invariant, table-driven, per format*: read a hostile fixture, write the
+  same format, read back, assert equality of IR *plus* natives. This is the
+  test that would have caught every defect in § Five defects, and the fixture
+  registry behind it is the D6 enforcement -- an exhaustive =match=, no
+  catch-all, so a tenth spoke cannot compile the suite without one.
+- *The hostile fixture is the work.* One per format, each built to carry
+  something the IR does not model -- the GeoJSON one is the =exotic.geojson=
+  above, and it should stay that aggressive (foreign members at *both* levels,
+  an explicit null, a nested property object). Per =plans/README.org=, source
+  each from a real tool, and record in the test comment *why* each member is
+  there, so it is not simplified away later.
+- *Tag mismatch is inert*: hand a writer a native tagged for another format and
+  assert the output is byte-identical to the same run with =native: None=. The
+  safety property of the whole design.
+- *Derived data is recomputed, not replayed* (D4): edit a geometry between read
+  and write, assert the output =bbox= reflects the *new* geometry. The
+  =envelope.org= failure mode in miniature.
+- *=None= in the common case* (D3): a wide table with no unmodelled members
+  allocates no natives; assert on the =performance.org= harness.
+- *Each defect pinned*: an FGB null cell survives; a GeoPackage boolean returns
+  as a boolean; a =gpkg= → =gpkg= run preserves user tables, metadata and
+  extension rows; an FGB header carries the source's collection name rather
+  than the constant =geosetta=.
+- *Cross-format still drops, and still warns.* The asymmetry is deliberate;
+  a test that asserts a native is *gone* after a format change is as important
+  as the ones asserting it survived.
+
+** OPEN QUESTIONS
+- ~~*Can the new-spoke obligation be compiler-enforced?*~~ *Answered
+  2026-08-20: yes, but not where it was being looked for.* Not a
+  =native_members()= constant -- see D6. The enforcement is a catch-all-free
+  =match= in the test harness's fixture registry, which makes the compiler
+  demand a fixture and the assertion demand the property.
+- ~~*Does the invariant apply to a multi-layer GeoPackage, or only to a
+  layer?*~~ *DECIDED 2026-08-20: the container too* -- see § THE DOMAIN OF THE
+  RULE.
+- ~~*What does the rule mean for a format geosetta writes better than it
+  reads?*~~ *DECIDED 2026-08-20: any file this crate reads without rejecting*
+  -- see § THE DOMAIN OF THE RULE.
+- ~~*Is WKT2 output a renderer or a passthrough?*~~ *Answered 2026-08-20:
+  neither.* Both framings were wrong. A WKT2 renderer is already rejected by
+  [[file:projjson-to-wkt.org][projjson-to-wkt.org]] § Output dialect --
+  =NamedCrs.wkt= is one =Option<String>= slot that FlatGeobuf, GeoPackage and
+  Shapefile's =.prj= all read as WKT1/ESRI text, and =.prj= is consumed by
+  tools with no WKT2 support at all. Passthrough is impossible: the WKT2 is not
+  in the GeoParquet to pass through. The real answer is a cross-format warning,
+  now in =lossy-conversion-warnings.org=.
+
+** DEPENDS ON / RELATED
+- [[file:same-format-output.org][same-format-output.org]] -- *gated by this
+  plan* (§ SEQUENCING). Supplies the reasoning this rule generalises, the
+  =ogr2ogr= comparison that started it, and the same-file guard.
+- [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] -- the
+  existing standing rule this one sits beside: that plan governs what a
+  *cross-format* run must say, this one governs what a *same-format* run must
+  not do.
+- [[file:edit-composability.org][edit-composability.org]] -- the consumer.
+  Its § THE IN-PLACE HAZARD turned out *not* to be covered by this invariant at
+  all (§ The invariant binds an invocation, not a pipeline) -- the correction
+  that produced this plan's § THE TRANSIT COROLLARY cross-link. Its D4
+  classification problem is still this plan's D4.
+- [[file:multi-geometry-columns.org][multi-geometry-columns.org]] /
+  =arbitrary-geoparquet.org= -- the two live hard-rejections that § A refusal
+  honours the rule protects.
+- [[file:envelope.org][envelope.org]] -- why a replayed =bbox= is dangerous
+  rather than merely stale (D4).
+- [[file:crs-definition-output.org][crs-definition-output.org]] /
+  [[file:projjson-to-wkt.org][projjson-to-wkt.org]] -- the verbatim CRS
+  contract, and the *deliberate* WKT1 output dialect that made the reclassified
+  fourth candidate a warning rather than a renderer bug.
+- [[file:performance.org][performance.org]] -- the wide-table benchmarks D3's
+  =None=-by-default claim has to survive.
+- [[file:../../architecture.org][../../architecture.org]] -- the hub-and-spoke
+  reasoning § THE ARCHITECTURAL BILL leans on.

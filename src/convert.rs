@@ -96,6 +96,7 @@ fn read_wkt_lines(input: &[u8]) -> Result<FeatureCollection> {
             features.push(Feature {
                 geometry: Some(from_wkt(line)?),
                 properties: Vec::new(),
+                native: None,
             });
         }
     }
@@ -213,6 +214,7 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
         features.push(Feature {
             geometry,
             properties: Vec::with_capacity(num_cols),
+            native: None,
         });
     }
 
@@ -228,6 +230,9 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
     Ok(FeatureCollection {
         features,
         crs: parsed.crs,
+        name: None,
+        schema: Vec::new(),
+        native: None,
     })
 }
 
@@ -710,9 +715,9 @@ mod tests {
     fn hilbert_reorder_preserves_the_feature_set() {
         use crate::geometry::Geometry::Point;
         let mut fc = FeatureCollection::new(vec![
-            Feature { geometry: Some(Point(Position::new(100.0, 100.0))), properties: vec![] },
-            Feature { geometry: Some(Point(Position::new(0.0, 0.0))), properties: vec![] },
-            Feature { geometry: Some(Point(Position::new(1.0, 1.0))), properties: vec![] },
+            Feature { geometry: Some(Point(Position::new(100.0, 100.0))), properties: vec![], native: None },
+            Feature { geometry: Some(Point(Position::new(0.0, 0.0))), properties: vec![], native: None },
+            Feature { geometry: Some(Point(Position::new(1.0, 1.0))), properties: vec![], native: None },
         ]);
         let before = sorted_geoms(&fc);
         reorder_hilbert(&mut fc);
@@ -774,10 +779,12 @@ mod tests {
             Feature {
                 geometry: Some(crate::geometry::Geometry::Point(Position::with_m(1.0, 2.0, 5.0))),
                 properties: vec![],
+                native: None,
             },
             Feature {
                 geometry: Some(crate::geometry::Geometry::Point(Position::with_zm(3.0, 4.0, 5.0, 6.0))),
                 properties: vec![],
+                native: None,
             },
         ]);
         let pq = features_to_parquet(&fc);
@@ -827,6 +834,7 @@ mod tests {
         let mut src = FeatureCollection::new(vec![Feature {
             geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
+            native: None,
         }]);
         src.crs = Some(Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
@@ -884,6 +892,7 @@ mod tests {
         let mut fc = FeatureCollection::new(vec![Feature {
             geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
+            native: None,
         }]);
         fc.crs = Some(Crs::Named(NamedCrs {
             authority: None,
@@ -1200,6 +1209,70 @@ mod tests {
 
     fn shp_to_fc(shp: &[u8], dbf: &[u8]) -> FeatureCollection {
         crate::shapefile::read(shp, dbf, None, None).unwrap()
+    }
+
+    /// The pipeline D1 in `plans/same-format-fidelity.org` is written to make
+    /// work: a Shapefile's declared field widths survive a FlatGeobuf transit
+    /// and land in the far-end `.dbf` intact.
+    ///
+    /// `gdal_hostile.*` is `ogr2ogr`'s own output and declares
+    /// `String (80.0)` against values 6 and 8 bytes long, so nothing in the
+    /// rows could produce the 80 — it can only have been carried.
+    #[test]
+    fn declared_shapefile_widths_survive_a_flatgeobuf_transit() {
+        let source = shp_to_fc(
+            include_bytes!("../tests/fixtures/gdal_hostile.shp"),
+            include_bytes!("../tests/fixtures/gdal_hostile.dbf"),
+        );
+        let width = |fc: &FeatureCollection, name: &str| {
+            fc.schema.iter().find(|d| d.name == name).and_then(|d| d.width)
+        };
+        assert_eq!(width(&source, "name"), Some(80), "the reader must recover the declaration");
+
+        let transit = crate::flatgeobuf::read(&crate::flatgeobuf::write(&source)).unwrap();
+        assert_eq!(width(&transit, "name"), Some(80), "FlatGeobuf must carry it across the pipe");
+
+        let out = crate::shapefile::write(&transit).unwrap();
+        let far_end = crate::shapefile::read(&out.shp, &out.dbf, None, None).unwrap();
+        assert_eq!(width(&far_end, "name"), Some(80), "the far end must honour it");
+        // The numeric declaration travels in its own two slots.
+        let price = far_end.schema.iter().find(|d| d.name == "price").unwrap();
+        assert_eq!((price.precision, price.scale), (Some(24), Some(15)));
+    }
+
+    /// The reason the schema is *modelled* rather than carried as a native
+    /// (D1/D5): a middle stage can edit it. A native never crosses the pipe,
+    /// so nothing but a modelled field could widen a declaration alongside the
+    /// value that outgrew it.
+    #[test]
+    fn a_middle_stage_can_widen_a_declaration_mid_pipeline() {
+        let source = shp_to_fc(
+            include_bytes!("../tests/fixtures/gdal_hostile.shp"),
+            include_bytes!("../tests/fixtures/gdal_hostile.dbf"),
+        );
+        let mut transit = crate::flatgeobuf::read(&crate::flatgeobuf::write(&source)).unwrap();
+
+        // What an external tool does: lengthen a value and widen the
+        // declaration that governs it.
+        for f in &mut transit.features {
+            if let Some((_, v)) = f.properties.iter_mut().find(|(k, _)| &**k == "name") {
+                *v = crate::json::JsonValue::String("x".repeat(100));
+            }
+        }
+        transit.schema.iter_mut().find(|d| d.name == "name").unwrap().width = Some(120);
+
+        let out = crate::shapefile::write(&transit).unwrap();
+        let far_end = crate::shapefile::read(&out.shp, &out.dbf, None, None).unwrap();
+        assert_eq!(
+            far_end.schema.iter().find(|d| d.name == "name").unwrap().width,
+            Some(120),
+            "the widened declaration, not the original 80"
+        );
+        assert_eq!(
+            far_end.features[0].properties.iter().find(|(k, _)| &**k == "name").unwrap().1,
+            crate::json::JsonValue::String("x".repeat(100)),
+            "and the lengthened value survives it"
+        );
     }
 
     #[test]

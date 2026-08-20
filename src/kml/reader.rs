@@ -82,7 +82,7 @@ fn placemark_to_feature(el: &XmlElement) -> Result<Feature> {
         .iter()
         .find_map(parse_geometry)
         .transpose()?;
-    Ok(Feature { geometry, properties })
+    Ok(Feature { geometry, properties, native: None })
 }
 
 /// `<Data name="k"><value>v</value></Data>` and the schema-typed

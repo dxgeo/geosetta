@@ -6,8 +6,10 @@
 
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
+use crate::format::Format;
 use crate::geometry::{Geometry, Position};
 use crate::json::{self, JsonValue, Parser};
+use crate::native::{Native, NativePayload};
 use std::collections::HashSet;
 use std::rc::Rc;
 
@@ -58,6 +60,7 @@ pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
         _ => Ok(wgs84(vec![Feature {
             geometry: Some(parse_geometry(value)?),
             properties: Vec::new(),
+            native: None,
         }])),
     }
 }
@@ -66,10 +69,45 @@ pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
 /// always WGS 84 longitude/latitude per RFC 7946; a file carries no other CRS,
 /// so reading one always yields the spec default.
 fn wgs84(features: Vec<Feature>) -> FeatureCollection {
+    wgs84_with(features, None, Vec::new())
+}
+
+/// [`wgs84`], plus the collection's own `name` and whatever else the reader
+/// skipped at collection level.
+///
+/// `name` is modelled ([`FeatureCollection::name`]); the rest becomes a
+/// [`Native`] tagged `GeoJson`, so only the GeoJSON writer replays it.
+fn wgs84_with(
+    features: Vec<Feature>,
+    name: Option<String>,
+    unmodelled: Vec<(Rc<str>, JsonValue)>,
+) -> FeatureCollection {
     FeatureCollection {
         features,
         crs: Some(crate::crs::Crs::Wgs84),
+        name,
+        schema: Vec::new(),
+        native: native_from(unmodelled),
     }
+}
+
+/// Tag skipped members as a GeoJSON native, or `None` when there were none —
+/// the common case, which must not allocate.
+fn native_from(unmodelled: Vec<(Rc<str>, JsonValue)>) -> Option<Native> {
+    (!unmodelled.is_empty())
+        .then(|| Native::new(Format::GeoJson, NativePayload::GeoJson(unmodelled)))
+}
+
+/// Whether a skipped member is worth stashing for replay.
+///
+/// `type` is structural — the writer re-emits it unconditionally, so replaying
+/// it would duplicate a key. `bbox` is *derived*: `plans/same-format-fidelity.org`
+/// D4 forbids replaying derived data, because a middle stage that edits geometry
+/// leaves a stale extent behind, and a stale extent is worse than none (GDAL
+/// trusts a cached one on the spatial-filter path). Recomputing it on write is
+/// follow-on work; dropping it here is deliberate, not an oversight.
+fn is_replayable(key: &str) -> bool {
+    !matches!(key, "type" | "bbox" | "geometry" | "properties" | "features")
 }
 
 // --- streaming reader ------------------------------------------------------
@@ -104,6 +142,8 @@ pub fn from_geojson_str(input: &str) -> Result<FeatureCollection> {
 fn stream_collection(p: &mut Parser) -> Result<Option<FeatureCollection>> {
     p.expect(b'{')?;
     let mut features: Option<Vec<Feature>> = None;
+    let mut name: Option<String> = None;
+    let mut unmodelled: Vec<(Rc<str>, JsonValue)> = Vec::new();
     p.skip_ws();
     if p.peek() == Some(b'}') {
         p.bump();
@@ -115,6 +155,20 @@ fn stream_collection(p: &mut Parser) -> Result<Option<FeatureCollection>> {
             p.expect(b':')?;
             if key == "features" && features.is_none() {
                 features = Some(stream_features(p)?);
+            } else if key == "name" && name.is_none() {
+                // Modelled, not stashed: several formats have a first-class
+                // slot for a collection's name (see `FeatureCollection::name`).
+                name = match p.parse_value()? {
+                    JsonValue::String(s) => Some(s),
+                    // A non-string `name` is not the member RFC 7946 tooling
+                    // writes; keep it verbatim rather than coercing it.
+                    other => {
+                        unmodelled.push((Rc::from(key.as_str()), other));
+                        None
+                    }
+                };
+            } else if is_replayable(&key) {
+                unmodelled.push((Rc::from(key.as_str()), p.parse_value()?));
             } else {
                 p.skip_value()?;
             }
@@ -131,7 +185,7 @@ fn stream_collection(p: &mut Parser) -> Result<Option<FeatureCollection>> {
             if !p.at_end() {
                 return Err(p.err("unexpected trailing characters"));
             }
-            Ok(Some(wgs84(f)))
+            Ok(Some(wgs84_with(f, name, unmodelled)))
         }
         None => Ok(None),
     }
@@ -168,10 +222,11 @@ fn stream_feature(p: &mut Parser, keys: &mut KeyInterner) -> Result<Feature> {
     p.expect(b'{')?;
     let mut geometry = None;
     let mut properties: Vec<(Rc<str>, JsonValue)> = Vec::new();
+    let mut unmodelled: Vec<(Rc<str>, JsonValue)> = Vec::new();
     p.skip_ws();
     if p.peek() == Some(b'}') {
         p.bump();
-        return Ok(Feature { geometry, properties });
+        return Ok(Feature { geometry, properties, native: None });
     }
     loop {
         p.skip_ws();
@@ -196,6 +251,10 @@ fn stream_feature(p: &mut Parser, keys: &mut KeyInterner) -> Result<Feature> {
                         .collect();
                 }
             }
+            // `id` and any foreign member are kept verbatim so a GeoJSON →
+            // GeoJSON run can put them back; `type`/`bbox` are filtered by
+            // `is_replayable`.
+            k if is_replayable(k) => unmodelled.push((keys.intern(k), p.parse_value()?)),
             _ => p.skip_value()?,
         }
         p.skip_ws();
@@ -205,7 +264,7 @@ fn stream_feature(p: &mut Parser, keys: &mut KeyInterner) -> Result<Feature> {
             _ => return Err(p.err("expected ',' or '}' in feature")),
         }
     }
-    Ok(Feature { geometry, properties })
+    Ok(Feature { geometry, properties, native: native_from(unmodelled) })
 }
 
 /// Stream one geometry object. `coordinates` are parsed straight into typed
@@ -374,7 +433,13 @@ fn stream_array<T>(p: &mut Parser, elem: fn(&mut Parser) -> Result<T>) -> Result
 pub fn to_geojson_string(fc: &FeatureCollection) -> String {
     // Rough guess: geometry + a little overhead per feature.
     let mut out = String::with_capacity(fc.features.len() * 96 + 64);
-    out.push_str("{\"type\":\"FeatureCollection\",\"features\":[");
+    out.push_str("{\"type\":\"FeatureCollection\"");
+    if let Some(name) = &fc.name {
+        out.push_str(",\"name\":");
+        json::escape_into(name, &mut out);
+    }
+    write_natives(&mut out, fc.native.as_ref());
+    out.push_str(",\"features\":[");
     for (i, f) in fc.features.iter().enumerate() {
         if i > 0 {
             out.push(',');
@@ -385,8 +450,30 @@ pub fn to_geojson_string(fc: &FeatureCollection) -> String {
     out
 }
 
+/// Re-emit the members a GeoJSON source carried that the IR does not model.
+///
+/// Replays only when the native was produced by *this* format
+/// ([`Native::payload_for`]) — a FlatGeobuf-tagged payload is ignored here, and
+/// that is an ordinary cross-format conversion rather than an error. Emits
+/// nothing at all when there is no native, which is the common case.
+fn write_natives(out: &mut String, native: Option<&Native>) {
+    let Some(NativePayload::GeoJson(members)) =
+        native.and_then(|n| n.payload_for(Format::GeoJson))
+    else {
+        return;
+    };
+    for (k, v) in members {
+        out.push(',');
+        json::escape_into(k, out);
+        out.push(':');
+        v.write_json_to(out);
+    }
+}
+
 fn write_feature(out: &mut String, f: &Feature) {
-    out.push_str("{\"type\":\"Feature\",\"geometry\":");
+    out.push_str("{\"type\":\"Feature\"");
+    write_natives(out, f.native.as_ref());
+    out.push_str(",\"geometry\":");
     match &f.geometry {
         Some(g) => write_geometry(out, g),
         None => out.push_str("null"),
@@ -479,10 +566,32 @@ fn write_rings(out: &mut String, rings: &[Vec<Position>]) {
 #[cfg(test)]
 pub fn to_json(fc: &FeatureCollection) -> JsonValue {
     let features = fc.features.iter().map(feature_to_json).collect();
-    obj(vec![
-        ("type", JsonValue::String("FeatureCollection".into())),
-        ("features", JsonValue::Array(features)),
-    ])
+    let mut members = vec![("type", JsonValue::String("FeatureCollection".into()))];
+    if let Some(name) = &fc.name {
+        members.push(("name", JsonValue::String(name.clone())));
+    }
+    let mut members = obj_members(members, fc.native.as_ref());
+    members.push(("features".to_string(), JsonValue::Array(features)));
+    JsonValue::Object(members)
+}
+
+/// Shared by both tree builders: turn `&str`-keyed members into owned ones and
+/// append the replayed natives, so member *order* matches
+/// [`to_geojson_string`] exactly (natives sit after `type`/`name` and before
+/// `features`/`geometry`).
+#[cfg(test)]
+fn obj_members(
+    base: Vec<(&str, JsonValue)>,
+    native: Option<&Native>,
+) -> Vec<(String, JsonValue)> {
+    let mut out: Vec<(String, JsonValue)> =
+        base.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    if let Some(NativePayload::GeoJson(members)) =
+        native.and_then(|n| n.payload_for(Format::GeoJson))
+    {
+        out.extend(members.iter().map(|(k, v)| (k.to_string(), v.clone())));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -491,19 +600,21 @@ fn feature_to_json(f: &Feature) -> JsonValue {
         Some(g) => geometry_to_json(g),
         None => JsonValue::Null,
     };
-    obj(vec![
-        ("type", JsonValue::String("Feature".into())),
-        ("geometry", geometry),
-        (
-            "properties",
-            JsonValue::Object(
-                f.properties
-                    .iter()
-                    .map(|(k, v)| (k.to_string(), v.clone()))
-                    .collect(),
-            ),
+    let mut members = obj_members(
+        vec![("type", JsonValue::String("Feature".into()))],
+        f.native.as_ref(),
+    );
+    members.push(("geometry".to_string(), geometry));
+    members.push((
+        "properties".to_string(),
+        JsonValue::Object(
+            f.properties
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.clone()))
+                .collect(),
         ),
-    ])
+    ));
+    JsonValue::Object(members)
 }
 
 #[cfg(test)]
@@ -576,9 +687,20 @@ fn parse_feature(value: &JsonValue, keys: &mut KeyInterner) -> Result<Feature> {
             .collect(),
         _ => Vec::new(),
     };
+    // Must match `stream_feature`'s stash exactly: the two paths are required
+    // to produce identical output (see `from_geojson_str`).
+    let unmodelled = match value {
+        JsonValue::Object(members) => members
+            .iter()
+            .filter(|(k, _)| is_replayable(k))
+            .map(|(k, v)| (keys.intern(k), v.clone()))
+            .collect(),
+        _ => Vec::new(),
+    };
     Ok(Feature {
         geometry,
         properties,
+        native: native_from(unmodelled),
     })
 }
 
@@ -665,6 +787,98 @@ fn array(value: &JsonValue) -> Result<&[JsonValue]> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The round-trip invariant for this spoke: read a hostile fixture, write
+    /// the same format, and get every unmodelled member back.
+    ///
+    /// The fixture is `tests/fixtures/hand_hostile.geojson`, described in
+    /// `tests/fixtures/HOSTILE.org`; it is inlined here rather than read from
+    /// disk so this stays a unit test. Keep the two in step.
+    const HOSTILE: &str = r#"{"type":"FeatureCollection",
+ "name":"hostile",
+ "vendor:extension":{"produced_by":"hand","v":2},
+ "features":[
+  {"type":"Feature","id":42,"vendor:featureNote":"keep-me",
+   "geometry":{"type":"Point","coordinates":[12.5683,55.6761]},
+   "properties":{"zip":"007","note":null}},
+  {"type":"Feature","id":"a-string-id",
+   "geometry":{"type":"Point","coordinates":[8.5417,47.3769]},
+   "properties":{"zip":"08001"}}]}"#;
+
+    #[test]
+    fn same_format_round_trip_keeps_unmodelled_members() {
+        let fc = from_geojson_str(HOSTILE).unwrap();
+
+        // Modelled, not stashed.
+        assert_eq!(fc.name.as_deref(), Some("hostile"));
+
+        let out = to_geojson_string(&fc);
+        // Collection-level foreign member.
+        assert!(out.contains(r#""vendor:extension":{"produced_by":"hand","v":2}"#), "{out}");
+        // Feature `id`, in both of the forms GeoJSON permits.
+        assert!(out.contains(r#""id":42"#), "{out}");
+        assert!(out.contains(r#""id":"a-string-id""#), "{out}");
+        // Feature-level foreign member.
+        assert!(out.contains(r#""vendor:featureNote":"keep-me""#), "{out}");
+        // And the modelled name is re-emitted.
+        assert!(out.contains(r#""name":"hostile""#), "{out}");
+
+        // The real assertion: reading the output back yields an equal IR.
+        assert_eq!(from_geojson_str(&out).unwrap(), fc);
+    }
+
+    /// A native must never leak into a format that did not produce it. This is
+    /// the safety property the format tag exists for.
+    #[test]
+    fn a_foreign_native_is_ignored_rather_than_replayed() {
+        let mut fc = from_geojson_str(HOSTILE).unwrap();
+        let with_natives = to_geojson_string(&fc);
+
+        // Re-tag every native as if some other spoke had produced it.
+        let retag = |n: &mut Option<crate::native::Native>| {
+            if let Some(n) = n {
+                n.format = Format::FlatGeobuf;
+            }
+        };
+        retag(&mut fc.native);
+        for f in &mut fc.features {
+            retag(&mut f.native);
+        }
+        let ignored = to_geojson_string(&fc);
+
+        assert_ne!(with_natives, ignored);
+        assert!(!ignored.contains("vendor:"), "{ignored}");
+        assert!(!ignored.contains(r#""id":"#), "{ignored}");
+        // `name` is modelled, not a native, so it is unaffected by the tag.
+        assert!(ignored.contains(r#""name":"hostile""#), "{ignored}");
+    }
+
+    /// `None` in the common case (D3): a collection with nothing unmodelled
+    /// must not allocate a payload, on any feature or on itself.
+    #[test]
+    fn a_plain_collection_carries_no_native() {
+        let plain = r#"{"type":"FeatureCollection","features":[
+            {"type":"Feature","geometry":{"type":"Point","coordinates":[1,2]},
+             "properties":{"a":1}}]}"#;
+        let fc = from_geojson_str(plain).unwrap();
+        assert!(fc.native.is_none());
+        assert!(fc.name.is_none());
+        assert!(fc.features.iter().all(|f| f.native.is_none()));
+    }
+
+    /// `bbox` is derived, so D4 forbids replaying it — a middle stage that
+    /// edits geometry would leave a stale extent behind. It is dropped on
+    /// purpose; recomputing it on write is separate work.
+    #[test]
+    fn bbox_is_not_stashed_because_it_is_derived() {
+        let with_bbox = r#"{"type":"FeatureCollection","bbox":[0,0,1,1],"features":[
+            {"type":"Feature","bbox":[0,0,1,1],
+             "geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}]}"#;
+        let fc = from_geojson_str(with_bbox).unwrap();
+        assert!(fc.native.is_none(), "collection bbox was stashed");
+        assert!(fc.features[0].native.is_none(), "feature bbox was stashed");
+        assert!(!to_geojson_string(&fc).contains("bbox"));
+    }
     use super::*;
     use crate::json::parse;
 
@@ -706,6 +920,7 @@ mod tests {
         let fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
+            native: None,
         }]);
         let written = to_geojson_string(&fc);
         assert!(written.contains("\"coordinates\":[1,2]}") || written.contains("\"coordinates\":[1.0,2.0]}"));

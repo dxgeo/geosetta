@@ -1,0 +1,14 @@
+{"type":"FeatureCollection",
+ "name":"hostile",
+ "bbox":[8.5417,47.3769,12.5683,55.6761],
+ "vendor:extension":{"produced_by":"hand","v":2},
+ "features":[
+  {"type":"Feature","id":42,"bbox":[12.5683,55.6761,12.5683,55.6761],
+   "vendor:featureNote":"keep-me",
+   "geometry":{"type":"Point","coordinates":[12.5683,55.6761],"vendor:geomNote":"on the geometry"},
+   "properties":{"name":"K\u00f8benhavn","zip":"007","price":1.50,"note":null,
+                 "nested":{"deep":[1,2,{"k":"v"}]},"flag":true}},
+  {"type":"Feature","id":"a-string-id",
+   "geometry":{"type":"Point","coordinates":[8.5417,47.3769]},
+   "properties":{"name":"Zürich","zip":"08001","price":22.25,"note":"café",
+                 "nested":{},"flag":false}}]}

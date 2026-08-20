@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::json::JsonValue;
-use crate::schema::{Cell, Column, ColumnType};
+use crate::schema::{Cell, Column, ColumnType, FieldDecl, declared_or};
 use std::rc::Rc;
 
 const HEADER_LEN: usize = 32;
@@ -98,6 +98,42 @@ pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool) -> Result<Vec<R
         records.push(Record { deleted, properties });
     }
     Ok(records)
+}
+
+/// The field descriptors' *declarations*, independent of any record — the
+/// widths and decimal counts the `.dbf` header states, which are exactly what
+/// re-deriving a schema from today's values throws away.
+///
+/// A separate entry point rather than a second return value from [`read`]
+/// because it costs only the header: [`read`]'s callers that do not carry a
+/// schema pay nothing, and this reads no records at all.
+///
+/// The mapping to [`FieldDecl`]'s FlatGeobuf-derived vocabulary follows GDAL's
+/// own, verified against `ogr2ogr`-written FlatGeobuf: a character field's
+/// length is a *width*, a numeric field's length is a *precision* (significant
+/// digits) with its `decimals` as the *scale*. dBase declares nothing about
+/// nullability, uniqueness or keys, so those three stay `None` — a `.dbf` that
+/// went through a FlatGeobuf transit carrying them will lose them here, and
+/// that is the target's incapacity rather than a defect.
+pub fn read_schema(data: &[u8]) -> Result<Vec<FieldDecl>> {
+    if data.len() < HEADER_LEN {
+        return Ok(Vec::new());
+    }
+    Ok(read_fields(data)?
+        .into_iter()
+        .map(|f| {
+            let mut decl = FieldDecl::new(f.name);
+            match f.ty {
+                b'N' | b'F' => {
+                    decl.precision = Some(f.len as u32);
+                    decl.scale = Some(f.decimals as u32);
+                }
+                _ => decl.width = Some(f.len as u32),
+            }
+            decl
+        })
+        .filter(|d| !d.is_empty())
+        .collect())
 }
 
 fn read_fields(data: &[u8]) -> Result<Vec<Field>> {
@@ -307,8 +343,22 @@ fn resolve_field_names(columns: &[Column], fields: &mut [DbfField], warnings: &m
     Ok(())
 }
 
+/// Resolve one column to a `.dbf` field descriptor.
+///
+/// Every size below is the width the *data* needs, then widened by whatever
+/// the source declared (see [`declared_or`]) — never narrowed to it. Without
+/// that second step an 80-character field holding one-character values comes
+/// back out one character wide, which is the single most workflow-breaking
+/// loss in `plans/native-inventory.org`: the file still holds today's rows and
+/// can no longer hold tomorrow's.
+///
+/// Which declaration slot applies depends on the type, per [`FieldDecl`]:
+/// character fields take `width`, numeric fields take `precision` for the
+/// field length and `scale` for the decimal count. dBase's logical field is
+/// exactly one byte wide by definition, so a declaration cannot move it.
 fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
     let name = col.name.clone();
+    let decl = col.decl.as_ref();
     match col.ty {
         ColumnType::Bool => Ok(DbfField { name, ty: b'L', len: 1, decimals: 0 }),
         ColumnType::Int64 => {
@@ -326,6 +376,11 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
                 .max()
                 .unwrap_or(1)
                 .clamp(1, 255);
+            // `decimals` stays 0 whatever the source declared: an integer
+            // column has no decimal part, and `write_cell` formats an `Int`
+            // without one, so a non-zero declaration here would put a width in
+            // the header that the records do not match.
+            let len = declared_or(decl.and_then(|d| d.precision), len).min(255);
             Ok(DbfField { name, ty: b'N', len, decimals: 0 })
         }
         ColumnType::Double => {
@@ -338,16 +393,20 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
             // Only the *lower* bound is clamped, to cover an empty/all-null
             // column.
             const DECIMALS: usize = 6;
+            // A declared scale replaces the fallback *before* the widths are
+            // measured, since the decimal count is what the formatted width is
+            // measured against.
+            let decimals = decl.and_then(|d| d.scale).map(|s| s as usize).unwrap_or(DECIMALS);
             let len = col
                 .values
                 .iter()
                 .filter_map(|c| match c {
-                    Cell::Double(v) => Some(format!("{v:.DECIMALS$}").len()),
+                    Cell::Double(v) => Some(format!("{v:.decimals$}").len()),
                     _ => None,
                 })
                 .max()
-                .unwrap_or(1 + DECIMALS + 1)
-                .max(DECIMALS + 2);
+                .unwrap_or(1 + decimals + 1)
+                .max(decimals + 2);
             if len > 255 {
                 return Err(Error::Convert(format!(
                     "shapefile: property \"{}\" has a value {len} bytes wide as fixed-point decimal text, \
@@ -356,7 +415,11 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
                     col.name
                 )));
             }
-            Ok(DbfField { name, ty: b'N', len, decimals: DECIMALS })
+            // The declaration widens the field but cannot push it past
+            // dBase's own 255-byte limit; the error above already established
+            // that the *data* fits inside it.
+            let len = declared_or(decl.and_then(|d| d.precision), len).min(255);
+            Ok(DbfField { name, ty: b'N', len, decimals })
         }
         ColumnType::String => {
             // Sized to the longest observed UTF-8 byte length, capped at DBF's
@@ -380,7 +443,8 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
                     col.name
                 ));
             }
-            Ok(DbfField { name, ty: b'C', len: true_max.clamp(1, 255), decimals: 0 })
+            let len = declared_or(decl.and_then(|d| d.width), true_max).clamp(1, 255);
+            Ok(DbfField { name, ty: b'C', len, decimals: 0 })
         }
     }
 }
@@ -429,8 +493,105 @@ mod tests {
             .map(|p| Feature {
                 geometry: None,
                 properties: p.iter().map(|(k, v)| (Rc::from(*k), v.clone())).collect(),
+                native: None,
             })
             .collect()
+    }
+
+    /// `gdal_hostile.dbf` is `ogr2ogr`'s own output and declares exactly the
+    /// widths this crate used to throw away: `String (80.0)` three times and
+    /// `Real (24.15)`.
+    const HOSTILE_DBF: &[u8] = include_bytes!("../../tests/fixtures/gdal_hostile.dbf");
+
+    fn decl(name: &str) -> FieldDecl {
+        read_schema(HOSTILE_DBF).unwrap().into_iter().find(|d| d.name == name).unwrap()
+    }
+
+    #[test]
+    fn read_schema_recovers_declared_character_widths() {
+        // The 80 is on disk; the values in it are 6 and 8 bytes long. Nothing
+        // about the rows could produce this number.
+        assert_eq!(decl("name").width, Some(80));
+        assert_eq!(decl("zip").width, Some(80));
+        assert_eq!(decl("note").width, Some(80));
+    }
+
+    #[test]
+    fn read_schema_maps_a_numeric_field_to_precision_and_scale() {
+        // `.dbf` says len 24, decimals 15 — GDAL calls that `Real (24.15)`.
+        // In FlatGeobuf's vocabulary, which `FieldDecl` follows, the field
+        // length is a *precision* and the decimals a *scale*; `width` stays
+        // unset, exactly as GDAL writes it.
+        let price = decl("price");
+        assert_eq!((price.precision, price.scale), (Some(24), Some(15)));
+        assert_eq!(price.width, None);
+    }
+
+    #[test]
+    fn read_schema_declares_nothing_about_nulls_or_keys() {
+        // dBase has no such concepts; a `.dbf` cannot state them, so the
+        // reader must not invent them.
+        for d in read_schema(HOSTILE_DBF).unwrap() {
+            assert_eq!((d.nullable, d.unique, d.primary_key), (None, None, None), "{}", d.name);
+        }
+    }
+
+    /// The defect this whole mechanism exists to fix: without a declaration an
+    /// 80-character field comes back sized to today's longest value.
+    #[test]
+    fn a_declared_width_survives_the_writer_and_re_derivation_does_not() {
+        let feats = features(&[&[("name", JsonValue::String("Zürich".into()))]]);
+        let mut columns = infer_columns(&feats);
+
+        let (narrowed, _) = write(&columns).unwrap();
+        assert_eq!(read_schema(&narrowed).unwrap()[0].width, Some(7), "no declaration: sized to the data");
+
+        columns[0].decl = Some(FieldDecl { name: "name".into(), width: Some(80), ..FieldDecl::default() });
+        let (honoured, _) = write(&columns).unwrap();
+        assert_eq!(read_schema(&honoured).unwrap()[0].width, Some(80));
+        // And the values still read back intact at the wider size.
+        assert_eq!(
+            read(&honoured, Encoding::Utf8, true).unwrap()[0].properties[0].1,
+            JsonValue::String("Zürich".into())
+        );
+    }
+
+    #[test]
+    fn a_declaration_narrower_than_the_data_is_widened_not_obeyed() {
+        // The mid-pipeline case: a middle stage lengthened the value but left
+        // the declaration alone. Obeying it would truncate what it wrote.
+        let long = "x".repeat(40);
+        let feats = features(&[&[("name", JsonValue::String(long.clone()))]]);
+        let mut columns = infer_columns(&feats);
+        columns[0].decl = Some(FieldDecl { name: "name".into(), width: Some(10), ..FieldDecl::default() });
+        let (bytes, warnings) = write(&columns).unwrap();
+        assert_eq!(read_schema(&bytes).unwrap()[0].width, Some(40));
+        assert!(warnings.is_empty(), "widening is not a loss and must not warn: {warnings:?}");
+        assert_eq!(read(&bytes, Encoding::Utf8, true).unwrap()[0].properties[0].1, JsonValue::String(long));
+    }
+
+    #[test]
+    fn a_declared_scale_sets_the_numeric_field_s_decimals() {
+        let feats = features(&[&[("price", JsonValue::Number { value: 1.5, is_int: false })]]);
+        let mut columns = infer_columns(&feats);
+        columns[0].decl =
+            Some(FieldDecl { name: "price".into(), precision: Some(24), scale: Some(15), ..FieldDecl::default() });
+        let (bytes, _) = write(&columns).unwrap();
+        let d = &read_schema(&bytes).unwrap()[0];
+        assert_eq!((d.precision, d.scale), (Some(24), Some(15)));
+        assert_eq!(
+            read(&bytes, Encoding::Utf8, true).unwrap()[0].properties[0].1,
+            JsonValue::Number { value: 1.5, is_int: false }
+        );
+    }
+
+    #[test]
+    fn a_declaration_cannot_push_a_field_past_dbase_s_own_limit() {
+        let feats = features(&[&[("name", JsonValue::String("x".into()))]]);
+        let mut columns = infer_columns(&feats);
+        columns[0].decl = Some(FieldDecl { name: "name".into(), width: Some(4000), ..FieldDecl::default() });
+        let (bytes, _) = write(&columns).unwrap();
+        assert_eq!(read_schema(&bytes).unwrap()[0].width, Some(255));
     }
 
     #[test]

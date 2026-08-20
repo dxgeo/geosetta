@@ -285,6 +285,48 @@ why, not to implement the spec's table from symmetry.
   zeros it wrote. Geosetta does not promote, so folding real Zs only is exact
   here; the invariant -- the bbox Z range must cover every Z actually written
   -- is pinned by a test that would fail if a future writer started promoting.
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] :: A standing
+  invariant -- *reading a format and writing the same format loses nothing* --
+  and the one mechanism that delivers it without the IR swelling into a union
+  of all nine spokes. A capability gap in the target excuses a drop; the target
+  being the source's own format does not. Verified against GDAL 3.13.2, which
+  already works this way: a hostile GeoJSON fixture (foreign members at both
+  the collection *and* feature level, both =bbox=es, =id=, a nested property, an
+  explicit null) survives =ogr2ogr= same-format intact, while a GeoPackage
+  detour drops precisely the feature-level members -- an asymmetry that reveals
+  the mechanism as an *opaque, driver-keyed* blob rather than semantic
+  modelling. Adopts that shape: one =Native { format, payload }= field on
+  =Feature=/=FeatureCollection=, replayed by a writer only when the tag matches
+  itself, so adding a format touches only its own spoke and a native can never
+  leak across a format change. Classifies natives as opaque / identity /
+  *derived*, the last never replayed (a stale =bbox= is the =envelope.org=
+  failure mode, where GDAL trusts the cache on the spatial-filter path).
+  *Gates* [[file:same-format-output.org][same-format-output.org]] and inverts
+  part of its scope. Carries three confirmed defects that become bugs the
+  moment the rule is adopted -- the FlatGeobuf reader not restoring an omitted
+  cell to null, the GeoPackage reader ignoring a =BOOLEAN= declaration its own
+  writer emits correctly, and a =gpkg= → =gpkg= run destroying the container
+  around the layers (measured: user tables, metadata, extensions and every
+  R*Tree gone, exit 0, no warning). *Scoping only.*
+- [[file:native-inventory.org][native-inventory.org]] :: *Reference, not a
+  plan.* What each of the nine readers discards, classified per
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] D4
+  (opaque / identity / derived). M1's deliverable, and the thing
+  [[file:same-format-output.org][same-format-output.org]] M2 and
+  [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]
+  § OPEN QUESTION are both blocked on -- the warning-scope argument was being
+  had over a set nobody had enumerated. Every entry is marked /measured/,
+  /code/ or /unverified/, because the confidence differs. First pass covers
+  all nine; Shapefile's write side and some KML elements remain unconfirmed.
+  Notable findings: CSV and WKT lose the *lexeme* rather than any member
+  (=007= → =7=, =1.50= → =1.5=, and a 20-digit integer through an =f64=),
+  FlatGeobuf's =Column= table drops *nine* fields of per-column schema, and
+  *KMZ is a second container spoke* -- a =.kmz= is a zip and geosetta writes
+  =doc.kml= alone, so icons and overlays are dropped and the surviving KML
+  keeps its dangling references. GeoParquet, measured against a real =ogr2ogr=
+  file, drops two of three =key_value_metadata= keys (=ARROW:schema=,
+  =gdal:metadata=), =orientation=, and the whole =covering= bbox index with its
+  five schema entries.
 - [[file:same-format-output.org][same-format-output.org]] :: Drop the
   =args.from == out.format= rejection in =main.rs=, so a user can write the
   format they read -- =--crs= relabelling, =--sort-hilbert=, =--envelope= and a
@@ -302,4 +344,31 @@ why, not to implement the spec's table from symmetry.
   it" is no longer a defence for dropping them silently. Also restores the
   in-place guard the format check had been providing by accident (=ogr2ogr=
   refuses same-file too; geosetta's =gpkg= path currently allows it).
+  *Scoping only.*
+- [[file:edit-composability.org][edit-composability.org]] :: Read a file, let
+  *some other program* modify the feature collection, write it back -- the
+  third seam in the family
+  [[file:reproject-composability.org][reproject-composability.org]] started,
+  where the external tool rewrites the whole collection rather than just its
+  coordinates. The loop already runs (=geosetta f.fgb - --to geojson | jq ...
+  | geosetta - out.fgb --from geojson --crs saved.crs=, verified end to end
+  with the CRS surviving verbatim), so the plan is about what is wrong with
+  it: *no transit format carries a full collection without loss*, and four of
+  the losses are silent -- WKT drops every property, KML coerces them all to
+  strings, FlatGeobuf drops null-valued ones outright, GeoPackage turns
+  booleans into integers, none of them saying a word. The measured
+  transit-fidelity matrix is the centrepiece, and its shape is the problem:
+  the formats a stranger can edit are the lossy ones and the faithful ones are
+  binary. The conclusion it does *not* support is "we need a new transit
+  format" -- every silent loss in the two faithful rows traces to a geosetta
+  defect over a wire that was already carrying the data (FGB keeps the column
+  in its header and the reader will not restore an omitted cell to null;
+  GeoParquet stored the CRS fine and =projjson_to_wkt= renders WKT1 by
+  construction), so FlatGeobuf is one reader fix from carrying everything the
+  IR models. What no format can raise is the IR's own ceiling -- feature =id=,
+  collection =name= and the =bbox=es die at read time, before a transit is
+  chosen. Also surfaces a live hazard -- in-place overwrite *through a pipe*
+  works today, silently degraded a verbatim WKT2 CRS to WKT1, and is exempt by
+  construction from the same-file guard
+  [[file:same-format-output.org][same-format-output.org]] proposes.
   *Scoping only.*

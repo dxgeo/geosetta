@@ -7,7 +7,7 @@ use crate::crs::Crs;
 use crate::error::Result;
 use crate::feature::FeatureCollection;
 use crate::geometry::Geometry;
-use crate::schema::infer_columns;
+use crate::schema::columns_for;
 use crate::shapefile::{dbf, geometry};
 
 /// The encoded sibling files of a Shapefile. `.shp`/`.shx`/`.dbf` are always
@@ -35,7 +35,7 @@ pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
     let geometries: Vec<Option<Geometry>> = fc.features.iter().map(|f| f.geometry.clone()).collect();
     let (shp, shx) = geometry::write(&geometries)?;
 
-    let columns = infer_columns(&fc.features);
+    let columns = columns_for(fc);
     let (dbf_bytes, warnings) = dbf::write(&columns)?;
 
     let prj = fc.crs.as_ref().and_then(prj_wkt);
@@ -71,6 +71,7 @@ mod tests {
         let mut fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
+            native: None,
         }]);
         fc.crs = crs;
         fc

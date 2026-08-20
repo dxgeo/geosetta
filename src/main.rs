@@ -626,9 +626,16 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
         // Shapefile input's siblings are located via read_input; every other
         // format reads a single buffer the same way it always has.
         let fc = read_input(args)?;
+        // `--layer` wins, then the name the *source* recorded, then the input
+        // file's stem. The middle step is what makes an edit loop replace a
+        // layer instead of appending a duplicate: with `-` for input there is
+        // no stem to draw on, so before collections carried a name every piped
+        // write landed in a layer called `layer`
+        // (`plans/edit-composability.org` D4).
         let name = args
             .layer
             .clone()
+            .or_else(|| fc.name.clone())
             .unwrap_or_else(|| layer_stem(&args.input));
         vec![(name, fc)]
     };
@@ -678,6 +685,9 @@ fn collect_conversion_warnings(fc: &FeatureCollection, target: Format) -> Vec<St
     if let Some(w) = fc.m_downgrade_warning(target) {
         warnings.push(w);
     }
+    if let Some(w) = fc.schema_drop_warning(target) {
+        warnings.push(w);
+    }
     warnings
 }
 
@@ -718,9 +728,10 @@ fn print_warnings(warnings: &[String], quiet: bool) {
     }
 }
 
-/// The file stem of `path`, used as a default layer name. `"-"` (stdin) has
-/// no filename to draw one from, so it falls back to `"layer"` same as an
-/// extension-less/empty path does.
+/// The file stem of `path`, used as a default layer name of *last* resort:
+/// `--layer` and the collection's own [`FeatureCollection::name`] are both
+/// consulted first. `"-"` (stdin) has no filename to draw one from, so it falls
+/// back to `"layer"` same as an extension-less/empty path does.
 fn layer_stem(path: &str) -> String {
     if path == "-" {
         return "layer".into();

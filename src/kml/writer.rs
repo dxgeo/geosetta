@@ -140,6 +140,7 @@ mod tests {
         Feature {
             geometry,
             properties: properties.into_iter().map(|(k, v)| (Rc::from(k), v)).collect(),
+            native: None,
         }
     }
 

@@ -6,6 +6,9 @@ use crate::feature::{Feature, FeatureCollection};
 use crate::flatbuffers::{Table, Vector};
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
+use crate::format::Format;
+use crate::native::{FgbColumnNative, FgbNative, Native, NativePayload};
+use crate::schema::FieldDecl;
 use std::rc::Rc;
 
 const MAGIC_LEN: usize = 8;
@@ -50,20 +53,43 @@ mod ctype {
 // than trusting a summary flag on a file whose per-geometry dimensionality
 // might not be perfectly uniform.
 mod header {
+    pub const NAME: usize = 0;
     pub const GEOMETRY_TYPE: usize = 2;
     pub const COLUMNS: usize = 7;
     pub const FEATURES_COUNT: usize = 8;
     pub const INDEX_NODE_SIZE: usize = 9;
     pub const CRS: usize = 10;
+    pub const TITLE: usize = 11;
+    pub const DESCRIPTION: usize = 12;
+    pub const METADATA: usize = 13;
 }
 mod crs {
     pub const ORG: usize = 0;
     pub const CODE: usize = 1;
+    pub const NAME: usize = 2;
+    pub const DESCRIPTION: usize = 3;
     pub const WKT: usize = 4;
+    pub const CODE_STRING: usize = 5;
 }
+// Column's declaration slots, verified by hand-decoding `ogr2ogr`-written
+// FlatGeobuf vtables (a `.dbf` `String (80.0)` lands in slot 4 as `80`; a
+// `Real (23.15)` lands in slots 5/6 as `23`/`15` with slot 4 absent; a
+// `NOT NULL UNIQUE` column lands in slots 7/8 as `0`/`1`). Slots 2/3
+// (`title`/`description`) and 10 (`metadata`) are not read yet — they are
+// per-column natives, not declarations, and belong with the M3 FlatGeobuf
+// spoke rather than here.
 mod column {
     pub const NAME: usize = 0;
     pub const TYPE: usize = 1;
+    pub const TITLE: usize = 2;
+    pub const DESCRIPTION: usize = 3;
+    pub const WIDTH: usize = 4;
+    pub const PRECISION: usize = 5;
+    pub const SCALE: usize = 6;
+    pub const NULLABLE: usize = 7;
+    pub const UNIQUE: usize = 8;
+    pub const PRIMARY_KEY: usize = 9;
+    pub const METADATA: usize = 10;
 }
 mod feature {
     pub const GEOMETRY: usize = 0;
@@ -81,6 +107,13 @@ mod geometry {
 struct Column {
     name: String,
     ty: u8,
+    /// What the header declared about this column, or `None` when it declared
+    /// nothing beyond the name and type.
+    decl: Option<FieldDecl>,
+    /// This column's `title`/`description`/`metadata` — descriptive rather
+    /// than declarative, so they ride in the native rather than in
+    /// [`FieldDecl`]. `None` when the column carried none.
+    native: Option<FgbColumnNative>,
 }
 
 /// Parse a FlatGeobuf file into a feature collection.
@@ -100,7 +133,7 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
     let default_geom_type = header.read_u8(header::GEOMETRY_TYPE, 0)?;
     let features_count = header.read_u64(header::FEATURES_COUNT, 0)?;
     let index_node_size = header.read_u16(header::INDEX_NODE_SIZE, 16)?;
-    let crs = read_crs(&header)?;
+    let (crs, crs_extras) = read_crs_and_extras(&header)?;
     let columns = read_columns(&header)?;
     // Intern each column's key once so every feature shares one `Rc`.
     let keys: Vec<Rc<str>> = columns.iter().map(|c| Rc::from(c.name.as_str())).collect();
@@ -130,18 +163,59 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
         features.push(Feature {
             geometry,
             properties,
+            native: None,
         });
     }
 
-    Ok(FeatureCollection { features, crs })
+    let schema = columns.iter().filter_map(|c| c.decl.clone()).collect();
+    let native = FgbNative {
+        title: owned(header.read_str(header::TITLE)?),
+        description: owned(header.read_str(header::DESCRIPTION)?),
+        metadata: owned(header.read_str(header::METADATA)?),
+        crs_name: crs_extras.0,
+        crs_description: crs_extras.1,
+        crs_code_string: crs_extras.2,
+        columns: columns.iter().filter_map(|c| c.native.clone()).collect(),
+    };
+    Ok(FeatureCollection {
+        features,
+        crs,
+        // The header's own `name`, which the writer used to overwrite with a
+        // constant. Modelled rather than stashed (D1) because it is what makes
+        // a layer name survive a pipe — see `FeatureCollection::name`.
+        name: owned(header.read_str(header::NAME)?),
+        schema,
+        native: (!native.is_empty())
+            .then(|| Native::new(Format::FlatGeobuf, NativePayload::FlatGeobuf(native))),
+    })
+}
+
+/// An owned copy of a FlatBuffers string field, preserving the distinction
+/// between *absent* and *empty*: a writer that emitted `title: ""` said
+/// something, and re-emitting it as absent would not be putting the file back.
+fn owned(s: Option<&str>) -> Option<String> {
+    s.map(str::to_string)
 }
 
 /// Read the header's `Crs` sub-table into a [`Crs`], carrying the org/code/WKT
-/// through unchanged. Absent (or empty) means the file recorded no CRS.
-fn read_crs(header: &Table) -> Result<Option<Crs>> {
+/// through unchanged; absent (or empty) means the file recorded no CRS. Plus
+/// the three members [`Crs`] has no slot for: `name(2)`, `description(3)` and
+/// `code_string(5)`.
+///
+/// They come back beside the CRS rather than inside it because they are
+/// *opaque* under D4 — `NamedCrs` models an identity and a definition, and a
+/// human-readable name is neither. `name` is populated in every
+/// `ogr2ogr`-written file observed, so this is not a theoretical slot.
+type CrsExtras = (Option<String>, Option<String>, Option<String>);
+fn read_crs_and_extras(header: &Table) -> Result<(Option<Crs>, CrsExtras)> {
     let Some(t) = header.read_table(header::CRS)? else {
-        return Ok(None);
+        return Ok((None, (None, None, None)));
     };
+    let extras = (
+        owned(t.read_str(crs::NAME)?),
+        owned(t.read_str(crs::DESCRIPTION)?),
+        owned(t.read_str(crs::CODE_STRING)?),
+    );
     let org = t.read_str(crs::ORG)?.map(str::to_string);
     let code = match t.read_i32(crs::CODE, 0)? {
         0 => None,
@@ -149,9 +223,9 @@ fn read_crs(header: &Table) -> Result<Option<Crs>> {
     };
     let wkt = t.read_str(crs::WKT)?.filter(|s| !s.is_empty()).map(str::to_string);
     if org.is_none() && code.is_none() && wkt.is_none() {
-        return Ok(None);
+        return Ok((None, extras));
     }
-    Ok(Some(Crs::from_authority_code(org, code, wkt, None)))
+    Ok((Some(Crs::from_authority_code(org, code, wkt, None)), extras))
 }
 
 fn read_columns(header: &Table) -> Result<Vec<Column>> {
@@ -159,13 +233,67 @@ fn read_columns(header: &Table) -> Result<Vec<Column>> {
     if let Some(vec) = header.read_vector(header::COLUMNS)? {
         for i in 0..vec.len() {
             let c = vec.get_table(i)?;
+            let name = c.read_str(column::NAME)?.unwrap_or_default().to_string();
+            let decl = read_decl(&c, &name)?;
+            let native = FgbColumnNative {
+                name: name.clone(),
+                title: owned(c.read_str(column::TITLE)?),
+                description: owned(c.read_str(column::DESCRIPTION)?),
+                metadata: owned(c.read_str(column::METADATA)?),
+            };
             columns.push(Column {
-                name: c.read_str(column::NAME)?.unwrap_or_default().to_string(),
+                name,
                 ty: c.read_u8(column::TYPE, ctype::STRING)?,
+                decl,
+                native: (!native.is_empty()).then_some(native),
             });
         }
     }
     Ok(columns)
+}
+
+/// The six declaration slots of one `Column` table, or `None` when the writer
+/// left all of them at their defaults.
+///
+/// The spec's defaults are `-1` for the three sizes and `true`/`false`/`false`
+/// for the three flags, so a slot at its default carries no declaration.
+/// A size of *zero* is treated the same way: GDAL writes `width: 0` for a
+/// GeoPackage `TEXT` column, which declares no width at all rather than a
+/// zero-wide field, and re-emitting it as a real declaration would pin every
+/// downstream field to width 0.
+fn read_decl(c: &Table, name: &str) -> Result<Option<FieldDecl>> {
+    let size = |slot: usize| -> Result<Option<u32>> {
+        Ok(match c.read_i32(slot, -1)? {
+            n if n > 0 => Some(n as u32),
+            _ => None,
+        })
+    };
+    // `scale` is meaningful at zero (an integer column declares 0 decimals),
+    // but only alongside a precision — on its own it describes nothing.
+    let precision = size(column::PRECISION)?;
+    let scale = match precision {
+        Some(_) => match c.read_i32(column::SCALE, -1)? {
+            n if n >= 0 => Some(n as u32),
+            _ => None,
+        },
+        None => size(column::SCALE)?,
+    };
+    let flag = |slot: usize, default: u8| -> Result<Option<bool>> {
+        Ok(match c.read_u8(slot, default)? {
+            n if n == default => None,
+            n => Some(n != 0),
+        })
+    };
+    let decl = FieldDecl {
+        name: name.to_string(),
+        width: size(column::WIDTH)?,
+        precision,
+        scale,
+        nullable: flag(column::NULLABLE, 1)?,
+        unique: flag(column::UNIQUE, 0)?,
+        primary_key: flag(column::PRIMARY_KEY, 0)?,
+    };
+    Ok((!decl.is_empty()).then_some(decl))
 }
 
 /// Byte size of the packed Hilbert R-tree, so we can skip it.

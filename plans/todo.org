@@ -3,6 +3,10 @@
 #+DATE: {{{time(%Y-%m-%d)}}}
 
 * Current Working Items
+/Picking up the fidelity work? Read [[file:../handoff.org][handoff.org]] first
+-- it carries the sequencing, the nine settled decisions, and the live bugs
+found but not fixed./
+
 Live list of what's open right now — not the full historical plan index (see
 [[file:README.org][README.org]] for that, ordered by dependency, everything
 DONE included). Each entry is just a link to its real plan/section for detail;
@@ -19,6 +23,27 @@ check it off and remove it once the item ships or is shelved.
   run "the target can't hold it" is no longer a defence — so a warning ships
   with it. Also restores the in-place guard the format check was accidentally
   providing. Scoping only.
+- [ ] [[file:native-inventory.org][native-inventory.org]] — M1 of
+  =same-format-fidelity.org=: what each reader discards, classified. First pass
+  *complete* (all 9 spokes, measured or traced), and the nine hostile fixtures
+  are built and documented in =tests/fixtures/HOSTILE.org=. Only the
+  =edges=/=epoch= fixture hunt remains, and no available tool emits either. Blocks the warning-scope
+  question in =lossy-conversion-warnings.org=.
+- [ ] [[file:same-format-fidelity.org][same-format-fidelity.org]] — the
+  standing invariant that a same-format run loses nothing, and the opaque
+  format-tagged =Native= channel that delivers it without the IR becoming a
+  union of all nine spokes. GDAL already works this way (verified). *Gates*
+  =same-format-output.org= and inverts part of its scope: its warning would
+  otherwise be permanent furniture describing a bug. Ships three confirmed
+  defects — =fgb= null cells and =gpkg= booleans (both free), plus a =gpkg= →
+  =gpkg= run destroying the container around its layers. Scoping only.
+- [ ] [[file:edit-composability.org][edit-composability.org]] — let an
+  external program modify the feature collection between a geosetta read and a
+  geosetta write. The loop already runs; what is missing is fidelity — no
+  transit format carries a full collection without loss, and four of the losses
+  are silent (WKT drops every property, KML strings them, =fgb= drops nulls,
+  =gpkg= booleans → ints). Also flags in-place-through-a-pipe, which overwrites
+  the file today with a silently downgraded CRS. Scoping only.
 - [ ] [[file:multi-geometry-columns.org][multi-geometry-columns.org]] — carry
   a second GeoParquet geometry column through the IR (=Feature::extra_geometries=)
   instead of rejecting it; text-fallback for every other target format.

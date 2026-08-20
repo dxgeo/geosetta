@@ -358,7 +358,7 @@ mod tests {
     use crate::geometry::{Geometry, Position};
 
     fn point_feat(x: f64, y: f64) -> Feature {
-        Feature { geometry: Some(Geometry::Point(Position::new(x, y))), properties: vec![] }
+        Feature { geometry: Some(Geometry::Point(Position::new(x, y))), properties: vec![], native: None }
     }
 
     #[test]

@@ -1,0 +1,3 @@
+zip,big,money,flag,padded,unicode,geometry
+007,12345678901234567890,1.50,TRUE,"  spaced  ",København,"POINT (12.5683 55.6761)"
+08001,42,22.250,false,x,"Zürich, CH","POINT (8.5417 47.3769)"

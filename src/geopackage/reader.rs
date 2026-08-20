@@ -129,6 +129,7 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
         features.push(Feature {
             geometry,
             properties,
+            native: None,
         });
     }
     // The caller fills in `crs` from the layer's srs_id.

@@ -1,0 +1,202 @@
+#+TITLE: Hostile Fixtures -- What Each One Carries, And Why
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Hostile Fixtures
+
+** WHAT THESE ARE
+One fixture per format spoke, each built to carry something the IR does *not*
+model. They are the input side of the round-trip invariant test in
+[[file:../../plans/same-format-fidelity.org][plans/same-format-fidelity.org]]:
+read the fixture, write the same format, read it back, assert nothing was lost.
+
+*Every member in these files is load-bearing.* This document exists because
+=plans/README.org= § Sourcing a fixture from a real tool says to record *why*
+each element is present -- otherwise the next person simplifies a fixture back
+down to something that passes while exercising nothing. That has already
+happened once in this crate's history (the degenerate =POINT= bbox that made
+GDAL emit no GeoPackage envelope).
+
+*Most do not pass today.* See =same-format-fidelity.org= § MILESTONES for what
+has landed: as of 2026-08-20 the GeoJSON spoke carries its unmodelled members,
+and =gdal_hostile.shp='s declared field widths survive a FlatGeobuf transit.
+Everything else is still the target.
+
+** NAMING
+- =gdal_hostile.*= -- produced by *GDAL 3.13.2 =ogr2ogr=*. Preferred, because a
+  member a real tool actually writes is a member that really occurs.
+- =hand_hostile.*= -- *authored*, for cases no tool will emit. GeoJSON foreign
+  members are the clearest example: any tool that round-trips them would have
+  had to model them, and a tool that models them will not emit an unmodelled
+  one on demand.
+
+All nine were confirmed *readable by geosetta without error* before being
+committed. A fixture the reader rejects tests nothing.
+
+** THE COMMON SOURCE
+The four GDAL-produced fixtures all derive from one two-row table, chosen so a
+single source exercises several classes at once:
+
+#+begin_src text
+name,zip,price,note,flag,geometry
+København,007,1.50,,true,"POINT (12.5683 55.6761)"
+Zürich,08001,22.25,café,false,"POINT (8.5417 47.3769)"
+#+end_src
+
+- =København= / =Zürich= / =café= -- *non-ASCII, verified as real UTF-8 bytes*
+  (=b'K\xc3\xb8benhavn'=). An early draft of these fixtures was written through
+  a shell heredoc that silently mangled them to =Ke\xe2\x88\x9a\xe2\x88\x8f...=;
+  they are now written via explicit encoding, and the byte check is part of
+  rebuilding them. This is the =plans/README.org= "hand-decode the actual bytes"
+  step, and it caught a corrupt fixture.
+- =007= / =08001= -- leading zeros, which are data in this domain (ZIP, FIPS,
+  census tract) and which type inference destroys.
+- =1.50= / =22.25= -- a trailing zero that re-rendering drops, and a
+  =Real (24.15)= field declaration.
+- empty =note= on row 1 -- the null/empty cell.
+- =flag= -- a boolean, which several spokes cannot store as one.
+
+** THE FIXTURES
+
+*** =hand_hostile.geojson=
+Authored; no tool emits unmodelled members by definition.
+| carries                                    | why |
+|--------------------------------------------+-----|
+| collection =name=, =bbox=                  | identity + derived-information |
+| collection =vendor:extension=              | collection-level foreign member |
+| feature =id= (numeric *and* string)        | identity; GeoJSON permits both, and the string form is the one a naive =u64= slot loses |
+| feature =bbox=                             | derived-information |
+| feature =vendor:featureNote=               | feature-level foreign member -- the one GDAL's own driver-keyed native drops across a format change |
+| *geometry-level* =vendor:geomNote=         | the rarest case, and the one no plan listed before the inventory found it |
+| =note: null=                               | an explicit null property |
+| =nested: {...}= and =nested: {}=           | a nested object property, and an *empty* one -- FGB *stringifies* these on the way through |
+| =K\u00f8benhavn= escaped *and* =Zürich= raw | both JSON unicode forms, so the unescape path and the raw-UTF-8 path are each exercised |
+
+*** =hand_hostile.csv=
+Authored. Every cell is a lexeme the reader's type inference changes.
+=007= → =7=, =08001= → =8001= (*a different number, not a reformat*),
+=12345678901234567890= → =12345678901234567000= (past =i64=, through an =f64=),
+=1.50= → =1.5=, =22.250= → =22.25=, =TRUE= → =true=, and =" spaced "= plus
+="Zürich, CH"= to pin quoting and embedded-comma handling.
+
+*** =hand_hostile.wkt=
+Authored. =POINT (1.50 2.00)= (trailing zeros), =point (1e2 3E-1)= (lowercase
+keyword, scientific notation), =MULTIPOINT ((1 2), (3 4))= (the parenthesised
+dialect, which geosetta normalises to the bare form), a =LINESTRING ZM= to keep
+M in the round trip, and a =POLYGON= for ring handling.
+
+*Deliberately absent: =POINT EMPTY=.* Geosetta rejects it outright
+(=wkt: expected '('=), and a fixture the reader refuses tests nothing. The
+refusal is tracked separately in
+[[file:../../plans/native-inventory.org][plans/native-inventory.org]] § WKT --
+do not "fix" this fixture by adding it.
+
+*** =gdal_hostile.fgb=
+=ogr2ogr= FlatGeobuf, written *from the GeoPackage* so GDAL propagates metadata
+into it. Confirmed present in the bytes:
+- =header::METADATA= = ={"GPKG_METADATA_ITEM_1":"<lineage>surveyed 2019</lineage>"}=
+  -- geosetta's reader has no constant for field 13 at all.
+- =header::NAME= = =cities= -- which geosetta's writer overwrites with the
+  constant =geosetta= (=flatgeobuf/writer.rs:181=).
+- A =Crs= carrying full WKT2 *and* the name =WGS 84= -- geosetta reads
+  =org=/=code=/=wkt= and drops =name=.
+This is the fixture behind the inventory's claim that FlatGeobuf's =Column=
+table is load-bearing: it is the only transit that can carry a schema
+declaration to an external tool.
+
+*But it does not exercise the widths, and cannot.* Because it was written
+*from the GeoPackage*, which declares none, every column here reads
+=String (0.0)= /(measured via =ogrinfo -so=)/. Do not "fix" that by rewriting
+it from the shapefile -- the whole reason this fixture exists is the GeoPackage
+metadata GDAL only propagates on that path, and the =0.0= turned out to be
+load-bearing in its own right: it is what established that GDAL writes
+=width: 0= to mean *undeclared*, so a reader treating 0 as a declaration would
+pin every downstream field to width 0. For the width case, write a throwaway
+FGB from =gdal_hostile.shp= instead; GDAL propagates =String (80.0)= and
+=Real (23.15)= across that hop.
+
+*** =gdal_hostile.parquet=
+=ogr2ogr= GeoParquet with =WRITE_COVERING_BBOX=YES=. Carries *five*
+=key_value_metadata= keys where geosetta reads one: =geo=, =ARROW:schema=,
+=gdal:metadata=, =gdal:schema=, =gdal:creation-options=. Inside ="geo"=:
+=covering= (with its four =geom_bbox= sub-columns) and
+=orientation: "counterclockwise"=, neither of which geosetta reads or writes.
+Note =primary_column= is =geom=, not =geometry= -- a non-default column name, on
+purpose.
+
+*** =gdal_hostile.gpkg=
+=ogr2ogr= plus =sqlite3= for the container content. Carries:
+| content                          | why |
+|----------------------------------+-----|
+| two layers (=cities=, =second=)  | multi-layer container |
+| =side_notes= plain user table    | not a layer at all; geosetta destroys it |
+| =gpkg_metadata= + =_reference=   | dataset lineage |
+| =gpkg_extensions= (2 rows)       | the *real* R*Tree registrations |
+| R*Tree tables + triggers         | derived-capability |
+| =gpkg_ogr_contents=              | derived-capability |
+| =flag BOOLEAN= declared column   | defect 2 -- the declaration is on disk and unread |
+
+*A fake vendor row in =gpkg_extensions= was tried and removed.* With
+=scope='read-write'=, GDAL refuses the layer entirely
+(="relies on the 'example_vendor_ext' extension ... ERROR 1"=), which would make
+the fixture unreadable by the reference tool. The two genuine R*Tree
+registrations exercise =gpkg_extensions= preservation without that. *Do not
+re-add a fake extension row.*
+
+Read it with =--layer cities=: it is multi-layer, so a bare stdout conversion
+correctly errors asking for a layer or a directory.
+
+*** =gdal_hostile.shp= (+ =.shx=, =.dbf=, =.prj=, =.cpg=)
+=ogr2ogr= Esri Shapefile with =-lco ENCODING=UTF-8=.
+- =name/zip/note: String (80.0)= -- the *declared width*, which geosetta used
+  to re-derive down to the current data. The single most workflow-breaking loss
+  in the inventory, and *fixed 2026-08-20*: this fixture is now the one the
+  =declared_shapefile_widths_survive_a_flatgeobuf_transit= test in
+  =convert.rs= runs against, chosen because its values are 6 and 10 bytes long
+  so the 80 cannot have come from the rows.
+- =price: Real (24.15)= -- declared precision, which geosetta used to rewrite
+  to =Real (8.6)= from a hardcoded =DECIMALS = 6=. Also fixed; a declared
+  =scale= now replaces that constant.
+- =flag: Integer(Boolean) (1.0)= -- Shapefile's boolean *subtype*.
+- =.cpg= = =UTF-8= -- the declared codepage. Geosetta writes no =.cpg=; so does
+  =ogr2ogr=, which is why the inventory ranks this below the width loss.
+- =.prj= -- EPSG:4326, so the CRS path is exercised too.
+
+*** =hand_hostile.kml=
+Authored: =ogr2ogr='s KML writer emits none of the presentation tree, so a
+hostile KML has to be written by hand. Verified that geosetta reads it and that
+each element below is in fact dropped.
+| carries                          | why |
+|----------------------------------+-----|
+| =<Style>= + =<styleUrl>=         | KML's whole point for many users |
+| document =<name>= / =<description>= | the collection's own identity |
+| =<Folder>= nesting               | flattened deliberately (=kml/reader.rs:49=) |
+| =<visibility>=, =<TimeStamp>=    | per-Placemark presentation/time |
+| =<altitudeMode>=                 | already an OPEN CANDIDATE in =lossy-conversion-warnings.org= |
+| =<ExtendedData>= with =007=/=1.50= | survives, but coerced to strings |
+| a =<Model>= Placemark            | an unmodelled geometry -- becomes =geometry: null= *silently* |
+| a =<GroundOverlay>=              | *vanishes entirely* -- a georeferenced image, not decoration |
+
+The =GroundOverlay= references =files/overlay.png=, which is why the KMZ below
+carries that file: together they pin the dangling-reference failure.
+
+*** =hand_hostile.kmz=
+=hand_hostile.kml= as =doc.kml=, plus =files/overlay.png= (a real 1×1 PNG, not a
+text stub, so it is a plausible referenced asset) and =files/notes.txt=.
+Geosetta writes =doc.kml= *alone*, so both sidecars are dropped and the
+surviving KML keeps a reference to an image that is no longer in the archive.
+
+This is the fixture for the container obligation that
+=same-format-fidelity.org= M3c added after the inventory found that KMZ is a
+container on the same terms as GeoPackage.
+
+** REBUILDING
+The GDAL-produced four come from the § THE COMMON SOURCE table via =ogr2ogr=
+(Shapefile and GeoPackage direct; FlatGeobuf and GeoParquet *from the
+GeoPackage*, which is what makes GDAL propagate metadata into them). The
+authored five are written with explicit UTF-8 encoding -- *not* through a shell
+heredoc, per § THE COMMON SOURCE.
+
+If you rebuild any of them, re-check two things before committing: that the
+non-ASCII bytes are still real UTF-8, and that geosetta still *reads* every
+fixture without error.

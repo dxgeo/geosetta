@@ -1,0 +1,5 @@
+POINT (1.50 2.00)
+point (1e2 3E-1)
+MULTIPOINT ((1 2), (3 4))
+LINESTRING ZM (0 0 5 100, 10 10 6 200)
+POLYGON ((0 0, 0 1, 1 1, 1 0, 0 0))

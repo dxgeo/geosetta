@@ -491,6 +491,7 @@ mod tests {
                     ("name".into(), JsonValue::String("a".into())),
                     ("n".into(), JsonValue::Number { value: 5.0, is_int: true }),
                 ],
+                native: None,
             },
             Feature {
                 geometry: point(3.0, 4.0),
@@ -498,6 +499,7 @@ mod tests {
                     ("name".into(), JsonValue::String("b".into())),
                     ("n".into(), JsonValue::Null),
                 ],
+                native: None,
             },
         ]);
         let bytes = write_layers(None, &[("places".into(), layer)], false, false).unwrap();
@@ -523,6 +525,7 @@ mod tests {
         let layer = fc(vec![Feature {
             geometry: Some(Geometry::Point(Position::with_zm(1.0, 2.0, 3.0, 4.0))),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write_layers(None, &[("places".into(), layer)], false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
@@ -586,6 +589,7 @@ mod tests {
         let layer = fc(vec![Feature {
             geometry: linestring(vec![Position::new(0.0, 0.0), Position::new(20.0, 10.0)]),
             properties: vec![],
+            native: None,
         }]);
         let plain = write_layers(None, &[("l".into(), layer)], false, false).unwrap();
         let (flags, indicator, env) = gpb_parts(&plain);
@@ -603,6 +607,7 @@ mod tests {
                 Position::new(20.0, 5.0),
             ]),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
         let (flags, indicator, env) = gpb_parts(&bytes);
@@ -621,6 +626,7 @@ mod tests {
                 Position::with_z(20.0, 5.0, 3.0),
             ]),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
         let (flags, indicator, env) = gpb_parts(&bytes);
@@ -643,6 +649,7 @@ mod tests {
                 Position::with_m(20.0, 10.0, 30.0),
             ]),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write_layers(None, &[("l".into(), m_only)], false, true).unwrap();
         let (_, indicator, env) = gpb_parts(&bytes);
@@ -658,6 +665,7 @@ mod tests {
                 Position::with_zm(20.0, 10.0, 3.0, 30.0),
             ]),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write_layers(None, &[("l".into(), zm)], false, true).unwrap();
         let (_, indicator, env) = gpb_parts(&bytes);
@@ -676,6 +684,7 @@ mod tests {
         let layer = fc(vec![Feature {
             geometry: linestring(vec![]),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
         let (flags, indicator, env) = gpb_parts(&bytes);
@@ -699,6 +708,7 @@ mod tests {
             let layer = fc(vec![Feature {
                 geometry: geom.clone(),
                 properties: vec![],
+                native: None,
             }]);
             let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
             let back = read_layers(&bytes).unwrap();
@@ -743,7 +753,7 @@ mod tests {
         // A layer big enough to force interior rtree nodes (> one node of cells)
         // and a multi-page sqlite_master (many trigger rows).
         let feats: Vec<Feature> = (0..120)
-            .map(|i| Feature { geometry: point(i as f64, (i % 7) as f64), properties: vec![] })
+            .map(|i| Feature { geometry: point(i as f64, (i % 7) as f64), properties: vec![], native: None })
             .collect();
         let bytes = write_layers(None, &[("grid".into(), fc(feats))], true, false).unwrap();
 
@@ -766,7 +776,7 @@ mod tests {
 
     #[test]
     fn wgs84_layer_round_trips_as_wgs84() {
-        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![], native: None }]);
         layer.crs = Some(Crs::Wgs84);
         let bytes = write_layers(None, &[("p".into(), layer)], false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
@@ -777,7 +787,7 @@ mod tests {
     fn no_crs_layer_round_trips_as_none() {
         // CSV/WKT-style input with no CRS lands on the "undefined" SRS and reads
         // back as no CRS, not a mislabeled 4326.
-        let layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        let layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![], native: None }]);
         let bytes = write_layers(None, &[("p".into(), layer)], false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(back[0].1.crs, None);
@@ -786,7 +796,7 @@ mod tests {
     #[test]
     fn named_crs_is_registered_and_round_trips() {
         use crate::crs::NamedCrs;
-        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![], native: None }]);
         layer.crs = Some(Crs::Named(NamedCrs {
             authority: Some("EPSG".into()),
             code: Some("3857".into()),
@@ -817,7 +827,7 @@ mod tests {
         // GeoPackage's native INTEGER srs_id; it must fall into the same
         // synthetic-id path as "no code at all", never mislabel or fail to
         // write, and the WKT still carries through.
-        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![], native: None }]);
         layer.crs = Some(Crs::Named(NamedCrs {
             authority: Some("IGNF".into()),
             code: Some("LAMB93".into()),
@@ -852,7 +862,7 @@ mod tests {
         // `gpkg_spatial_ref_sys.definition` via `NamedCrs::structural_wkt`,
         // instead of falling to a bare "undefined".
         let pj = r#"{"type":"GeographicCRS","name":"custom","datum":{"type":"GeodeticReferenceFrame","name":"custom datum","ellipsoid":{"name":"custom ellipsoid","semi_major_axis":6378137,"inverse_flattening":298.257223563}}}"#;
-        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![] }]);
+        let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![], native: None }]);
         layer.crs = Some(Crs::Named(NamedCrs {
             authority: None,
             code: None,
@@ -887,10 +897,10 @@ mod tests {
 
     #[test]
     fn append_adds_a_layer_then_upsert_replaces() {
-        let a = fc(vec![Feature { geometry: point(0.0, 0.0), properties: vec![] }]);
+        let a = fc(vec![Feature { geometry: point(0.0, 0.0), properties: vec![], native: None }]);
         let b = fc(vec![
-            Feature { geometry: point(1.0, 1.0), properties: vec![] },
-            Feature { geometry: point(2.0, 2.0), properties: vec![] },
+            Feature { geometry: point(1.0, 1.0), properties: vec![], native: None },
+            Feature { geometry: point(2.0, 2.0), properties: vec![], native: None },
         ]);
 
         let g1 = write_layers(None, &[("a".into(), a)], false, false).unwrap();
@@ -901,7 +911,7 @@ mod tests {
         assert!(layers.iter().any(|(n, l)| n == "b" && l.features.len() == 2));
 
         // Upsert "a" with three features -> still two layers, "a" replaced.
-        let a2 = fc(vec![Feature { geometry: point(9.0, 9.0), properties: vec![] }; 3]);
+        let a2 = fc(vec![Feature { geometry: point(9.0, 9.0), properties: vec![], native: None }; 3]);
         let g3 = write_layers(Some(&g2), &[("a".into(), a2)], false, false).unwrap();
         let layers = read_layers(&g3).unwrap();
         assert_eq!(layers.len(), 2);

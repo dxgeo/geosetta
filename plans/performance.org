@@ -30,6 +30,15 @@ cargo test --release --test perf wide_table -- --ignored --nocapture
 # scaling in the column dimension.
 #+end_src
 
+*A gap worth closing before M4 lands* /(noted 2026-08-20)/: =wide_table=
+generates *dense* rows -- every column populated in every feature -- so it
+cannot see a regression in *sparse* property handling. That matters because
+=same-format-fidelity.org= M4 makes FlatGeobuf's reader materialize an omitted
+cell as null, taking a sparse wide table from "only the populated pairs" to
+=rows x cols=. Every other rectangular spoke already pays that cost, so the
+question is the size of the bill; a sparse variant of this benchmark is what
+would answer it, and it should exist *before* the change rather than after.
+
 ** DONE — GeoJSON writer bypasses the JsonValue tree
 The writer used to build a whole =JsonValue= tree (=geojson::to_json=) and then
 serialize it — an =Array=/=Object= heap allocation per coordinate, ring, and

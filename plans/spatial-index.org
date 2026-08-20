@@ -123,3 +123,15 @@ an opt-in =--rtree= flag (index-less GPKG is valid, so it stays the default):
   flip it on by default once it has seen more real-world files — it doesn't
   change row order, so the main reason to keep it opt-in is caution over the
   from-scratch node format, which =rtreecheck()= and GDAL validation now cover.
+
+  /Narrowed 2026-08-20, not answered./
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] D4 decided a
+  *separate and smaller* rule that does not settle this one: an index is
+  rebuilt when *the source carried one*, whether or not =--rtree= was passed,
+  because a same-format run must not hand back a file measurably worse than it
+  received. Today the source's R*Tree is destroyed unconditionally and rebuilt
+  only on request — verified on a two-layer =.gpkg=.
+
+  So the question left here is strictly the remaining one: *should a file that
+  never had an index get one?* That is a defaulting decision about new
+  capability, and it stays this plan's call.

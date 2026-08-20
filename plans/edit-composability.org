@@ -1,0 +1,526 @@
+#+TITLE: Plan: Edit Composability
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Making Geosetta Composable With Any Feature-Editing Tool
+
+** STATUS -- scoping only (2026-08-20). Nothing implemented.
+The ask: =geosetta= reads a file, *some other program* modifies the feature
+collection, =geosetta= writes the result to a new file or back over the
+original.
+
+This is the third seam in the same family as
+[[file:reproject-composability.org][reproject-composability.org]]. That plan
+made an external tool able to rewrite *coordinates*; this one is about an
+external tool rewriting *the collection* -- properties, feature membership,
+geometry, or all three. Same composition model
+([[file:../../architecture.org][../../architecture.org]] § THE COMPOSITION
+MODEL route (b)), same no-silent-exec rule, one new problem: a reprojection
+tool hands back the same collection with different numbers in it, so nothing
+about the *shape* of the data has to survive the trip. An editing tool needs
+the whole collection to survive the trip, in both directions, and today
+nothing carries it.
+
+** THE FINDING THAT REFRAMES THIS -- the loop already runs
+Before designing anything, the obvious case was tried against the built
+binaries (=plans/README.org= § Sourcing a fixture from a real tool). It works:
+
+#+begin_src text
+geosetta base.fgb --print-crs > saved.crs
+geosetta base.fgb - --to geojson \
+  | jq -c '.features |= map(.properties.edited = true)' \
+  | geosetta - edited.fgb --from geojson --crs saved.crs
+#+end_src
+
+Verified end to end: the edit lands, and =edited.fgb= carries the original's
+*verbatim WKT2* back out through =--print-crs=. No new flag was needed, and
+the middle stage is an ordinary tool that has never heard of this ecosystem.
+
+So this plan is not "make the loop possible." *The loop is possible.* It is
+about the three things that are wrong with it:
+
+1. *Nothing carries a full collection through a pipe without loss*, and four
+   of the losses are silent (§ WHAT THE VERIFICATION FOUND).
+2. *The recipe above cannot be written down as a one-liner* -- it needs a
+   temp file and two reads of the input, which rules out a =geosetta= that is
+   itself mid-pipeline (§ THE TWO-READ CONSTRAINT).
+3. *The in-place form already works, is already lossy, and warns about
+   nothing* (§ THE IN-PLACE HAZARD). It destroys the original in the process,
+   so there is nothing left to compare against.
+
+** WHY THIS IS ROUTE (b) AND NOT ROUTE (a)
+Route (a) -- a caller linking =geosetta= as a library and mutating
+=FeatureCollection= directly -- already covers this completely, and needs
+nothing from this plan. =read_features= → mutate → =write_features=, with the
+IR fully exposed (=Feature.geometry=, =Feature.properties=, =crs=). A Rust
+caller wanting to edit a collection should do that.
+
+Route (b) exists for the tool that is *not* a Rust caller: =jq=, a Python
+script, an existing CLI, a sibling binary. Under
+[[file:../../architecture.org][../../architecture.org]] no sibling crate may
+depend on =geosetta=, so a sibling that wants to edit a collection has route
+(b) and only route (b) -- it cannot reach the IR any other way. That
+constraint is what makes the transit format the whole problem: whatever
+crosses the pipe has to be something a stranger can parse and re-emit, which
+means it has to be a format neither crate owns (Rule 1's logic, applied to
+features instead of CRS text).
+
+*On =geoscribe= specifically.* The ask names it as the example middle stage,
+so worth saying plainly: nothing here needs a new =geoscribe= capability, and
+feature-attribute editing does not obviously fit its charter ("geospatial
+*metadata* that isn't a simple pass-through" -- =geoscribe/project.org= §
+ROADMAP, whose own worked example is a capability that passed the charter
+test and still landed in the wrong crate). =geoscribe= editing a collection's
+*CRS* is in charter and already implemented, via =--identify=. =geoscribe=
+editing its *properties* is a charter argument to have in
+=geoscribe/project.org= first, not a consequence of this plan. This plan
+treats the middle stage as anonymous, and uses =jq= as the reference
+implementation of it, exactly the way =reproject-composability.org= used
+=cs2cs= and =ogr2ogr= rather than a sibling.
+
+** WHAT THE VERIFICATION FOUND
+Every cell below was measured against the release binaries on two fixtures: a
+propertied collection in EPSG:28356 (string / int / bool / null / float
+properties, verbatim WKT2 CRS), and a =LINESTRING ZM= / =POINT ZM= collection
+in the same CRS. Method: write the fixture as =.fgb=, pipe it out through the
+transit format and back in, and compare -- =.fgb= is the reference endpoint
+because it was the one format that carried every axis of the fixture.
+
+*** The transit-fidelity matrix
+| transit  | CRS                     | M       | property types      | null property | hand-editable |
+|----------+-------------------------+---------+---------------------+---------------+---------------|
+| GeoJSON  | forced WGS 84 /(warns)/ | dropped /(warns)/ | kept              | kept          | yes -- =jq=   |
+| GeoParquet | WKT2 → WKT1 /(silent)/ | kept    | kept                | kept          | no -- binary  |
+| FlatGeobuf | verbatim              | kept    | kept                | *dropped* /(silent)/ | no -- binary |
+| GeoPackage | kept                  | kept    | bool → int /(silent)/ | kept        | no -- SQLite  |
+| CSV      | dropped /(warns)/       | kept    | re-inferred on read | ↔ empty field | yes           |
+| WKT      | dropped /(warns)/       | kept    | *all dropped* /(silent)/ | n/a      | partly        |
+| KML/KMZ  | forced WGS 84 /(warns)/ | dropped /(warns)/ | *all → string* /(silent)/ | → =""= | awkward XML |
+
+*There is no lossless row.* That is the finding -- but read the next section
+before concluding that a *format* is what is missing.
+
+*** Every loss in the two faithful rows is geosetta's, not the format's
+The matrix invites the conclusion "we need a transit format that carries
+everything." Chased down, each silent cell in the two binary rows turns out to
+be a geosetta defect over a wire that was already carrying the data:
+
+- *FlatGeobuf's null.* The column survives in the header and the null is
+  encoded by omission, exactly as the format intends; geosetta's *reader* does
+  not turn an omitted cell back into a null one (§ Four silent property drops).
+- *GeoParquet's WKT2 → WKT1.* GeoParquet stored the definition faithfully as
+  PROJJSON. The dialect changed when it was rendered *back out* to
+  FlatGeobuf's WKT slot, because =crs/wkt_projjson.rs:58='s =projjson_to_wkt=
+  dispatches to =render_wkt1_geographic= / =render_wkt1_projected= -- WKT1 by
+  construction, with no WKT2 renderer to choose instead.
+- *GeoPackage's bool → int.* SQLite has no boolean type; GeoPackage's own spec
+  says a =BOOLEAN= column stores 0/1. The column declaration carries the type,
+  so the reader could restore it and does not.
+
+So *FlatGeobuf is one reader fix away from carrying everything the IR models*,
+and GeoParquet is one renderer away. Neither needs a new format, and inventing
+one would leave all three defects in place on the paths that already exist.
+This is the § THE DESIGN QUESTION recommendation restated with its evidence:
+the deliverable is repairs plus warnings, not a spoke.
+
+*The ceiling that no transit format can raise.* Worth stating in the same
+breath, because it is the thing a new format would be silently assumed to fix
+and could not: the IR is =geometry + properties + crs=
+(=feature.rs=), so feature =id=, collection =name=, both =bbox=es and any
+foreign member die at *read* time, before the transit format is chosen. A
+perfect wire carries perfectly what the reader handed it. Widening the IR is a
+separate, still-unowned plan (=same-format-output.org= § SCOPE / Out), and
+until it lands "lossless transit" means "lossless with respect to the IR" --
+which is worth having, and is not the same promise.
+
+*** The tension that makes this hard
+Read the matrix by column and the shape of the problem is immediate: *the
+formats a stranger can edit are the lossy ones, and the faithful ones are
+binary.* GeoJSON is the only transit an arbitrary middle stage can realistically
+rewrite, and it is the one that relabels the CRS and drops M. FlatGeobuf is
+the most faithful and needs a FlatBuffers decoder to touch -- which a sibling
+crate cannot borrow from =geosetta= (§ WHY THIS IS ROUTE (b)), so "use FGB as
+transit" silently means "every middle stage implements FGB."
+
+*** Four silent property drops
+The crate's standing rule -- any silent data drop on conversion must warn
+([[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]) -- is
+implemented for exactly two axes, CRS (=Crs::downgrade_warning=) and M
+(=FeatureCollection::m_downgrade_warning=). *Properties have no equivalent,
+and four spokes lose them without a word:*
+
+#+begin_src text
+$ geosetta src.geojson - --to wkt 2>&1 >/dev/null
+wrote stdout (36 bytes)          # every property gone; no warning
+#+end_src
+
+- *WKT* drops all properties. 36 bytes out for a two-feature collection with
+  five properties each -- geometry alone. This one is arguably fine as a
+  format fact and indefensible as a silent one: the WKT writer's contract is
+  geometry-only, and =same-format-output.org= § THE FIDELITY PROBLEM already
+  notes the writer "would drop every property it were handed."
+- *KML/KMZ* coerces every property to a string: =7= → ="7"=, =true= →
+  ="true"=, =null= → ="="=. Types are not recoverable on the way back.
+- *FlatGeobuf* drops a null-valued property on the way back in. *The wire is
+  innocent:* FGB encodes properties as sparse =[u16 col_index][value]= pairs
+  (=flatgeobuf/writer.rs:343=), so a null is encoded by omission *and the
+  column still stands in the header* -- confirmed by decoding =n.fgb='s header,
+  where the all-null =nil= column is present by name. What is lost is the
+  reader's side: it materializes only the columns a row actually carries, so an
+  omitted cell comes back as an absent key rather than a null one. A one-sided
+  bug in =flatgeobuf/reader.rs=, not a format limit.
+- *GeoPackage* stores booleans as integers, so =true= comes back as =1=.
+
+None of these was introduced by this plan and none is caused by piping; they
+are equally true of an ordinary file conversion. What an editing pipeline does
+is *double* them -- the collection crosses the same lossy boundary twice, out
+and back -- and put them somewhere the user cannot inspect, because the
+intermediate never lands on disk.
+
+*** The in-place hazard
+=same-format-output.org= § DECISIONS D4 proposes refusing input and output
+that resolve to the same file, matching =ogr2ogr=. Note what that guard does
+*not* cover, by construction: its own mechanics say "=-= is never same-file
+(stdin and stdout are different streams)". So the pipe form of in-place is
+permitted, and it runs today:
+
+#+begin_src text
+$ cp base.fgb inplace.fgb
+$ geosetta inplace.fgb - --to parquet | geosetta - inplace.fgb --from parquet
+wrote inplace.fgb (1188 bytes)   # was 1756; exit 0; no warning
+#+end_src
+
+The file was overwritten in place with a *silently degraded* CRS -- verbatim
+WKT2 in, WKT1 out, via GeoParquet's PROJJSON (matrix row 2). =EPSG:28356=
+still resolves, so nothing downstream errors; the definition text the user
+had is simply gone, and so is the original it could have been compared to.
+
+Two things follow. First, this is *the* motivating hazard for the plan, not a
+side note: the loop the ask describes is reachable today by a route that
+quietly damages the file. Second, D4's guard is aimed at the wrong form --
+the dangerous in-place run is the one that goes through a pipe, which D4
+explicitly exempts.
+
+Why it does not corrupt outright, today: every reader buffers the whole input
+before the writer opens anything (=read_bytes= → IR → =write_bytes=), and the
+final stage cannot see EOF on stdin until the first stage has exited, by which
+point the source file is closed. That is a property of the current batch
+implementation, not a promise -- and =streaming-progress.org=, which threads
+incremental progress through readers and writers, is the plan most likely to
+end it.
+
+** THE TWO-READ CONSTRAINT
+The working recipe in § THE FINDING reads the input *twice*: once for
+=--print-crs=, once for the conversion. That is the price of carrying the CRS
+beside the feature stream instead of inside it, and it has one hard
+consequence worth stating before anyone builds on the pattern:
+
+*It cannot be used when geosetta's own input is a pipe.* =geosetta - ... =
+consumes stdin to EOF; there is no second read. So the recipe works for
+=geosetta file.fgb ...= and fails for the middle of a longer pipeline -- which
+is precisely the position § WHY THIS IS ROUTE (b) says geosetta occupies at
+both ends of every composition.
+
+For a large file the second read is also a real cost, though a bounded one:
+=--print-crs= parses only as far as the CRS, not the features.
+
+** THE DESIGN QUESTION
+Given the matrix, three routes. They are not exclusive; the recommendation is
+that the first is the answer and the other two are the reasons it is.
+
+*** Route 1 -- close the silent gaps, document the faithful recipe, ship no new format
+Treat the matrix as a bug list rather than a specification gap. The four
+silent property drops become warnings (they violate the standing rule
+regardless of this plan). The GeoJSON transit keeps its two *warned* losses --
+the CRS one is already answered by =--print-crs= / =--crs=, and M is what is
+left. Then write the recipe down in =README.md= as a supported pattern, the
+way =reproject-composability.org='s pipe seam is written down.
+
+What the user gets: an honest pipeline. Every loss either cannot happen or is
+announced on stderr before it does. What the user does not get: an M-bearing
+collection through a =jq=-editable transit.
+
+*Recommended.* It is the only route that is entirely within existing
+mechanisms, and every other route needs its warnings anyway.
+
+*** Route 2 -- a new spoke that is both faithful and text
+The gap Route 1 leaves is exactly "text transit that carries a CRS and M."
+JSON-FG (OGC Features and Geometries JSON) is the obvious candidate and is
+Rule-1 shaped -- an external, spec-defined format neither crate owns, with a
+=coordRefSys= member that answers the CRS half directly.
+
+*Unverified, and must not be planned from memory.* Whether JSON-FG has any M
+representation at all is the question this route turns on, and this plan does
+not answer it. Per =plans/README.org=, that gets settled by making a real tool
+emit one before a line is designed -- and *a null result is the finding*: if
+nothing will produce an M-bearing JSON-FG, nothing consumes one either, and
+the route collapses back to Route 1 with an extra spoke to maintain.
+
+*** Route 3 -- an ecosystem transit format
+A geosetta-native serialization of the IR, exact by construction.
+
+*Rejected.* It is the "custom bundle format" =reproject-composability.org=
+already rejected for the Shapefile pipe case, and the reasoning is unchanged
+and stronger here: no external tool would recognize it, so it defeats the goal
+(any editor should work), and a sibling crate cannot link =geosetta= to get a
+reader for it. It would be a format whose only speakers are two copies of the
+same binary.
+
+** THE TRANSIT COROLLARY -- only a same-format transit is lossless
+/Added 2026-08-20./ Falls out of
+[[file:same-format-fidelity.org][same-format-fidelity.org]] § The invariant
+binds an invocation, not a pipeline, and it is the single most useful sentence
+this plan can give a user:
+
+#+begin_quote
+An edit loop is lossless end to end only when the transit format *is* the
+endpoint format.
+#+end_quote
+
+=geosetta in.fgb - --to fgb | tool | geosetta - out.fgb --from fgb= is one
+round trip. Anything else -- including every recipe in § THE FINDING and every
+row of the matrix -- is *two cross-format conversions* wearing a round trip's
+clothing, and each hop is independently entitled to drop what its target
+cannot hold. The GeoJSON recipe works not because GeoJSON is a good transit
+but because =--crs= re-attaches by hand the one thing that mattered most.
+
+Two consequences:
+- [[file:same-format-output.org][same-format-output.org]] is a *prerequisite*,
+  not a convenience. Until it lands, no lossless edit loop exists for any
+  format, because =geosetta in.fgb - --to fgb= is refused.
+- The matrix in § WHAT THE VERIFICATION FOUND measures the *wrong thing* for
+  users who can wait for that: it ranks transits by how little they lose, when
+  the right answer is to not change format at all. It stays because it is
+  still the honest picture of what a user can do *today*, and because it is
+  what found three of the five defects.
+
+** SCOPE
+
+*** In
+- A property-fidelity warning axis alongside =Crs::downgrade_warning= and
+  =FeatureCollection::m_downgrade_warning=, covering the four silent drops in
+  § Four silent property drops.
+- Documenting the read → edit → write recipe as a supported pattern, including
+  the two-read constraint and the CRS re-attachment step
+  (=--print-crs= → =--crs=).
+- The in-place question: deciding what a pipe-form in-place run promises, and
+  making it not be luck (§ DECISIONS D4).
+- A test that the loop holds against a real, external middle stage -- =jq= --
+  the way =tests/reproject_pipe.rs= tests against =ogr2ogr= / =cs2cs=.
+
+*** Out
+- *Same-format output.* [[file:same-format-output.org][same-format-output.org]]
+  owns it. It is a prerequisite for two users of this loop (§ DEPENDS ON), not
+  part of it.
+- *Closing the property gaps themselves* -- teaching WKT to carry properties,
+  KML to carry types. This plan warns; it does not close. (Same split
+  =same-format-output.org= makes for =id=/=bbox=.)
+- *Widening the IR* to carry feature =id= / collection =bbox= / foreign
+  members. Still unowned by any plan, still the thing that would make any of
+  this genuinely round-trip clean.
+- *A geoscribe feature-editing mode.* § WHY THIS IS ROUTE (b) -- charter
+  question, different repo.
+- *The atomic-write implementation.* D4 now *commits* to it, so it is no longer
+  an out-of-scope idea -- but it is crate-wide I/O discipline touching every
+  write path, and it is sequenced after the collection-name fix. Owned by
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] § SCOPE, which
+  also carries its interaction with the GeoPackage container work.
+
+** DECISIONS
+
+*** D1 -- the transit format is whatever the middle tool speaks; geosetta ships no new one
+Route 3, rejected above. The corollary that matters: *geosetta's job here is
+to be honest about the transit the user picked*, not to supply a better one.
+That is why the deliverable is a warning axis and a documented recipe rather
+than a format.
+
+*** D2 -- GeoJSON is the reference editing transit, and its CRS loss is already solved
+Not because it is the most faithful -- the matrix says it is not -- but
+because it is the only row where an arbitrary middle stage can actually make
+an edit. Its CRS loss has an existing answer that was verified to work
+(§ THE FINDING), and that answer should be documented rather than replaced.
+M remains lost and *warned*, which is the honest state; a user with M data and
+an editing need has FGB and a decoder, or Route 2 if it survives verification.
+
+*** D3 -- the property warnings are owed regardless
+They are not scoped to editing pipelines and should not be gated on this plan
+shipping. A =.geojson= → =.wkt= run drops every property in silence today, and
+that is a violation of the crate's own standing rule with or without a middle
+stage. If this plan stalls, extract § Four silent property drops and ship it
+alone.
+
+*** D4 -- pipe-form in-place: fix the identity loss first, then make writes atomic
+/Decided 2026-08-20, after the hazard was measured and turned out not to be the
+one this section originally described./
+
+=same-format-output.org= D4 refuses same-file for the two-path form and exempts
+=-= by construction, so it cannot reach the pipe case. Nor can it: the two
+stages are separate processes that cannot see each other's paths, and geosetta
+must not go looking (no silent exec, and no inspecting what else is on the
+user's command line).
+
+*The measured failure is not truncation.* Running the loop on a GeoPackage
+duplicates the data:
+
+#+begin_src text
+$ geosetta a.gpkg - --to fgb | tool | geosetta - a.gpkg --from fgb
+wrote a.gpkg (24576 bytes)
+before:  src (2 features)
+after:   src (2 features)  +  layer (2 features)
+#+end_src
+
+Exit 0, no warning. The pre-edit features survive *beside* the edited ones, so
+a middle stage that deleted features leaves the deletions undone in the old
+layer. This is the happy path returning wrong data, not an unhappy-path risk.
+
+*Root cause: the collection's name is lost in transit, twice over.*
+=flatgeobuf/writer.rs:181= hardcodes the FGB header name to the constant
+=geosetta= -- FlatGeobuf has a first-class name slot and geosetta overwrites
+whatever the source called the layer. Then =main.rs:726= falls back to =layer=
+when there is no output filename to derive a name from, which is exactly the
+pipe case. The destination therefore does not recognise =src=, and appends.
+Given =--layer src= explicitly, the same run *replaces* correctly -- so the
+entire failure is the missing name.
+
+*Decision.* Both, identity first:
+1. *Fix the identity loss at root.* Collection =name= must survive a round
+   trip. This is [[file:same-format-fidelity.org][same-format-fidelity.org]]'s
+   work -- and specifically its D1 *exception*, because =name= is one of the
+   few members with a first-class slot in four spokes, so it wants modelling
+   rather than an opaque native.
+2. *Then atomic write-and-rename*, as a committed follow-on rather than a
+   someday. It addresses what identity does not: truncation before a failed
+   write, and =write_shapefile_to_path='s four-file sequence, where a failure
+   at =.dbf= leaves a =.shp= from the new data and no original to retry from.
+
+*Note what atomic writes would* not *have fixed*: the duplication above. That
+is why the ordering is this way round and not the other, which is how this
+section originally had it.
+
+*GeoPackage append stays the default* (decided 2026-08-20). Create-or-append is
+=geopackage.org='s designed behaviour and the multi-layer accumulation case is
+real; once the layer name survives, a same-named layer is replaced and the
+pipeline case is correct without a flag change.
+
+*** D5 -- the middle stage stays anonymous in tests
+=jq= for the reference test, on the same reasoning
+=reproject-composability.org= used for =cs2cs=/=ogr2ogr=: proving interop
+against a tool that has never heard of this ecosystem is the point. A test
+against a sibling binary would prove less, and would encode a dependency the
+architecture does not have.
+
+** MILESTONES
+- *M1* -- the property-fidelity warning axis: one pass per spoke establishing
+  what its writer does to a property it cannot represent faithfully, and a
+  warning for each of the four cases found. Shippable alone (D3).
+- *M2* -- the =jq= round-trip test: fixture out through GeoJSON, edited by a
+  real =jq= process, back in with =--crs=, asserting the edit landed *and* the
+  CRS survived verbatim. This is the § THE FINDING recipe, pinned.
+- *M3* -- documentation: the recipe in =README.md=, § THE TRANSIT COROLLARY
+  (only a same-format transit is lossless), *"piping edits a layer, not a
+  container"* from § OPEN QUESTIONS, the two-read constraint, and the in-place
+  answer from D4. =main.rs='s module doc already documents the pipe seam for
+  reprojection and is the natural place for the editing one.
+- *M4* -- (conditional) Route 2's verification: can any real tool emit an
+  M-bearing JSON-FG? Answer before designing, and record a null result as the
+  finding if that is what it is.
+
+** TESTING
+- The § THE FINDING recipe, against real =jq=: edit lands, CRS verbatim,
+  properties and types intact.
+- Each of the four silent drops gets a warning test -- and, more importantly,
+  a *no-spurious-warning* test on the transit that does not lose the thing
+  (GeoParquet keeps nulls; FlatGeobuf keeps types).
+- The transit matrix itself, as a table-driven test over format pairs
+  asserting what each round trip preserves. It is the artifact that would have
+  caught all four silent drops, and it is cheap now that the values are known.
+- In-place through a pipe: whatever D4 settles on, assert it. If the answer is
+  "documented risk," assert at minimum that the *warned* losses still fire, so
+  the user overwriting a file is told what the overwrite costs.
+- The GeoParquet WKT2 → WKT1 CRS downgrade specifically. It is silent today
+  and it is the loss that fired in the in-place hazard; whether it warrants a
+  warning or is correct-by-design (PROJJSON is the format's native CRS
+  channel, and the identity does survive) is § OPEN QUESTIONS, but either way
+  the behaviour should be pinned rather than incidental.
+
+** OPEN QUESTIONS
+- ~~*Is the GeoParquet WKT2 → WKT1 downgrade a bug or a fact?*~~ *Answered
+  2026-08-20: a bug, but not the kind this plan assumed.* It is a *missing
+  cross-format warning*, now owned by
+  [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] § OWED
+  WARNING. Two corrections worth keeping, because both were believed here
+  first:
+  1. *Nothing is mis-rendered on the way out.* The WKT2 is absent from the
+     GeoParquet entirely -- GeoParquet's only CRS channel is PROJJSON, so the
+     text is dropped on the way *in*. =projjson_to_wkt= emitting WKT1 is the
+     deliberate choice of [[file:projjson-to-wkt.org][projjson-to-wkt.org]]
+     § Output dialect, not a defect to fix.
+  2. *§ THE IN-PLACE HAZARD is not a same-format round trip*, though it reads
+     as one. Both hops are cross-format, so
+     [[file:same-format-fidelity.org][same-format-fidelity.org]]'s invariant
+     never covered it -- see that plan's § The invariant binds an invocation,
+     not a pipeline, and § THE TRANSIT COROLLARY below.
+- *Does the property warning belong on every conversion, or only where the
+  loss is unrecoverable?* *Moved 2026-08-20* to
+  [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] §
+  OPEN QUESTION, which owns what a warning must say. It was being carried in
+  three places at once -- here, =same-format-output.org=, and implicitly by
+  =same-format-fidelity.org= -- which is how one question acquires two
+  answers. It is blocked on that plan's M1 inventory; do not settle it here.
+- ~~*Should =--print-crs= gain a way to emit the CRS and the features in one
+  pass?*~~ *Closed 2026-08-20: no, and not on "wait and see" grounds.* It is
+  the fix for § THE TWO-READ CONSTRAINT, but "the features plus a sidecar" is
+  Route 3 -- an ecosystem-private transit format wearing a flag -- and Route 3
+  is rejected on the same reasoning that rejects the sidecar's cousins
+  throughout this plan: no external tool would know what to do with it, so it
+  defeats the goal that any editor should work.
+
+  *§ THE TRANSIT COROLLARY also removed most of the demand.* The two-read
+  constraint only bites when the CRS has to be carried *around* a lossy
+  transit. Under a same-format transit -- which is the only lossless shape
+  anyway -- the CRS rides in the stream, there is nothing to re-attach, and
+  =--print-crs= is not in the loop at all. So the flag would buy a workaround
+  for a pipeline the user should not be running.
+
+  Reopen only if someone is blocked with a *same-format* transit, which would
+  mean the CRS failed to survive a hop it should have -- a fidelity bug to fix
+  at the spoke, not a flag to add here.
+- ~~*Does the =--layer= / multi-layer GeoPackage case have an editing story at
+  all?*~~ *Closed 2026-08-20: not through a pipe, and it no longer needs one.*
+  Mostly dissolved by
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] § THE DOMAIN OF
+  THE RULE: since the invariant binds the whole container, a =.gpkg= round-trips
+  *whole* through a single invocation, layers and all. The multi-layer case
+  therefore has an editing story -- it is just route (a), a caller holding the
+  container, not route (b).
+
+  What stays closed is the *pipe*: a four-layer =.gpkg= piped out is one layer
+  or a fan-out, and neither reassembles, because the transit is a single
+  collection and nothing in the stream says which layer a feature came from.
+  Inventing a framing that did say so would be Route 3 again. So the honest
+  statement, which belongs in =README.md= rather than only here: *piping edits
+  a layer, not a container.* Use =--layer= to name the one you mean, and
+  round-trip the container in place when you want all of it.
+
+** DEPENDS ON / RELATED
+- [[file:reproject-composability.org][reproject-composability.org]] -- the
+  sibling seam and the model for this one: two composition routes, verified
+  against real third-party tools rather than stand-ins.
+- [[file:same-format-output.org][same-format-output.org]] -- *prerequisite for
+  two of this loop's users.* A GeoJSON-native or WKT-native user's first stage
+  is =geosetta in.geojson - --to geojson=, refused today; both were confirmed
+  refused against the binary. Also owns the =id=/=bbox= half of the fidelity
+  story and the same-file guard this plan's D4 extends.
+- [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] -- the
+  standing rule the four silent property drops violate, and the mechanism M1
+  plugs into.
+- [[file:crs-definition-output.org][crs-definition-output.org]] /
+  [[file:crs-external-resolution.org][crs-external-resolution.org]] --
+  =--print-crs= → =--crs= is what makes the CRS survive a lossy transit; the
+  verbatim contract is what the GeoParquet open question is measured against.
+- [[file:streaming-progress.org][streaming-progress.org]] -- the plan most
+  likely to end the batch-I/O accident that currently makes pipe-form in-place
+  safe (§ THE IN-PLACE HAZARD).
+- [[file:../../architecture.org][../../architecture.org]] § THE COMPOSITION
+  MODEL -- why the middle stage cannot link =geosetta=, which is what forces
+  the transit format to be one neither crate owns.

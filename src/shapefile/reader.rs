@@ -31,10 +31,14 @@ pub fn read(shp: &[u8], dbf_bytes: &[u8], prj: Option<&str>, cpg: Option<&str>) 
         if record.deleted {
             continue;
         }
-        features.push(Feature { geometry, properties: record.properties });
+        features.push(Feature { geometry, properties: record.properties, native: None });
     }
 
     let mut fc = FeatureCollection::new(features);
+    // The `.dbf` header's own declarations, kept alongside the values so a
+    // same-format write puts back the field widths it was handed rather than
+    // re-deriving them from the rows (see `crate::schema::FieldDecl`).
+    fc.schema = dbf::read_schema(dbf_bytes)?;
     // The definition is the `.prj`'s text; the newline a writer may have framed
     // it with is not part of it. Trimming here is the same rule
     // `crate::json::raw_at` applies to a PROJJSON definition nested in `geo`
@@ -58,6 +62,7 @@ mod tests {
         FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![("name".into(), crate::json::JsonValue::String("a".into()))],
+            native: None,
         }])
     }
 

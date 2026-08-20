@@ -200,8 +200,11 @@ file that happened to have none).
   make same-format output genuinely round-trip clean, and it is a separate plan
   with its own effect on all nine spokes. This one warns about the gap; it does
   not close it.
-- *Atomic writes* (temp file + rename). Related to D4 and would change the
-  answer there, but it is a crate-wide I/O discipline, not this change.
+- *Atomic writes* (temp file + rename) -- still out of *this* plan, but no
+  longer an open idea: committed 2026-08-20 and owned by
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] § SCOPE. It
+  remains crate-wide I/O discipline rather than part of this change, and it
+  bears on D4 (see § OPEN QUESTIONS).
 - *In-place =--crs= without a rewrite.* Editing a =.prj= or a =gpkg_spatial_ref_sys=
   row in place, leaving the rest of the file untouched. Legitimate ask, entirely
   different mechanism.
@@ -322,20 +325,51 @@ is luck rather than design.
   covers every warning) by default, but this one may fire on every run of a
   normalising pipeline stage, which is the case for a targeted escape hatch. Do
   not invent one until someone is actually annoyed by it.
-- *Does the same-format warning belong on cross-format runs too?* The loss is
-  identical there and equally silent (§ THE FIDELITY PROBLEM's asymmetry note).
-  The argument for holding the line at same-format is that the target's
-  incapacity is a genuine defence and the message would have to be hedged into
-  uselessness; the argument against is that a =.geojson= → =.fgb= user losing
-  their =id=s is no happier for the hedge. Deferred to whichever plan closes
-  the gap rather than describes it.
-- *Should atomic writes make D4 unnecessary?* Temp-file-plus-rename would make
-  in-place safe rather than merely refused, and it is strictly better UX. It is
-  also a crate-wide change touching every write path including shapefile's
-  four-file set. If it lands, revisit D4 -- but the refusal is the right
-  interim, since it matches the reference tool and cannot lose data.
+- *Does the same-format warning belong on cross-format runs too?* *Moved
+  2026-08-20* to
+  [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] §
+  OPEN QUESTION, which owns what a warning must say. It was being carried here,
+  in =edit-composability.org= D3, and implicitly by =same-format-fidelity.org=
+  -- three copies of one question, which is how it acquires two answers. It is
+  blocked on that plan's M1 inventory, since the argument is currently being
+  had over a set nobody has enumerated. Note the same-format *half* of this
+  question is dissolved rather than deferred: under
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] there is nothing
+  left to warn about on a same-format run.
+- *Should atomic writes make D4 unnecessary?* *Partly answered 2026-08-20:
+  atomic writes are now committed*, as the second half of
+  [[file:edit-composability.org][edit-composability.org]] D4 -- sequenced after
+  the collection-name fix, because the failure actually measured there
+  (a GeoPackage edit loop duplicating its layers) is caused by lost identity
+  and atomic writes would not have prevented it.
+
+  What is *not* settled is this plan's own question: whether the same-file
+  refusal here becomes unnecessary once writes are atomic. The refusal remains
+  the right interim -- it matches the reference tool and cannot lose data --
+  and it should be revisited, not automatically dropped, when atomic writes
+  land. Note they are also a prerequisite for the =gpkg= container work
+  ([[file:same-format-fidelity.org][same-format-fidelity.org]] M3b), which may
+  stop rewriting the file wholesale and would change what "atomic" has to
+  cover.
 
 ** DEPENDS ON / RELATED
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] -- *gates this
+  plan, and inverts part of § SCOPE / Out and D3* (added 2026-08-20). It adopts
+  as a standing rule the conclusion § THE FIDELITY PROBLEM stopped one step
+  short of: a same-format run must lose nothing, so the gap this plan describes
+  should be *closed* rather than warned about. Consequence for the sequencing
+  here, *decided 2026-08-20*: M1 follows that plan's natives channel. The
+  reason is that M2's =Format::unmodelled_members= inventory is the same pass
+  the natives need, so shipping it first produces nine constants that are dead
+  code as soon as natives replace them with real handling. M1 and M3 are
+  themselves unchanged; M2 narrows to genuine cross-format capability gaps.
+  (An earlier draft of this backlink argued the warning could not be phrased
+  honestly, since the crate writes no pending state into user-facing text.
+  That was withdrawn -- "feature ids are not preserved" is a statement of
+  current fact, and removing it later would be ordinary. The decision rests on
+  the duplicated inventory pass alone.) It also answers
+  this plan's OPEN QUESTION about a =--quiet= escape hatch for the same-format
+  warning, by removing the warning.
 - [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] --
   supplies the standing rule (§ THE FIDELITY PROBLEM) and the mechanism the
   M2 warning plugs into.

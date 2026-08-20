@@ -5,8 +5,10 @@
 
 use crate::feature::FeatureCollection;
 use crate::flatbuffers::Builder;
+use crate::format::Format;
+use crate::native::{FgbNative, NativePayload};
 use crate::geometry::{Bbox, Geometry, Position};
-use crate::schema::{Cell, ColumnType, infer_columns};
+use crate::schema::{Cell, ColumnType, columns_for};
 
 const MAGIC: [u8; 8] = [b'f', b'g', b'b', 3, b'f', b'g', b'b', 1];
 
@@ -46,18 +48,37 @@ mod header {
     pub const FEATURES_COUNT: usize = 8;
     pub const INDEX_NODE_SIZE: usize = 9;
     pub const CRS: usize = 10;
-    pub const NUM_FIELDS: usize = 11;
+    pub const TITLE: usize = 11;
+    pub const DESCRIPTION: usize = 12;
+    pub const METADATA: usize = 13;
+    pub const NUM_FIELDS: usize = 14;
 }
 mod crs {
     pub const ORG: usize = 0;
     pub const CODE: usize = 1;
+    pub const NAME: usize = 2;
+    pub const DESCRIPTION: usize = 3;
     pub const WKT: usize = 4;
+    pub const CODE_STRING: usize = 5;
     pub const NUM_FIELDS: usize = 6;
 }
+// Slots 4-9 are the declaration half, mirroring `reader.rs`'s `column`
+// module; 2/3 (`title`/`description`) and 10 (`metadata`) are not written yet.
+// `NUM_FIELDS` is the table's full width regardless, since a vtable is sized
+// by the schema and not by which fields happen to be set.
 mod column {
     pub const NAME: usize = 0;
     pub const TYPE: usize = 1;
-    pub const NUM_FIELDS: usize = 2;
+    pub const WIDTH: usize = 4;
+    pub const PRECISION: usize = 5;
+    pub const SCALE: usize = 6;
+    pub const NULLABLE: usize = 7;
+    pub const UNIQUE: usize = 8;
+    pub const PRIMARY_KEY: usize = 9;
+    pub const TITLE: usize = 2;
+    pub const DESCRIPTION: usize = 3;
+    pub const METADATA: usize = 10;
+    pub const NUM_FIELDS: usize = 11;
 }
 mod feature {
     pub const GEOMETRY: usize = 0;
@@ -78,7 +99,7 @@ mod geometry {
 pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     // Columns (name + type) inferred by scanning all features; `values[row]` is
     // this row's cell for each column.
-    let columns = infer_columns(&fc.features);
+    let columns = columns_for(fc);
 
     // Bounding box, the geometry-type set, and Z/M presence across all
     // features (the header's `hasZ`/`hasM` are file-level hints; a source
@@ -131,16 +152,7 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
 
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
-    let header = build_header(
-        &columns,
-        &bbox,
-        header_type,
-        has_z,
-        has_m,
-        fc.features.len() as u64,
-        node_size,
-        fc.crs.as_ref(),
-    );
+    let header = build_header(fc, &columns, &bbox, header_type, has_z, has_m, node_size);
     out.extend_from_slice(&(header.len() as u32).to_le_bytes());
     out.extend_from_slice(&header);
     if indexed {
@@ -157,36 +169,68 @@ fn feature_bbox(f: &crate::feature::Feature) -> Bbox {
 
 #[allow(clippy::too_many_arguments)]
 fn build_header(
+    fc: &FeatureCollection,
     columns: &[crate::schema::Column],
     bbox: &Bbox,
     header_type: u8,
     has_z: bool,
     has_m: bool,
-    features_count: u64,
     node_size: u16,
-    crs: Option<&crate::crs::Crs>,
 ) -> Vec<u8> {
     let mut b = Builder::new();
+    // Whatever this collection's source recorded that the IR does not model,
+    // but only when the source *was* FlatGeobuf — `payload_for` is the tag
+    // check, and a GeoJSON foreign member must never reach these slots.
+    let native = match fc.native.as_ref().and_then(|n| n.payload_for(Format::FlatGeobuf)) {
+        Some(NativePayload::FlatGeobuf(f)) => Some(f),
+        _ => None,
+    };
+    let col_natives = native.map(|n| &n.columns[..]).unwrap_or(&[]);
 
     // Column sub-tables first (referenced objects precede their referrers).
     let mut col_offsets = Vec::with_capacity(columns.len());
     for col in columns {
+        let cn = col_natives.iter().find(|c| c.name == col.name);
         let name = b.create_string(&col.name);
+        // Every string this table references must be built before the table is
+        // started, so the three descriptive members are created up front.
+        let title = cn.and_then(|c| c.title.as_deref()).map(|s| b.create_string(s));
+        let description = cn.and_then(|c| c.description.as_deref()).map(|s| b.create_string(s));
+        let metadata = cn.and_then(|c| c.metadata.as_deref()).map(|s| b.create_string(s));
         b.start_table(column::NUM_FIELDS);
         b.add_offset(column::NAME, name);
         b.add_u8(column::TYPE, fgb_column_type(col.ty), 255);
+        for (slot, off) in
+            [(column::TITLE, title), (column::DESCRIPTION, description), (column::METADATA, metadata)]
+        {
+            if let Some(o) = off {
+                b.add_offset(slot, o);
+            }
+        }
+        write_decl(&mut b, col.decl.as_ref());
         col_offsets.push(b.end_table());
     }
     let columns_vec = b.create_offset_vector(&col_offsets);
-    let name = b.create_string("geosetta");
+    // The collection's own name. Writing a constant here was defect 4: it made
+    // a layer name unable to survive an FGB transit, which is what let a
+    // GeoPackage edit loop append a duplicate layer instead of replacing one
+    // (`plans/edit-composability.org` D4). A nameless collection writes no
+    // name rather than inventing one — naming an output is the caller's job,
+    // and `main.rs` supplies one from `--layer` or the input's stem.
+    let name = fc.name.as_deref().map(|n| b.create_string(n));
+    let title = native.and_then(|n| n.title.as_deref()).map(|s| b.create_string(s));
+    let description = native.and_then(|n| n.description.as_deref()).map(|s| b.create_string(s));
+    let metadata = native.and_then(|n| n.metadata.as_deref()).map(|s| b.create_string(s));
     let envelope = (!bbox.is_empty())
         .then(|| b.create_f64_vector(&[bbox.min_x, bbox.min_y, bbox.max_x, bbox.max_y]));
     // The CRS sub-table (built before the header that references it), carrying
     // whatever the source recorded through unchanged.
-    let crs_off = build_crs(&mut b, crs);
+    let crs_off = build_crs(&mut b, fc.crs.as_ref(), native);
 
     b.start_table(header::NUM_FIELDS);
-    b.add_offset(header::NAME, name);
+    if let Some(n) = name {
+        b.add_offset(header::NAME, n);
+    }
     if let Some(env) = envelope {
         b.add_offset(header::ENVELOPE, env);
     }
@@ -194,12 +238,19 @@ fn build_header(
     b.add_u8(header::HAS_Z, has_z as u8, 0);
     b.add_u8(header::HAS_M, has_m as u8, 0);
     b.add_offset(header::COLUMNS, columns_vec);
-    b.add_u64(header::FEATURES_COUNT, features_count, 0);
+    b.add_u64(header::FEATURES_COUNT, fc.features.len() as u64, 0);
     // Default index_node_size is 16, so an indexed file (16) omits the field and
     // an index-less one writes 0.
     b.add_u16(header::INDEX_NODE_SIZE, node_size, 16);
     if let Some(off) = crs_off {
         b.add_offset(header::CRS, off);
+    }
+    for (slot, off) in
+        [(header::TITLE, title), (header::DESCRIPTION, description), (header::METADATA, metadata)]
+    {
+        if let Some(o) = off {
+            b.add_offset(slot, o);
+        }
     }
     let root = b.end_table();
     b.finish(root)
@@ -208,27 +259,49 @@ fn build_header(
 /// Build the FlatGeobuf `Crs` sub-table, returning its offset, or `None` when
 /// the collection has no CRS (so the header omits the field). WGS 84 is written
 /// as EPSG:4326, the spelling GDAL uses.
-fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>) -> Option<usize> {
+fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>, native: Option<&FgbNative>) -> Option<usize> {
     use crate::crs::Crs;
     // FlatGeobuf's Crs.code is int32 on the wire — genuinely numeric, unlike the
     // IR's string code (which also holds IGNF/OGC/PROJ/NKG's alphanumeric
     // codes). A non-numeric code can't be represented here; it falls back to
     // the same "no code" 0/unset sentinel as below, same as GeoPackage's
     // synthetic-id fallback — org and wkt still carry through.
-    let (org, code, wkt) = match crs? {
-        Crs::Wgs84 => (Some("EPSG".to_string()), Some(4326), None),
-        Crs::Named(n) => (
+    // Not `crs?`: a source may have recorded a CRS *name* and nothing else,
+    // and returning early on a missing `Crs` would drop the sub-table with the
+    // native still in it.
+    let (org, code, wkt) = match crs {
+        Some(Crs::Wgs84) => (Some("EPSG".to_string()), Some(4326), None),
+        Some(Crs::Named(n)) => (
             n.authority.clone(),
             n.code.as_deref().and_then(|c| c.parse::<i64>().ok()),
             n.wkt.clone().or_else(|| n.structural_wkt()),
         ),
+        None => (None, None, None),
     };
-    // Nothing worth recording.
-    if org.is_none() && code.is_none() && wkt.is_none() {
+    // The three members `Crs` itself has no slot for, carried across as a
+    // native. `name` is populated in every `ogr2ogr`-written file observed.
+    let extra = |f: fn(&FgbNative) -> Option<&String>| native.and_then(f).map(String::as_str);
+    let crs_name = extra(|n| n.crs_name.as_ref());
+    let crs_description = extra(|n| n.crs_description.as_ref());
+    let crs_code_string = extra(|n| n.crs_code_string.as_ref());
+
+    // Nothing worth recording. The natives count: a file whose only CRS
+    // content was a name still recorded something, and dropping the sub-table
+    // would lose it.
+    if org.is_none()
+        && code.is_none()
+        && wkt.is_none()
+        && crs_name.is_none()
+        && crs_description.is_none()
+        && crs_code_string.is_none()
+    {
         return None;
     }
     let org_off = org.as_deref().map(|s| b.create_string(s));
     let wkt_off = wkt.as_deref().map(|s| b.create_string(s));
+    let name_off = crs_name.map(|s| b.create_string(s));
+    let desc_off = crs_description.map(|s| b.create_string(s));
+    let code_string_off = crs_code_string.map(|s| b.create_string(s));
     b.start_table(crs::NUM_FIELDS);
     if let Some(o) = org_off {
         b.add_offset(crs::ORG, o);
@@ -238,6 +311,13 @@ fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>) -> Option<usize> {
     b.add_i32(crs::CODE, code.unwrap_or(0) as i32, 0);
     if let Some(w) = wkt_off {
         b.add_offset(crs::WKT, w);
+    }
+    for (slot, off) in
+        [(crs::NAME, name_off), (crs::DESCRIPTION, desc_off), (crs::CODE_STRING, code_string_off)]
+    {
+        if let Some(o) = off {
+            b.add_offset(slot, o);
+        }
     }
     Some(b.end_table())
 }
@@ -372,6 +452,39 @@ fn fgb_geometry_type(g: &Geometry) -> u8 {
         Geometry::MultiLineString(_) => gtype::MULTILINESTRING,
         Geometry::MultiPolygon(_) => gtype::MULTIPOLYGON,
         Geometry::GeometryCollection(_) => gtype::GEOMETRYCOLLECTION,
+    }
+}
+
+/// Replay a source's column declaration into the `Column` table being built.
+///
+/// This is the half of a FlatGeobuf file that makes it usable as *transit*: a
+/// declaration written here survives into a pipeline's middle stage, where an
+/// external tool can read and widen it before the far end writes a format that
+/// has fixed-width fields. Nothing else in the crate carries a schema between
+/// processes (see `plans/same-format-fidelity.org` D1/D5).
+///
+/// Each `add_*` is given the spec's own default, so a field equal to its
+/// default costs no vtable slot — an undeclared column writes exactly the two
+/// bytes it wrote before this existed.
+fn write_decl(b: &mut Builder, decl: Option<&crate::schema::FieldDecl>) {
+    let Some(d) = decl else { return };
+    if let Some(w) = d.width {
+        b.add_i32(column::WIDTH, w as i32, -1);
+    }
+    if let Some(p) = d.precision {
+        b.add_i32(column::PRECISION, p as i32, -1);
+    }
+    if let Some(s) = d.scale {
+        b.add_i32(column::SCALE, s as i32, -1);
+    }
+    if let Some(n) = d.nullable {
+        b.add_u8(column::NULLABLE, n as u8, 1);
+    }
+    if let Some(u) = d.unique {
+        b.add_u8(column::UNIQUE, u as u8, 0);
+    }
+    if let Some(k) = d.primary_key {
+        b.add_u8(column::PRIMARY_KEY, k as u8, 0);
     }
 }
 
@@ -587,6 +700,7 @@ mod tests {
                     "id".into(),
                     JsonValue::Number { value: i as f64, is_int: true },
                 )],
+                native: None,
             })
             .collect();
         let bytes = write(&FeatureCollection::new(features));
@@ -608,6 +722,7 @@ mod tests {
         let fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::with_z(1.0, 2.0, 381.0))),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
@@ -622,6 +737,7 @@ mod tests {
                 Position::with_zm(1.0, 1.0, 2.0, 20.0),
             ])),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
@@ -654,10 +770,163 @@ mod tests {
                 ],
             ])),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
         assert_eq!(back.features[0].geometry, fc.features[0].geometry);
+    }
+
+    fn hostile() -> FeatureCollection {
+        crate::flatgeobuf::read(include_bytes!("../../tests/fixtures/gdal_hostile.fgb")).unwrap()
+    }
+
+    fn fgb_native(fc: &FeatureCollection) -> crate::native::FgbNative {
+        match fc.native.as_ref().and_then(|n| n.payload_for(Format::FlatGeobuf)) {
+            Some(NativePayload::FlatGeobuf(f)) => f.clone(),
+            other => panic!("expected a FlatGeobuf native, got {other:?}"),
+        }
+    }
+
+    /// The header members `gdal_hostile.fgb` actually carries, round-tripped.
+    /// All three are real `ogr2ogr` output, not synthesized: the reader had no
+    /// constant for `metadata` at all, and the writer used to put the literal
+    /// `geosetta` in the name slot.
+    #[test]
+    fn a_real_header_s_name_metadata_and_crs_name_survive_a_round_trip() {
+        let source = hostile();
+        assert_eq!(source.name.as_deref(), Some("cities"));
+        let native = fgb_native(&source);
+        assert!(native.metadata.as_deref().unwrap().contains("surveyed 2019"), "{native:?}");
+        assert_eq!(native.crs_name.as_deref(), Some("WGS 84"));
+
+        let back = crate::flatgeobuf::read(&write(&source)).unwrap();
+        assert_eq!(back.name, source.name);
+        assert_eq!(fgb_native(&back), native);
+        assert_eq!(back.crs, source.crs);
+    }
+
+    /// Defect 4: the writer hardcoded `geosetta` into the header's name slot,
+    /// so no layer name could survive an FGB transit — which is what let a
+    /// GeoPackage edit loop append a duplicate layer instead of replacing one.
+    #[test]
+    fn the_header_name_is_the_collection_s_own_not_a_constant() {
+        let mut fc = FeatureCollection::new(vec![Feature::default()]);
+        fc.name = Some("cities".into());
+        assert_eq!(crate::flatgeobuf::read(&write(&fc)).unwrap().name.as_deref(), Some("cities"));
+
+        // A nameless collection writes no name rather than inventing one:
+        // naming an output is the caller's job.
+        let anonymous = FeatureCollection::new(vec![Feature::default()]);
+        assert_eq!(crate::flatgeobuf::read(&write(&anonymous)).unwrap().name, None);
+    }
+
+    /// The whole descriptive surface, including the slots no observed tool
+    /// populates — carried because the spec has them, not because GDAL used
+    /// them.
+    #[test]
+    fn every_descriptive_header_and_column_member_round_trips() {
+        let mut fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![(std::rc::Rc::from("a"), crate::json::JsonValue::String("x".into()))],
+            native: None,
+        }]);
+        let native = crate::native::FgbNative {
+            title: Some("Cities".into()),
+            description: Some("a description".into()),
+            metadata: Some(r#"{"k":"v"}"#.into()),
+            crs_name: Some("WGS 84".into()),
+            crs_description: Some("the ensemble".into()),
+            crs_code_string: Some("IGNF:LAMB93".into()),
+            columns: vec![crate::native::FgbColumnNative {
+                name: "a".into(),
+                title: Some("Column A".into()),
+                description: Some("what A means".into()),
+                metadata: Some(r#"{"unit":"m"}"#.into()),
+            }],
+        };
+        fc.native = Some(crate::Native::new(
+            Format::FlatGeobuf,
+            NativePayload::FlatGeobuf(native.clone()),
+        ));
+        assert_eq!(fgb_native(&crate::flatgeobuf::read(&write(&fc)).unwrap()), native);
+    }
+
+    /// The tag check, at the spoke rather than in `native.rs`: a payload from
+    /// another format must not reach these slots.
+    #[test]
+    fn a_geojson_native_is_not_replayed_into_a_flatgeobuf_header() {
+        let mut fc = FeatureCollection::new(vec![Feature::default()]);
+        fc.native = Some(crate::Native::new(
+            Format::GeoJson,
+            NativePayload::GeoJson(vec![(std::rc::Rc::from("id"), crate::json::JsonValue::Null)]),
+        ));
+        assert_eq!(crate::flatgeobuf::read(&write(&fc)).unwrap().native, None);
+    }
+
+    /// D3 at the header: a collection with nothing unmodelled allocates no
+    /// payload and writes no extra slots.
+    #[test]
+    fn a_plain_collection_carries_no_flatgeobuf_native() {
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![],
+            native: None,
+        }]);
+        assert_eq!(crate::flatgeobuf::read(&write(&fc)).unwrap().native, None);
+    }
+
+    /// A FlatGeobuf column declaration survives a write/read cycle. This is
+    /// what makes FGB usable as *transit*: it is the only format in the crate
+    /// that carries a schema between processes.
+    #[test]
+    fn a_column_declaration_round_trips_through_the_header() {
+        let mut fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![
+                (std::rc::Rc::from("name"), crate::json::JsonValue::String("Zürich".into())),
+                (std::rc::Rc::from("price"), crate::json::JsonValue::Number { value: 1.5, is_int: false }),
+            ],
+            native: None,
+        }]);
+        fc.schema = vec![
+            crate::schema::FieldDecl {
+                name: "name".into(),
+                width: Some(80),
+                nullable: Some(false),
+                unique: Some(true),
+                primary_key: Some(true),
+                ..Default::default()
+            },
+            crate::schema::FieldDecl {
+                name: "price".into(),
+                precision: Some(24),
+                scale: Some(15),
+                ..Default::default()
+            },
+        ];
+        let back = crate::flatgeobuf::read(&write(&fc)).unwrap();
+        assert_eq!(back.schema, fc.schema);
+    }
+
+    /// The declaration slots cost nothing when there is nothing to declare —
+    /// D3's rule, applied to the header rather than to a native.
+    #[test]
+    fn an_undeclared_column_writes_no_declaration_slots() {
+        let fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![(std::rc::Rc::from("name"), crate::json::JsonValue::String("x".into()))],
+            native: None,
+        }]);
+        let bytes = write(&fc);
+        assert!(crate::flatgeobuf::read(&bytes).unwrap().schema.is_empty());
+        // A declaration-free file is byte-identical to what this writer
+        // produced before the slots existed, since each `add_*` is given the
+        // spec's default and a default costs no vtable entry.
+        let mut declared = fc.clone();
+        declared.schema =
+            vec![crate::schema::FieldDecl { name: "name".into(), width: Some(80), ..Default::default() }];
+        assert!(write(&declared).len() > bytes.len());
     }
 
     #[test]
@@ -681,6 +950,7 @@ mod tests {
                 ]],
             ])),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
@@ -692,6 +962,7 @@ mod tests {
         let fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
+            native: None,
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
@@ -702,6 +973,7 @@ mod tests {
         let mut fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
+            native: None,
         }]);
         fc.crs = crs;
         fc
@@ -788,3 +1060,4 @@ mod tests {
         }
     }
 }
+

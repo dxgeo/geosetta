@@ -107,6 +107,43 @@ fn gen_points_geojson(n: usize) -> String {
 /// `schema::infer_columns` (a HashMap-keyed single pass, `O(rows × cols)`)
 /// and the per-row property key/value (de)construction — neither of which the
 /// narrow four-property `gen_geojson` exercises.
+/// A wide table where each row populates only a few of its columns.
+///
+/// The dense generator below cannot see the cost this exists to measure: M4
+/// made FlatGeobuf's reader materialize an omitted cell as null (defect 1), so
+/// a *sparse* wide table now rebuilds `rows x cols` properties where it used to
+/// rebuild only the populated ones. Every other rectangular spoke already paid
+/// that, so the question was always the size of the bill, not whether it is
+/// owed — this is what answers it.
+fn gen_sparse_wide_geojson(n: usize, cols: usize, per_row: usize) -> String {
+    use std::fmt::Write;
+    let mut s = String::with_capacity(n * (48 + per_row * 16));
+    s.push_str("{\"type\":\"FeatureCollection\",\"features\":[");
+    for i in 0..n {
+        if i > 0 {
+            s.push(',');
+        }
+        let x = -180.0 + (i as f64 * 0.001) % 360.0;
+        let y = -90.0 + (i as f64 * 0.0007) % 180.0;
+        let _ = write!(
+            s,
+            "{{\"type\":\"Feature\",\"geometry\":{{\"type\":\"Point\",\"coordinates\":[{x:.6},{y:.6}]}},\"properties\":{{"
+        );
+        // A moving window, so every column is populated by *some* row (the
+        // whole schema still exists) while any given row carries few.
+        for k in 0..per_row {
+            let j = (i * per_row + k) % cols;
+            if k > 0 {
+                s.push(',');
+            }
+            let _ = write!(s, "\"c{j}\":{}", i as i64 + j as i64);
+        }
+        s.push_str("}}");
+    }
+    s.push_str("]}");
+    s
+}
+
 fn gen_wide_geojson(n: usize, cols: usize) -> String {
     use std::fmt::Write;
     let mut s = String::with_capacity(n * (48 + cols * 16));
@@ -290,6 +327,25 @@ fn wide_table() {
 
     let back = std::fs::read_to_string(dir.join("wide_out.geojson")).unwrap();
     assert_eq!(back.matches("\"Feature\"").count(), n, "feature count preserved");
+
+    // The sparse counterpart: same column count, a handful populated per row.
+    // Compare the FlatGeobuf read path against the dense numbers above — that
+    // is the one M4 changed.
+    let sparse = dir.join("sparse.geojson");
+    let text = gen_sparse_wide_geojson(n, cols, 3);
+    std::fs::write(&sparse, &text).unwrap();
+    let sparse_bytes = text.len() as u64;
+    println!("\n=== geosetta sparse wide-table: {n} features x {cols} props, 3 set per row ===");
+    bench("geojson->fgb (sparse)", &sparse, sparse_bytes, n, &dir.join("sparse.fgb"), &[]);
+    let fgb = std::fs::metadata(dir.join("sparse.fgb")).map(|m| m.len()).unwrap_or(0);
+    bench(
+        "fgb->geojson (sparse)",
+        &dir.join("sparse.fgb"),
+        fgb,
+        n,
+        &dir.join("sparse_out.geojson"),
+        &[],
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -12,7 +12,7 @@
 //! so each page body is `[u32 len][RLE definition levels][PLAIN values]`.
 
 use super::geo::GEOMETRY_COLUMN;
-use crate::schema::{Cell, Column, ColumnType};
+use crate::schema::{Cell, Column, ColumnType, DeclType};
 use crate::compress::snappy;
 use super::thrift::{ct, CompactWriter};
 use super::types::{codec, converted, encoding, page, ptype, repetition};
@@ -26,6 +26,8 @@ const FORMAT_VERSION: i32 = 1;
 struct Prepared {
     name: String,
     ptype: i32,
+    /// The `converted_type` annotation this column carries, if any.
+    converted: Option<i32>,
     num_values: usize,
     /// One byte per row: 1 = present, 0 = null.
     def_levels: Vec<u8>,
@@ -38,6 +40,7 @@ struct Prepared {
 struct ChunkInfo {
     name: String,
     ptype: i32,
+    converted: Option<i32>,
     data_page_offset: i64,
     compressed_size: i64,
     uncompressed_size: i64,
@@ -76,13 +79,99 @@ pub fn write_geoparquet(
 
 // --- column preparation ---------------------------------------------------
 
-fn prepare_property(col: &Column) -> Prepared {
-    let ptype = match col.ty {
-        ColumnType::Bool => ptype::BOOLEAN,
-        ColumnType::Int64 => ptype::INT64,
-        ColumnType::Double => ptype::DOUBLE,
-        ColumnType::String => ptype::BYTE_ARRAY,
+/// How one column's cells are laid down: its Parquet physical type, its
+/// `converted_type` annotation, and which encoding to use.
+///
+/// Parquet's type system is wider than the hub's four, so a column that
+/// arrived carrying a declaration is written as *that* type rather than as
+/// whatever its values re-infer to — an `Int16` stays 16-bit and a `DateTime`
+/// stays a timestamp instead of becoming text (defect 5).
+#[derive(Clone, Copy, PartialEq)]
+enum Plan {
+    Bool,
+    /// Physical `INT32`, from a `Cell::Int`.
+    Int32(Option<i32>),
+    /// Physical `INT64`, from a `Cell::Int`.
+    Int64(Option<i32>),
+    Float,
+    Double,
+    /// Physical `BYTE_ARRAY`, from a `Cell::Str`.
+    Text(Option<i32>),
+    /// `INT32` days since the epoch, parsed from an ISO date string.
+    DateDays,
+    /// `INT64` milliseconds since the epoch, parsed from an ISO date-time.
+    TimestampMillis,
+}
+
+impl Plan {
+    fn ptype(self) -> i32 {
+        match self {
+            Plan::Bool => ptype::BOOLEAN,
+            Plan::Int32(_) | Plan::DateDays => ptype::INT32,
+            Plan::Int64(_) | Plan::TimestampMillis => ptype::INT64,
+            Plan::Float => ptype::FLOAT,
+            Plan::Double => ptype::DOUBLE,
+            Plan::Text(_) => ptype::BYTE_ARRAY,
+        }
+    }
+
+    fn converted(self) -> Option<i32> {
+        match self {
+            Plan::Int32(c) | Plan::Int64(c) | Plan::Text(c) => c,
+            Plan::DateDays => Some(converted::DATE),
+            Plan::TimestampMillis => Some(converted::TIMESTAMP_MILLIS),
+            _ => None,
+        }
+    }
+}
+
+/// Choose a column's on-disk shape: the declaration if it still fits the data,
+/// else the hub type the values inferred.
+///
+/// The two temporal plans are conditional on *every* non-null cell parsing.
+/// The IR holds a date as text, so a declaration this writer cannot honour
+/// exactly would otherwise turn a value into a wrong number — declining to
+/// text is the same "data wins where it contradicts" rule `type_for` applies.
+fn plan_for(col: &Column) -> Plan {
+    let text_default = || match col.ty {
+        ColumnType::Bool => Plan::Bool,
+        ColumnType::Int64 => Plan::Int64(None),
+        ColumnType::Double => Plan::Double,
+        ColumnType::String => Plan::Text(Some(converted::UTF8)),
     };
+    let Some(declared) = col.declared_type() else {
+        return text_default();
+    };
+    let strs = || col.values.iter().filter_map(|c| match c {
+        Cell::Str(s) => Some(s.as_str()),
+        _ => None,
+    });
+    match declared {
+        DeclType::Bool => Plan::Bool,
+        DeclType::Int8 => Plan::Int32(Some(converted::INT_8)),
+        DeclType::UInt8 => Plan::Int32(Some(converted::UINT_8)),
+        DeclType::Int16 => Plan::Int32(Some(converted::INT_16)),
+        DeclType::UInt16 => Plan::Int32(Some(converted::UINT_16)),
+        DeclType::Int32 => Plan::Int32(None),
+        DeclType::UInt32 => Plan::Int32(Some(converted::UINT_32)),
+        DeclType::Int64 => Plan::Int64(None),
+        DeclType::UInt64 => Plan::Int64(Some(converted::UINT_64)),
+        DeclType::Float32 => Plan::Float,
+        DeclType::Float64 => Plan::Double,
+        DeclType::Json => Plan::Text(Some(converted::JSON)),
+        DeclType::Date if strs().all(|s| parse_date_days(s).is_some()) => Plan::DateDays,
+        DeclType::DateTime if strs().all(|s| parse_timestamp_millis(s).is_some()) => {
+            Plan::TimestampMillis
+        }
+        // `String`, a temporal type whose text this writer cannot parse back,
+        // and `Binary` (whose cells are hex text, not bytes — see the reader's
+        // `decl_type`) all land on plain UTF8.
+        _ => Plan::Text(Some(converted::UTF8)),
+    }
+}
+
+fn prepare_property(col: &Column) -> Prepared {
+    let plan = plan_for(col);
 
     let mut def = Vec::with_capacity(col.values.len());
     let mut values = Vec::new();
@@ -90,41 +179,104 @@ fn prepare_property(col: &Column) -> Prepared {
     let mut bits: Vec<bool> = Vec::new();
 
     for cell in &col.values {
-        match (col.ty, cell) {
-            (_, Cell::Null) => def.push(0),
-            (ColumnType::Bool, Cell::Bool(b)) => {
-                def.push(1);
-                bits.push(*b);
+        let mut present = true;
+        match (plan, cell) {
+            (_, Cell::Null) => present = false,
+            (Plan::Bool, Cell::Bool(b)) => bits.push(*b),
+            (Plan::Int32(_), Cell::Int(n)) => {
+                values.extend_from_slice(&(*n as i32).to_le_bytes())
             }
-            (ColumnType::Int64, Cell::Int(n)) => {
-                def.push(1);
-                values.extend_from_slice(&n.to_le_bytes());
+            (Plan::Int64(_), Cell::Int(n)) => values.extend_from_slice(&n.to_le_bytes()),
+            (Plan::Float, Cell::Double(d)) => {
+                values.extend_from_slice(&(*d as f32).to_le_bytes())
             }
-            (ColumnType::Double, Cell::Double(d)) => {
-                def.push(1);
-                values.extend_from_slice(&d.to_le_bytes());
+            (Plan::Double, Cell::Double(d)) => values.extend_from_slice(&d.to_le_bytes()),
+            (Plan::Text(_), Cell::Str(s)) => plain_byte_array(&mut values, s.as_bytes()),
+            // `plan_for` only chooses these when every cell parses.
+            (Plan::DateDays, Cell::Str(s)) => {
+                values.extend_from_slice(&(parse_date_days(s).unwrap_or(0) as i32).to_le_bytes())
             }
-            (ColumnType::String, Cell::Str(s)) => {
-                def.push(1);
-                plain_byte_array(&mut values, s.as_bytes());
+            (Plan::TimestampMillis, Cell::Str(s)) => {
+                values.extend_from_slice(&parse_timestamp_millis(s).unwrap_or(0).to_le_bytes())
             }
             // Type/cell mismatches cannot arise from `infer_columns`, but be
             // safe and treat them as null.
-            _ => def.push(0),
+            _ => present = false,
         }
+        def.push(present as u8);
     }
 
-    if col.ty == ColumnType::Bool {
+    if plan == Plan::Bool {
         values = pack_bits(&bits);
     }
 
     Prepared {
         name: col.name.clone(),
-        ptype,
+        ptype: plan.ptype(),
+        converted: plan.converted(),
         num_values: col.values.len(),
         def_levels: def,
         values,
     }
+}
+
+/// Days since 1970-01-01 for `YYYY-MM-DD`, the inverse of the reader's
+/// `format_date`. Howard Hinnant's `days_from_civil`, the same proleptic
+/// Gregorian algorithm `civil_from_days` inverts.
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64; // [0, 399]
+    let mp = if m > 2 { m - 3 } else { m + 9 } as u64; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + d as u64 - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146_097 + doe as i64 - 719_468
+}
+
+/// `YYYY-MM-DD` → days since the epoch, or `None` if it is not that shape.
+fn parse_date_days(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| s.get(r)?.parse::<i64>().ok();
+    let (y, m, d) = (num(0..4)?, num(5..7)?, num(8..10)?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    Some(days_from_civil(y, m as u32, d as u32))
+}
+
+/// `YYYY-MM-DDTHH:MM:SS[.fff]` → milliseconds since the epoch, the inverse of
+/// the reader's `format_timestamp` at millisecond precision.
+///
+/// Sub-millisecond digits are *rejected* rather than truncated: a microsecond
+/// source that round-tripped through this would silently lose precision, and
+/// declining leaves it as exact text instead.
+fn parse_timestamp_millis(s: &str) -> Option<i64> {
+    let (date, rest) = s.split_once(['T', ' '])?;
+    let days = parse_date_days(date)?;
+    let (time, frac) = match rest.split_once('.') {
+        Some((t, f)) => (t, Some(f)),
+        None => (rest, None),
+    };
+    let parts: Vec<&str> = time.split(':').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let n = |p: &str| p.parse::<i64>().ok();
+    let (hh, mm, ss) = (n(parts[0])?, n(parts[1])?, n(parts[2])?);
+    if hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    let millis = match frac {
+        None => 0,
+        Some(f) if f.len() <= 3 && f.bytes().all(|c| c.is_ascii_digit()) => {
+            n(f)? * 10i64.pow(3 - f.len() as u32)
+        }
+        Some(_) => return None,
+    };
+    Some((days * 86_400 + hh * 3600 + mm * 60 + ss) * 1000 + millis)
 }
 
 fn prepare_geometry(geometry: &[Option<Vec<u8>>]) -> Prepared {
@@ -142,6 +294,7 @@ fn prepare_geometry(geometry: &[Option<Vec<u8>>]) -> Prepared {
     Prepared {
         name: GEOMETRY_COLUMN.to_string(),
         ptype: ptype::BYTE_ARRAY,
+        converted: None,
         num_values: geometry.len(),
         def_levels: def,
         values,
@@ -205,6 +358,7 @@ fn write_column_page(file: &mut Vec<u8>, pc: &Prepared) -> ChunkInfo {
     ChunkInfo {
         name: pc.name.clone(),
         ptype: pc.ptype,
+        converted: pc.converted,
         data_page_offset,
         compressed_size: (header.len() + compressed.len()) as i64,
         uncompressed_size: (header.len() + body.len()) as i64,
@@ -285,12 +439,12 @@ fn build_file_metadata(
     w.into_bytes()
 }
 
-/// String columns carry the UTF8 converted type; everything else none.
+/// The annotation decided when the column was prepared. Geometry is raw WKB
+/// and carries none; everything else was settled by [`plan_for`].
 fn converted_type_for(c: &ChunkInfo) -> Option<i32> {
-    if c.ptype == ptype::BYTE_ARRAY && c.name != GEOMETRY_COLUMN {
-        Some(converted::UTF8)
-    } else {
-        None
+    match c.name == GEOMETRY_COLUMN {
+        true => None,
+        false => c.converted,
     }
 }
 

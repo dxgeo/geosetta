@@ -22,6 +22,87 @@ pub enum ColumnType {
     String,
 }
 
+/// A column type *as the source declared it*, in a vocabulary wide enough to
+/// carry what the declaring spokes name.
+///
+/// Distinct from [`ColumnType`], and deliberately so. `ColumnType` is the
+/// hub's four-value lattice — what a cell is *stored as* in memory, inferred
+/// from values. `DeclType` is what a *file* said the column is, which is a
+/// richer thing: FlatGeobuf's `Column.type` names fifteen types, GeoPackage
+/// declares SQL types, and a `.dbf` field descriptor names five.
+///
+/// Collapsing the second into the first is defect 5 in
+/// `plans/same-format-fidelity.org`: it is why a FlatGeobuf `Integer(Int16)`
+/// column used to come back `Integer64`, a `Float32` as float64, and — the one
+/// that is a semantic downgrade rather than a widening — a `DateTime` as
+/// `String`.
+///
+/// Every variant here is named by at least one spoke's own on-disk vocabulary.
+/// Nothing is invented for symmetry: there is no `Decimal` or `List` because
+/// no spoke this crate reads declares one today, and a variant no reader
+/// produces is a variant every writer must handle for nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeclType {
+    Bool,
+    Int8,
+    UInt8,
+    Int16,
+    UInt16,
+    Int32,
+    UInt32,
+    Int64,
+    UInt64,
+    Float32,
+    Float64,
+    String,
+    /// Text that is known to be JSON. FlatGeobuf and GeoPackage both say so.
+    Json,
+    /// A date and time. Carried as text in every spoke this crate writes, which
+    /// is exactly why it needs declaring — text is what it degrades *into*.
+    DateTime,
+    /// A date with no time part.
+    Date,
+    Binary,
+}
+
+impl DeclType {
+    /// The hub type a value of this declared type is stored as.
+    ///
+    /// Many-to-one: every integer width collapses to [`ColumnType::Int64`] and
+    /// every text-ish type to [`ColumnType::String`], because that is all the
+    /// IR's cells can hold. The declaration is what remembers the difference.
+    pub fn hub(self) -> ColumnType {
+        use DeclType::*;
+        match self {
+            Bool => ColumnType::Bool,
+            Int8 | UInt8 | Int16 | UInt16 | Int32 | UInt32 | Int64 | UInt64 => ColumnType::Int64,
+            Float32 | Float64 => ColumnType::Double,
+            String | Json | DateTime | Date | Binary => ColumnType::String,
+        }
+    }
+
+    /// The inclusive range an integer type admits, if it is one.
+    ///
+    /// Used to decline a declaration the data has outgrown — see
+    /// [`FieldDecl::type_for`].
+    pub fn int_range(self) -> Option<(i64, i64)> {
+        use DeclType::*;
+        Some(match self {
+            Int8 => (i8::MIN as i64, i8::MAX as i64),
+            UInt8 => (0, u8::MAX as i64),
+            Int16 => (i16::MIN as i64, i16::MAX as i64),
+            UInt16 => (0, u16::MAX as i64),
+            Int32 => (i32::MIN as i64, i32::MAX as i64),
+            UInt32 => (0, u32::MAX as i64),
+            Int64 => (i64::MIN, i64::MAX),
+            // A u64 above i64::MAX cannot be held by `Cell::Int` at all, so the
+            // representable range is the one that matters here.
+            UInt64 => (0, i64::MAX),
+            _ => return None,
+        })
+    }
+}
+
 /// One materialized value in a column (one per feature/row).
 #[derive(Debug, Clone, PartialEq)]
 pub enum Cell {
@@ -46,8 +127,19 @@ pub struct Column {
     ///
     /// A writer treats this as a *floor*, never a ceiling: it may widen a
     /// declaration to fit the data it was handed, but must not narrow one to
-    /// fit it. See [`Column::declared_width`].
+    /// fit it. See [`declared_or`].
     pub decl: Option<FieldDecl>,
+}
+
+impl Column {
+    /// The declared type to write this column as, once reconciled against the
+    /// cells actually present — see [`FieldDecl::type_for`].
+    ///
+    /// `None` means "write whatever [`Column::ty`] implies": either nothing was
+    /// declared, or what was declared no longer describes the data.
+    pub fn declared_type(&self) -> Option<DeclType> {
+        self.decl.as_ref().and_then(|d| d.type_for(self.ty, &self.values))
+    }
 }
 
 /// Reconcile a source's declared size with the size this column's data
@@ -101,6 +193,11 @@ pub fn declared_or(declared: Option<u32>, required: usize) -> usize {
 pub struct FieldDecl {
     /// The property this describes, matched to [`Column::name`] exactly.
     pub name: String,
+    /// The type the source declared this column to be, in that source's own
+    /// vocabulary rather than the hub's — see [`DeclType`], and
+    /// [`FieldDecl::type_for`] for the rule that decides whether it still
+    /// applies to the data at hand.
+    pub ty: Option<DeclType>,
     /// Encoded width of a value — a string field's declared length.
     pub width: Option<u32>,
     /// Significant digits, numbers only. This is what OGR calls a numeric
@@ -126,12 +223,49 @@ impl FieldDecl {
     /// Whether this carries no declaration at all, in which case there is
     /// nothing to preserve and it need not be recorded.
     pub fn is_empty(&self) -> bool {
-        self.width.is_none()
+        self.ty.is_none()
+            && self.width.is_none()
             && self.precision.is_none()
             && self.scale.is_none()
             && self.nullable.is_none()
             && self.unique.is_none()
             && self.primary_key.is_none()
+    }
+
+    /// The declared type to write this column as, or `None` to fall back to
+    /// whatever the data inferred.
+    ///
+    /// **The declaration wins where the data is silent; the data wins where it
+    /// contradicts.** That is the same asymmetry [`declared_or`] applies to
+    /// widths, for the same reason: a declaration describes what the source
+    /// *could* hold, and honouring a stale one must never destroy a value a
+    /// later stage actually produced.
+    ///
+    /// So an all-null column keeps its declared `Int16` (the data says
+    /// nothing, and re-inferring would call it `String`), but a column a middle
+    /// stage refilled with text declines it. The integer case is checked
+    /// against the *values*, not just the inferred type: a middle stage that
+    /// writes `40000` into a declared `Int16` column has outgrown the
+    /// declaration, and writing it as a 16-bit field would corrupt the number.
+    pub fn type_for(&self, inferred: ColumnType, values: &[Cell]) -> Option<DeclType> {
+        let declared = self.ty?;
+        // A declaration only speaks for cells the hub stores the same way. An
+        // all-null column infers as `String` but has no value to contradict
+        // anything, so it keeps whatever it was declared.
+        let all_null = values.iter().all(|c| matches!(c, Cell::Null));
+        if !all_null && declared.hub() != inferred {
+            return None;
+        }
+        if let Some((lo, hi)) = declared.int_range() {
+            let fits = values.iter().all(|c| match c {
+                Cell::Int(v) => *v >= lo && *v <= hi,
+                _ => true,
+            });
+            if !fits {
+                return None;
+            }
+        }
+        Some(declared)
     }
 }
 

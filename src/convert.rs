@@ -118,8 +118,11 @@ fn write_wkt_lines(fc: &FeatureCollection) -> Vec<u8> {
 
 /// Feature IR → GeoParquet bytes.
 fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
-    // Property columns (schema inferred by scanning all features).
-    let columns = crate::schema::infer_columns(&fc.features);
+    // Property columns. `columns_for`, not `infer_columns`: a column carrying
+    // a declared type is written as that type rather than as whatever its
+    // values re-infer to, which is what keeps an `Int16` 16-bit and a
+    // `DateTime` a timestamp on the way out (defect 5).
+    let columns = crate::schema::columns_for(fc);
 
     // Geometry column: WKB per feature, plus bbox and the set of types. Each
     // type name carries GeoParquet's own `" Z"`/`" M"`/`" ZM"` suffix per the
@@ -221,7 +224,17 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
     // Transpose columns → rows by *draining* each column (values move rather
     // than being cloned) and sharing one `Rc` key across every row. Columns are
     // consumed in file order, so each row keeps that property order.
+    let mut schema = Vec::new();
     for col in parsed.properties {
+        // The type the file declared, kept so it can reach a target able to
+        // express it — a `TIMESTAMP` column stops becoming text (defect 5).
+        if let Some(ty) = col.decl {
+            schema.push(crate::schema::FieldDecl {
+                name: col.name.clone(),
+                ty: Some(ty),
+                ..Default::default()
+            });
+        }
         let key: Rc<str> = Rc::from(col.name);
         for (feature, value) in features.iter_mut().zip(col.values) {
             feature.properties.push((Rc::clone(&key), value));
@@ -231,7 +244,7 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
         features,
         crs: parsed.crs,
         name: None,
-        schema: Vec::new(),
+        schema,
         native: None,
     })
 }
@@ -1508,4 +1521,254 @@ mod tests {
         let via_parquet = geojson::from_json(&json::parse(&geoparquet_to_geojson(&pq).unwrap()).unwrap()).unwrap();
         assert_eq!(sorted_geoms(&direct), sorted_geoms(&via_parquet));
     }
+
+    // --- M4: declared column types (defects 1, 2 and 5) --------------------
+
+    /// Build a one-row collection whose single property is `value`, declared
+    /// as `ty`. The declaration is what a real reader would have recovered.
+    fn declared(name: &str, ty: crate::schema::DeclType, value: json::JsonValue) -> FeatureCollection {
+        let mut fc = FeatureCollection::new(vec![Feature {
+            geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![(Rc::from(name), value)],
+            native: None,
+        }]);
+        fc.schema =
+            vec![crate::schema::FieldDecl { name: name.into(), ty: Some(ty), ..Default::default() }];
+        fc
+    }
+
+    fn decl_of(fc: &FeatureCollection, name: &str) -> Option<crate::schema::DeclType> {
+        fc.schema.iter().find(|d| d.name == name).and_then(|d| d.ty)
+    }
+
+    /// Defect 5, FlatGeobuf: the hub's four column types cannot tell an
+    /// `Int16` from an `Int64` or a `DateTime` from a `String`, so a spoke
+    /// that re-infers from values alone silently widens or degrades every
+    /// column. Each of these round-trips through the format's own writer and
+    /// reader, which is the same-format invariant applied to the type.
+    #[test]
+    fn flatgeobuf_preserves_every_declared_column_type() {
+        use crate::schema::DeclType::*;
+        let int = |n: f64| json::JsonValue::Number { value: n, is_int: true };
+        let cases = [
+            (Bool, json::JsonValue::Bool(true)),
+            (Int8, int(-7.0)),
+            (UInt8, int(200.0)),
+            (Int16, int(-3000.0)),
+            (UInt16, int(60000.0)),
+            (Int32, int(-70000.0)),
+            (UInt32, int(3_000_000_000.0)),
+            (Int64, int(9_000_000_000.0)),
+            (UInt64, int(9_000_000_001.0)),
+            (Float32, json::JsonValue::Number { value: 1.5, is_int: false }),
+            (Float64, json::JsonValue::Number { value: 1.25, is_int: false }),
+            (String, json::JsonValue::String("x".into())),
+            (Json, json::JsonValue::String("{\"a\":1}".into())),
+            (DateTime, json::JsonValue::String("2024-03-01T10:30:00".into())),
+        ];
+        for (ty, value) in cases {
+            let fc = declared("v", ty, value.clone());
+            let back = flatgeobuf::read(&flatgeobuf::write(&fc)).unwrap();
+            assert_eq!(decl_of(&back, "v"), Some(ty), "{ty:?} did not survive");
+            // The value has to survive the narrower on-disk encoding too — a
+            // column written as `SHORT` stores two bytes, not eight.
+            assert_eq!(back.features[0].properties[0].1, value, "{ty:?} value changed");
+        }
+    }
+
+    /// Defect 1: FlatGeobuf encodes a null by *omitting* the cell, so a column
+    /// null in every row has no cell anywhere — and a reader that materialized
+    /// only present cells dropped the column entirely, declaration and all.
+    /// This is the case that needs both halves of M4: the null to keep the
+    /// column, and the declared type to keep it from re-inferring as `String`.
+    #[test]
+    fn flatgeobuf_keeps_an_all_null_column_and_its_declared_type() {
+        let fc = declared("cnt", crate::schema::DeclType::Int16, json::JsonValue::Null);
+        let back = flatgeobuf::read(&flatgeobuf::write(&fc)).unwrap();
+
+        let keys: Vec<&str> = back.features[0].properties.iter().map(|(k, _)| &**k).collect();
+        assert_eq!(keys, vec!["cnt"], "the all-null column vanished");
+        assert_eq!(back.features[0].properties[0].1, json::JsonValue::Null);
+        assert_eq!(decl_of(&back, "cnt"), Some(crate::schema::DeclType::Int16));
+    }
+
+    /// The precedence rule: a declaration is honoured where the data is silent
+    /// and declined where the data contradicts it. A middle stage that writes
+    /// 40000 into a declared `Int16` column has outgrown the declaration, and
+    /// obeying it would truncate the number that was just written — the same
+    /// asymmetry `declared_or` applies to widths.
+    #[test]
+    fn a_declared_type_the_data_outgrew_is_declined_not_obeyed() {
+        let big = json::JsonValue::Number { value: 40_000.0, is_int: true };
+        let fc = declared("v", crate::schema::DeclType::Int16, big.clone());
+        let back = flatgeobuf::read(&flatgeobuf::write(&fc)).unwrap();
+        // Written as a wider type, so the value survives intact...
+        assert_eq!(back.features[0].properties[0].1, big);
+        // ...and the header now says what was actually written, not the stale
+        // declaration.
+        assert_ne!(decl_of(&back, "v"), Some(crate::schema::DeclType::Int16));
+
+        // A type change the data contradicts outright is declined the same way.
+        let text = declared("v", crate::schema::DeclType::Int16, json::JsonValue::String("no".into()));
+        let back = flatgeobuf::read(&flatgeobuf::write(&text)).unwrap();
+        assert_eq!(back.features[0].properties[0].1, json::JsonValue::String("no".into()));
+        assert_eq!(decl_of(&back, "v"), Some(crate::schema::DeclType::String));
+    }
+
+    /// Defect 2: GeoPackage stores a `BOOLEAN` as SQLite `INTEGER` 0/1, per
+    /// spec, so a reader that looks only at the storage class hands back a
+    /// number. The writer was always right; the declaration was on disk and
+    /// unread, which is why a boolean could not survive its own format.
+    #[test]
+    fn geopackage_round_trips_a_boolean_as_a_boolean() {
+        let fc = declared("flag", crate::schema::DeclType::Bool, json::JsonValue::Bool(true));
+        let bytes = crate::geopackage::write_layers(None, &[("t".into(), fc)], false, false).unwrap();
+        let back = crate::geopackage::read_layers(&bytes).unwrap().remove(0).1;
+        assert_eq!(back.features[0].properties[0].1, json::JsonValue::Bool(true));
+        assert_eq!(decl_of(&back, "flag"), Some(crate::schema::DeclType::Bool));
+    }
+
+    /// GeoPackage's other declared types survive their own format too — the
+    /// same defect-5 obligation, in SQL's vocabulary rather than FlatGeobuf's.
+    #[test]
+    fn geopackage_preserves_declared_column_types() {
+        use crate::schema::DeclType::*;
+        let int = |n: f64| json::JsonValue::Number { value: n, is_int: true };
+        let cases = [
+            (Int16, int(-3000.0)),
+            (Int32, int(-70000.0)),
+            (Int64, int(9_000_000_000.0)),
+            (Float64, json::JsonValue::Number { value: 1.25, is_int: false }),
+            (String, json::JsonValue::String("x".into())),
+            (DateTime, json::JsonValue::String("2024-03-01T10:30:00".into())),
+            (Date, json::JsonValue::String("2024-03-01".into())),
+        ];
+        for (ty, value) in cases {
+            let fc = declared("v", ty, value.clone());
+            let bytes =
+                crate::geopackage::write_layers(None, &[("t".into(), fc)], false, false).unwrap();
+            let back = crate::geopackage::read_layers(&bytes).unwrap().remove(0).1;
+            assert_eq!(decl_of(&back, "v"), Some(ty), "{ty:?} did not survive");
+            assert_eq!(back.features[0].properties[0].1, value, "{ty:?} value changed");
+        }
+    }
+
+    /// Shapefile's `.dbf` names five field types, two of which the inferred
+    /// `ColumnType` cannot reach: `L` and `D` both store as text, so a column
+    /// with nothing left to infer from would stop being logical or a date.
+    #[test]
+    fn shapefile_preserves_the_dbf_field_types_it_can_express() {
+        use crate::schema::DeclType::*;
+        let cases = [
+            (Bool, json::JsonValue::Bool(true), Bool),
+            (Date, json::JsonValue::String("2024-03-01".into()), Date),
+            (String, json::JsonValue::String("x".into()), String),
+            // dBase has one numeric field type; an integer is a zero-scale
+            // numeric, which is what comes back.
+            (Int64, json::JsonValue::Number { value: 42.0, is_int: true }, Int64),
+        ];
+        for (ty, value, expected) in cases {
+            let fc = declared("v", ty, value);
+            let out = crate::shapefile::write(&fc).unwrap();
+            let back = crate::shapefile::read(&out.shp, &out.dbf, None, None).unwrap();
+            assert_eq!(decl_of(&back, "v"), Some(expected), "{ty:?} did not survive");
+        }
+    }
+
+    /// A declaration crossing a format with no slot for one is still lost —
+    /// deliberately, and it warns. The asymmetry is the whole rule: the target's
+    /// incapacity excuses the drop, and a test asserting the declaration is
+    /// *gone* matters as much as the ones asserting it survived.
+    #[test]
+    fn formats_without_a_schema_slot_drop_the_declaration_and_say_so() {
+        let fc = declared("cnt", crate::schema::DeclType::Int16,
+            json::JsonValue::Number { value: 7.0, is_int: true });
+
+        for target in [Format::GeoJson, Format::Csv, Format::Wkt, Format::Kml] {
+            assert!(!target.carries_column_schema(), "{target:?}");
+            let w = fc.schema_drop_warning(target).expect("the drop must warn");
+            assert!(w.contains("cnt"), "{w}");
+
+            // And it really is gone at the far end, not merely unwarned.
+            let bytes = write_features(target, &fc).unwrap();
+            let back = read_features(target, &bytes).unwrap();
+            assert_eq!(decl_of(&back, "cnt"), None, "{target:?} kept a declaration it cannot hold");
+        }
+    }
+
+    /// The three spokes that *do* carry declarations stay silent, which is the
+    /// other half of the same contract.
+    #[test]
+    fn formats_with_a_schema_slot_do_not_warn() {
+        let fc = declared("cnt", crate::schema::DeclType::Int16,
+            json::JsonValue::Number { value: 7.0, is_int: true });
+        for target in [Format::FlatGeobuf, Format::Shapefile, Format::Gpkg, Format::Parquet] {
+            assert!(target.carries_column_schema(), "{target:?}");
+            assert_eq!(fc.schema_drop_warning(target), None, "{target:?}");
+        }
+    }
+
+    /// GeoParquet was the last of the four declaring spokes to be wired up.
+    /// Its type system is the widest of them: narrow integers ride an
+    /// `INT32`/`INT64` physical type with the real width in `converted_type`,
+    /// and a timestamp is a genuine `TIMESTAMP_MILLIS` rather than the text the
+    /// IR holds — so this round trip exercises the parse/format inverse pair as
+    /// well as the annotation.
+    #[test]
+    fn geoparquet_preserves_every_declared_column_type() {
+        use crate::schema::DeclType::*;
+        let int = |n: f64| json::JsonValue::Number { value: n, is_int: true };
+        let cases = [
+            (Bool, json::JsonValue::Bool(true)),
+            (Int8, int(-7.0)),
+            (UInt8, int(200.0)),
+            (Int16, int(-3000.0)),
+            (UInt16, int(60000.0)),
+            (Int32, int(-70000.0)),
+            (UInt32, int(3_000_000_000.0)),
+            (Int64, int(9_000_000_000.0)),
+            (Float32, json::JsonValue::Number { value: 1.5, is_int: false }),
+            (Float64, json::JsonValue::Number { value: 1.25, is_int: false }),
+            (String, json::JsonValue::String("x".into())),
+            // A JSON-annotated column decodes to *structured* JSON, not text
+            // (`push_json_embedded`), so the round trip is Object -> Object:
+            // the writer stringifies it and the annotation makes the reader
+            // parse it back.
+            (
+                Json,
+                json::JsonValue::Object(vec![(
+                    "a".into(),
+                    json::JsonValue::Number { value: 1.0, is_int: true },
+                )]),
+            ),
+            (Date, json::JsonValue::String("2024-03-01".into())),
+            (DateTime, json::JsonValue::String("2024-03-01T10:30:00".into())),
+        ];
+        for (ty, value) in cases {
+            let fc = declared("v", ty, value.clone());
+            let back = parquet_to_features(&features_to_parquet(&fc)).unwrap();
+            assert_eq!(decl_of(&back, "v"), Some(ty), "{ty:?} did not survive");
+            assert_eq!(back.features[0].properties[0].1, value, "{ty:?} value changed");
+        }
+    }
+
+    /// A declared temporal type whose text this writer cannot parse back is
+    /// declined rather than guessed at — writing a wrong epoch number would be
+    /// worse than keeping exact text. Sub-millisecond precision is declined for
+    /// the same reason: truncating it would silently lose digits.
+    #[test]
+    fn geoparquet_declines_a_timestamp_it_cannot_encode_exactly() {
+        for text in ["not a date", "2024-03-01T10:30:00.123456"] {
+            let fc = declared(
+                "v",
+                crate::schema::DeclType::DateTime,
+                json::JsonValue::String(text.into()),
+            );
+            let back = parquet_to_features(&features_to_parquet(&fc)).unwrap();
+            // Kept as exact text rather than turned into a wrong instant.
+            assert_eq!(back.features[0].properties[0].1, json::JsonValue::String(text.into()));
+            assert_eq!(decl_of(&back, "v"), Some(crate::schema::DeclType::String));
+        }
+    }
+
 }

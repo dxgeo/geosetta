@@ -12,10 +12,13 @@ plans it points at.
 mechanism (=src/native.rs=) and the GeoJSON spoke, plus both of D1's modelled
 fields -- =FeatureCollection::name= and the column schema (=FieldDecl= on
 =FeatureCollection::schema=, populated and honoured by the Shapefile and
-FlatGeobuf spokes). 487 tests pass (=cargo test -p geosetta=: 442 lib, 44
-integration, 1 doc), clippy clean. The other seven spokes pass =native: None=
-and carry no declaration; they lose exactly what they lost before, but a
-dropped declaration now *warns*. See
+FlatGeobuf spokes). *M4 is also done* -- =FieldDecl= gained a declared type
+and closed defects 1, 2 and 5 -- and so is =edit-composability.org='s live bug
+1. 500 tests pass (=cargo test -p geosetta=: 455 lib, 44 integration, 1 doc),
+clippy clean. The other six readers pass =native: None=; *all four declaring
+spokes now carry a column declaration* (FlatGeobuf, Shapefile, GeoPackage,
+GeoParquet), and a declaration dropped to a format without a slot still
+*warns*. See
 [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
 § STATUS for the precise line between done and not.
 
@@ -57,12 +60,11 @@ edited; see § WHAT CHANGED IN EXISTING DOCS.
 This is the one thing spread across two plans and worth having in one place:
 
 #+begin_src text
-  M4 step 0: settle the type vocabulary    <- free-standing, ship any time
-      then FieldDecl gains a declared type      one piece: none of the three
-      then defect 1 (fgb nulls)                 defects closes without it
-           defect 2 (gpkg booleans)
-           defect 5 (type narrowed to IR's 4)
-            |
+  M4  FieldDecl gains a declared type         [DONE]
+      defect 1 (fgb nulls)                    [DONE]
+      defect 2 (gpkg booleans)                [DONE]
+      defect 5 (type narrowed to IR's 4)      [DONE for fgb/gpkg/shp;
+            |                                  GeoParquet with its M3 spoke]
   M1 inventory + fixtures  [DONE]
             |
   M2  Native channel in the IR + GeoJSON spoke        [DONE]
@@ -122,24 +124,28 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
 - *The inventory*, all nine spokes, every entry marked /measured/ or /code/.
 - *The natives mechanism and the GeoJSON spoke* -- see § STATUS in the
   fidelity plan for exactly what that covers.
-- *The modelled column schema*, end to end for two spokes: a =.dbf= field's
+- *The modelled column schema*, end to end for three spokes: a =.dbf= field's
   declared width survives =shp -> fgb -> shp= intact, and a middle stage can
   widen it. Losing a declaration to a target that does not carry one now warns.
+- *Declared column types* (M4) -- =crate::DeclType= on =FieldDecl=, carried by
+  *all four* declaring spokes: FlatGeobuf, GeoPackage, Shapefile and
+  GeoParquet. An =Int16= stays an =Int16=, a =DateTime= stops becoming text, a
+  GeoPackage =BOOLEAN= comes back a boolean, and an all-null column keeps both
+  its existence and its type. GeoParquet needed no =ARROW:schema=: its own
+  =converted_type= annotations carry every width and both temporal types.
 - *Nine hostile fixtures* in =tests/fixtures/= (=gdal_hostile.*= produced by
   =ogr2ogr=, =hand_hostile.*= authored), each confirmed *readable by geosetta*
   before being committed. They fail the invariant by design -- they are the
   target, not a regression suite.
 
 ** WHAT IS NOT BUILT
-- The seven remaining spokes (M3), and both containers (M3b =gpkg=, M3c
-  =kmz=). Two of those matter more than the rest now: *GeoPackage and
-  GeoParquet both have real column-declaration slots* (=TEXT(80)= and
-  =ARROW:schema=) and neither is wired to =FeatureCollection::schema=, so a
-  declaration crossing either is still lost -- warned about, but lost. They are
-  the two entries to move out of =Format::carries_column_schema= when you get
-  there.
-- The five still-live entries in § LIVE BUGS -- whose numbering is *not* the
-  plan's "five defects"; see that section's note on the two numberings.
+- The remaining spokes' *natives* (M3) and both containers (M3b =gpkg=, M3c
+  =kmz=). *Column declarations are done everywhere they can be*: all four
+  declaring spokes carry one as of M4, so =Format::carries_column_schema= has
+  stopped shrinking and the four remaining =false= answers (GeoJSON, CSV, WKT,
+  KML) are permanent -- those formats have no slot.
+- *Defect 3* -- the only entry left in § LIVE BUGS. Note that section's
+  numbering is *not* the plan's "five defects"; see its own note.
 - The exhaustive-match fixture registry (D6) and any warning work.
 - The format-check deletion, which is sequenced last.
 
@@ -156,18 +162,19 @@ FlatGeobuf null cell and the GeoPackage boolean -- read as a contradiction of
 this section. It never was one; the two lists were simply counting different
 things. /Reconciled 2026-08-20./
 
-1. *A GeoPackage edit loop silently duplicates layers.* Not one of the four --
-   it belongs to =edit-composability.org= D4, which calls it *live bug 1*.
-   *HALF FIXED 2026-08-20; still reproduces.*
-   =geosetta a.gpkg - --to fgb | tool | geosetta - a.gpkg --from fgb= leaves
-   the pre-edit features *beside* the edited ones, so a middle stage that
-   deleted features leaves the deletions undone. Two causes, and only one is
-   gone: the FGB writer no longer hardcodes =geosetta= into the header name and
-   =main.rs= now consults =fc.name= before the file stem, *but the GeoPackage
-   reader still does not set =fc.name= from the table name*, so the FGB on the
-   wire has no name to carry. /Re-measured after the FlatGeobuf spoke: still
-   appends a =layer= table./ Closes with the GeoPackage spoke. *The workaround
-   works today: pass =--layer <name>=.*
+1. ~~*A GeoPackage edit loop silently duplicates layers.*~~ *FIXED
+   2026-08-20.* Not one of the five -- it belongs to =edit-composability.org=
+   D4, which calls it *live bug 1*. The second cause was the one left: the
+   GeoPackage reader did not set =fc.name= from the table name, so the FGB on
+   the wire had no name to carry and the write-back landed in a new table
+   called =layer=. One line in =geopackage/reader.rs='s =read_layers=, because
+   =write_layers= already *replaces* a same-named layer rather than appending
+   rows. /Verified on the original reproduction, both the pure-FGB and
+   FGB-via-GeoJSON forms:/ one =bug1= table, and a middle stage that deletes a
+   feature now has its deletion stick -- which was the real damage, since a
+   delete silently became a no-op. Pinned by
+   =an_edit_loop_that_deletes_a_feature_does_not_duplicate_the_layer=, which
+   asserts on the surviving rows rather than the table name.
 2. ~~*Shapefile narrows the schema.*~~ Also not one of the four -- it is the
    inventory's own finding, M1 § 3. *FIXED 2026-08-20* by D1's column
    schema. An 80-character =.dbf= field used to return sized to today's longest
@@ -176,15 +183,13 @@ things. /Reconciled 2026-08-20./
    =shp -> gpkg -> shp= still narrow, and now warn.
 3. *A =gpkg= → =gpkg= run destroys the container* around the layers: user
    tables, =gpkg_metadata=, =gpkg_extensions=, every R*Tree. Exit 0, no
-   warning. This is *defect 3*.
-4. *FlatGeobuf drops null cells* -- *defect 1*. The column survives in the
-   header and the reader will not restore an omitted cell to null.
-   /Re-measured and re-scoped 2026-08-20; still reproduces, and it is *two*
-   losses, not one./ Fixing the cell is necessary and *not sufficient*: an
-   all-null column then returns as =String=, because =infer_columns= has no
-   values to infer from and =FieldDecl= carries no *type*. /Measured/ on a
-   real =ogr2ogr= FGB with an all-null =Integer= column -- GDAL round-trips it
-   as =Integer=, geosetta loses the column outright.
+   warning. This is *defect 3*, and after M4 it is *the only defect left* --
+   it travels with the GeoPackage container (M3b).
+4. ~~*FlatGeobuf drops null cells*~~ -- *defect 1*, *FIXED 2026-08-20 (M4)*.
+   It was *two* losses, not one, and the second was nearly missed: fixing the
+   cell is necessary and not sufficient, because an all-null column then
+   returns as =String= -- =infer_columns= has no values to infer from, and
+   =FieldDecl= carried no *type*. Both halves landed together.
 
    *The unset-vs-null worry recorded here on 2026-08-20 was wrong and has been
    retracted.* It read =ogrinfo='s display convention as GDAL's data model.
@@ -195,28 +200,29 @@ things. /Reconciled 2026-08-20./
    format rectangular in its header and sparse in its rows. There is no fork
    to settle. See =same-format-fidelity.org= § Five defects for the
    spoke-by-spoke measurement.
-5. *GeoPackage loses booleans* -- *defect 2*. The writer declares =BOOLEAN=
-   correctly and the reader never reads the declaration. *This is defect 1's
-   second half in another format*: both are a declared column type on disk
-   that the IR cannot hold, and both close with a declared type on
-   =FieldDecl=. Plan M4 now scopes them as one piece of work.
-6. *Every spoke narrows a declared column type to the IR's four* --
-   *defect 5*, /found 2026-08-20 while reviewing defect 1/. Placed last here
-   and *first* in importance: unlike defect 1 it needs no null to show
-   itself, so it fires on most real =ogr2ogr= output. /Measured/, all rows
-   populated: FlatGeobuf =Integer(Int16)= returns =Integer64=,
-   =Real(Float32)= returns float64, and *=DateTime= returns =String=* -- a
-   temporal column silently becoming text. =ogr2ogr= preserves all three.
-   =schema::ColumnType= has four values; FlatGeobuf's =Column.type= names
-   fourteen. This is what re-scoped M4 and why its step 0 is an
-   investigation: the declared type has to carry the *source's* vocabulary,
-   not the hub's.
+5. ~~*GeoPackage loses booleans*~~ -- *defect 2*, *FIXED 2026-08-20 (M4)*.
+   The reader now parses the declared SQL type out of the table DDL, so a
+   =BOOLEAN= storing =0=/=1= comes back a boolean. *It was defect 1's second
+   half in another format* -- both were a declared column type on disk that
+   the IR could not hold -- which is why M4 shipped them as one piece.
+6. ~~*Every spoke narrows a declared column type to the IR's four*~~ --
+   *defect 5*, /found 2026-08-20 while reviewing defect 1/, *FIXED the same
+   day (M4) across all four declaring spokes* -- FlatGeobuf, GeoPackage,
+   Shapefile and GeoParquet. It was the largest of the five:
+   unlike defect 1 it needed no null to show itself, so it fired on most real
+   =ogr2ogr= output. /Measured before/: =Integer(Int16)= returned
+   =Integer64=, =Real(Float32)= returned float64, and *=DateTime= returned
+   =String=* -- a temporal column silently becoming text. /Measured after,
+   through GDAL:/ all three arrive intact across =parquet -> gpkg=,
+   =parquet -> fgb=, =fgb -> gpkg= and =fgb -> parquet=. This is what
+   re-scoped M4 around a vocabulary investigation -- the declared type has to
+   carry the *source's* vocabulary, not the hub's.
 
-*Defects 1, 2 and 5* -- entries (4), (5) and (6) above -- are the
-free-standing group in the sequencing diagram, plan M4, shippable at any time.
-They are also *one piece of work*, not three that happen to be small: see M4's
-scoping, which settles the type vocabulary first because none of them closes
-without it.
+*Defects 1, 2 and 5* -- entries (4), (5) and (6) -- were the free-standing
+group in the sequencing diagram, and *all three shipped together as M4* on
+2026-08-20, which is what their shared fix required. What remains in this
+section is *defect 3* alone (entry 3), and it travels with the GeoPackage
+container (M3b).
 *Defect 3* is entry (3) and travels with the GeoPackage container (M3b).
 *Defect 4* is not in this list because it is done: it was the FlatGeobuf
 header's hardcoded =geosetta= name, retired with the FlatGeobuf spoke.
@@ -233,6 +239,22 @@ FlatGeobuf tests, =ogrinfo= re-confirmed on our own output). Recorded: the
 stale =482= test count here and in the fidelity plan, replaced by a figure
 that says which suites it counts; and the *two conflicting defect numberings*
 reconciled in § LIVE BUGS.
+
+*M4 and live bug 1, 2026-08-20 -- code.* Everything above this entry was
+documentation; this one shipped. =FieldDecl::ty= + =DeclType= + the
+=type_for= precedence rule; FlatGeobuf null cells and =Column.type=;
+GeoPackage DDL type parsing, boolean recovery and type emission; Shapefile
+=.dbf= =L=/=D= field types; GeoParquet's =converted_type= annotations and
+=TIMESTAMP=/=DATE= columns in both directions, which also fixed a *latent
+pre-existing bug* -- an unsigned column above =i32::MAX= was being read back
+negative, because Parquet has no unsigned physical type and the annotation was
+never applied; the GeoPackage reader setting =fc.name=. 500 tests (from 487),
+clippy clean, and =tests/perf.rs= gained the sparse =wide_table=
+counterpart. Three surprises are recorded in the plan's M4 entry -- the one
+worth repeating here is that *an absent FlatGeobuf properties vector is not
+"no properties"*: an all-null row encodes as an empty blob the writer omits,
+so the reader has to decode against the header columns even when there is no
+vector at all.
 
 *The defect 5 discovery, same day -- documentation only.* Advising on whether
 to finish M3 before M4 turned up a *fifth defect*: =schema::ColumnType='s four

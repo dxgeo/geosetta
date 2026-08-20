@@ -229,14 +229,15 @@ mod tests {
     fn schema_drop_warning_fires_only_where_a_declaration_is_actually_lost() {
         let mut fc = FeatureCollection::new(vec![]);
         fc.schema = vec![FieldDecl { name: "name".into(), width: Some(80), ..FieldDecl::default() }];
-        for target in [Format::GeoJson, Format::Csv, Format::Wkt, Format::Kml, Format::Kmz, Format::Gpkg, Format::Parquet]
-        {
+        for target in [Format::GeoJson, Format::Csv, Format::Wkt, Format::Kml, Format::Kmz] {
             let w = fc.schema_drop_warning(target).unwrap();
             assert!(w.contains("name"), "{w}");
             assert!(w.contains(target.display_name()), "{w}");
         }
-        // The two spokes that carry declarations stay silent.
-        for target in [Format::FlatGeobuf, Format::Shapefile] {
+        // The spokes that carry declarations stay silent. GeoPackage joined
+        // them in M4 — it reads and writes a column's declared type — so a
+        // declaration crossing it is no longer lost and no longer warns.
+        for target in [Format::FlatGeobuf, Format::Shapefile, Format::Gpkg, Format::Parquet] {
             assert_eq!(fc.schema_drop_warning(target), None, "{target:?} should not warn");
         }
     }
@@ -247,6 +248,7 @@ mod tests {
         // own must not add a line to every conversion.
         let fc = FeatureCollection::new(vec![Feature::default()]);
         for target in [Format::GeoJson, Format::Csv, Format::Gpkg, Format::Parquet, Format::Kml] {
+
             assert_eq!(fc.schema_drop_warning(target), None, "{target:?}");
         }
     }

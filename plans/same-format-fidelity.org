@@ -26,20 +26,33 @@ Cross-format drops of a declaration now *warn*
 (=FeatureCollection::schema_drop_warning=), because reading a member the crate
 then discards is precisely what =lossy-conversion-warnings.org= governs.
 
-*487 tests pass* as of the FlatGeobuf spoke, and =cargo clippy --all-targets=
-is clean. That figure is the whole of =cargo test -p geosetta= -- 442 lib, 44
-integration, 1 doc -- recorded that way because an earlier bare "482" left the
-next reader unable to tell which suites it counted, and so unable to tell
-drift from a different denominator.
+*500 tests pass* as of M4, and =cargo clippy --all-targets= is clean. That
+figure is the whole of =cargo test -p geosetta= -- 455 lib, 44 integration, 1
+doc -- recorded that way because an earlier bare "482" left the next reader
+unable to tell which suites it counted, and so unable to tell drift from a
+different denominator.
 
 *M3 in progress:* the *FlatGeobuf* spoke is done (natives, the header name,
 and defect 4 with it). Still to do: GeoPackage, GeoParquet, CSV, WKT, KML, and
-Shapefile's remaining members, then both containers (M3b/M3c), defects 1--3,
-and the exhaustive-match fixture registry (M5/D6). The six remaining readers
-pass =native: None=, and only two of the four spokes with schema slots carry a
-declaration -- GeoPackage's column declarations and GeoParquet's =ARROW:schema=
-are still open. They lose exactly what they lost before, and no more, but now
-they say so.
+Shapefile's remaining *natives*, then both containers (M3b/M3c), defect 3, and
+the exhaustive-match fixture registry (M5/D6). The six remaining readers still
+pass =native: None=.
+
+*M4 is done (2026-08-20), and it closed three defects rather than two.*
+=FieldDecl= gained a declared *type* in a vocabulary wide enough for the
+spokes' own (=crate::DeclType=), and with it: FlatGeobuf materializes an
+omitted cell as null and keeps its =Column.type= (defects 1 and 5), GeoPackage
+reads and writes its column declarations (defects 2 and 5), Shapefile keeps
+its =.dbf= =L=/=D= field types, and GeoParquet carries both its
+integer-width annotations and real =TIMESTAMP=/=DATE= columns.
+
+*All four declaring spokes now carry a declaration*, so
+=Format::carries_column_schema= has stopped shrinking -- the four that answer
+=false= (GeoJSON, CSV, WKT, KML) have no slot and never will.
+/Verified against GDAL in both directions:/ a real =ogr2ogr= file's
+=Integer(Int16)=, =Real(Float32)= and =DateTime= columns survive
+=parquet -> gpkg=, =parquet -> fgb=, =fgb -> gpkg= and =fgb -> parquet=,
+with =ogrinfo= reporting the same types on our output as on the source.
 This plan proposes a standing invariant for the crate, and the one mechanism
 that can deliver it without the IR growing into a union of all nine spokes:
 
@@ -273,7 +286,16 @@ which in both of the first two is *not* the side the symptom suggests.
 /Was four until 2026-08-20; defect 5 was found while reviewing defect 1 and is
 the largest of them./
 
-1. *FlatGeobuf drops a null property cell.* The wire is innocent: FGB encodes
+1. ~~*FlatGeobuf drops a null property cell.*~~ *FIXED 2026-08-20 (M4)*, both
+   halves: =decode_properties= now yields every header column in header order,
+   an omitted cell coming back =Null=, and the column's declared type rides in
+   =FieldDecl::ty= so it no longer re-infers as =String=. /Verified/ on the
+   original measurement -- an =allnull= column survives a round trip, and
+   =geosetta='s GeoJSON output for a null-bearing FlatGeobuf is now identical
+   to =ogr2ogr='s. The analysis that led there is kept below, because the
+   second half of it was missed for most of a day.
+
+   The wire is innocent: FGB encodes
    properties as sparse =[u16 col_index][value]= pairs
    (=flatgeobuf/writer.rs:343=), so a null is encoded by omission and *the
    column still stands in the header* -- confirmed by decoding the header,
@@ -332,12 +354,14 @@ the largest of them./
    sparse in its *rows*. And =schema::materialize= already collapses =None=
    and =JsonValue::Null= to the same =Cell::Null=, so the IR has no /unset/ to
    protect. Restoring the null is not a new policy; it ends an inconsistency.
-2. *GeoPackage loses booleans.* Also a reader defect, and the writer is
-   spec-correct: =geopackage/writer.rs:449= declares the column =BOOLEAN= and
-   =:459= stores 0/1, which is what the GeoPackage spec requires of SQLite.
-   The declared type is on disk and unread -- =geopackage/reader.rs= has no
-   notion of a declared column type at all, mapping storage classes straight to
-   JSON. Fix reads the declaration.
+2. ~~*GeoPackage loses booleans.*~~ *FIXED 2026-08-20 (M4)*: the reader parses
+   each column's declared SQL type out of the table DDL and a declared
+   =BOOLEAN= holding =0=/=1= comes back as a boolean. Also a reader defect,
+   and the writer is spec-correct: =geopackage/writer.rs:449= declares the
+   column =BOOLEAN= and =:459= stores 0/1, which is what the GeoPackage spec
+   requires of SQLite. The declared type is on disk and unread --
+   =geopackage/reader.rs= has no notion of a declared column type at all,
+   mapping storage classes straight to JSON. Fix reads the declaration.
 
    *Defects 1 and 2 are the same bug wearing two formats* /(found 2026-08-20,
    reviewing defect 1)/. Both are *a declared column type sitting on disk,
@@ -396,10 +420,13 @@ the largest of them./
    the fix:/ the loop still appends a =layer= table, because the *GeoPackage*
    reader does not set =fc.name= from the table name, so the FGB it writes has
    no name to carry. That half lands with the GeoPackage spoke.
-5. *Every spoke narrows a declared column type to the IR's four.* /Found and
-   measured 2026-08-20, reviewing defect 1./ =schema::ColumnType= has four
-   values -- =Bool=, =Int64=, =Double=, =String= -- while FlatGeobuf's
-   =Column.type= names fourteen, GeoPackage declares SQL types, and
+5. ~~*Every spoke narrows a declared column type to the IR's four.*~~
+   *FIXED 2026-08-20 (M4), all four declaring spokes* -- FlatGeobuf,
+   GeoPackage, Shapefile and GeoParquet. /Found and measured 2026-08-20,
+   reviewing defect 1./
+   =schema::ColumnType= has four values -- =Bool=, =Int64=, =Double=,
+   =String= -- while FlatGeobuf's =Column.type= names fourteen, GeoPackage
+   declares SQL types, and
    GeoParquet carries an =ARROW:schema=. A reader decodes with the real type
    and then discards it; the writer re-infers from the *values* and emits the
    widest member of the four that fits. The declaration is read, used, and
@@ -865,9 +892,44 @@ travels with D1's =name= modelling.
   derived tables recomputed, and the raster question from § The collision
   answered. Largest item in the plan; sequence it last, and expect it to
   reopen whether =run_geopackage_write= should rewrite the file at all.
-- *M4* -- defects 1--2 (§ Five defects). *Independent of M1--M3b; ship
-  whenever.* Defect 3 travels with M3b; defect 4 is *done*, with M3's
-  FlatGeobuf spoke.
+- *M4* -- *DONE 2026-08-20*, closing defects 1, 2 and 5. Defect 3 travels with
+  M3b; defect 4 was done earlier, with M3's FlatGeobuf spoke.
+
+  *What landed*, and it followed the scoping below exactly, step 0 included:
+  =crate::DeclType= (sixteen variants, every one named by some spoke's own
+  on-disk vocabulary), =FieldDecl::ty=, and =FieldDecl::type_for= holding the
+  precedence rule. Then FlatGeobuf's reader/writer (null cells, =Column.type=,
+  and per-type value encoding -- a column written =SHORT= stores two bytes, so
+  =encode_properties= had to switch on the *on-disk* type rather than the hub
+  type), GeoPackage's DDL type parsing and emission, and Shapefile's =.dbf=
+  =L=/=D= field types.
+
+  *Five things the plan did not predict* -- the last two from GeoParquet,
+  which was closed after the rest:
+  1. *An absent properties vector is not "no properties".* A row whose every
+     cell is null encodes as an empty blob, which the writer omits entirely,
+     so the reader must decode against the header columns even when there is
+     no vector at all. Caught by the all-null test, not by reasoning.
+  2. *Reading a FlatGeobuf now always yields a schema.* The =Column= table has
+     no "unspecified" type, so every column declares one. Two tests asserting
+     =schema.is_empty()= were pinning the old meaning of "declared nothing"
+     and were rewritten to assert the six *slots* stay absent instead.
+  3. *=.dbf= needed a =D= write arm.* Declaring a date field type without one
+     hit =write_cell='s =unreachable!=, which is exactly the failure mode that
+     arm existed to make loud.
+  4. *A temporal column has to be parsed, not just annotated.* The IR holds a
+     date as *text*, so writing a real =TIMESTAMP_MILLIS= meant inverting the
+     reader's =format_timestamp= -- =days_from_civil= plus an ISO parser. The
+     rule that falls out is the precedence rule again: a declaration this
+     writer cannot honour *exactly* is declined, so unparseable text and
+     sub-millisecond precision both stay exact text rather than becoming a
+     wrong instant.
+  5. *Parquet has no unsigned physical type, and reading one back was already
+     wrong.* A =UINT_32= rides an =INT32=, so a value above =i32::MAX= arrives
+     with its sign bit set and read as signed becomes negative. The reader had
+     never applied the annotation, so this was a *latent pre-existing bug* that
+     M4's round-trip test exposed rather than introduced -- any GDAL-written
+     unsigned column was already being misread. Fixed in =emit_ints=.
 
   *Re-scoped 2026-08-20, twice in one day.* First to *defects 1--2 as one
   piece* (they share a fix, not merely a milestone -- § Five defects, defect
@@ -890,11 +952,25 @@ travels with D1's =name= modelling.
      the declared type -- both halves of defect 1, plus its share of defect 5.
   3. *GeoPackage's reader* reads its column declaration -- defect 2, and its
      share of defect 5.
+  4. *GeoParquet*, both directions -- the widest vocabulary of the four, and
+     the one step 0 was most worried about. It turned out *not* to need
+     =ARROW:schema= at all: Parquet's own =converted_type= annotations carry
+     every width (=INT_16=, =UINT_32=, …) and both temporal types, which is
+     what GDAL reads. Reader and writer each gained a mapping; the writer also
+     gained =INT32= and =FLOAT= physical encoding, which it had never emitted.
 
   *Do not shrink (0) back into (1).* The temptation is to type =FieldDecl=
   with =schema::ColumnType= because it already exists and is already threaded
   everywhere. Measured: that fixes neither defect 5 nor defect 1's type half,
   since an all-null =Short= would still come back =Int64=.
+
+  *The cost, measured rather than feared* (=tests/perf.rs= gained the sparse
+  =wide_table= counterpart this plan asked for, /before/ the change landed).
+  40 000 features x 30 columns, 3 populated per row: =fgb -> geojson= runs at
+  *1.08 M feat/s*, faster than the dense =parquet -> geojson= case beside it.
+  The bill is *output size*, not time -- 6.3 MB of sparse input becomes 16.7 MB
+  of rectangular GeoJSON, which is precisely the nulls now being written, and
+  is what every other spoke already emitted.
 
   *One cost to measure first.* A wide *sparse* FlatGeobuf will materialize
   =rows x cols= property pairs where it previously held only populated ones.

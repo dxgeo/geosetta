@@ -7,7 +7,7 @@ use crate::crs::Crs;
 use crate::error::Result;
 use crate::feature::FeatureCollection;
 use crate::geometry::{to_wkb, Bbox, Geometry};
-use crate::schema::{infer_columns, Cell, ColumnType};
+use crate::schema::{columns_for, Cell, Column, ColumnType, DeclType};
 use crate::sqlite::{MasterEntry, TableSpec, Value, write_database};
 
 use super::reader::read_layers;
@@ -311,12 +311,16 @@ fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64
 }
 
 fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64, envelope: bool) -> TableSpec {
-    let columns = infer_columns(&fc.features);
+    // `columns_for`, not `infer_columns`: a column the source declared a type
+    // for is declared as *that* type here, which is what lets a `BOOLEAN`, a
+    // `DATETIME` or a `SMALLINT` survive rather than collapsing to the four
+    // types the hub can infer.
+    let columns = columns_for(fc);
 
     // DDL: fid (rowid), geom, then one column per property.
     let mut sql = format!("CREATE TABLE {} (\"fid\" INTEGER PRIMARY KEY NOT NULL, \"geom\" GEOMETRY", quote(name));
     for col in &columns {
-        sql.push_str(&format!(", {} {}", quote(&col.name), sqlite_type(col.ty)));
+        sql.push_str(&format!(", {} {}", quote(&col.name), sqlite_type(col)));
     }
     sql.push(')');
 
@@ -444,8 +448,30 @@ fn bbox(fc: &FeatureCollection) -> (Value, Value, Value, Value) {
     }
 }
 
-fn sqlite_type(ty: ColumnType) -> &'static str {
-    match ty {
+/// The SQL type to declare a column as: what the source declared, when that
+/// still describes the data, else what the values inferred.
+///
+/// Every name here is from GeoPackage spec table 1 (*GeoPackage Data Types*),
+/// so a declaration carried in from another spoke's richer vocabulary lands on
+/// a spelling this format actually sanctions.
+fn sqlite_type(col: &Column) -> &'static str {
+    if let Some(d) = col.declared_type() {
+        return match d {
+            DeclType::Bool => "BOOLEAN",
+            DeclType::Int8 | DeclType::UInt8 => "TINYINT",
+            DeclType::Int16 | DeclType::UInt16 => "SMALLINT",
+            DeclType::Int32 | DeclType::UInt32 => "MEDIUMINT",
+            DeclType::Int64 | DeclType::UInt64 => "INTEGER",
+            DeclType::Float32 => "FLOAT",
+            DeclType::Float64 => "DOUBLE",
+            DeclType::String => "TEXT",
+            DeclType::Json => "JSON",
+            DeclType::DateTime => "DATETIME",
+            DeclType::Date => "DATE",
+            DeclType::Binary => "BLOB",
+        };
+    }
+    match col.ty {
         ColumnType::Bool => "BOOLEAN",
         ColumnType::Int64 => "INTEGER",
         ColumnType::Double => "REAL",
@@ -513,6 +539,49 @@ mod tests {
         let names: Vec<&str> = back[0].1.features[0].properties.iter().map(|(k, _)| &**k).collect();
         assert_eq!(names, vec!["name", "n"]);
         assert_eq!(back[0].1.features[0].properties[1].1.as_f64(), Some(5.0));
+    }
+
+    /// The GeoPackage half of `edit-composability.org` D4's layer-duplication
+    /// bug: a layer read back must carry the *table name* as its identity, or
+    /// an edit loop cannot tell the writer which layer it is replacing.
+    #[test]
+    fn a_layer_read_back_knows_its_own_name() {
+        let bytes =
+            write_layers(None, &[("roads".into(), fc(vec![]))], false, false).unwrap();
+        let back = read_layers(&bytes).unwrap();
+        assert_eq!(back[0].1.name.as_deref(), Some("roads"));
+    }
+
+    /// The failure that bug was actually about, end to end: a middle stage
+    /// *deletes* a feature, and the deletion has to stick. Before the reader
+    /// set `fc.name`, the edited collection landed in a second table called
+    /// `layer` and the pre-edit features stayed standing in `roads` — so a
+    /// delete silently became a no-op, which is the worst shape this could
+    /// take. Asserted on the surviving rows, not just the table name, because
+    /// the table name is the mechanism and this is the consequence.
+    #[test]
+    fn an_edit_loop_that_deletes_a_feature_does_not_duplicate_the_layer() {
+        let feature = |n: f64| Feature {
+            geometry: point(n, n),
+            properties: vec![("id".into(), JsonValue::Number { value: n, is_int: true })],
+            native: None,
+        };
+        let original = fc(vec![feature(1.0), feature(2.0), feature(3.0)]);
+        let bytes = write_layers(None, &[("roads".into(), original)], false, false).unwrap();
+
+        // Read it back the way a pipeline would, drop the middle feature, and
+        // write it into the same GeoPackage using only the name the IR carries.
+        let mut edited = read_layers(&bytes).unwrap().remove(0).1;
+        edited.features.retain(|f| f.properties[0].1.as_f64() != Some(2.0));
+        let name = edited.name.clone().expect("the reader names the layer");
+        let after = write_layers(Some(&bytes), &[(name, edited)], false, false).unwrap();
+
+        let layers = read_layers(&after).unwrap();
+        assert_eq!(layers.len(), 1, "the edit loop appended a duplicate layer");
+        assert_eq!(layers[0].0, "roads");
+        let ids: Vec<Option<f64>> =
+            layers[0].1.features.iter().map(|f| f.properties[0].1.as_f64()).collect();
+        assert_eq!(ids, vec![Some(1.0), Some(3.0)], "the deletion did not stick");
     }
 
     #[test]

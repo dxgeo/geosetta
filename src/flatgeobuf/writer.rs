@@ -8,7 +8,7 @@ use crate::flatbuffers::Builder;
 use crate::format::Format;
 use crate::native::{FgbNative, NativePayload};
 use crate::geometry::{Bbox, Geometry, Position};
-use crate::schema::{Cell, ColumnType, columns_for};
+use crate::schema::{Cell, ColumnType, columns_for, DeclType};
 
 const MAGIC: [u8; 8] = [b'f', b'g', b'b', 3, b'f', b'g', b'b', 1];
 
@@ -29,12 +29,24 @@ mod gtype {
     pub const GEOMETRYCOLLECTION: u8 = 7;
 }
 
-// ColumnType enum (ubyte).
+// ColumnType enum (ubyte). The full set, not just the four the hub infers:
+// a column carrying a declared type is written as *that* type, so every value
+// the reader can name has to be nameable here too.
 mod ctype {
+    pub const BYTE: u8 = 0;
+    pub const UBYTE: u8 = 1;
     pub const BOOL: u8 = 2;
+    pub const SHORT: u8 = 3;
+    pub const USHORT: u8 = 4;
+    pub const INT: u8 = 5;
+    pub const UINT: u8 = 6;
     pub const LONG: u8 = 7;
+    pub const ULONG: u8 = 8;
+    pub const FLOAT: u8 = 9;
     pub const DOUBLE: u8 = 10;
     pub const STRING: u8 = 11;
+    pub const JSON: u8 = 12;
+    pub const DATETIME: u8 = 13;
 }
 
 // Field indices.
@@ -199,7 +211,7 @@ fn build_header(
         let metadata = cn.and_then(|c| c.metadata.as_deref()).map(|s| b.create_string(s));
         b.start_table(column::NUM_FIELDS);
         b.add_offset(column::NAME, name);
-        b.add_u8(column::TYPE, fgb_column_type(col.ty), 255);
+        b.add_u8(column::TYPE, fgb_column_type(col), 255);
         for (slot, off) in
             [(column::TITLE, title), (column::DESCRIPTION, description), (column::METADATA, metadata)]
         {
@@ -428,16 +440,32 @@ fn encode_properties(columns: &[crate::schema::Column], row: usize) -> Vec<u8> {
             continue;
         }
         blob.extend_from_slice(&(i as u16).to_le_bytes());
-        match (col.ty, cell) {
-            (ColumnType::Bool, Cell::Bool(v)) => blob.push(*v as u8),
-            (ColumnType::Int64, Cell::Int(v)) => blob.extend_from_slice(&v.to_le_bytes()),
-            (ColumnType::Double, Cell::Double(v)) => blob.extend_from_slice(&v.to_le_bytes()),
-            (ColumnType::String, Cell::Str(s)) => {
+        // The value must be encoded in the width the *header* declares for this
+        // column, which is `fgb_column_type`'s answer and not necessarily the
+        // hub type's: a column written as `SHORT` stores two bytes, and writing
+        // eight would desynchronise every value after it in the row.
+        match (fgb_column_type(col), cell) {
+            (ctype::BOOL, Cell::Bool(v)) => blob.push(*v as u8),
+            (ctype::BYTE, Cell::Int(v)) => blob.push(*v as i8 as u8),
+            (ctype::UBYTE, Cell::Int(v)) => blob.push(*v as u8),
+            (ctype::SHORT, Cell::Int(v)) => blob.extend_from_slice(&(*v as i16).to_le_bytes()),
+            (ctype::USHORT, Cell::Int(v)) => blob.extend_from_slice(&(*v as u16).to_le_bytes()),
+            (ctype::INT, Cell::Int(v)) => blob.extend_from_slice(&(*v as i32).to_le_bytes()),
+            (ctype::UINT, Cell::Int(v)) => blob.extend_from_slice(&(*v as u32).to_le_bytes()),
+            (ctype::LONG, Cell::Int(v)) => blob.extend_from_slice(&v.to_le_bytes()),
+            (ctype::ULONG, Cell::Int(v)) => blob.extend_from_slice(&(*v as u64).to_le_bytes()),
+            (ctype::FLOAT, Cell::Double(v)) => {
+                blob.extend_from_slice(&(*v as f32).to_le_bytes())
+            }
+            (ctype::DOUBLE, Cell::Double(v)) => blob.extend_from_slice(&v.to_le_bytes()),
+            (ctype::STRING | ctype::JSON | ctype::DATETIME, Cell::Str(s)) => {
                 blob.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 blob.extend_from_slice(s.as_bytes());
             }
-            // infer_columns guarantees the cell matches the column type.
-            _ => unreachable!("cell type does not match column type"),
+            // `declared_type` only returns a declaration whose `hub()` matches
+            // this column's inferred type, and `infer_columns` guarantees each
+            // cell matches that — so every reachable pairing is above.
+            _ => unreachable!("cell type does not match the column's on-disk type"),
         }
     }
     blob
@@ -488,12 +516,44 @@ fn write_decl(b: &mut Builder, decl: Option<&crate::schema::FieldDecl>) {
     }
 }
 
-fn fgb_column_type(ty: ColumnType) -> u8 {
-    match ty {
+/// The on-disk type for a column: what the source *declared*, when that
+/// declaration still describes the data, else what the values inferred.
+///
+/// The declaration is consulted first because the hub's four types cannot tell
+/// an `Int16` from an `Int64` or a `DateTime` from a `String` — re-deriving
+/// from values alone is defect 5, and it is why a temporal column used to come
+/// back as text. [`Column::declared_type`] is where the "still describes the
+/// data" judgement lives.
+fn fgb_column_type(col: &crate::schema::Column) -> u8 {
+    if let Some(d) = col.declared_type() {
+        return decl_column_type(d);
+    }
+    match col.ty {
         ColumnType::Bool => ctype::BOOL,
         ColumnType::Int64 => ctype::LONG,
         ColumnType::Double => ctype::DOUBLE,
         ColumnType::String => ctype::STRING,
+    }
+}
+
+fn decl_column_type(d: DeclType) -> u8 {
+    match d {
+        DeclType::Bool => ctype::BOOL,
+        DeclType::Int8 => ctype::BYTE,
+        DeclType::UInt8 => ctype::UBYTE,
+        DeclType::Int16 => ctype::SHORT,
+        DeclType::UInt16 => ctype::USHORT,
+        DeclType::Int32 => ctype::INT,
+        DeclType::UInt32 => ctype::UINT,
+        DeclType::Int64 => ctype::LONG,
+        DeclType::UInt64 => ctype::ULONG,
+        DeclType::Float32 => ctype::FLOAT,
+        DeclType::Float64 => ctype::DOUBLE,
+        DeclType::Json => ctype::JSON,
+        DeclType::DateTime => ctype::DATETIME,
+        // No FlatGeobuf slot narrower than text, and `Binary` never reaches
+        // here: the reader declines to declare it (its cells decode to null).
+        DeclType::String | DeclType::Date | DeclType::Binary => ctype::STRING,
     }
 }
 
@@ -906,7 +966,18 @@ mod tests {
             },
         ];
         let back = crate::flatgeobuf::read(&write(&fc)).unwrap();
-        assert_eq!(back.schema, fc.schema);
+        // Every column also comes back with a declared *type* now, which the
+        // input did not set — the header always states one, so reading it is
+        // how an `Int16` or a `DateTime` survives (defect 5). Compare the six
+        // slots this test is about, with the type normalised away.
+        let without_ty: Vec<_> = back
+            .schema
+            .iter()
+            .map(|d| crate::schema::FieldDecl { ty: None, ..d.clone() })
+            .collect();
+        assert_eq!(without_ty, fc.schema);
+        assert_eq!(back.schema[0].ty, Some(crate::schema::DeclType::String));
+        assert_eq!(back.schema[1].ty, Some(crate::schema::DeclType::Float64));
     }
 
     /// The declaration slots cost nothing when there is nothing to declare —
@@ -919,7 +990,18 @@ mod tests {
             native: None,
         }]);
         let bytes = write(&fc);
-        assert!(crate::flatgeobuf::read(&bytes).unwrap().schema.is_empty());
+        // The schema is not *empty* — the header always declares a type, and
+        // the reader keeps it. What costs nothing is the six declaration slots.
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+        assert_eq!(back.schema.len(), 1);
+        assert_eq!(
+            back.schema[0],
+            crate::schema::FieldDecl {
+                name: "name".into(),
+                ty: Some(crate::schema::DeclType::String),
+                ..Default::default()
+            }
+        );
         // A declaration-free file is byte-identical to what this writer
         // produced before the slots existed, since each `add_*` is given the
         // spec's default and a default costs no vtable entry.

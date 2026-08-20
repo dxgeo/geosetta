@@ -221,16 +221,16 @@ The nested tables lose more, and this is the part that was not anticipated:
 Plus the null cell (defect 1), which is a reader bug rather than an unmodelled
 member: the column survives in the header and the value is encoded by omission.
 
-*Except that its second half /is/ an unmodelled member* /(found 2026-08-20,
-reviewing defect 1 -- see =same-format-fidelity.org= § Five defects)./
-Restoring the cell is the reader bug; keeping the column's *declared type* is
-not, because =FieldDecl= has no type field and =infer_columns= defaults an
-all-null column to =String=. So =Column.type(1)= belongs in this inventory
-after all, alongside slots 4--9 -- a *tenth* discarded =Column= field, missed
-because the reader visibly /does/ read it (to decode values) and only drops it
-when a column has no values left to describe. It is the same missing
-affordance as GeoPackage's unread =BOOLEAN= declaration, which is why the two
-defects now ship together.
+*Except that its second half /was/ an unmodelled member* /(found 2026-08-20,
+reviewing defect 1 -- see =same-format-fidelity.org= § Five defects)./ Both
+halves are *fixed* as of M4. Restoring the cell was the reader bug; keeping the
+column's *declared type* was not, because =FieldDecl= had no type field and
+=infer_columns= defaults an all-null column to =String=. So =Column.type(1)=
+belonged in this inventory after all, alongside slots 4--9 -- a *tenth*
+discarded =Column= field, missed because the reader visibly /does/ read it (to
+decode values) and only dropped it when a column had no values left to
+describe. It was the same missing affordance as GeoPackage's unread =BOOLEAN=
+declaration, which is why the two defects shipped together.
 
 *And nested objects are stringified* /(measured while building the fixtures)/.
 A GeoJSON property =nested: {"deep":[1,2,{"k":"v"}]}= comes back through FGB as
@@ -247,7 +247,7 @@ Two levels, and decision 2a put both in scope.
 *Layer level:*
 | member                                   | class    | note |
 |------------------------------------------+----------+------|
-| declared column type (=BOOLEAN=)          | *modelled* | defect 2; =geopackage/reader.rs= reads storage class, never the declaration. *Reclassified opaque -> modelled 2026-08-20*: it wants a declared type on =FieldDecl=, the same affordance FlatGeobuf's =Column.type(1)= needs |
+| declared column type (=BOOLEAN=)          | *modelled* | ~~defect 2~~ *FIXED 2026-08-20 (M4)*: reclassified opaque -> modelled, then implemented -- the reader parses the DDL's declared type and the writer emits one, so a =BOOLEAN= survives its own format |
 | =gpkg_contents.identifier= / =description=| identity | |
 | =gpkg_data_columns= / constraints         | opaque   | |
 

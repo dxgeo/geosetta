@@ -34,6 +34,7 @@
 use super::geo::GEOMETRY_COLUMN;
 use super::thrift::{ct, CompactReader, Field};
 use super::types::{codec, converted, encoding, page, ptype, repetition};
+use crate::schema::DeclType;
 use crate::compress::{gzip, lz4, snappy, zstd};
 use crate::error::{Error, Result};
 use crate::json::{self, JsonValue};
@@ -44,6 +45,15 @@ const MAGIC: &[u8; 4] = b"PAR1";
 pub struct PropertyColumn {
     pub name: String,
     pub values: Vec<JsonValue>,
+    /// The type the file declared this column to be, from its physical type
+    /// and any `converted_type` annotation.
+    ///
+    /// Recovered rather than re-inferred because Parquet's type system is
+    /// wider than the hub's four: an `INT32` annotated `INT_16` is a 16-bit
+    /// column, and a `TIMESTAMP_MILLIS` is a time rather than the text it
+    /// decodes to. Dropping that was defect 5 — and the reader already had
+    /// both facts in hand to decode the values at all.
+    pub decl: Option<DeclType>,
 }
 
 /// The decoded contents of a GeoParquet file.
@@ -55,6 +65,55 @@ pub struct GeoParquet {
     pub geometry: Vec<Option<Vec<u8>>>,
     /// The CRS recovered from the `geo` metadata, carried through unchanged.
     pub crs: Option<crate::crs::Crs>,
+}
+
+/// A Parquet leaf's declared type, from its physical type plus any
+/// `converted_type` annotation.
+///
+/// The annotation wins where it says something the physical type cannot: an
+/// `INT32` is an `Int32` unless annotated `DATE`, and a `BYTE_ARRAY` is
+/// `Binary` unless annotated `UTF8`/`JSON`. Unannotated widths map straight
+/// across, which is what carries `INT32`/`FLOAT` through.
+///
+/// `INT96` and unannotated `BYTE_ARRAY` are deliberately absent, for the same
+/// reason FlatGeobuf's `BINARY` is: this reader renders both as *text* (a
+/// nanosecond timestamp, and hex, respectively), so declaring the type would
+/// promise a round trip the value side cannot keep — a writer honouring it
+/// would lay the hex string down as raw bytes.
+fn decl_type(physical: i32, converted: Option<i32>) -> Option<DeclType> {
+    if let Some(c) = converted {
+        match c {
+            converted::DATE => return Some(DeclType::Date),
+            converted::TIMESTAMP_MILLIS | converted::TIMESTAMP_MICROS => {
+                return Some(DeclType::DateTime)
+            }
+            converted::JSON => return Some(DeclType::Json),
+            converted::UTF8 => return Some(DeclType::String),
+            // Narrow integers live in an `INT32`/`INT64` physical type with
+            // their real width recorded here, so the annotation is the only
+            // place a 16-bit column says it is one.
+            converted::INT_8 => return Some(DeclType::Int8),
+            converted::UINT_8 => return Some(DeclType::UInt8),
+            converted::INT_16 => return Some(DeclType::Int16),
+            converted::UINT_16 => return Some(DeclType::UInt16),
+            converted::INT_32 => return Some(DeclType::Int32),
+            converted::UINT_32 => return Some(DeclType::UInt32),
+            converted::INT_64 => return Some(DeclType::Int64),
+            converted::UINT_64 => return Some(DeclType::UInt64),
+            // A DECIMAL's scale lives in the schema element, which this reader
+            // renders into text rather than modelling, so it declares nothing.
+            converted::DECIMAL => return None,
+            _ => {}
+        }
+    }
+    Some(match physical {
+        p if p == ptype::BOOLEAN => DeclType::Bool,
+        p if p == ptype::INT32 => DeclType::Int32,
+        p if p == ptype::INT64 => DeclType::Int64,
+        p if p == ptype::FLOAT => DeclType::Float32,
+        p if p == ptype::DOUBLE => DeclType::Float64,
+        _ => return None,
+    })
 }
 
 /// Parse a GeoParquet byte buffer.
@@ -132,6 +191,7 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
                         properties.push(PropertyColumn {
                             name: col.name.clone(),
                             values,
+                            decl: decl_type(col.physical, col.converted_type),
                         });
                     } else {
                         properties
@@ -1506,17 +1566,39 @@ fn push_json<T>(
 
 /// Integers render as JSON numbers, except DATE/TIMESTAMP columns, which render
 /// as ISO 8601 strings.
+///
+/// An *unsigned* annotation is applied here rather than at decode time:
+/// Parquet has no unsigned physical type, so a `UINT_32` rides an `INT32` and
+/// a value above `i32::MAX` arrives with its sign bit set. Reading it as
+/// signed turns 3 000 000 000 into a negative number, so the annotation is the
+/// only thing that can put it back.
 fn emit_ints(out: &mut Vec<JsonValue>, converted: Option<i32>, present: &Present, values: Vec<i64>) {
     if is_temporal(converted) {
         push_json(out, present, values, |i| {
             JsonValue::String(format_temporal(i, converted))
         });
     } else {
-        push_json(out, present, values, |i| JsonValue::Number {
-            value: i as f64,
+        let mask = unsigned_mask(converted);
+        push_json(out, present, values, move |i| JsonValue::Number {
+            value: match mask {
+                Some(m) => (i as u64 & m) as f64,
+                None => i as f64,
+            },
             is_int: true,
         });
     }
+}
+
+/// The bit mask that reinterprets a signed physical value as the unsigned
+/// width its annotation declares, or `None` when the column is signed.
+fn unsigned_mask(converted: Option<i32>) -> Option<u64> {
+    Some(match converted? {
+        converted::UINT_8 => u8::MAX as u64,
+        converted::UINT_16 => u16::MAX as u64,
+        converted::UINT_32 => u32::MAX as u64,
+        converted::UINT_64 => u64::MAX,
+        _ => return None,
+    })
 }
 
 /// Like [`push_json`] for `BYTE_ARRAY` string columns, validating UTF-8.

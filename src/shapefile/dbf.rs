@@ -8,7 +8,7 @@
 
 use crate::error::{Error, Result};
 use crate::json::JsonValue;
-use crate::schema::{Cell, Column, ColumnType, FieldDecl, declared_or};
+use crate::schema::{Cell, Column, ColumnType, DeclType, FieldDecl, declared_or};
 use std::rc::Rc;
 
 const HEADER_LEN: usize = 32;
@@ -123,6 +123,19 @@ pub fn read_schema(data: &[u8]) -> Result<Vec<FieldDecl>> {
         .into_iter()
         .map(|f| {
             let mut decl = FieldDecl::new(f.name);
+            // The one-byte field type is a declaration in its own right: a
+            // `.dbf` `L` column holding no rows is still a logical column, and
+            // `D` is a date rather than the text it is stored as.
+            decl.ty = match f.ty {
+                b'L' => Some(DeclType::Bool),
+                b'D' => Some(DeclType::Date),
+                b'C' => Some(DeclType::String),
+                // dBase numerics are decimal text; `decimals == 0` is the only
+                // signal distinguishing an integer column from a fractional one.
+                b'N' if f.decimals == 0 => Some(DeclType::Int64),
+                b'N' | b'F' => Some(DeclType::Float64),
+                _ => None,
+            };
             match f.ty {
                 b'N' | b'F' => {
                     decl.precision = Some(f.len as u32);
@@ -359,6 +372,17 @@ fn resolve_field_names(columns: &[Column], fields: &mut [DbfField], warnings: &m
 fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
     let name = col.name.clone();
     let decl = col.decl.as_ref();
+    // Two declared types have a `.dbf` field type of their own that the
+    // inferred `ColumnType` cannot reach: a logical column and a date column
+    // both store as text, so a column with no values left to infer from would
+    // otherwise be written `C` and stop being either. The remaining declared
+    // types add nothing here — dBase has one numeric field type, sized by
+    // `precision`/`scale`, which the arms below already honour.
+    match col.declared_type() {
+        Some(DeclType::Bool) => return Ok(DbfField { name, ty: b'L', len: 1, decimals: 0 }),
+        Some(DeclType::Date) => return Ok(DbfField { name, ty: b'D', len: 8, decimals: 0 }),
+        _ => {}
+    }
     match col.ty {
         ColumnType::Bool => Ok(DbfField { name, ty: b'L', len: 1, decimals: 0 }),
         ColumnType::Int64 => {
@@ -465,7 +489,20 @@ fn write_cell(out: &mut Vec<u8>, field: &DbfField, cell: &Cell) {
             out.extend(std::iter::repeat_n(b' ', field.len - truncated.len()));
         }
         (b'C', _) => out.extend(std::iter::repeat_n(b' ', field.len)),
-        _ => unreachable!("dbf_field only emits L/N/C"),
+        // dBase stores a date as eight digits, `YYYYMMDD`. The reader hands
+        // dates back in ISO form, so accept that spelling too rather than
+        // requiring a caller to un-format what we just formatted; anything
+        // that is not eight digits after separators are dropped is written
+        // blank, which is dBase's own "no date".
+        (b'D', Cell::Str(s)) => {
+            let digits: String = s.chars().filter(char::is_ascii_digit).collect();
+            match digits.len() == 8 {
+                true => out.extend_from_slice(digits.as_bytes()),
+                false => out.extend(std::iter::repeat_n(b' ', 8)),
+            }
+        }
+        (b'D', _) => out.extend(std::iter::repeat_n(b' ', 8)),
+        _ => unreachable!("dbf_field only emits L/N/C/D"),
     }
     debug_assert_eq!(out.len() - start, field.len, "dbf field write must be exactly its declared width");
 }

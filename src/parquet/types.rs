@@ -58,5 +58,16 @@ pub mod converted {
     pub const DATE: i32 = 6;
     pub const TIMESTAMP_MILLIS: i32 = 9;
     pub const TIMESTAMP_MICROS: i32 = 10;
+    // The integer-width annotations. Parquet stores every narrow integer in an
+    // `INT32`/`INT64` physical type and records the real width here, so these
+    // are what keep an `Int16` from returning as an `Int64`.
+    pub const UINT_8: i32 = 11;
+    pub const UINT_16: i32 = 12;
+    pub const UINT_32: i32 = 13;
+    pub const UINT_64: i32 = 14;
+    pub const INT_8: i32 = 15;
+    pub const INT_16: i32 = 16;
+    pub const INT_32: i32 = 17;
+    pub const INT_64: i32 = 18;
     pub const JSON: i32 = 19;
 }

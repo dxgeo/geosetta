@@ -8,7 +8,7 @@ use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
 use crate::format::Format;
 use crate::native::{FgbColumnNative, FgbNative, Native, NativePayload};
-use crate::schema::FieldDecl;
+use crate::schema::{DeclType, FieldDecl};
 use std::rc::Rc;
 
 const MAGIC_LEN: usize = 8;
@@ -156,9 +156,13 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
             Some(g) => Some(decode_geometry(&g, default_geom_type)?),
             None => None,
         };
+        // An absent properties vector is not "no properties": a row whose
+        // every cell is null encodes as an *empty* blob, and the writer omits
+        // an empty vector altogether. The columns still stand in the header,
+        // so decode against them either way and let the omission mean null.
         let properties = match table.read_vector(feature::PROPERTIES)? {
             Some(v) => decode_properties(v.bytes()?, &columns, &keys)?,
-            None => Vec::new(),
+            None => decode_properties(&[], &columns, &keys)?,
         };
         features.push(Feature {
             geometry,
@@ -234,7 +238,8 @@ fn read_columns(header: &Table) -> Result<Vec<Column>> {
         for i in 0..vec.len() {
             let c = vec.get_table(i)?;
             let name = c.read_str(column::NAME)?.unwrap_or_default().to_string();
-            let decl = read_decl(&c, &name)?;
+            let ty = c.read_u8(column::TYPE, ctype::STRING)?;
+            let decl = read_decl(&c, &name, ty)?;
             let native = FgbColumnNative {
                 name: name.clone(),
                 title: owned(c.read_str(column::TITLE)?),
@@ -243,7 +248,7 @@ fn read_columns(header: &Table) -> Result<Vec<Column>> {
             };
             columns.push(Column {
                 name,
-                ty: c.read_u8(column::TYPE, ctype::STRING)?,
+                ty,
                 decl,
                 native: (!native.is_empty()).then_some(native),
             });
@@ -261,7 +266,7 @@ fn read_columns(header: &Table) -> Result<Vec<Column>> {
 /// GeoPackage `TEXT` column, which declares no width at all rather than a
 /// zero-wide field, and re-emitting it as a real declaration would pin every
 /// downstream field to width 0.
-fn read_decl(c: &Table, name: &str) -> Result<Option<FieldDecl>> {
+fn read_decl(c: &Table, name: &str, ty: u8) -> Result<Option<FieldDecl>> {
     let size = |slot: usize| -> Result<Option<u32>> {
         Ok(match c.read_i32(slot, -1)? {
             n if n > 0 => Some(n as u32),
@@ -286,6 +291,12 @@ fn read_decl(c: &Table, name: &str) -> Result<Option<FieldDecl>> {
     };
     let decl = FieldDecl {
         name: name.to_string(),
+        // Unlike the six slots below, the type is *always* a declaration: the
+        // `Column` table has no "unspecified" type, so every column states one.
+        // Recording it is what stops an `Int16` returning as `Int64` and a
+        // `DateTime` as `String` (defect 5), and what lets an all-null column
+        // keep its type at all, since there is nothing left to re-infer from.
+        ty: decl_type(ty),
         width: size(column::WIDTH)?,
         precision,
         scale,
@@ -294,6 +305,31 @@ fn read_decl(c: &Table, name: &str) -> Result<Option<FieldDecl>> {
         primary_key: flag(column::PRIMARY_KEY, 0)?,
     };
     Ok((!decl.is_empty()).then_some(decl))
+}
+
+/// FlatGeobuf's `Column.type` in the IR's declared-type vocabulary.
+///
+/// Total but for `BINARY`, which the reader cannot materialize as a cell (it
+/// decodes to `Null`), so declaring it would promise a fidelity the value side
+/// does not keep.
+fn decl_type(ty: u8) -> Option<DeclType> {
+    Some(match ty {
+        ctype::BOOL => DeclType::Bool,
+        ctype::BYTE => DeclType::Int8,
+        ctype::UBYTE => DeclType::UInt8,
+        ctype::SHORT => DeclType::Int16,
+        ctype::USHORT => DeclType::UInt16,
+        ctype::INT => DeclType::Int32,
+        ctype::UINT => DeclType::UInt32,
+        ctype::LONG => DeclType::Int64,
+        ctype::ULONG => DeclType::UInt64,
+        ctype::FLOAT => DeclType::Float32,
+        ctype::DOUBLE => DeclType::Float64,
+        ctype::STRING => DeclType::String,
+        ctype::JSON => DeclType::Json,
+        ctype::DATETIME => DeclType::DateTime,
+        _ => return None,
+    })
 }
 
 /// Byte size of the packed Hilbert R-tree, so we can skip it.
@@ -423,12 +459,23 @@ fn parts<'a>(g: &Table<'a>) -> Result<Vec<Table<'a>>> {
 
 /// Decode the packed properties blob against the column schema:
 /// `[u16 col_index][typed value]…`, little-endian.
+///
+/// Every column in the header yields a property, in header order. A cell the
+/// row omits comes back `Null`, because *omission is how FlatGeobuf encodes a
+/// null* — there is no other encoding for one. Materializing only the cells
+/// present was defect 1: a column null in every row then had no key in any
+/// feature, so nothing downstream could tell it had ever existed and the
+/// column vanished from a same-format round trip.
+///
+/// This makes the output rectangular, which is what every other spoke in this
+/// crate already produces (GeoParquet, GeoPackage and CSV are byte-identical
+/// to `ogr2ogr` here) and what `ogr2ogr` itself writes from a FlatGeobuf.
 fn decode_properties(
     blob: &[u8],
     columns: &[Column],
     keys: &[Rc<str>],
 ) -> Result<Vec<(Rc<str>, JsonValue)>> {
-    let mut out = Vec::new();
+    let mut values: Vec<JsonValue> = vec![JsonValue::Null; columns.len()];
     let mut pos = 0usize;
     while pos < blob.len() {
         let idx = u16_at(blob, pos)? as usize;
@@ -436,10 +483,9 @@ fn decode_properties(
         let col = columns
             .get(idx)
             .ok_or_else(|| Error::FlatGeobuf("property column index out of range".into()))?;
-        let value = read_property_value(blob, &mut pos, col.ty)?;
-        out.push((Rc::clone(&keys[idx]), value));
+        values[idx] = read_property_value(blob, &mut pos, col.ty)?;
     }
-    Ok(out)
+    Ok(keys.iter().cloned().zip(values).collect())
 }
 
 fn read_property_value(blob: &[u8], pos: &mut usize, ty: u8) -> Result<JsonValue> {

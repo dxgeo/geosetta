@@ -5,6 +5,7 @@ use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::from_wkb;
 use crate::json::JsonValue;
+use crate::schema::{DeclType, FieldDecl};
 use crate::sqlite::{Database, Table, Value};
 use std::rc::Rc;
 
@@ -32,6 +33,12 @@ pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
         let mut fc = read_layer(&db, table, geom_idx)?;
         // Carry the layer's coordinate reference system through unchanged.
         fc.crs = geom.and_then(|g| resolve_crs(g.srs_id, &srs));
+        // The table name *is* the layer's identity, so it belongs in the IR
+        // rather than being reconstructed by the caller. Without this a
+        // `gpkg -> fgb | tool | gpkg` edit loop writes its result into a new
+        // table called `layer` and leaves the pre-edit features standing in the
+        // original — see `plans/edit-composability.org` D4.
+        fc.name = Some(name.clone());
         layers.push((name, fc));
     }
     Ok(layers)
@@ -113,6 +120,11 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
     let mut features = Vec::new();
     // Intern each column's key once so every row shares one `Rc`.
     let keys: Vec<Rc<str>> = table.columns.iter().map(|n| Rc::from(n.as_str())).collect();
+    // Resolved once per layer rather than per cell: the DDL does not change
+    // between rows, and `decl_type` does string work.
+    let decl_types: Vec<Option<DeclType>> = (0..table.columns.len())
+        .map(|i| table.column_types.get(i).and_then(|t| t.as_deref()).and_then(decl_type))
+        .collect();
 
     for row in db.read_rows(table)? {
         let geometry = match geom_idx.and_then(|i| row.get(i)) {
@@ -124,7 +136,7 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
             .iter()
             .enumerate()
             .filter(|(i, _)| Some(*i) != geom_idx && Some(*i) != rowid_alias)
-            .map(|(i, key)| (Rc::clone(key), value_to_json(&row[i])))
+            .map(|(i, key)| (Rc::clone(key), value_to_json(&row[i], decl_types[i])))
             .collect();
         features.push(Feature {
             geometry,
@@ -132,8 +144,51 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
             native: None,
         });
     }
-    // The caller fills in `crs` from the layer's srs_id.
-    Ok(FeatureCollection::new(features))
+    // Carry each column's declared type into the IR, so it survives to a
+    // target that can express it. The geometry and rowid-alias columns are
+    // excluded for the same reason they are not properties.
+    let schema = keys
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| Some(*i) != geom_idx && Some(*i) != rowid_alias)
+        .filter_map(|(i, key)| {
+            let decl = FieldDecl { name: key.to_string(), ty: decl_types[i], ..Default::default() };
+            (!decl.is_empty()).then_some(decl)
+        })
+        .collect();
+
+    // The caller fills in `crs` from the layer's srs_id, and `name` from the
+    // table name — both live in `read_layers`, which is where that context is.
+    let mut fc = FeatureCollection::new(features);
+    fc.schema = schema;
+    Ok(fc)
+}
+
+/// A GeoPackage column's declared SQL type in the IR's vocabulary.
+///
+/// GeoPackage names a closed set (spec table 1: *GeoPackage Data Types*), but
+/// real files also carry SQLite's own spellings and OGR's, so the match is on
+/// the leading keyword with any size suffix (`VARCHAR(80)`) ignored — SQLite
+/// itself resolves affinity by substring, and being stricter here would drop
+/// declarations that every other tool honours.
+fn decl_type(sql: &str) -> Option<DeclType> {
+    let upper = sql.trim().to_ascii_uppercase();
+    let head = upper.split(['(', ' ']).next().unwrap_or("");
+    Some(match head {
+        "BOOLEAN" | "BOOL" => DeclType::Bool,
+        "TINYINT" => DeclType::Int8,
+        "SMALLINT" | "INT2" => DeclType::Int16,
+        "MEDIUMINT" | "INT4" => DeclType::Int32,
+        "INT" | "INTEGER" | "BIGINT" | "INT8" => DeclType::Int64,
+        "FLOAT" | "REAL" => DeclType::Float32,
+        "DOUBLE" | "DOUBLEPRECISION" | "NUMERIC" | "DECIMAL" => DeclType::Float64,
+        "TEXT" | "VARCHAR" | "CHARACTER" | "CLOB" => DeclType::String,
+        "JSON" => DeclType::Json,
+        "DATETIME" | "TIMESTAMP" => DeclType::DateTime,
+        "DATE" => DeclType::Date,
+        "BLOB" | "BINARY" => DeclType::Binary,
+        _ => return None,
+    })
 }
 
 /// Names of tables whose `gpkg_contents.data_type` is `features`.
@@ -213,7 +268,18 @@ fn strip_gpkg_header(blob: &[u8]) -> Result<&[u8]> {
         .ok_or_else(|| Error::Convert("geopackage: truncated geometry blob".into()))
 }
 
-fn value_to_json(v: &Value) -> JsonValue {
+/// One stored value as JSON, informed by what the column was *declared* to be.
+///
+/// The declaration matters because SQLite is dynamically typed and GeoPackage
+/// leans on that: the spec requires a `BOOLEAN` column to store 0 or 1 as an
+/// `INTEGER`, so a reader that looks only at the storage class cannot tell a
+/// boolean from a small number. That was defect 2 — this crate's own writer
+/// declared `BOOLEAN` correctly and its reader handed back `0`/`1`, so a
+/// boolean did not survive its own format.
+fn value_to_json(v: &Value, declared: Option<DeclType>) -> JsonValue {
+    if let (Some(DeclType::Bool), Value::Int(n)) = (declared, v) {
+        return JsonValue::Bool(*n != 0);
+    }
     match v {
         Value::Null => JsonValue::Null,
         Value::Int(n) => JsonValue::Number {

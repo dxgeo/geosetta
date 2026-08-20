@@ -32,6 +32,16 @@ pub enum Value {
 pub struct Table {
     pub name: String,
     pub columns: Vec<String>,
+    /// Each column's declared type as written in the DDL (`TEXT`, `BOOLEAN`,
+    /// `MEDIUMINT`…), parallel to [`Self::columns`], or `None` where the
+    /// declaration omitted one — SQLite permits that, and it means the column
+    /// has no type affinity rather than a default one.
+    ///
+    /// SQLite itself is dynamically typed, so a *value*'s storage class need
+    /// not match this. That gap is exactly the point: a GeoPackage `BOOLEAN`
+    /// stores 0/1 as `INTEGER`, so the declaration is the only place the
+    /// booleanness is recorded.
+    pub column_types: Vec<Option<String>>,
     root_page: u32,
     /// Index of the `INTEGER PRIMARY KEY` column (a rowid alias), if any: its
     /// stored value is NULL and the real value is the rowid.
@@ -94,6 +104,9 @@ impl<'a> Database<'a> {
         let master = Table {
             name: "sqlite_master".into(),
             columns: vec!["type".into(), "name".into(), "tbl_name".into(), "rootpage".into(), "sql".into()],
+            // Never consulted: this synthetic descriptor exists only to read
+            // `sqlite_master`'s own rows, whose types are known statically.
+            column_types: Vec::new(),
             root_page: 1,
             rowid_alias: None,
         };
@@ -106,10 +119,11 @@ impl<'a> Database<'a> {
                 && let (Some(name), Some(root), Some(sql)) = (as_text(&row, 1), root, sql)
                 && root > 0
             {
-                let (columns, rowid_alias) = parse_columns(&sql);
+                let (columns, column_types, rowid_alias) = parse_columns(&sql);
                 tables.push(Table {
                     name,
                     columns,
+                    column_types,
                     root_page: root as u32,
                     rowid_alias,
                 });
@@ -299,18 +313,19 @@ fn varint(data: &[u8], pos: usize) -> Result<(i64, usize)> {
 
 // --- CREATE TABLE column parsing -------------------------------------------
 
-/// Extract column names (in order) and the rowid-alias column index from a
-/// `CREATE TABLE` statement.
-fn parse_columns(sql: &str) -> (Vec<String>, Option<usize>) {
+/// Extract column names (in order), their declared types, and the rowid-alias
+/// column index from a `CREATE TABLE` statement.
+fn parse_columns(sql: &str) -> (Vec<String>, Vec<Option<String>>, Option<usize>) {
     let Some(open) = sql.find('(') else {
-        return (Vec::new(), None);
+        return (Vec::new(), Vec::new(), None);
     };
     let Some(close) = sql.rfind(')') else {
-        return (Vec::new(), None);
+        return (Vec::new(), Vec::new(), None);
     };
     let body = &sql[open + 1..close];
 
     let mut names = Vec::new();
+    let mut types = Vec::new();
     let mut rowid_alias = None;
     for part in split_top_level(body) {
         let part = part.trim();
@@ -324,9 +339,44 @@ fn parse_columns(sql: &str) -> (Vec<String>, Option<usize>) {
         if upper.contains("INTEGER") && upper.contains("PRIMARY KEY") {
             rowid_alias = Some(names.len());
         }
+        types.push(declared_type(part, &name));
         names.push(name);
     }
-    (names, rowid_alias)
+    (names, types, rowid_alias)
+}
+
+/// The type token of one column definition: everything between the column name
+/// and the first constraint keyword.
+///
+/// Kept as the source's own text rather than mapped here, because SQLite's type
+/// names are open-ended (any identifier is legal, affinity is decided by
+/// substring rules) and the GeoPackage spoke is the layer that knows which
+/// spellings it cares about.
+fn declared_type(part: &str, name: &str) -> Option<String> {
+    // Step over the column name however it was quoted.
+    let rest = match part.find(name) {
+        Some(i) => &part[i + name.len()..],
+        None => return None,
+    };
+    let rest = rest.trim_start_matches(['"', '\'', '`', ']']).trim();
+    const CONSTRAINTS: [&str; 8] = [
+        "PRIMARY", "NOT", "NULL", "UNIQUE", "CHECK", "DEFAULT", "COLLATE", "REFERENCES",
+    ];
+    let mut ty = String::new();
+    for token in rest.split_whitespace() {
+        if CONSTRAINTS.contains(&token.to_ascii_uppercase().trim_end_matches('(')) {
+            break;
+        }
+        if !ty.is_empty() {
+            ty.push(' ');
+        }
+        ty.push_str(token);
+        // A parenthesised size (`VARCHAR(80)`) closes the type.
+        if token.contains(')') {
+            break;
+        }
+    }
+    (!ty.is_empty()).then_some(ty)
 }
 
 /// Split on top-level commas, respecting parentheses and quotes.
@@ -860,9 +910,27 @@ mod tests {
     #[test]
     fn parses_column_ddl() {
         let sql = r#"CREATE TABLE "places" ( "fid" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "geom" GEOMETRY, "name" TEXT, "pop" MEDIUMINT, "score" DOUBLE)"#;
-        let (cols, alias) = parse_columns(sql);
+        let (cols, types, alias) = parse_columns(sql);
         assert_eq!(cols, vec!["fid", "geom", "name", "pop", "score"]);
         assert_eq!(alias, Some(0));
+        // The declared type is everything between the name and the first
+        // constraint keyword — `INTEGER`, not `INTEGER PRIMARY KEY ...`.
+        let types: Vec<Option<&str>> = types.iter().map(|t| t.as_deref()).collect();
+        assert_eq!(
+            types,
+            vec![Some("INTEGER"), Some("GEOMETRY"), Some("TEXT"), Some("MEDIUMINT"), Some("DOUBLE")]
+        );
+    }
+
+    /// A parenthesised size belongs to the type, and a column may legally
+    /// declare no type at all.
+    #[test]
+    fn parses_sized_and_untyped_column_ddl() {
+        let sql = r#"CREATE TABLE "t" ("a" VARCHAR(80) NOT NULL, "b", "c" DOUBLE PRECISION DEFAULT 0)"#;
+        let (cols, types, _) = parse_columns(sql);
+        assert_eq!(cols, vec!["a", "b", "c"]);
+        let types: Vec<Option<&str>> = types.iter().map(|t| t.as_deref()).collect();
+        assert_eq!(types, vec![Some("VARCHAR(80)"), None, Some("DOUBLE PRECISION")]);
     }
 
     #[test]

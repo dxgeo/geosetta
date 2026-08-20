@@ -30,14 +30,24 @@ cargo test --release --test perf wide_table -- --ignored --nocapture
 # scaling in the column dimension.
 #+end_src
 
-*A gap worth closing before M4 lands* /(noted 2026-08-20)/: =wide_table=
-generates *dense* rows -- every column populated in every feature -- so it
-cannot see a regression in *sparse* property handling. That matters because
-=same-format-fidelity.org= M4 makes FlatGeobuf's reader materialize an omitted
-cell as null, taking a sparse wide table from "only the populated pairs" to
-=rows x cols=. Every other rectangular spoke already pays that cost, so the
-question is the size of the bill; a sparse variant of this benchmark is what
-would answer it, and it should exist *before* the change rather than after.
+*A sparse counterpart exists as of 2026-08-20*, added *before* M4's change
+landed rather than after. =wide_table= generates *dense* rows -- every column
+populated in every feature -- so it could not see a regression in *sparse*
+property handling, which is what M4 changed: FlatGeobuf's reader now
+materializes an omitted cell as null, taking a sparse wide table from "only
+the populated pairs" to =rows x cols=.
+
+/Measured/ (40 000 features x 30 columns, 3 populated per row, release):
+
+| path                    | rate         |
+|-------------------------+--------------|
+| =geojson -> fgb= sparse | 884 k feat/s |
+| =fgb -> geojson= sparse | *1.08 M feat/s* |
+
+Faster than the dense =parquet -> geojson= case beside it, so the feared time
+cost did not materialise. *The bill is output size*: 6.3 MB of sparse input
+becomes 16.7 MB of rectangular GeoJSON, which is exactly the nulls now being
+written -- and is what every other rectangular spoke already emitted.
 
 ** DONE — GeoJSON writer bypasses the JsonValue tree
 The writer used to build a whole =JsonValue= tree (=geojson::to_json=) and then

@@ -128,10 +128,9 @@ impl Format {
     ///
     /// Unlike [`Self::supports_m`], which is a statement about each format's
     /// *spec*, this is a statement about this crate's *implementation*, and it
-    /// will shrink as the spokes land. GeoPackage has real column declarations
-    /// (`TEXT(80)`) and GeoParquet has `ARROW:schema`; neither is wired up yet,
-    /// so both answer `false` today and must be moved when they are (M3/M3b in
-    /// `plans/same-format-fidelity.org`). GeoJSON, CSV, WKT and KML have no
+    /// will shrink as the spokes land. GeoPackage and GeoParquet both joined
+    /// the list with M4, so **all four declaring spokes now carry one** and
+    /// this predicate has stopped shrinking. GeoJSON, CSV, WKT and KML have no
     /// slot for a declaration at all and will always answer `false`.
     ///
     /// The distinction matters because the two cases warn for different
@@ -139,7 +138,7 @@ impl Format {
     /// only the second has a fix pending. Both drop the same information, so
     /// both warn — see `plans/lossy-conversion-warnings.org` § OWED WARNING.
     pub fn carries_column_schema(self) -> bool {
-        matches!(self, Format::FlatGeobuf | Format::Shapefile)
+        matches!(self, Format::FlatGeobuf | Format::Shapefile | Format::Gpkg | Format::Parquet)
     }
 }
 

@@ -32,22 +32,7 @@ mod gtype {
 // ColumnType enum (ubyte). The full set, not just the four the hub infers:
 // a column carrying a declared type is written as *that* type, so every value
 // the reader can name has to be nameable here too.
-mod ctype {
-    pub const BYTE: u8 = 0;
-    pub const UBYTE: u8 = 1;
-    pub const BOOL: u8 = 2;
-    pub const SHORT: u8 = 3;
-    pub const USHORT: u8 = 4;
-    pub const INT: u8 = 5;
-    pub const UINT: u8 = 6;
-    pub const LONG: u8 = 7;
-    pub const ULONG: u8 = 8;
-    pub const FLOAT: u8 = 9;
-    pub const DOUBLE: u8 = 10;
-    pub const STRING: u8 = 11;
-    pub const JSON: u8 = 12;
-    pub const DATETIME: u8 = 13;
-}
+use super::reader::ctype;
 
 // Field indices.
 mod header {
@@ -462,6 +447,10 @@ fn encode_properties(columns: &[crate::schema::Column], row: usize) -> Vec<u8> {
                 blob.extend_from_slice(&(s.len() as u32).to_le_bytes());
                 blob.extend_from_slice(s.as_bytes());
             }
+            (ctype::BINARY, Cell::Bytes(b)) => {
+                blob.extend_from_slice(&(b.len() as u32).to_le_bytes());
+                blob.extend_from_slice(b);
+            }
             // `declared_type` only returns a declaration whose `hub()` matches
             // this column's inferred type, and `infer_columns` guarantees each
             // cell matches that — so every reachable pairing is above.
@@ -533,6 +522,7 @@ fn fgb_column_type(col: &crate::schema::Column) -> u8 {
         ColumnType::Int64 => ctype::LONG,
         ColumnType::Double => ctype::DOUBLE,
         ColumnType::String => ctype::STRING,
+        ColumnType::Binary => ctype::BINARY,
     }
 }
 
@@ -553,7 +543,14 @@ fn decl_column_type(d: DeclType) -> u8 {
         DeclType::DateTime => ctype::DATETIME,
         // No FlatGeobuf slot narrower than text, and `Binary` never reaches
         // here: the reader declines to declare it (its cells decode to null).
-        DeclType::String | DeclType::Date | DeclType::Binary => ctype::STRING,
+        DeclType::Binary => ctype::BINARY,
+        // FlatGeobuf has no DATE. Writing a date as DATETIME keeps it *temporal*
+        // rather than degrading it to text, which is what `ogr2ogr` does with
+        // the same hop (measured: a gpkg DATE column arrives in FlatGeobuf as
+        // `DateTime`). Still a recast — a date is not an instant, and
+        // `decl_recast_warning` says so — but the better of the two available.
+        DeclType::Date => ctype::DATETIME,
+        DeclType::String => ctype::STRING,
     }
 }
 
@@ -758,7 +755,7 @@ mod tests {
                 geometry: Some(Geometry::Point(Position::new((i % 10) as f64, (i / 10) as f64))),
                 properties: vec![(
                     "id".into(),
-                    JsonValue::Number { value: i as f64, is_int: true },
+                    JsonValue::Int((i as f64) as i64),
                 )],
                 native: None,
             })
@@ -945,7 +942,7 @@ mod tests {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![
                 (std::rc::Rc::from("name"), crate::json::JsonValue::String("Zürich".into())),
-                (std::rc::Rc::from("price"), crate::json::JsonValue::Number { value: 1.5, is_int: false }),
+                (std::rc::Rc::from("price"), crate::json::JsonValue::Float(1.5)),
             ],
             native: None,
         }]);

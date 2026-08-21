@@ -124,6 +124,53 @@ FGB from =gdal_hostile.shp= instead; GDAL propagates =String (80.0)= and
 Note =primary_column= is =geom=, not =geometry= -- a non-default column name, on
 purpose.
 
+*** =hand_mixed_number.geojson= -- /added 2026-08-21/
+Two columns and one contrast, which is the whole reason it exists:
+| column     | contents                        | what it shows |
+|------------+---------------------------------+---------------|
+| =pure_int= | =9007199254740993=, =9007199254740995= | every value an integer, so the column is =Int64= and 2^53 is no barrier -- this is what splitting the number model bought |
+| =mixed=    | =9007199254740993=, then =1.5=  | the same integer beside a fractional value, so the column infers =Double= and the integer arrives *one short* |
+
+*Authored*, because no tool emits this on purpose -- the point is a specific
+value one past =f64='s exact-integer limit, sitting in a column that something
+else has forced to be fractional.
+
+*Read the ignored test before changing anything here.*
+=convert.rs='s =a_mixed_number_column_loses_precision_above_2_53= is
+=#[ignore]=d and *passes*: it states a behaviour rather than guarding one. The
+loss in =mixed= is inference's judgement, not a bug -- the column is a double
+because something else in it was fractional, and no format this crate writes
+holds both exactly (GDAL's =OFTReal= does the same). **What is missing is the
+warning, not the exactness**, and whether that warning is worth its noise is an
+open call recorded in =lossy-conversion-warnings.org=.
+
+/Written with =python3= and explicit encoding rather than a shell heredoc, per
+the trap above, and the large integers were checked as literal digits in the
+file rather than an exponent form./
+
+*** =gdal_types.gpkg= -- /added 2026-08-21, and not hostile/
+The odd one out in this directory: it is not built to break anything, it is a
+*specimen sheet*. One layer, one column per GeoPackage spec table-1 data type
+(=BOOLEAN=, =TINYINT=, =SMALLINT=, =MEDIUMINT=, =INTEGER=, =FLOAT=, =DOUBLE=,
+=REAL=, =TEXT=, =DATE=, =DATETIME=, =BLOB=), each holding one value.
+
+It exists because =REAL= was read as 32-bit for a day and nothing noticed. The
+in-tree sweeps check geosetta against *itself*, and that bug was a case of
+geosetta being perfectly self-consistent while disagreeing with everyone else
+about what a spelling means -- only a second implementation catches that. So
+=tests/gdal_types.rs= runs =ogrinfo= on this file and on our output and requires
+the reported field types to match.
+
+/Authored with =python3= + =sqlite3=/ rather than =ogr2ogr=, because no
+=ogr2ogr= invocation emits all twelve declarations from a source that has none.
+*Verified through the reference tool*, which is what makes it a fixture rather
+than a guess -- GDAL reads every column and distinguishes exactly the three
+that matter: =c_float= is =Real(Float32)=, while =c_double= and =c_real= are
+both plain =Real=. That last pair *is* the bug, written down.
+
+*Do not "simplify" this by dropping =c_real= as a duplicate of =c_double=.*
+They are the same width and that is the entire point.
+
 *** =gdal_hostile.gpkg=
 =ogr2ogr= plus =sqlite3= for the container content. Carries:
 | content                          | why |
@@ -135,6 +182,32 @@ purpose.
 | R*Tree tables + triggers         | derived-capability |
 | =gpkg_ogr_contents=              | derived-capability |
 | =flag BOOLEAN= declared column   | defect 2 -- the declaration is on disk and unread |
+
+*Extended 2026-08-21 for the GeoPackage spoke* (M3), which needed layer-level
+members the file did not yet carry -- =identifier= was just the table name and
+=description= was empty, so a fixture built to be hostile was exercising
+neither:
+| content                                  | why |
+|------------------------------------------+-----|
+| =cities.identifier= =Bykerne — København og Zürich= | a *non-default* title, and non-ASCII besides -- the writer used to hardcode =identifier = table_name= |
+| =cities.description=                      | non-empty; the writer used to hardcode =""= |
+| =gpkg_data_columns= (2 rows)              | column alias/title/comment, and a =constraint_name= reference |
+| =gpkg_data_column_constraints= (1 row)    | the =price_range= domain those rows point at |
+| =second=, left at =ogr2ogr='s defaults    | the *negative* case: identifier = table name, empty description, so D3's "carry nothing" path is exercised by the same file |
+
+The identifier/description pair came from =ogr2ogr -lco IDENTIFIER= /
+=-lco DESCRIPTION=; the two Schema-extension tables were authored with
+=sqlite3=, because no =ogr2ogr= invocation writes one from a source that has
+none. *Both were then verified through the reference tool*, which is what makes
+them real rather than inert bytes -- =ogrinfo= reports
+=alternative name="city_name"=, =comment=Municipality name ...= and
+=domain name=price_range=, and =ogrinfo -fielddomain price_range= prints the
+range and its description. A fixture GDAL ignores would prove nothing.
+
+/The non-ASCII bytes were checked raw after writing/ (=b'Bykerne \xe2\x80\x94
+K\xc3\xb8benhavn og Z\xc3\xbcrich'=), per the heredoc trap recorded above --
+the additions were made with =python3= + =sqlite3= and explicit encoding, not
+through a shell heredoc.
 
 *A fake vendor row in =gpkg_extensions= was tried and removed.* With
 =scope='read-write'=, GDAL refuses the layer entirely

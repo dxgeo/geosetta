@@ -55,6 +55,20 @@ impl Table {
     }
 }
 
+/// One `sqlite_master` entry, reduced to what a survey of a file's contents
+/// needs: what kind of object it is and what it is attached to. Unlike
+/// [`Table`] this carries no decoded DDL, because it describes entries the
+/// column parser has no opinion about (triggers, views, virtual tables).
+pub struct MasterObject {
+    /// `sqlite_master.type` — `"table"`, `"index"`, `"view"` or `"trigger"`.
+    pub kind: String,
+    pub name: String,
+    /// The table this entry is attached to (its own name for a table).
+    pub tbl_name: String,
+    /// The b-tree root page, or 0 for a schema-only entry.
+    pub root_page: u32,
+}
+
 pub struct Database<'a> {
     data: &'a [u8],
     page_size: usize,
@@ -97,11 +111,10 @@ impl<'a> Database<'a> {
             .ok_or_else(|| Error::Convert("sqlite: page out of range".into()))
     }
 
-    /// All ordinary tables (`type = 'table'`) with a real root page.
-    pub fn tables(&self) -> Result<Vec<Table>> {
-        // sqlite_master is a table b-tree rooted at page 1. Its columns are
-        // (type, name, tbl_name, rootpage, sql).
-        let master = Table {
+    /// A descriptor for `sqlite_master` itself: a table b-tree rooted at page
+    /// 1 whose columns are (type, name, tbl_name, rootpage, sql).
+    fn master_descriptor() -> Table {
+        Table {
             name: "sqlite_master".into(),
             columns: vec!["type".into(), "name".into(), "tbl_name".into(), "rootpage".into(), "sql".into()],
             // Never consulted: this synthetic descriptor exists only to read
@@ -109,7 +122,38 @@ impl<'a> Database<'a> {
             column_types: Vec::new(),
             root_page: 1,
             rowid_alias: None,
-        };
+        }
+    }
+
+    /// Every `sqlite_master` entry, whatever its type — tables, indexes,
+    /// views, triggers, virtual tables.
+    ///
+    /// [`Self::tables`] is the *readable* subset of this: what the decoders
+    /// can turn into rows. This one answers the different question of what a
+    /// file actually *contains*, which is what a caller reporting on content
+    /// it is about to destroy needs — see
+    /// `geopackage::container_drop_warnings`.
+    pub fn master_objects(&self) -> Result<Vec<MasterObject>> {
+        let mut objects = Vec::new();
+        for row in self.read_rows(&Self::master_descriptor())? {
+            let (Some(kind), Some(name)) = (as_text(&row, 0), as_text(&row, 1)) else {
+                continue;
+            };
+            objects.push(MasterObject {
+                kind,
+                tbl_name: as_text(&row, 2).unwrap_or_else(|| name.clone()),
+                name,
+                // Schema-only entries (triggers, views, virtual tables) carry
+                // rootpage 0; a negative value is not something SQLite writes.
+                root_page: as_int(&row, 3).unwrap_or(0).max(0) as u32,
+            });
+        }
+        Ok(objects)
+    }
+
+    /// All ordinary tables (`type = 'table'`) with a real root page.
+    pub fn tables(&self) -> Result<Vec<Table>> {
+        let master = Self::master_descriptor();
         let mut tables = Vec::new();
         for row in self.read_rows(&master)? {
             let kind = as_text(&row, 0);

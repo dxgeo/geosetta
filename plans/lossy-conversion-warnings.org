@@ -43,9 +43,10 @@ growing its own wrapper — see § GENERALIZED COLLECTION.
 *** 1. Pre-write predictive check (preferred when the answer doesn't depend on the actual encoding)
 A pure function taking the source data and the target =Format=, returning
 =Option<String>= — =None= when nothing is lost, =Some(warning)= otherwise.
-Three real instances now, each just an entry in
+Five real instances now. Four are each just an entry in
 =main.rs='s =collect_conversion_warnings= (see below) rather than its own
-wrapper-function pair:
+wrapper-function pair; the last keeps the shape but not that collector, for a
+reason it states:
 - [[file:crs.org][=Crs::downgrade_warning(&self, target: Format) ->
   Option<String>=]] (=crs.rs=) — CRS-loss warnings, the original instance
   this pattern is named after.
@@ -62,6 +63,48 @@ wrapper-function pair:
   =alphanumeric_code_falls_back_to_a_synthetic_srs_id=) with *zero* runtime
   warning until this pass — a gap that had been sitting there, known and
   tested, since =projjson-to-wkt.org='s era.
+- =geopackage::container_drop_warnings(bytes, label, written, rtree) ->
+  Vec<String>= (=geopackage/container.rs=) — *defect 3's warning*, added
+  2026-08-21. Same pure-function-of-the-source shape, but it takes the
+  container's *bytes* and no target =Format=, so it cannot be an entry in
+  =collect_conversion_warnings= and is called directly from
+  =run_geopackage_write= instead.
+
+  *The deviation is the interesting part, and it is not laziness.* The other
+  three report a *capability gap in the target*: the target format has no slot,
+  so =(source, target)= is the whole question. This one's target is GeoPackage,
+  which represents user tables, =gpkg_metadata= and R*Trees perfectly well —
+  the loss is in *this crate's writer*, which rewrites the file from the tables
+  it knows how to build. So the question is not "can the target hold this" but
+  "does the container hold anything this writer does not reproduce", which only
+  the bytes can answer. Anyone tempted to fold it into the collector for
+  symmetry should note that doing so requires the collector to take a container,
+  which the other three have no use for.
+
+  It returns =Vec<String>= rather than =Option<String>= because it reports two
+  losses of *different kinds*: content destroyed outright, and — separately —
+  a spatial index not rebuilt, which is D4-derived and has a one-flag remedy
+  (=--rtree=). Folding them into one message would either bury the remedy or
+  imply the index is unrecoverable.
+
+- =FeatureCollection::decl_recast_warning(&self, target: Format) ->
+  Option<String>= (=feature.rs=) -- *the declared type* the target cannot hold,
+  added 2026-08-21. Ordinary entry in =collect_conversion_warnings=; the
+  interesting part is what it does *not* fire on.
+
+  *It is stated against a widening relation, not equality.* =DeclType::admits=
+  says whether one declaration can hold everything another can, so a Shapefile
+  writing every integer as its single numeric field type is silent (dBase's
+  design, nothing lost) and so is a GeoPackage writing =UInt16= as =MEDIUMINT=.
+  It fires only on a genuine narrowing or degradation -- a =DateTime= becoming
+  text, a =Binary= column becoming a string. Without that relation every check
+  would have to hand-wave which recasts are acceptable, and reviewers would
+  disagree case by case.
+
+  *The relation is deliberately narrow, and =String= admits nothing.* Text
+  holds the bytes of a =DateTime=, a =Date=, a =Json= or a =Binary= and holds
+  none of their meaning; a relation that called that lossless would define
+  defect 5 out of existence.
 
 *** 2. Post-write actual-outcome collection (when the loss is only knowable during real encoding)
 A writer returns its warnings alongside its bytes, collected as the actual
@@ -162,6 +205,31 @@ next pass through this area doesn't have to rediscover them:
   per =zm-geometry.org='s M7 follow-up) and =MultiPatch=(31) (never
   modeled, no =Geometry= variant exists to decode into) — not conversion
   losses in the sense this rule covers.
+
+** AN OPEN CALL -- the mixed-number column, and whether it earns a warning
+/Raised 2026-08-21, deliberately not decided./
+
+A column holding *both* an integer past 2^53 and a fractional value infers as
+=Double=, so the integer loses its low bits: =9007199254740993= arrives as
+=...992=. /Measured; fixture =tests/fixtures/hand_mixed_number.geojson=, and
+=convert.rs='s =a_mixed_number_column_loses_precision_above_2_53= states it./
+
+*The loss is inherent and must not be "fixed".* The column is a double because
+something else in it was fractional, and no format this crate writes holds both
+exactly -- GDAL's =OFTReal= does the same. So the only question § THE RULE can
+ask is whether it should be *said out loud*.
+
+*The argument against is this document's own noise bar.* It fires only for a
+genuinely mixed column *and* an integer above 2^53. Every other check here
+guards something a user routinely hits; this one may not, and a warning nobody
+ever sees is a maintenance cost with no reader.
+
+*The argument for is that the rule is written without an exception for rarity*,
+and the loss is exactly the kind it names: information the source carries,
+silently degraded, on a run that reports success.
+
+Whoever settles it: the shape is a fifth entry in =collect_conversion_warnings=,
+and the ignored test is written to be rewritten around it.
 
 ** OWED WARNING -- a WKT-bearing CRS written to GeoParquet loses its dialect
 /Added 2026-08-20, decided./ Reclassified in from

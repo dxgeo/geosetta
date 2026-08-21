@@ -57,9 +57,12 @@ fn property_text(value: &JsonValue) -> String {
         JsonValue::String(s) => s.clone(),
         JsonValue::Null => String::new(),
         JsonValue::Bool(b) => b.to_string(),
-        JsonValue::Number { value, is_int } => {
-            if *is_int { (*value as i64).to_string() } else { value.to_string() }
-        }
+        JsonValue::Int(n) => n.to_string(),
+        // Via the JSON serializer so a whole float keeps its `.0` here too.
+        JsonValue::Float(_) => value.to_json_string(),
+        // KML `<Data>` is text; bytes render as the hex the JSON serializer
+        // produces, minus its quotes.
+        JsonValue::Binary(_) => value.to_json_string().trim_matches('"').to_string(),
         JsonValue::Array(_) | JsonValue::Object(_) => value.to_json_string(),
     }
 }
@@ -151,7 +154,7 @@ mod tests {
             vec![
                 ("name", JsonValue::String("A Point".into())),
                 ("description", JsonValue::String("desc".into())),
-                ("height_m", JsonValue::Number { value: 381.0, is_int: true }),
+                ("height_m", JsonValue::Int(381)),
             ],
         )]);
         let bytes = write(&fc);

@@ -26,7 +26,12 @@ mod gtype {
 }
 
 // ColumnType enum (ubyte).
-mod ctype {
+//
+// `pub(super)` so `writer.rs` uses *these* rather than its own copy. It carried
+// a duplicate of all fourteen until 2026-08-21, when adding `BINARY` to one of
+// them made the drift risk concrete — two tables of magic numbers for the same
+// on-disk enum is the shape the `REAL` bug came in.
+pub(super) mod ctype {
     pub const BYTE: u8 = 0;
     pub const UBYTE: u8 = 1;
     pub const BOOL: u8 = 2;
@@ -309,9 +314,10 @@ fn read_decl(c: &Table, name: &str, ty: u8) -> Result<Option<FieldDecl>> {
 
 /// FlatGeobuf's `Column.type` in the IR's declared-type vocabulary.
 ///
-/// Total but for `BINARY`, which the reader cannot materialize as a cell (it
-/// decodes to `Null`), so declaring it would promise a fidelity the value side
-/// does not keep.
+/// Total, as of 2026-08-21. `BINARY` was the one omission — its cells decoded
+/// to `Null`, so declaring the type would have promised a fidelity the value
+/// side did not keep. Now that `JsonValue::Binary` exists the value side keeps
+/// it, and the declaration is honest.
 fn decl_type(ty: u8) -> Option<DeclType> {
     Some(match ty {
         ctype::BOOL => DeclType::Bool,
@@ -328,6 +334,7 @@ fn decl_type(ty: u8) -> Option<DeclType> {
         ctype::STRING => DeclType::String,
         ctype::JSON => DeclType::Json,
         ctype::DATETIME => DeclType::DateTime,
+        ctype::BINARY => DeclType::Binary,
         _ => return None,
     })
 }
@@ -496,10 +503,7 @@ fn read_property_value(blob: &[u8], pos: &mut usize, ty: u8) -> Result<JsonValue
         *pos += width;
         Ok(s)
     };
-    let int = |v: i64| JsonValue::Number {
-        value: v as f64,
-        is_int: true,
-    };
+    let int = JsonValue::Int;
 
     Ok(match ty {
         ctype::BOOL => JsonValue::Bool(scalar(1)?[0] != 0),
@@ -511,14 +515,10 @@ fn read_property_value(blob: &[u8], pos: &mut usize, ty: u8) -> Result<JsonValue
         ctype::UINT => int(u32::from_le_bytes(scalar(4)?.try_into().unwrap()) as i64),
         ctype::LONG => int(i64::from_le_bytes(scalar(8)?.try_into().unwrap())),
         ctype::ULONG => int(u64::from_le_bytes(scalar(8)?.try_into().unwrap()) as i64),
-        ctype::FLOAT => JsonValue::Number {
-            value: f32::from_le_bytes(scalar(4)?.try_into().unwrap()) as f64,
-            is_int: false,
-        },
-        ctype::DOUBLE => JsonValue::Number {
-            value: f64::from_le_bytes(scalar(8)?.try_into().unwrap()),
-            is_int: false,
-        },
+        ctype::FLOAT => {
+            JsonValue::Float(f32::from_le_bytes(scalar(4)?.try_into().unwrap()) as f64)
+        }
+        ctype::DOUBLE => JsonValue::Float(f64::from_le_bytes(scalar(8)?.try_into().unwrap())),
         ctype::STRING | ctype::JSON | ctype::DATETIME => {
             let len = u32::from_le_bytes(scalar(4)?.try_into().unwrap()) as usize;
             let bytes = blob
@@ -533,8 +533,12 @@ fn read_property_value(blob: &[u8], pos: &mut usize, ty: u8) -> Result<JsonValue
         }
         ctype::BINARY => {
             let len = u32::from_le_bytes(scalar(4)?.try_into().unwrap()) as usize;
-            *pos += len; // skip binary payload (no GeoJSON representation)
-            JsonValue::Null
+            let bytes = blob
+                .get(*pos..*pos + len)
+                .ok_or_else(|| Error::FlatGeobuf("truncated binary property".into()))?
+                .to_vec();
+            *pos += len;
+            JsonValue::Binary(bytes)
         }
         other => return Err(Error::FlatGeobuf(format!("unsupported column type {other}"))),
     })
@@ -558,4 +562,44 @@ fn u32_at(b: &[u8], at: usize) -> Result<u32> {
             .try_into()
             .unwrap(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Every `Column.type` code this reader accepts, and what it means.**
+    /// The FlatGeobuf sibling of `geopackage/reader.rs`'s SQL spelling table:
+    /// the codes are the format's own enum, so the assertion is that each keeps
+    /// its width, not that it parses. Written 2026-08-21 with that one, after
+    /// `REAL` showed what an unasserted mapping table costs.
+    #[test]
+    fn every_column_type_code_declares_the_width_flatgeobuf_gives_it() {
+        use crate::schema::DeclType::*;
+        let cases: &[(u8, crate::schema::DeclType)] = &[
+            (ctype::BOOL, Bool),
+            (ctype::BYTE, Int8),
+            (ctype::UBYTE, UInt8),
+            (ctype::SHORT, Int16),
+            (ctype::USHORT, UInt16),
+            (ctype::INT, Int32),
+            (ctype::UINT, UInt32),
+            (ctype::LONG, Int64),
+            (ctype::ULONG, UInt64),
+            (ctype::FLOAT, Float32),
+            (ctype::DOUBLE, Float64),
+            (ctype::STRING, String),
+            (ctype::JSON, Json),
+            (ctype::DATETIME, DateTime),
+            (ctype::BINARY, Binary),
+        ];
+        for (code, expected) in cases {
+            assert_eq!(decl_type(*code), Some(*expected), "column type {code}");
+        }
+        // `BINARY` was declined here until 2026-08-21, because its cells
+        // decoded to `Null` and declaring the type would have promised a
+        // fidelity the value side did not keep. `JsonValue::Binary` made the
+        // value side keep it.
+        assert_eq!(decl_type(200), None, "an unknown code must not be guessed at");
+    }
 }

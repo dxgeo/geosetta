@@ -156,18 +156,12 @@ fn infer_value(cell: &str) -> JsonValue {
         .is_some_and(|c| c.is_ascii_digit() || matches!(c, b'-' | b'+' | b'.'));
     if numeric_start {
         if let Ok(i) = cell.parse::<i64>() {
-            return JsonValue::Number {
-                value: i as f64,
-                is_int: true,
-            };
+            return JsonValue::Int(i);
         }
         if let Ok(f) = cell.parse::<f64>()
             && f.is_finite()
         {
-            return JsonValue::Number {
-                value: f,
-                is_int: false,
-            };
+            return JsonValue::Float(f);
         }
     }
     JsonValue::String(cell.to_string())
@@ -180,6 +174,10 @@ fn cell_text(cell: &Cell) -> String {
         Cell::Int(n) => n.to_string(),
         Cell::Double(d) => d.to_string(),
         Cell::Str(s) => s.clone(),
+        // CSV is text; bytes render as hex, the same spelling the JSON
+        // serializer and `materialize` use when a byte column meets a target
+        // with no byte-level type.
+        Cell::Bytes(b) => b.iter().map(|byte| format!("{byte:02x}")).collect(),
     }
 }
 
@@ -197,7 +195,7 @@ mod tests {
         assert_eq!(fc.features[0].properties[0], ("name".into(), JsonValue::String("A".into())));
         assert_eq!(
             fc.features[0].properties[1],
-            ("pop".into(), JsonValue::Number { value: 100.0, is_int: true })
+            ("pop".into(), JsonValue::Int(100))
         );
         // Quoted field with an embedded comma survives.
         assert_eq!(fc.features[1].properties[0].1.as_str(), Some("B, city"));
@@ -210,7 +208,7 @@ mod tests {
                     geometry: Some(Geometry::Point(Position::new(-73.9, 40.7))),
                     properties: vec![
                         ("name".into(), JsonValue::String("x".into())),
-                        ("n".into(), JsonValue::Number { value: 3.0, is_int: true }),
+                        ("n".into(), JsonValue::Int(3)),
                     ],
                     native: None,
                 },
@@ -233,7 +231,7 @@ mod tests {
         assert_eq!(back.features.len(), 2);
         assert_eq!(back.features[0].geometry, fc.features[0].geometry);
         assert_eq!(back.features[1].geometry, fc.features[1].geometry);
-        assert_eq!(back.features[0].properties[1].1, JsonValue::Number { value: 3.0, is_int: true });
+        assert_eq!(back.features[0].properties[1].1, JsonValue::Int(3));
     }
 
     #[test]

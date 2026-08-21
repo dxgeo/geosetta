@@ -8,13 +8,15 @@ Orientation doc for an agent picking up the fidelity work started 2026-08-20.
 Same role =geoscribe/handoff.org= plays for the CRS work: read this, then the
 plans it points at.
 
-*M1, M2 and M4 are done. M3 is half done: three of six spokes.*
+*M1, M2 and M4 are done. M3 is half done: four spokes carry natives, four
+still pass =native: None=.*
 
 - *The mechanism* -- =src/native.rs=, the opaque format-tagged =Native=
   channel, and D1's two modelled fields (=FeatureCollection::name=, the column
   schema on =FeatureCollection::schema=).
-- *Spokes with natives:* GeoJSON, FlatGeobuf, GeoParquet. *Still to do:*
-  GeoPackage, CSV, WKT, KML, Shapefile -- their readers pass =native: None=.
+- *Spokes with natives:* GeoJSON, FlatGeobuf, GeoParquet, GeoPackage.
+  *Still to do:* CSV, WKT, KML, Shapefile -- their readers pass
+  =native: None=.
 - *M4, declared column types* -- =crate::DeclType= on =FieldDecl=, closing
   defects 1, 2 and 5. *All four declaring spokes* carry a declaration
   (FlatGeobuf, Shapefile, GeoPackage, GeoParquet); a declaration dropped to a
@@ -22,10 +24,13 @@ plans it points at.
 - *=edit-composability.org='s live bug 1* -- the GeoPackage edit loop that
   duplicated layers -- is fixed.
 - *Defect 3 is the only defect left*, and it travels with the GeoPackage
-  container (M3b).
+  container (M3b). Its *warning* shipped 2026-08-21 -- a =gpkg= write now says
+  what the rewrite destroys instead of exiting 0 in silence -- but the *fix*
+  is still M3b's.
 
-503 tests pass (=cargo test -p geosetta=: 458 lib, 44 integration, 1 doc),
-clippy clean. See
+530 tests pass (=cargo test -p geosetta=: 482 lib, 47 integration, 1 doc),
+clippy clean. Two further GDAL cross-checks are =#[ignore]=d by default:
+=cargo test --test gdal_types -- --ignored=. See
 [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
 § STATUS for the precise line between done and not.
 
@@ -48,8 +53,8 @@ In this order. The first two are the load-bearing ones:
 
 1. [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]] --
    the rule, the mechanism (an opaque, format-tagged =Native= channel), and all
-   six design decisions. *Read § THE MECHANISM and § DECISIONS before anything
-   else.*
+   *seven* design decisions. *Read § THE MECHANISM and § DECISIONS before
+   anything else.*
 2. [[file:plans/native-inventory.org][plans/native-inventory.org]] -- what each
    of the nine readers actually discards, measured. This is the reference the
    other three plans are written against.
@@ -57,8 +62,8 @@ In this order. The first two are the load-bearing ones:
    deleting the =args.from == out.format= check. *Gated* by (1).
 4. [[file:plans/edit-composability.org][plans/edit-composability.org]] -- the
    original ask, now the consumer of the above.
-5. [[file:tests/fixtures/HOSTILE.org][tests/fixtures/HOSTILE.org]] -- what the
-   nine fixtures carry and why. Read before touching any of them.
+5. [[file:tests/fixtures/HOSTILE.org][tests/fixtures/HOSTILE.org]] -- what each
+   fixture carries and why. Read before touching any of them.
 
 =plans/lossy-conversion-warnings.org= and =plans/spatial-index.org= were also
 edited; see § WHAT CHANGED IN EXISTING DOCS.
@@ -75,7 +80,11 @@ time. *Not started.*
   M4  FieldDecl gains a declared type         [DONE]
       defect 1 (fgb nulls)                    [DONE]
       defect 2 (gpkg booleans)                [DONE]
-      defect 5 (type narrowed to IR's 4)      [DONE, all four spokes]
+      defect 5 (type narrowed to IR's 4)      [DONE -- but it was a
+                                               class, not a list: three more
+                                               instances shipped after M4
+                                               closed it. See the recast
+                                               matrix.]
             |
   M1 inventory + fixtures  [DONE]
             |
@@ -86,7 +95,8 @@ time. *Not started.*
   M3  remaining single-collection spokes
       FlatGeobuf                                  [DONE]
       GeoParquet                                  [DONE]
-      gpkg / csv / wkt / kml / shp                [not started]
+      GeoPackage                                  [DONE]
+      csv / wkt / kml / shp                       [not started]
             |
   M3b GeoPackage container   M3c KMZ container
             |
@@ -108,9 +118,10 @@ Each is recorded in full, with rejected alternatives, in the plan that owns it.
 One line each so you know what has already been settled.
 
 /This was "THE NINE DECISIONS" and stopped being nine on 2026-08-20. Rows
-10--15 are M4's and the GeoParquet spoke's; the section is an index of what is
-settled, so it grows rather than freezing at the count it happened to start
-with./
+10--15 are M4's and the GeoParquet spoke's; 16--22 are 2026-08-21's -- the
+GeoPackage spoke, the recast matrix, the value-model work and D7. The section
+is an index of what is settled, so it grows rather than freezing at the count
+it happened to start with./
 
 | # | decision | where |
 |---+----------+-------|
@@ -129,6 +140,13 @@ with./
 | 13 | =created_by= is *not* a native: it names the writer, and geosetta is the writer | § MILESTONES, M3 GeoParquet |
 | 14 | An opaque member can also be *derived*: =ARROW:schema= is replayed only while the columns match | § MILESTONES, M3 GeoParquet |
 | 15 | GeoParquet's =covering= is an *index*, not a native -- rebuilt if present, and handed over | =spatial-index.org= milestone E |
+| 16 | A member equal to *what the writer would emit anyway* is derived, not opaque -- so a =gpkg= =identifier= that repeats the table name is regenerated, not carried | =same-format-fidelity.org= § MILESTONES, M3 GeoPackage |
+| 17 | =FgbNative='s "absent and empty are different" rule *does not generalize*: it holds only where the writer omits an absent field | § MILESTONES, M3 GeoPackage |
+| 18 | =gpkg_data_columns= is *layer* content in a container-scoped table, so it travels with M3, not M3b | § MILESTONES, M3 GeoPackage |
+| 19 | A member equal to what the writer emits anyway is *derived*; =String= admits nothing, so a type becoming text always warns | =same-format-fidelity.org= § Defect 5 was a class |
+| 20 | The IR gets a *byte-level value*: a declaration whose values are destroyed is a promise the value side cannot keep | § The blob the schema check could not see |
+| 21 | =JsonValue= and =DeclType= are *exported*, =#[non_exhaustive]= -- a modelled field a caller cannot name is a native with extra steps | D7 |
+| 22 | Numbers are =Int(i64)= / =Float(f64)=, not an =f64= plus a flag; a whole float keeps its =.0=, as =ogr2ogr= writes it | § The number model |
 
 *Three later rulings extended D1*, all worth knowing before you design
 anything, and *all three now implemented*. The third is =FieldDecl='s
@@ -147,10 +165,12 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
 
 ** WHAT IS BUILT
 - *The inventory*, all nine spokes, every entry marked /measured/ or /code/.
-- *The natives mechanism and three spokes* -- GeoJSON (=id=, foreign members
+- *The natives mechanism and four spokes* -- GeoJSON (=id=, foreign members
   at three levels), FlatGeobuf (header/=Crs=/per-column descriptive members
-  plus the header name) and GeoParquet (every =key_value_metadata= entry
-  beside =geo=, plus =geo.orientation=). See § STATUS in the fidelity plan.
+  plus the header name), GeoParquet (every =key_value_metadata= entry
+  beside =geo=, plus =geo.orientation=) and GeoPackage (the layer's
+  =gpkg_contents= title/description and its =gpkg_data_columns= rows plus the
+  constraints they name). See § STATUS in the fidelity plan.
 - *The modelled column schema*, end to end for three spokes: a =.dbf= field's
   declared width survives =shp -> fgb -> shp= intact, and a middle stage can
   widen it. Losing a declaration to a target that does not carry one now warns.
@@ -165,9 +185,35 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
   before being committed. They fail the invariant by design -- they are the
   target, not a regression suite.
 
+  *Two more joined them on 2026-08-21 and neither is hostile*, which is why
+  =HOSTILE.org= now says so per entry: =gdal_types.gpkg= is a *specimen sheet*
+  (one column per GeoPackage declared type, for the GDAL cross-check), and
+  =hand_mixed_number.geojson= documents a single open case rather than testing
+  anything. =gdal_hostile.gpkg= also *grew* -- the GeoPackage spoke needed
+  layer-level members it did not carry.
+
+*Everything below landed on 2026-08-21, after M3's GeoPackage spoke, and none
+of it was planned work* -- each item was found by measuring the one above it:
+- *Defect 3's warning* -- =geopackage/container.rs= surveys the container a
+  =gpkg= write is about to rewrite and reports what will not survive. The
+  destruction is still M3b's to fix; the silence is not.
+- *The recast matrix* -- =DeclType::admits= (the widening relation),
+  =Format::recast= (what each format does to each type),
+  =decl_recast_warning=, =DeclType::ALL=, two sweeps, four *inbound* tables
+  asserting what each on-disk spelling means, and =tests/gdal_types.rs= for a
+  second opinion. It closed defect 5's *class* after M4 had closed its
+  instances.
+- *A byte-level value type* -- =JsonValue::Binary=. A =gpkg= run had been
+  destroying every blob it read while the =BLOB= declaration survived.
+- *An exact integer model* -- =JsonValue::Int= / =Float=, after a same-format
+  run was found turning =9007199254740993= into =...992=.
+- *D7, the public API* -- =JsonValue= and =DeclType= exported
+  =#[non_exhaustive]=, so the caller D1 and D5 argue for can finally *name* the
+  types those decisions are about. =tests/public_api.rs= runs the argument.
+
 ** WHAT IS NOT BUILT
-- The remaining spokes' *natives* (M3) and both containers (M3b =gpkg=, M3c
-  =kmz=). *Column declarations are done everywhere they can be*: all four
+- The remaining spokes' *natives* (M3 -- CSV, WKT, KML, Shapefile) and both
+  containers (M3b =gpkg=, M3c =kmz=). *Column declarations are done everywhere they can be*: all four
   declaring spokes carry one as of M4, so =Format::carries_column_schema= has
   stopped shrinking and the four remaining =false= answers (GeoJSON, CSV, WKT,
   KML) are permanent -- those formats have no slot.
@@ -179,14 +225,30 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
   it has never emitted a nested struct column.
 - *Defect 3* -- the only entry left in § LIVE BUGS. Note that section's
   numbering is *not* the plan's "five defects"; see its own note.
-- The exhaustive-match fixture registry (D6) and any warning work.
+- The exhaustive-match fixture registry (D6).
 - The format-check deletion, which is sequenced last.
+- *One open call, deliberately not decided*: a column mixing an integer past
+  2^53 with a fractional value infers =Double= and the integer loses its low
+  bits. The loss is *inherent* -- inference has decided the column is
+  fractional, and GDAL's =OFTReal= does the same -- so what is missing is a
+  warning, not exactness. Whether it earns one against the noise bar is argued
+  both ways in =lossy-conversion-warnings.org= § AN OPEN CALL. Fixture and an
+  =#[ignore]=d test that *passes* and exists to be rewritten:
+  =hand_mixed_number.geojson= and
+  =convert.rs='s =a_mixed_number_column_loses_precision_above_2_53=.
+
+/Warning work is no longer on this list./ It said "and any warning work" until
+2026-08-21, when two shipped: defect 3's container warning and
+=decl_recast_warning=.
 
 ** BUGS FOUND -- ONE STILL LIVE
 /Renamed 2026-08-20: this was "LIVE BUGS FOUND, NOT FIXED" when five of its
 six entries were live. Five are now struck through and fixed; **entry 3 is the
 only one left**. The fixed entries stay because each records how it was
 measured and what the fix turned on./
+
+/Four more were found on 2026-08-21 and all four are fixed; they are grouped in
+their own subsection at the end because what found them is the useful part./
 
 Ordered by how likely they were to bite a real user.
 
@@ -220,9 +282,21 @@ things. /Reconciled 2026-08-20./
    the only route that carries it -- =shp -> geojson -> shp= and
    =shp -> gpkg -> shp= still narrow, and now warn.
 3. *A =gpkg= → =gpkg= run destroys the container* around the layers: user
-   tables, =gpkg_metadata=, =gpkg_extensions=, every R*Tree. Exit 0, no
-   warning. This is *defect 3*, and after M4 it is *the only defect left* --
-   it travels with the GeoPackage container (M3b).
+   tables, =gpkg_metadata=, =gpkg_extensions=, every R*Tree. This is
+   *defect 3*, and after M4 it is *the only defect left* -- the destruction
+   travels with the GeoPackage container (M3b).
+
+   *No longer silent, as of 2026-08-21.* "Exit 0, no warning" was the original
+   finding; the exit code is unchanged (§ THE RULE is loud, not blocking) but
+   =geopackage/container.rs= now surveys the container being rewritten and
+   reports what will not survive -- destroyed content in one message, and an
+   R*Tree that will not be rebuilt in a second, since that one is *derived* and
+   =--rtree= fixes it. Silent on any GeoPackage this crate wrote itself. The
+   two things worth knowing before touching it: =REPRODUCED= is a statement
+   about what =writer::build= emits and has to move when the writer does, and
+   an R*Tree's =gpkg_extensions= rows are counted as part of the index rather
+   than as a loss of their own. Both are written up in
+   =same-format-fidelity.org= § Five defects, defect 3.
 4. ~~*FlatGeobuf drops null cells*~~ -- *defect 1*, *FIXED 2026-08-20 (M4)*.
    It was *two* losses, not one, and the second was nearly missed: fixing the
    cell is necessary and not sufficient, because an all-null column then
@@ -263,6 +337,38 @@ section is *defect 3* alone (entry 3), and it travels with the GeoPackage
 container (M3b). *Defect 4* is not in this list because it is done: it was the FlatGeobuf
 header's hardcoded =geosetta= name, retired with the FlatGeobuf spoke.
 
+*** Four more, all found and fixed 2026-08-21 -- and none of them by reading
+None was in the list above, none was hard, and every one broke the *same-format*
+invariant. They are grouped because what found them matters more than what they
+were: each fell out of measuring the fix for the one before it.
+
+7. *A GeoPackage =REAL= column read back 32-bit.* =decl_type= grouped =REAL=
+   with =FLOAT=; the spec and SQLite both make it 8 bytes. /Measured through
+   GDAL:/ =Real (0.0)= in, =Real(Float32) (0.0)= out. Found while measuring the
+   GeoPackage spoke's round trip. Fixed -- and note the fix *normalizes the
+   spelling* rather than preserving it: a =REAL= column comes back =DOUBLE=,
+   which GDAL reads identically. See the GeoPackage spoke's entry in § WHAT
+   CHANGED IN EXISTING DOCS.
+8. *Every unsigned width written as its same-width signed spelling.* =UInt32=
+   was written =MEDIUMINT=. The value survived SQLite's dynamic typing and the
+   *declaration* was a lie: **GDAL read =3000000000= back as =-1294967296=**.
+   Found by the recast matrix, which (7) is what motivated building.
+9. *Every blob destroyed on read.* =Value::Blob(_) => JsonValue::Null=, so a
+   =gpkg -> gpkg= run replaced =X'0102'= with =NULL= while the =BLOB=
+   declaration survived. Found by adding *value* assertions to a suite that
+   had only ever compared declarations.
+10. *64-bit integers routed through an =f64=.* =9007199254740993= came back
+    =...992= on a same-format run; past =i64::MAX= the serializer saturated, so
+    =12345678901234567890= became =9223372036854775807=. Found by pulling on
+    what looked like a JSON canonicalisation question.
+
+*The pattern worth carrying forward*, because it caught three of these four and
+is not obvious: **the obvious test shape has a blind spot exactly where the
+bugs are.** A self-round-trip misses a spelling the writer never emits (7). A
+sweep over every *type* misses a class if its *values* are unadventurous (10).
+And a check that compares declarations can be perfectly green while the values
+are being destroyed (8, 9).
+
 ** WHAT CHANGED IN EXISTING DOCS
 Listed explicitly because they were written before this work was committed.
 /Now that it is committed, =git log= is the better source where the two
@@ -270,6 +376,283 @@ disagree -- see § THE ONE REAL GAP, whose "no commits" claim was itself an
 error and is retracted there./
 
 /Newest first./
+
+*A review pass over the uncommitted work, 2026-08-21 -- code.* Everything since
+=16bd5dd= re-read and re-measured rather than taken on trust. The test count,
+clippy, and both =#[ignore]=d GDAL cross-checks all held; the value-level claims
+(2^53+1 exact, blobs surviving, =REAL= 64-bit, unsigned widths, =.dbf= fifteen
+decimals) were re-run against the release binary and hold too. Five things did
+not, and all five are fixed:
+
+1. *The R*Tree warning named layers that were not being written.*
+   =indexed_layers= filtered against every layer in =gpkg_contents= rather than
+   against =written=, so =--layer cities= reported an index on =second= -- a
+   layer absent from the output -- and offered =--rtree= as a remedy that
+   cannot apply, since the writer only indexes what it writes. That also
+   contradicted the module's own rule that a deliberate selection is not a
+   loss, which the row survey had followed and this had not. Now filtered by
+   =written=, pinned by
+   =an_index_on_a_layer_that_is_not_being_written_is_not_reported=.
+2. *=decl_recast_warning= said the opposite of its own doc.* The doc explains
+   that the message shows both types "rather than claiming which is worse,
+   because =Date -> DateTime= is not narrower and is still not what went in" --
+   and the message then ended "which is narrower than what went in", which is
+   the one claim a lateral recast does not support. Now "which is not the type
+   that went in", the claim both cases carry.
+3. *=NativePayload= was public and exhaustive.* D7 marked =JsonValue= and
+   =DeclType= =#[non_exhaustive]= and left the one enum that grows *by
+   construction* -- a variant per spoke, with four spokes and two containers
+   still to come, each of which would have broken every downstream =match=.
+   Now marked, and =tests/public_api.rs= gained the arm that *enforces* it:
+   every known variant named beside a wildcard, under a crate-level
+   =deny(unreachable_patterns)=, so removing the attribute fails the build.
+   /Verified by removing it and watching the build fail./ The two existing
+   arms in that test are demonstrations rather than enforcement -- they do not
+   list every variant -- and now say so.
+4. *Two doc comments orphaned by insertion.* New code was placed between an
+   existing doc comment and the item it documented, in =geopackage/reader.rs=
+   (=feature_layer_names='s doc absorbed by =ContentsMeta=) and
+   =json/value.rs= (=write_json_string='s absorbed by =write_json_f64=). Both
+   restored.
+5. =sqlite.rs= pointed at =container_drop_warning=; the function is
+   =container_drop_warnings=.
+
+/Worth noting about (1) and (2): both are warnings, and both were wrong in the
+direction the tests could not see -- a warning's *text* and its *scope* are not
+what a round-trip assertion looks at. That is the same blind-spot lesson as the
+type-vs-value one, one layer further out./
+
+*Two claims below were also measured and corrected in place* rather than
+restated here, since a correction filed at the top of a change log is a
+correction nobody reading the original will see: what the =REAL= fix actually
+produces (it normalizes the spelling to =DOUBLE=; it does not preserve
+=REAL=), and what "byte-identical to GDAL's" covers in the =.dbf= entry (the
+number's digits, not the field width). Both are in the entries that made them.
+
+*The number model and Shapefile's decimals, 2026-08-21 -- code.* Two findings
+that had been recorded rather than fixed. The first turned out to be a symptom.
+
+=JsonValue::Number= was an =f64= plus an =is_int= flag, and an =f64= carries
+integers exactly only to 2^53 -- so a *same-format* =gpkg -> gpkg= run turned
+=9007199254740993= into =...992=, on a plain 64-bit =INTEGER= column. Past
+=i64::MAX= the serializer's =as i64= saturated: =12345678901234567890= came
+back =9223372036854775807=, a specific wrong number. **The flag was the tell**
+-- it existed to remember what the representation had already thrown away.
+
+Now =Int(i64)= and =Float(f64)=, so an integer never touches a double. One too
+wide for an =i64= becomes =Float=: lossy, but honestly lossy, never a different
+integer. Whole floats keep their =.0= (=1.0= stays =1.0=), which matches
+=ogr2ogr= -- verified, including its coordinates, which it writes =[1.0,2.0]=.
+That change immediately caught =geojson/mod.rs='s *two writers disagreeing*:
+the direct writer formatted its own coordinates while the tree serializer went
+through =JsonValue=. Both now call one =write_json_f64=.
+
+*The sweep now uses values past 2^53*, because it did not before -- =Int64='s
+representative value was small enough to survive a double. A sweep can be
+exhaustive over *types* and still miss a whole class by being unadventurous
+about *values*. That is the third variation on the same lesson in two days,
+after the undeclared-column path and the type-vs-value blind spot.
+
+=dbf.rs='s =DECIMALS= fallback went 6 → 15, matching the =15= in =ogr2ogr='s
+=Real (24.15)= for an undeclared double. *The number's text is now
+byte-identical to GDAL's; the field around it is not, and deliberately.*
+/Measured on =1.23456789012345=:/ both write the digits =1.234567890123450=,
+and geosetta writes them into an =N(17,15)= field where =ogr2ogr= writes
+=N(24,15)= -- the difference is trailing pad, because this writer sizes a field
+from the values it actually holds while GDAL uses a fixed default. That is the
+same policy that makes an integer column =N(2)= here and =N(9)= there, it is
+not part of this change, and the =24= was never the thing being matched.
+*Whether that policy is the right one is now an open question* --
+=same-format-fidelity.org= § OPEN QUESTIONS' first entry, and § OPEN QUESTIONS
+WORTH KNOWING below.
+Fifteen decimals push the fixed-point text past the 255-byte =.dbf= limit at
+lower magnitudes, so the *fallback* is trimmed to fit (at =1e240= those
+decimals are padding an =f64= never carried); a *declared* scale is left to
+fail loudly, since that is the source stating a fact.
+
+*The JSON half of the original finding stands unfixed and is fine*: a =Json=
+column round-trips through GeoParquet as a parsed object, so its text is not
+byte-preserved. That is the open canonicalisation question, not a defect.
+
+*D7, the public API, 2026-08-21 -- code.* D1 models the column schema in the IR
+rather than carrying it as a native, and D5 says why: only a modelled field lets
+an external tool widen a declaration mid-flight. Both are arguments about a
+*caller*, and neither had ever been run from where a caller stands.
+
+=Feature::properties= is a public field of type =JsonValue=; =FieldDecl::ty= is
+a public field of type =DeclType=; both types lived in =pub(crate)= modules, so
+**neither could be named outside this crate**. A consumer could read a
+declaration and not construct one, read a feature's properties and not build a
+feature that had any. The library was a read-and-convert API whose docs
+described an edit-in-the-middle API.
+
+The tell was found by accident: adding =JsonValue::Binary= earlier the same day
+was a new variant on a public enum -- normally breaking for every downstream
+=match= -- and it broke nothing, because no downstream match was possible.
+
+Both are now exported =#[non_exhaustive]=; =DeclType::hub= and
+=FieldDecl::type_for= are demoted to =pub(crate)= (both name types that stay
+internal); =ColumnType=/=Cell=/=Column= stay internal and are now reachable
+from nothing public. *The enforcement is =tests/public_api.rs=, and it has to
+live in =tests/=* -- an integration test compiles as a separate crate, so it
+sees what a real dependent sees. A unit test in =src/= cannot check this
+property at all, because inside the crate everything is nameable, which is
+exactly why the gap survived this long.
+
+*The binary cell type, 2026-08-21 -- code.* The recast matrix asserted
+*declarations*, and it was green while a =gpkg -> gpkg= run **destroyed every
+blob in the file**: the =BLOB= declaration survived, so the types matched, and
+=X'0102'= came back =NULL=. The GDAL cross-check missed it for the same reason
+-- it diffed =ogrinfo -so=, which prints the schema and no values.
+
+The cause was structural rather than careless. The IR's property type is
+=JsonValue=, so bytes had nowhere to live; =geopackage/reader.rs= returned
+=Null=, FlatGeobuf skipped the payload, GeoParquet rendered hex text, and all
+three then *declined to declare* =Binary= -- correctly, since declaring a type
+whose values are destroyed is a promise the value side cannot keep. So the fix
+was the IR: =JsonValue::Binary(Vec<u8>)=, whose doc admits it makes the type's
+name a slight lie and cites the precedent (=Number { is_int }= is not a JSON
+distinction either). The compiler then enumerated the blast radius exactly as
+D3 intends -- eight sites, each a writer that had to decide.
+
+Two spokes gained a capability they already had on disk: FlatGeobuf's
+=ctype::BINARY= was in the reader's table and unreachable from the writer,
+which kept *its own duplicate of all fourteen constants* -- collapsed to one
+shared table in the same pass. GeoParquet's unannotated =BYTE_ARRAY= is binary
+in Parquet's own model and was being decoded as UTF-8.
+
+=Date= also stopped degrading to text: FlatGeobuf has no =DATE= but has
+=DATETIME=, which is what =ogr2ogr= writes for the same hop. And once the type
+survived the transit, the *value* turned out not to -- =format_timestamp=
+emitted no =Z=, so =gpkg -> parquet -> gpkg= turned =12:00:00+00= into an
+unzoned =12:00:00=. =TIMESTAMP_MILLIS= is UTC by definition, so it emits the
+designator now.
+
+*The rule this bought*, and it belongs beside the undeclared-column one below:
+**a type-fidelity test that never looks at a value can be perfectly green while
+the values are being destroyed.** Three of those four bugs fell out of one
+change -- adding a value comparison beside the type comparison, in both the
+in-tree sweep and the GDAL check.
+
+*Two findings recorded, not fixed*, both policy calls rather than defects: a
+=Json= column round-trips through GeoParquet as a *parsed object* rather than
+its text (not byte-preserving -- ={"a": 1}= loses the space -- and an instance
+of the open canonicalisation question), and Shapefile rounds an undeclared
+double to =dbf.rs='s =DECIMALS= fallback of 6, silently, where GDAL uses 15.
+
+*The recast matrix, 2026-08-21 -- code.* Defect 5 was closed by M4 across all
+four declaring spokes, and then three more instances of it shipped anyway.
+=REAL= read back 32-bit; GeoPackage wrote every unsigned width as the
+same-width *signed* spelling (=UInt32= as =MEDIUMINT=, so GDAL read 3000000000
+back as -1294967296); and an ISO 8601 =DateTime= carrying the standard =Z=
+degraded to text on the GeoParquet writer's parse side, which is what a
+=gpkg -> parquet= hop always produces. All three were shallow. All three
+survived because *every test that touched the type surface was an example
+test*, while the surface is eight =match= tables over sixteen variants and some
+forty on-disk spellings.
+
+What went in instead of a fourth example: =DeclType::admits= (the widening
+relation, derived from =int_range=, in which *=String= admits nothing* --
+see the plan for why that matters), =Format::recast= (what each format does to
+each type), =FeatureCollection::decl_recast_warning= (the fourth entry in
+=collect_conversion_warnings=, firing only where =admits= fails),
+=DeclType::ALL= with a catch-all-free completeness test, two sweeps in
+=convert.rs=, four *inbound* tables asserting what each on-disk spelling
+*means*, and =tests/gdal_types.rs= + =tests/fixtures/gdal_types.gpkg= for the
+differential check against the reference tool. 522 tests (from 513), plus 2
+=#[ignore]=d.
+
+*The one lesson worth carrying forward*, because it is not obvious and it cost
+a day: **a self-round-trip over declared values is not sufficient.** The =REAL=
+bug lived on the *undeclared* path -- the writer emits =REAL= for a plain
+double and the reader read =REAL= as =Float32=, so an undeclared column
+acquired a narrower declaration out of nowhere. The declared path
+(=Float32= → =FLOAT= → =Float32=) was closed the entire time. A writer never
+emits the spelling it cannot read, so closure under *our own output* can hide
+an inbound bug indefinitely; only a table of what each spelling *means*, or a
+second implementation, will say.
+
+*Also worth knowing:* =DeclType= is *not publicly exported* -- =FieldDecl.ty= is
+a public field of a type an external consumer cannot name, so a pipeline stage
+can read a declaration but not construct one. That partly undercuts D5's
+argument for modelling the schema rather than carrying it as a native. Left
+alone deliberately: it is an API decision, not a bug fix.
+
+*The GeoPackage spoke, 2026-08-21 -- code.* =GpkgNative= carries a layer's
+=gpkg_contents.identifier=/=description= and its =gpkg_data_columns= rows plus
+the =gpkg_data_column_constraints= they name; verified on real =ogr2ogr= output
+and *read back by GDAL* (=ogrinfo= reports the same alternative names, comments
+and domain off our output; =ogr2ogr= rewrites it). 513 tests (from 509). The
+identifier was defect 4's shape in another format -- =gpkg_contents(identifier)=
+was hardcoded to the table name, =description= to ='' =, exactly as FlatGeobuf's
+=NAME= slot had been hardcoded to =geosetta=.
+
+Three things came out of it, all in the plan's M3 entry:
+1. *A member equal to what the writer would emit anyway is derived, not
+   opaque.* =identifier= is carried only when it differs from the table name,
+   =description= only when non-empty -- otherwise every GeoPackage in existence
+   gets a payload, =is_empty= is never true, and a renamed layer gets a *stale*
+   title replayed into it.
+2. *=FgbNative='s "absent and empty are different" rule does not generalize*,
+   and this is worth knowing before the next spoke: it holds there because the
+   FlatGeobuf writer *omits* an absent field. =gpkg_contents= is a row always
+   written, so NULL and ='' = are the same bytes.
+3. *The Schema extension's tables are layer content in container-scoped
+   tables*, keyed by =(table_name, column_name)= -- so they travel with the
+   layer, not with M3b, and had to come out of defect 3's warning. That is
+   =container.rs='s =REPRODUCED= coupling moving for the first time, one day
+   after it was flagged.
+
+*And a pre-existing bug that measuring found and reading would not have.*
+=decl_type= grouped =REAL= with =FLOAT= as =Float32=, but =REAL= is 64-bit in
+both the GeoPackage spec's table 1 and SQLite's storage classes -- so a
+=price REAL= column came back declared =FLOAT=: =Real (0.0)= in,
+=Real(Float32) (0.0)= out, on a *same-format* run, per GDAL. *Defect 5's shape
+in one more spelling*, sitting inside work M4 had declared complete across all
+four declaring spokes. /Fixed the same day./
+
+*What the fix produces, since the width was only half the question:* the round
+trip is 64-bit in both directions now, and the *spelling is normalized*. All
+five of GeoPackage's 64-bit float names collapse to =DeclType::Float64=, and
+the writer has one spelling per variant -- so =REAL=, =NUMERIC=, =DECIMAL= and
+=DOUBLE PRECISION= all come back declared =DOUBLE=. /Measured:/ GDAL reports
+=Real (0.0)= for every one of them before *and* after, so nothing a reader can
+act on is lost; the file is simply not byte-identical in its DDL. Left alone on
+decision 16's grounds -- =DOUBLE= is what this writer emits for a 64-bit float
+anyway, and carrying the source's spelling would mean a =DeclType= variant per
+synonym for a distinction no format, and no tool, draws. *Worth knowing before
+the next reader assumes a same-format =gpkg= run is byte-preserving: it is
+value- and type-preserving, which is what the rule asks for.* /A related
+measurement, recorded because it cuts the other way:/ =ogrinfo= does not list a
+=DECIMAL= or =DOUBLE PRECISION= column at all -- GDAL skips spellings outside
+its own table -- and reads them fine off our output, where they have become
+=DOUBLE=.
+
+The step that caught it was
+diffing =ogrinfo= on the input against =ogrinfo= on the output, which is the
+argument for the reference-tool check being part of a spoke rather than a
+nicety.
+
+*Defect 3's warning, 2026-08-21 -- code.* =src/geopackage/container.rs= (new,
+the survey and both messages), =src/sqlite.rs= (=MasterObject= and
+=Database::master_objects=, which enumerates *every* =sqlite_master= entry --
+=tables()= returns only the readable subset, and what a file *contains* is a
+different question from what it can *read*), =src/geopackage/mod.rs=
+(re-export), =src/main.rs= (two call sites in =run_geopackage_write= -- the
+source container and the destination being appended to -- plus =names_of=).
+Six new tests, 509 from 503. =plans/lossy-conversion-warnings.org= gained it as
+the *fourth* pre-write instance, with the reason it is the only one not wired
+into =collect_conversion_warnings=: the other three answer "can the target hold
+this", and this one's target is GeoPackage, which holds all of it perfectly
+well -- the loss is in *this writer*, so only the bytes can answer.
+
+*One thing the first draft got wrong, kept because it is the useful part:* it
+reported =gpkg_extensions= as destroyed content. Feeding this crate's own
+=--rtree= output back in showed it warning about the very table it had just
+written -- the registration rows are *derived*, travelling with the index that
+=indexed= already reports separately, so counting them named one loss twice.
+The check that caught it was the cheap one available from the start: run the
+tool on its own output and see whether it stays quiet.
 
 *The GeoParquet spoke, 2026-08-20 -- code.* =ParquetNative= carries every
 =key_value_metadata= entry beside =geo= (=ARROW:schema=, =gdal:metadata=,
@@ -391,6 +774,18 @@ touching every declaring spoke:
 - =src/format.rs= -- =carries_column_schema= gained =Gpkg= and =Parquet=.
 - =src/convert.rs=, =tests/perf.rs= -- tests, and the sparse benchmark.
 
+*The GeoPackage spoke, sixth* (2026-08-21): =src/native.rs= (=GpkgNative=,
+=GpkgDataColumn=, =GpkgConstraint=), =src/lib.rs= (re-exports),
+=src/geopackage/reader.rs= (=layer_native= and the three table readers; also
+the =REAL= → =Float64= fix), =src/geopackage/writer.rs= (=gpkg_contents=
+replays identifier/description, =schema_extension_tables= rebuilds the Schema
+extension), =src/geopackage/container.rs= (=LAYER_SCOPED=, so defect 3's
+warning stops reporting what the spoke now carries), =src/convert.rs= (five new
+tests), =tests/fixtures/gdal_hostile.gpkg= + =HOSTILE.org= (the layer-level
+members the fixture did not previously carry). *Left to M3b deliberately:*
+everything at container level -- user tables, =gpkg_metadata=, extension
+registrations.
+
 *The GeoParquet spoke, fifth* (2026-08-20): =src/native.rs=
 (=ParquetNative=), =src/lib.rs= (re-export), =src/parquet/reader.rs= (collect
 every =key_value_metadata= entry beside =geo=, plus =geo_orientation=),
@@ -468,23 +863,57 @@ committed to. *Always run =git= from =geosetta/= itself*, and check
 level up would sweep in =basin/=, =hen/=, =sphere2/= and a =.venv=.
 
 The fidelity work described in this handoff /was/ uncommitted while it was
-being done, which is what made the error plausible. Most of it is committed
-now -- =4e29eea= (the mechanism, column schema and FlatGeobuf spoke) and
-=e27163c= (M4 plus live bug 1) -- so § WHAT CHANGED IN EXISTING DOCS is no
-longer the only substitute for a diff; prefer =git log= / =git show= where the
-two disagree. *The GeoParquet spoke and the =covering= handover are not yet
-committed* at the time of writing, so for those the change log above is still
-the only record.
+being done, which is what made the error plausible.
+
+*The durable rule, since naming which commits exist is a claim that expires:*
+**prefer =git log= / =git show= over this document wherever the two disagree.**
+§ WHAT CHANGED IN EXISTING DOCS exists for work that has not reached a commit
+yet, and which work that is changes every time someone commits -- so treat it
+as a record of *what was done*, never as a statement about *what is committed*.
+
+/An earlier version of this paragraph listed the commits and then asserted that
+the GeoParquet spoke and the =covering= handover were "not yet committed". They
+had landed in =16bd5dd= by the time anyone read it. Corrected 2026-08-21, and
+rewritten as a rule rather than a snapshot so it cannot go stale the same way
+again./
 
 ** OPEN QUESTIONS WORTH KNOWING
 Not blockers, but they will come up:
 - *Is canonicalisation a loss?* =MULTIPOINT ((1 2))= → =MULTIPOINT (1 2)=,
   =linestring= → =LINESTRING=. Decides whether the CSV/WKT lexeme problem is
   two bugs or a whole class. (=native-inventory.org= § QUESTIONS, item 1.)
+
+  *A third instance arrived 2026-08-21 and it is not CSV/WKT*: GeoParquet
+  *parses* a =Json= column, so ={"a": 1}= comes back as an object and
+  re-serializes without the space. GeoPackage and FlatGeobuf keep the text --
+  so this is also a *spoke inconsistency*, and settling the question settles
+  which of the three is right. Measured; the values are otherwise unharmed
+  (key order holds, and numbers are exact now that the number model is split).
+- *Does the mixed-number column earn a warning?* A column holding an integer
+  past 2^53 *and* a fractional value infers =Double=, and the integer loses its
+  low bits. The loss is inherent -- do not try to make the value survive -- so
+  the question is only whether it should be *said*. Argued both ways in
+  =lossy-conversion-warnings.org= § AN OPEN CALL; fixture and an =#[ignore]=d
+  test are in place, written to be rewritten around the warning.
 - *=edges= / =epoch= in GeoParquet* -- no available tool emits either, so no
   fixture exists. *Do not close this as a null result* the way =envelope.org=
   closed the GPKG XYM indicators: =edges: "spherical"= would restate what the
   coordinates *mean*, which is a semantic corruption, not a dropped member.
+- *Should a =.dbf= field be sized to the data or fixed per type?* This writer
+  sizes from the values; =ogr2ogr= uses a fixed default per type (=String
+  (80.0)=, =Integer (9.0)=, =Real (24.15)=) and ignores the data. *Not a rule
+  violation either way* -- on a route that carries the declaration the source's
+  width wins and no default is consulted -- so it is only about what to invent
+  on a carrier-less hop. Both sides measured, and each has one hard number:
+  fixed widths cost *6.5x the file* (9.7 MB against 1.5 MB on 50,000 rows of
+  four ordinary columns, because dBase records are fixed-width), and GDAL's
+  fixed =Real (24.15)= **silently writes a different number** for =1e240= --
+  =1.00000000000000008388608e23=, off by ~10^217, at warning severity -- where
+  this writer widens to =Real (255.13)= and keeps it. Argued in full, with the
+  =max(fitted, gdal_default)= floor that is the likely shape of a decision, in
+  =same-format-fidelity.org= § OPEN QUESTIONS. /Do not decide this from the
+  ratchet complaint alone: =schema_drop_warning= already tells the user the
+  declaration did not survive that hop./
 - *Raster GeoPackages* -- container scope puts tile pyramids in the domain
   while geosetta is vector-only. Recommendation on file is to *reject* a
   populated tile container rather than silently drop the imagery.

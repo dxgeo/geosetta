@@ -69,11 +69,21 @@ pub use crs::{Crs, NamedCrs, WGS84_CRS_CODE};
 pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection};
 pub use format::Format;
-pub use native::{FgbColumnNative, FgbNative, Native, NativePayload, ParquetNative};
+pub use native::{
+    FgbColumnNative, FgbNative, GpkgConstraint, GpkgDataColumn, GpkgNative, Native, NativePayload,
+    ParquetNative,
+};
 pub use geometry::{Bbox, Geometry, Position};
 // `schema` is crate-internal (its column materialization is a writer detail),
 // but `FieldDecl` is not: it is a public field of `FeatureCollection`, and a
 // route (a) caller editing a schema between `read_features` and
 // `write_features` is precisely the case that field exists for — see
 // `plans/same-format-fidelity.org` D1.
-pub use schema::FieldDecl;
+pub use schema::{DeclType, FieldDecl};
+
+// `json` is crate-internal (its parser and escaping helpers are reader
+// details), but `JsonValue` is not: it is the type of `Feature::properties`,
+// so a caller that cannot name it cannot *build* a feature — only read one.
+// That gap made the route (a) editing story above true of the schema and false
+// of the data it describes; see `plans/same-format-fidelity.org` D5.
+pub use json::JsonValue;

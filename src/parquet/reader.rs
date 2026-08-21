@@ -78,11 +78,14 @@ pub struct GeoParquet {
 /// `Binary` unless annotated `UTF8`/`JSON`. Unannotated widths map straight
 /// across, which is what carries `INT32`/`FLOAT` through.
 ///
-/// `INT96` and unannotated `BYTE_ARRAY` are deliberately absent, for the same
-/// reason FlatGeobuf's `BINARY` is: this reader renders both as *text* (a
-/// nanosecond timestamp, and hex, respectively), so declaring the type would
-/// promise a round trip the value side cannot keep — a writer honouring it
-/// would lay the hex string down as raw bytes.
+/// `INT96` is deliberately absent: this reader renders a nanosecond timestamp
+/// as *text*, so declaring the type would promise a round trip the value side
+/// cannot keep.
+///
+/// Unannotated `BYTE_ARRAY` used to be absent for the same reason — it rendered
+/// as hex text. Since 2026-08-21 it decodes to [`JsonValue::Binary`] and the
+/// declaration is honest, so a Parquet blob survives a round trip instead of
+/// arriving as a string of hex digits that no writer could tell from data.
 fn decl_type(physical: i32, converted: Option<i32>) -> Option<DeclType> {
     if let Some(c) = converted {
         match c {
@@ -115,6 +118,7 @@ fn decl_type(physical: i32, converted: Option<i32>) -> Option<DeclType> {
         p if p == ptype::INT64 => DeclType::Int64,
         p if p == ptype::FLOAT => DeclType::Float32,
         p if p == ptype::DOUBLE => DeclType::Float64,
+        p if p == ptype::BYTE_ARRAY => DeclType::Binary,
         _ => return None,
     })
 }
@@ -1494,6 +1498,14 @@ fn decode_plain(
             p if p == ptype::BYTE_ARRAY && *converted == Some(converted::JSON) => {
                 push_json_embedded(out, present, plain_byte_arrays(values, n)?)?
             }
+            // An *unannotated* `BYTE_ARRAY` is binary in Parquet's own model:
+            // text carries `UTF8`. Read as a UTF-8 string until 2026-08-21,
+            // which both rejected genuine binary ("string column has invalid
+            // utf-8") and gave the ones that happened to decode a `String`
+            // declaration no writer could tell from real text.
+            p if p == ptype::BYTE_ARRAY && converted.is_none() => {
+                push_json(out, present, plain_byte_arrays(values, n)?, JsonValue::Binary)
+            }
             p if p == ptype::BYTE_ARRAY => push_json_strings(out, present, plain_byte_arrays(values, n)?)?,
             p if p == ptype::FIXED_LEN_BYTE_ARRAY => {
                 let width = col.type_length.ok_or_else(|| {
@@ -1503,7 +1515,7 @@ fn decode_plain(
                 if *converted == Some(converted::DECIMAL) {
                     push_json_decimal_bytes(out, present, raw, col.scale)?
                 } else {
-                    push_json(out, present, raw, |b| JsonValue::String(to_hex(&b)))
+                    push_json(out, present, raw, JsonValue::Binary)
                 }
             }
             other => return Err(Error::Parquet(format!("unsupported physical type {other}"))),
@@ -1571,7 +1583,7 @@ fn decode_dict_indices(
 
 /// A plain `f64` JSON number.
 fn json_number(value: f64) -> JsonValue {
-    JsonValue::Number { value, is_int: false }
+    JsonValue::Float(value)
 }
 
 /// Push `values` into `out` at the present rows, inserting `Null` for the rest —
@@ -1616,12 +1628,13 @@ fn emit_ints(out: &mut Vec<JsonValue>, converted: Option<i32>, present: &Present
         });
     } else {
         let mask = unsigned_mask(converted);
-        push_json(out, present, values, move |i| JsonValue::Number {
-            value: match mask {
-                Some(m) => (i as u64 & m) as f64,
-                None => i as f64,
-            },
-            is_int: true,
+        // Exactly, not through an `f64`: a Parquet `INT64` is 64-bit and a
+        // double carries only 53 bits of it.
+        push_json(out, present, values, move |i| {
+            JsonValue::Int(match mask {
+                Some(m) => (i as u64 & m) as i64,
+                None => i,
+            })
         });
     }
 }
@@ -2137,11 +2150,74 @@ fn format_timestamp(value: i64, subsecond_digits: u32) -> String {
     if frac != 0 {
         s.push_str(&format!(".{frac:0width$}", width = subsecond_digits as usize));
     }
+    // The UTC designator, because `TIMESTAMP_MILLIS`/`_MICROS` *are* UTC by
+    // definition — they count from the Unix epoch — and a bare
+    // `2019-05-01T12:00:00` is an unzoned local time, a different fact.
+    //
+    // Emitted since 2026-08-21. Without it a `gpkg -> parquet -> gpkg` round
+    // trip quietly turned an instant into a local time: GeoPackage stores
+    // `...Z` and got back a string with none, which GDAL then reported as
+    // `12:00:00` where the source said `12:00:00+00`. Caught by comparing
+    // ogrinfo's *values* rather than only its field types.
+    s.push('Z');
     s
 }
 
 #[cfg(test)]
 mod tests {
+    /// **Every Parquet annotation this reader accepts, and what it means.**
+    /// Third of the inbound tables (with `geopackage/reader.rs`'s SQL
+    /// spellings and `flatgeobuf/reader.rs`'s type codes), all written
+    /// 2026-08-21 after `REAL` showed what an unasserted mapping costs.
+    ///
+    /// The annotation matters more here than in the other two: a 16-bit column
+    /// is *physically* an `INT32` in Parquet, so the `converted_type` is the
+    /// only place its real width is written down. Lose the annotation and every
+    /// narrow integer silently becomes `Int32`.
+    #[test]
+    fn every_converted_type_declares_the_width_parquet_gives_it() {
+        use DeclType::*;
+        let cases: &[(i32, i32, DeclType)] = &[
+            (ptype::INT32, converted::INT_8, Int8),
+            (ptype::INT32, converted::UINT_8, UInt8),
+            (ptype::INT32, converted::INT_16, Int16),
+            (ptype::INT32, converted::UINT_16, UInt16),
+            (ptype::INT32, converted::INT_32, Int32),
+            (ptype::INT32, converted::UINT_32, UInt32),
+            (ptype::INT64, converted::INT_64, Int64),
+            (ptype::INT64, converted::UINT_64, UInt64),
+            (ptype::INT32, converted::DATE, Date),
+            (ptype::INT64, converted::TIMESTAMP_MILLIS, DateTime),
+            (ptype::INT64, converted::TIMESTAMP_MICROS, DateTime),
+            (ptype::BYTE_ARRAY, converted::JSON, Json),
+            (ptype::BYTE_ARRAY, converted::UTF8, String),
+        ];
+        for (physical, annotation, expected) in cases {
+            assert_eq!(
+                decl_type(*physical, Some(*annotation)),
+                Some(*expected),
+                "physical {physical} annotated {annotation}"
+            );
+        }
+
+        // Unannotated physical types fall back to their own width.
+        assert_eq!(decl_type(ptype::BOOLEAN, None), Some(Bool));
+        assert_eq!(decl_type(ptype::INT32, None), Some(Int32));
+        assert_eq!(decl_type(ptype::INT64, None), Some(Int64));
+        assert_eq!(decl_type(ptype::FLOAT, None), Some(Float32));
+        assert_eq!(decl_type(ptype::DOUBLE, None), Some(Float64));
+
+        // Unannotated BYTE_ARRAY is Parquet's own spelling of binary: text
+        // carries UTF8. Declined here until 2026-08-21, when it started
+        // decoding to real bytes instead of hex text.
+        assert_eq!(decl_type(ptype::BYTE_ARRAY, None), Some(Binary));
+
+        // And the two this reader still declines rather than guess at, both
+        // because it renders the value as *text*.
+        assert_eq!(decl_type(ptype::INT96, None), None, "rendered as text");
+        assert_eq!(decl_type(ptype::INT32, Some(converted::DECIMAL)), None, "scale not modelled");
+    }
+
     use super::*;
 
     #[test]
@@ -2212,12 +2288,12 @@ mod tests {
     fn formats_timestamps() {
         // 2020-01-01T00:00:00 in micros since epoch.
         let base = 18262i64 * 86_400 * 1_000_000;
-        assert_eq!(format_timestamp(base, 6), "2020-01-01T00:00:00");
-        assert_eq!(format_timestamp(base + 3_600_000_000, 6), "2020-01-01T01:00:00");
+        assert_eq!(format_timestamp(base, 6), "2020-01-01T00:00:00Z");
+        assert_eq!(format_timestamp(base + 3_600_000_000, 6), "2020-01-01T01:00:00Z");
         // Sub-second micros are rendered with six digits.
-        assert_eq!(format_timestamp(base + 123_456, 6), "2020-01-01T00:00:00.123456");
+        assert_eq!(format_timestamp(base + 123_456, 6), "2020-01-01T00:00:00.123456Z");
         // Milliseconds scale, three digits.
-        assert_eq!(format_timestamp(18262 * 86_400 * 1000 + 500, 3), "2020-01-01T00:00:00.500");
+        assert_eq!(format_timestamp(18262 * 86_400 * 1000 + 500, 3), "2020-01-01T00:00:00.500Z");
     }
 
     #[test]
@@ -2299,16 +2375,19 @@ mod tests {
     }
 
     #[test]
-    fn decode_plain_routes_plain_fixed_len_byte_array_to_hex() {
+    fn decode_plain_routes_plain_fixed_len_byte_array_to_bytes() {
         let mut col = test_col(ptype::FIXED_LEN_BYTE_ARRAY);
         col.type_length = Some(2);
         let mut out = ColumnSink::Json { out: Vec::new(), converted: None };
         let values = [0x00u8, 0x01, 0xAB, 0xFF]; // two 2-byte values
         decode_plain(&mut out, &col, &values, &Present::All(2), 2).unwrap();
         match out {
+            // Hex *text* until 2026-08-21; real bytes since, so a writer with
+            // a byte-level column can lay them down as data rather than as a
+            // string of hex digits.
             ColumnSink::Json { out, .. } => assert_eq!(
                 out,
-                vec![JsonValue::String("0001".into()), JsonValue::String("abff".into())]
+                vec![JsonValue::Binary(vec![0x00, 0x01]), JsonValue::Binary(vec![0xab, 0xff])]
             ),
             _ => unreachable!(),
         }

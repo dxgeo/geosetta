@@ -244,12 +244,12 @@ GeoParquet keeps them structured.
 *** GeoPackage -- /measured/ + /code/
 Two levels, and decision 2a put both in scope.
 
-*Layer level:*
+*Layer level:* /all three carried as of 2026-08-21 -- see § GeoPackage spoke./
 | member                                   | class    | note |
 |------------------------------------------+----------+------|
 | declared column type (=BOOLEAN=)          | *modelled* | ~~defect 2~~ *FIXED 2026-08-20 (M4)*: reclassified opaque -> modelled, then implemented -- the reader parses the DDL's declared type and the writer emits one, so a =BOOLEAN= survives its own format |
-| =gpkg_contents.identifier= / =description=| identity | |
-| =gpkg_data_columns= / constraints         | opaque   | |
+| =gpkg_contents.identifier= / =description=| identity | *DONE 2026-08-21*: carried on =GpkgNative=, but only when they say something the layer name and the writer's own defaults do not |
+| =gpkg_data_columns= / constraints         | opaque   | *DONE 2026-08-21*: carried per layer, rows re-emitted for columns that still exist |
 
 *Container level* /(measured)/ -- a =.gpkg= with two layers, a user table,
 dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
@@ -259,7 +259,7 @@ dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
 | =side_notes= (plain user table)  | *no*      | opaque |
 | =gpkg_metadata= / =_reference=   | *no*      | opaque |
 | =gpkg_extensions=                | *no*      | opaque |
-| =gpkg_data_columns= (+constraints)| *no*     | opaque |
+| =gpkg_data_columns= (+constraints)| *yes*, since 2026-08-21 | opaque, but *layer* content -- its rows are keyed by =(table_name, column_name)=, so the spoke carries them and this table is not M3b's after all |
 | =gpkg_ogr_contents=              | *no*      | derived-capability |
 | R*Tree tables + triggers (8)     | *no*      | derived-capability |
 | =gpkg_tile_matrix= / =_set=      | *no*      | the § collision -- raster |
@@ -268,6 +268,89 @@ dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
 =--rtree= rebuilds the indexes for every layer and the result passes
 =rtreecheck()= /(measured)/, so the derived-capability half needs a trigger,
 not machinery.
+
+*** A discard the table missed entirely -- blob *values*, 2026-08-21
+Every entry above answers "what does this reader fail to *model*". None asked
+what a reader fails to *carry*, and that is where the worst loss in this
+document was hiding: =geopackage/reader.rs= mapped =Value::Blob(_)= to
+=JsonValue::Null=, so **a =gpkg -> gpkg= run destroyed every blob in the file**
+while its =BLOB= declaration survived intact. FlatGeobuf skipped the payload
+and yielded =Null= too; GeoParquet rendered hex text.
+
+All three were *correct given the IR*: its property type is =JsonValue=, so
+bytes had nowhere to live, and all three then rightly declined to *declare*
+=Binary= -- a declaration whose values are destroyed is a promise the value
+side cannot keep. The fix was the IR (=JsonValue::Binary=), not the spokes.
+
+*The lesson for this document:* an inventory of unmodelled *members* does not
+catch a destroyed *value*. The same blind spot appeared in the test suite the
+same day -- see =same-format-fidelity.org= § The blob the schema check could
+not see.
+
+*** The IR's own discards -- 2026-08-21
+Not a spoke's, so they belong outside the table. Both were found by pulling on
+entries above, and both are now closed:
+- *Bytes had no value type.* Above.
+- *Integers went through an =f64=.* =JsonValue::Number= was a double plus an
+  =is_int= flag, so a *same-format* run turned =9007199254740993= into =...992=
+  on a plain 64-bit column, and anything past =i64::MAX= saturated to
+  =i64::MAX=. Now =Int(i64)= / =Float(f64)=.
+
+  *One case remains and is inherent*: a column mixing a large integer with a
+  fractional value infers =Double=, and the integer loses its low bits. Fixture
+  =hand_mixed_number.geojson=; the open call is whether it warrants a warning,
+  recorded in =lossy-conversion-warnings.org=.
+
+*** GeoPackage spoke -- DONE 2026-08-21
+=GpkgNative= (=src/native.rs=) carries =gpkg_contents.identifier= and
+=description= plus the layer's =gpkg_data_columns= rows and the
+=gpkg_data_column_constraints= they name. /Measured/ on =gdal_hostile.gpkg=,
+extended for this spoke (see =tests/fixtures/HOSTILE.org=): a =gpkg -> gpkg=
+run now preserves the title =Bykerne — København og Zürich=, the description,
+both column rows and the =price_range= domain -- and *=ogrinfo= reads all of it
+back off our output*, reporting the same alternative names, comments and
+domain, with =ogr2ogr= able to rewrite the result.
+
+*Two members carried conditionally, which is the ruling this spoke adds.* Both
+are cases where the *default the writer already produces* is indistinguishable
+from the source, so carrying them would be recording the absence of content:
+- =identifier= is dropped when it equals the table name. GDAL writes that for
+  every layer it creates, so keeping it would put a payload on essentially
+  every GeoPackage in existence, make =is_empty= permanently false, and -- the
+  part that is a bug rather than noise -- *replay a stale title into a layer
+  that had since been renamed*. An identifier equal to the layer name is
+  *derived* under D4 and regenerated.
+- =description= is dropped when empty. =ogr2ogr= writes ='' = (not NULL), and
+  so does this writer.
+
+  *This deliberately does not follow =FgbNative='s "absent and empty are
+  different" rule*, and the difference is worth stating because the next spoke
+  will meet it: that rule holds for FlatGeobuf because its writer *omits* an
+  absent field, so the distinction survives into the file. =gpkg_contents= is a
+  row that is always written, so NULL and ='' = produce the same bytes and the
+  distinction has nowhere to live.
+
+*The constraints are container-scoped on disk but carried per layer*, because a
+constraint no data column refers to describes nothing. Two layers sharing one
+therefore each carry a copy, and the writer de-duplicates on the way out. A
+=gpkg_data_columns= row whose column no longer exists is dropped on write --
+decision 14's "an opaque member can also be derived", second instance, since
+GDAL would otherwise report an alias on a field that is not there.
+
+*A bug found by measuring rather than by reading the code.* The round trip
+turned =price REAL= into =price FLOAT=: =decl_type= grouped =REAL= with =FLOAT=
+as =Float32=, but =REAL= is 64-bit in both the GeoPackage spec's table 1 and
+SQLite's storage classes. GDAL made it visible -- =Real (0.0)= going in,
+=Real(Float32) (0.0)= coming out -- on a *same-format* run. It is defect 5's
+shape in one more spelling, and it was sitting inside work M4 had already
+declared complete; nothing but running the file through and comparing the two
+=ogrinfo= outputs would have surfaced it. /Fixed 2026-08-21./
+
+*Still not carried, and deliberately:* everything at container level below,
+which is M3b's. The two Schema-extension tables are the exception that proves
+the split -- they *live* in container-scoped tables but their rows are keyed by
+=(table_name, column_name)=, so they are layer content and travel with the
+layer.
 
 *** KML / KMZ -- /code/, traced; =kml/reader.rs=
 Upgraded from /unverified/ to /code/ by tracing the reader rather than listing
@@ -344,15 +427,27 @@ re-deriving. Re-measured on =tests/fixtures/gdal_hostile.shp= (=ogr2ogr='s own
 output, declaring =String (80.0)= against values 6 and 10 bytes long, so the 80
 cannot have come from the rows):
 
-| route                              | =name=        | =price=      |
-|------------------------------------+---------------+--------------|
-| source                             | String (80.0) | Real (24.15) |
-| =shp -> fgb -> shp=                | String (80.0) | Real (24.15) |
-| =shp -> geojson -> shp=            | String (10.0) | Real (9.6)   |
-| =shp -> gpkg -> shp=               | String (10.0) | Real (9.6)   |
+| route                              | =name=        | =price=       |
+|------------------------------------+---------------+---------------|
+| source                             | String (80.0) | Real (24.15)  |
+| =shp -> fgb -> shp=                | String (80.0) | Real (24.15)  |
+| =shp -> geojson -> shp=            | String (10.0) | Real (18.15)  |
+| =shp -> gpkg -> shp=               | String (10.0) | Real (18.15)  |
 
 All /measured/ via =ogrinfo -so=. The FGB row is better than =ogr2ogr='s own,
 which reformats =24.15= to =23.15= on the same hop.
+
+/The two carrier-less rows read =Real (9.6)= until 2026-08-21, and the change
+is the =DECIMALS= fallback going 6 → 15 (see the handoff's number-model entry).
+Worth reading precisely, because the remaining loss is smaller than it looks:
+the *scale* now survives a route with no schema carrier -- it is re-derived
+rather than carried, but re-derived to the same 15 -- and so do the **values**.
+=1.50= and =22.25= come back byte-identical as =1.500000000000000= and
+=22.250000000000000= on all three routes, where the old fallback re-rendered
+them at six decimals. What still narrows on the two carrier-less rows is the
+field *width*, which is measured from the rows: =24= against =18=. That is the
+schema-contract loss this section is about and it is unchanged; the lexeme loss
+beside it is gone./
 
 *Two rules the writer follows, and the second is not obvious.* The declaration
 is a *floor, never a ceiling* -- a declared 80 beats a data-derived 1, but a

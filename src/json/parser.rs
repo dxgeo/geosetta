@@ -91,8 +91,9 @@ impl<'a> Parser<'a> {
     /// distinction the [`JsonValue`] number keeps).
     pub(crate) fn parse_f64(&mut self) -> Result<f64> {
         match self.parse_number()? {
-            JsonValue::Number { value, .. } => Ok(value),
-            _ => unreachable!("parse_number yields a Number"),
+            JsonValue::Int(n) => Ok(n as f64),
+            JsonValue::Float(v) => Ok(v),
+            _ => unreachable!("parse_number yields a number"),
         }
     }
 
@@ -259,11 +260,18 @@ impl<'a> Parser<'a> {
         }
         let text = std::str::from_utf8(&self.bytes[start..self.pos])
             .map_err(|_| self.err("invalid number"))?;
+        // An integer token goes straight to `i64` without touching an `f64`,
+        // so a value past 2^53 survives the parse. One too wide for an `i64`
+        // falls through to `Float`: lossy, but honestly lossy — the old model
+        // saturated `as i64` and produced `i64::MAX`, a different integer.
+        if is_int && let Ok(n) = text.parse::<i64>() {
+            return Ok(JsonValue::Int(n));
+        }
         let value: f64 = text.parse().map_err(|_| Error::Json {
             offset: start,
             message: "invalid number".to_string(),
         })?;
-        Ok(JsonValue::Number { value, is_int })
+        Ok(JsonValue::Float(value))
     }
 
     /// Parse a JSON string, with the opening quote at the cursor.
@@ -366,20 +374,33 @@ mod tests {
 
     #[test]
     fn distinguishes_int_and_float() {
-        match parse("42").unwrap() {
-            JsonValue::Number { value, is_int } => {
-                assert_eq!(value, 42.0);
-                assert!(is_int);
-            }
-            _ => panic!(),
-        }
-        match parse("-3.5e2").unwrap() {
-            JsonValue::Number { value, is_int } => {
-                assert_eq!(value, -350.0);
-                assert!(!is_int);
-            }
-            _ => panic!(),
-        }
+        assert_eq!(parse("42").unwrap(), JsonValue::Int(42));
+        assert_eq!(parse("-3.5e2").unwrap(), JsonValue::Float(-350.0));
+    }
+
+    /// The reason the number model was split (2026-08-21): an `f64` carries
+    /// integers exactly only to 2^53, so routing every JSON integer through one
+    /// silently changed values that every format in this crate can hold.
+    #[test]
+    fn a_large_integer_parses_exactly() {
+        // 2^53 + 1: the first integer an f64 cannot represent.
+        assert_eq!(parse("9007199254740993").unwrap(), JsonValue::Int(9007199254740993));
+        assert_eq!(parse("-9223372036854775808").unwrap(), JsonValue::Int(i64::MIN));
+        assert_eq!(parse("9223372036854775807").unwrap(), JsonValue::Int(i64::MAX));
+    }
+
+    /// An integer too wide for an `i64` is `Float` — lossy, but never a
+    /// *different* integer. The old model's `as i64` saturated, so
+    /// `12345678901234567890` was written back as `9223372036854775807`.
+    #[test]
+    fn an_integer_too_wide_for_i64_falls_back_to_float_rather_than_saturating() {
+        let v = parse("12345678901234567890").unwrap();
+        assert!(matches!(v, JsonValue::Float(_)), "{v:?}");
+        // Near the true value rather than clamped to a boundary. (Casting the
+        // f64 to an i64 *would* saturate — which is exactly why the value must
+        // not be carried as one.)
+        assert!((v.as_f64().unwrap() - 1.234_567_890_123_456_8e19).abs() < 1e4);
+        assert_eq!(v.as_i64(), None, "a float must not masquerade as an exact integer");
     }
 
     #[test]

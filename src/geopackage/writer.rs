@@ -8,6 +8,8 @@ use crate::error::Result;
 use crate::feature::FeatureCollection;
 use crate::geometry::{to_wkb, Bbox, Geometry};
 use crate::schema::{columns_for, Cell, Column, ColumnType, DeclType};
+use crate::format::Format;
+use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
 use crate::sqlite::{MasterEntry, TableSpec, Value, write_database};
 
 use super::reader::read_layers;
@@ -70,6 +72,11 @@ fn build(layers: &[(String, FeatureCollection)], rtree: bool, envelope: bool) ->
     if !extension_rows.is_empty() {
         specs.push(extensions_table(extension_rows));
     }
+    // The Schema extension's two tables, replayed from the layers' natives.
+    // Written only when some layer carried rows: an empty `gpkg_data_columns`
+    // is not something a producer would have left behind, and D3 says a spoke
+    // that recovered nothing writes nothing.
+    specs.extend(schema_extension_tables(layers));
     for ((name, fc), &srs_id) in layers.iter().zip(&srs.per_layer) {
         specs.push(feature_table(name, fc, srs_id, envelope));
     }
@@ -98,6 +105,125 @@ pub(crate) struct ExtensionRow {
     pub(crate) extension_name: String,
     pub(crate) definition: String,
     pub(crate) scope: String,
+}
+
+/// This layer's GeoPackage payload, if it carried one. `None` for every
+/// collection that came from another format — the tag check in
+/// [`crate::Native::payload_for`] is what makes a cross-format run drop it
+/// rather than replay someone else's members.
+fn gpkg_native(fc: &FeatureCollection) -> Option<&GpkgNative> {
+    match fc.native.as_ref()?.payload_for(Format::Gpkg)? {
+        NativePayload::Gpkg(native) => Some(native),
+        // The tag matched, so this is unreachable unless a second GeoPackage
+        // payload variant is added without updating this arm.
+        _ => None,
+    }
+}
+
+/// `gpkg_data_columns` and `gpkg_data_column_constraints`, rebuilt from every
+/// layer's payload. Empty when no layer carried either.
+///
+/// Constraints are carried *per layer* (a layer that names one keeps its own
+/// copy) but the table is container-scoped, so identical rows shared by two
+/// layers are de-duplicated here on the way out. Rows describing a column the
+/// layer no longer has are dropped: this is the same "an opaque member can
+/// also be derived" ruling decision 14 made for `ARROW:schema`, since a
+/// dangling `gpkg_data_columns` row is a description of nothing and GDAL
+/// surfaces it as an alias on a field that is not there.
+fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableSpec> {
+    let mut columns: Vec<(String, GpkgDataColumn)> = Vec::new();
+    let mut constraints: Vec<GpkgConstraint> = Vec::new();
+    for (name, fc) in layers {
+        let Some(native) = gpkg_native(fc) else { continue };
+        let present = columns_for(fc);
+        for column in &native.data_columns {
+            if present.iter().any(|c| c.name == column.column_name) {
+                columns.push((name.clone(), column.clone()));
+            }
+        }
+        for constraint in &native.constraints {
+            if !constraints.contains(constraint) {
+                constraints.push(constraint.clone());
+            }
+        }
+    }
+    // A constraint whose every referring column was dropped above describes
+    // nothing, and would be a row GDAL reports as an unused domain.
+    constraints.retain(|constraint| {
+        columns.iter().any(|(_, column)| {
+            column.constraint_name.as_deref() == Some(constraint.constraint_name.as_str())
+        })
+    });
+    if columns.is_empty() && constraints.is_empty() {
+        return Vec::new();
+    }
+
+    let mut specs = vec![TableSpec {
+        name: "gpkg_data_columns".into(),
+        // No PRIMARY KEY, for the reason `gpkg_contents` gives: a key here
+        // would need an auto-index this writer does not build.
+        sql: "CREATE TABLE gpkg_data_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, name TEXT, title TEXT, description TEXT, mime_type TEXT, constraint_name TEXT)".into(),
+        rows: columns
+            .into_iter()
+            .enumerate()
+            .map(|(i, (table, column))| {
+                (
+                    (i + 1) as i64,
+                    vec![
+                        Value::Text(table),
+                        Value::Text(column.column_name),
+                        text_or_null(column.name),
+                        text_or_null(column.title),
+                        text_or_null(column.description),
+                        text_or_null(column.mime_type),
+                        text_or_null(column.constraint_name),
+                    ],
+                )
+            })
+            .collect(),
+    }];
+    if !constraints.is_empty() {
+        specs.push(TableSpec {
+            name: "gpkg_data_column_constraints".into(),
+            sql: "CREATE TABLE gpkg_data_column_constraints (constraint_name TEXT NOT NULL, constraint_type TEXT NOT NULL, value TEXT, min NUMERIC, min_is_inclusive BOOLEAN, max NUMERIC, max_is_inclusive BOOLEAN, description TEXT)".into(),
+            rows: constraints
+                .into_iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    (
+                        (i + 1) as i64,
+                        vec![
+                            Value::Text(c.constraint_name),
+                            Value::Text(c.constraint_type),
+                            text_or_null(c.value),
+                            number_or_null(c.min),
+                            bool_or_null(c.min_is_inclusive),
+                            number_or_null(c.max),
+                            bool_or_null(c.max_is_inclusive),
+                            text_or_null(c.description),
+                        ],
+                    )
+                })
+                .collect(),
+        });
+    }
+    specs
+}
+
+/// An absent optional member is a NULL cell, not an empty string: the reader
+/// distinguishes them and so must the writer.
+fn text_or_null(value: Option<String>) -> Value {
+    value.map_or(Value::Null, Value::Text)
+}
+
+fn number_or_null(value: Option<f64>) -> Value {
+    value.map_or(Value::Null, Value::Real)
+}
+
+/// GeoPackage `BOOLEAN` is `INTEGER` 0/1 — the same storage M4's declared-type
+/// work reads back as a boolean.
+fn bool_or_null(value: Option<bool>) -> Value {
+    value.map_or(Value::Null, |b| Value::Int(b.into()))
 }
 
 fn extensions_table(rows: Vec<ExtensionRow>) -> TableSpec {
@@ -258,13 +384,24 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) 
         .enumerate()
         .map(|(i, ((name, fc), &srs_id))| {
             let (minx, miny, maxx, maxy) = bbox(fc);
+            let native = gpkg_native(fc);
+            // The layer's own title and description when it recorded any; the
+            // layer name and an empty string otherwise, which is what GDAL
+            // writes for a layer created without them. An identifier equal to
+            // the name is not carried at all (see `GpkgNative`), so this
+            // regenerates it and a rename stays consistent.
+            let identifier = native
+                .and_then(|n| n.identifier.clone())
+                .unwrap_or_else(|| name.clone());
+            let description =
+                native.and_then(|n| n.description.clone()).unwrap_or_default();
             (
                 (i + 1) as i64,
                 vec![
                     Value::Text(name.clone()),
                     Value::Text("features".into()),
-                    Value::Text(name.clone()),
-                    Value::Text(String::new()),
+                    Value::Text(identifier),
+                    Value::Text(description),
                     Value::Text(LAST_CHANGE.into()),
                     minx,
                     miny,
@@ -448,6 +585,35 @@ fn bbox(fc: &FeatureCollection) -> (Value, Value, Value, Value) {
     }
 }
 
+/// The GeoPackage spelling for a declared type, split out from
+/// [`sqlite_type`] so the reader's tests can assert the two directions agree
+/// without constructing a [`Column`] — see
+/// `every_declared_type_is_written_with_a_spelling_that_reads_back_wide_enough`.
+pub(super) fn sql_type_for(d: DeclType) -> &'static str {
+    match d {
+        DeclType::Bool => "BOOLEAN",
+        // GeoPackage has no unsigned type, so each unsigned width is
+        // written as the *next signed width up* — the one that admits its
+        // whole range. Pairing them with the same-width signed spelling
+        // (`UInt32` as `MEDIUMINT`) was a silent narrowing: the value
+        // survived SQLite's dynamic typing, but the declaration was a lie
+        // and GDAL read 3000000000 back as -1294967296. Found 2026-08-21 by
+        // the recast matrix; `Format::recast` states the result and
+        // `every_declared_type_survives_or_is_admitted` pins it.
+        DeclType::Int8 => "TINYINT",
+        DeclType::UInt8 | DeclType::Int16 => "SMALLINT",
+        DeclType::UInt16 | DeclType::Int32 => "MEDIUMINT",
+        DeclType::UInt32 | DeclType::Int64 | DeclType::UInt64 => "INTEGER",
+        DeclType::Float32 => "FLOAT",
+        DeclType::Float64 => "DOUBLE",
+        DeclType::String => "TEXT",
+        DeclType::Json => "JSON",
+        DeclType::DateTime => "DATETIME",
+        DeclType::Date => "DATE",
+        DeclType::Binary => "BLOB",
+    }
+}
+
 /// The SQL type to declare a column as: what the source declared, when that
 /// still describes the data, else what the values inferred.
 ///
@@ -456,26 +622,14 @@ fn bbox(fc: &FeatureCollection) -> (Value, Value, Value, Value) {
 /// a spelling this format actually sanctions.
 fn sqlite_type(col: &Column) -> &'static str {
     if let Some(d) = col.declared_type() {
-        return match d {
-            DeclType::Bool => "BOOLEAN",
-            DeclType::Int8 | DeclType::UInt8 => "TINYINT",
-            DeclType::Int16 | DeclType::UInt16 => "SMALLINT",
-            DeclType::Int32 | DeclType::UInt32 => "MEDIUMINT",
-            DeclType::Int64 | DeclType::UInt64 => "INTEGER",
-            DeclType::Float32 => "FLOAT",
-            DeclType::Float64 => "DOUBLE",
-            DeclType::String => "TEXT",
-            DeclType::Json => "JSON",
-            DeclType::DateTime => "DATETIME",
-            DeclType::Date => "DATE",
-            DeclType::Binary => "BLOB",
-        };
+        return sql_type_for(d);
     }
     match col.ty {
         ColumnType::Bool => "BOOLEAN",
         ColumnType::Int64 => "INTEGER",
         ColumnType::Double => "REAL",
         ColumnType::String => "TEXT",
+        ColumnType::Binary => "BLOB",
     }
 }
 
@@ -486,6 +640,7 @@ fn cell_to_value(cell: &Cell) -> Value {
         Cell::Int(n) => Value::Int(*n),
         Cell::Double(d) => Value::Real(*d),
         Cell::Str(s) => Value::Text(s.clone()),
+        Cell::Bytes(b) => Value::Blob(b.clone()),
     }
 }
 
@@ -515,7 +670,7 @@ mod tests {
                 geometry: point(1.0, 2.0),
                 properties: vec![
                     ("name".into(), JsonValue::String("a".into())),
-                    ("n".into(), JsonValue::Number { value: 5.0, is_int: true }),
+                    ("n".into(), JsonValue::Int(5)),
                 ],
                 native: None,
             },
@@ -563,7 +718,7 @@ mod tests {
     fn an_edit_loop_that_deletes_a_feature_does_not_duplicate_the_layer() {
         let feature = |n: f64| Feature {
             geometry: point(n, n),
-            properties: vec![("id".into(), JsonValue::Number { value: n, is_int: true })],
+            properties: vec![("id".into(), JsonValue::Int((n) as i64))],
             native: None,
         };
         let original = fc(vec![feature(1.0), feature(2.0), feature(3.0)]);

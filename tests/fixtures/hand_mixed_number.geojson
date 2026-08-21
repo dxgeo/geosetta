@@ -1,0 +1,1 @@
+{"type":"FeatureCollection","features":[{"type":"Feature","geometry":{"type":"Point","coordinates":[12.5683,55.6761]},"properties":{"mixed":9007199254740993,"pure_int":9007199254740993,"note":"int past 2^53"}},{"type":"Feature","geometry":{"type":"Point","coordinates":[8.5417,47.3769]},"properties":{"mixed":1.5,"pure_int":9007199254740995,"note":"fractional, same column"}}]}

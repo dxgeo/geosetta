@@ -191,8 +191,20 @@ fn decode_field(field: &Field, raw: &[u8], encoding: Encoding, cpg_declared: boo
             let text = std::str::from_utf8(raw).unwrap_or("").trim();
             match text.is_empty() {
                 true => JsonValue::Null,
+                // `decimals == 0` is dBase's only signal that a numeric
+                // field is an integer, so parse it as one — text straight to
+                // `i64`, never via an `f64`, so a 19-digit key stays itself.
+                false if field.decimals == 0 => match text.parse::<i64>() {
+                    Ok(n) => JsonValue::Int(n),
+                    // Too wide for an `i64`, or not an integer after all:
+                    // fall back rather than invent a value.
+                    Err(_) => match text.parse::<f64>() {
+                        Ok(v) => JsonValue::Float(v),
+                        Err(_) => JsonValue::Null,
+                    },
+                },
                 false => match text.parse::<f64>() {
-                    Ok(v) => JsonValue::Number { value: v, is_int: field.decimals == 0 },
+                    Ok(v) => JsonValue::Float(v),
                     Err(_) => JsonValue::Null, // e.g. an overflow-marker field of '*'s
                 },
             }
@@ -416,11 +428,44 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
             // here used to silently desync every field/row after this one).
             // Only the *lower* bound is clamped, to cover an empty/all-null
             // column.
-            const DECIMALS: usize = 6;
+            // What `ogr2ogr` writes for an undeclared double: a `.dbf` field
+            // of `Real (24.15)`. Was 6 until 2026-08-21, which silently rounded
+            // `1.23456789012345` to `1.234568` — no warning, and no reason
+            // beyond the number having been picked first. Fifteen is also about
+            // as many decimal digits as an `f64` carries meaningfully, so it is
+            // the reference implementation's answer *and* the representation's.
+            //
+            // Only the fallback: a source that declared a scale still wins,
+            // just below.
+            const DECIMALS: usize = 15;
             // A declared scale replaces the fallback *before* the widths are
             // measured, since the decimal count is what the formatted width is
             // measured against.
             let decimals = decl.and_then(|d| d.scale).map(|s| s as usize).unwrap_or(DECIMALS);
+            // A huge magnitude needs its *integer* digits and has no room for
+            // fractional ones: `1e240` is 241 characters before the decimal
+            // point, and an `f64` carries about 17 significant digits total, so
+            // every one of those decimals is padding. Trim the fallback until
+            // the widest value fits dBase's 255 bytes rather than refusing a
+            // file over digits that were never information.
+            //
+            // Only the *fallback* is trimmed — a declared scale is the source
+            // stating a fact, and is left alone to fail loudly below if it
+            // cannot fit.
+            let integer_digits = col
+                .values
+                .iter()
+                .filter_map(|c| match c {
+                    Cell::Double(v) => Some(format!("{v:.0}").len()),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(1);
+            let decimals = match decl.and_then(|d| d.scale) {
+                Some(_) => decimals,
+                // 255 = integer digits + '.' + decimals.
+                None => decimals.min(255usize.saturating_sub(integer_digits + 1)),
+            };
             let len = col
                 .values
                 .iter()
@@ -445,7 +490,11 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
             let len = declared_or(decl.and_then(|d| d.precision), len).min(255);
             Ok(DbfField { name, ty: b'N', len, decimals })
         }
-        ColumnType::String => {
+        // dBase has no byte-level field type — GDAL's shapefile driver has no
+        // OFTBinary either — so bytes land in a character field as the hex the
+        // rest of the crate renders them with. The declaration is a genuine
+        // capability gap and `decl_recast_warning` says so.
+        ColumnType::Binary | ColumnType::String => {
             // Sized to the longest observed UTF-8 byte length, capped at DBF's
             // 255-byte field-width limit. Longer values are truncated on write
             // (at a char boundary) — an accepted, documented gap (unlike the
@@ -520,6 +569,42 @@ fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
 
 #[cfg(test)]
 mod tests {
+    /// **Every `.dbf` field type this reader accepts, and what it means.**
+    /// Last of the four inbound tables (see `geopackage/reader.rs`,
+    /// `flatgeobuf/reader.rs`, `parquet/reader.rs`), all written 2026-08-21.
+    ///
+    /// dBase is the narrowest vocabulary of the four — one numeric field type,
+    /// disambiguated only by `decimals` — so this table is short and the
+    /// *widening* it forces is the point: an `Int16` column written here comes
+    /// back `Int64`, which is correct, and `Format::recast` says so.
+    #[test]
+    fn every_dbf_field_type_declares_what_dbase_gives_it() {
+        use crate::schema::DeclType::*;
+        // A one-field `.dbf` header, so field types this crate's own writer
+        // never emits (`F`, `M`) are still covered — the round-trip sweep in
+        // `convert.rs` can only reach the ones we write.
+        let decl_of = |ty: u8, decimals: u8| {
+            let mut data = vec![0u8; HEADER_LEN];
+            let mut desc = vec![0u8; FIELD_DESCRIPTOR_LEN];
+            desc[0] = b'v';
+            desc[11] = ty;
+            desc[16] = 10; // length
+            desc[17] = decimals;
+            data.extend_from_slice(&desc);
+            data.push(FIELD_TERMINATOR);
+            read_schema(&data).unwrap()[0].ty
+        };
+        assert_eq!(decl_of(b'L', 0), Some(Bool));
+        assert_eq!(decl_of(b'D', 0), Some(Date));
+        assert_eq!(decl_of(b'C', 0), Some(String));
+        // `decimals == 0` is the only thing separating an integer column from a
+        // fractional one: dBase stores both as decimal text.
+        assert_eq!(decl_of(b'N', 0), Some(Int64));
+        assert_eq!(decl_of(b'N', 2), Some(Float64));
+        assert_eq!(decl_of(b'F', 0), Some(Float64), "F is floating whatever its decimals");
+        assert_eq!(decl_of(b'M', 0), None, "a memo field declares nothing");
+    }
+
     use super::*;
     use crate::schema::infer_columns;
     use crate::feature::Feature;
@@ -609,7 +694,7 @@ mod tests {
 
     #[test]
     fn a_declared_scale_sets_the_numeric_field_s_decimals() {
-        let feats = features(&[&[("price", JsonValue::Number { value: 1.5, is_int: false })]]);
+        let feats = features(&[&[("price", JsonValue::Float(1.5))]]);
         let mut columns = infer_columns(&feats);
         columns[0].decl =
             Some(FieldDecl { name: "price".into(), precision: Some(24), scale: Some(15), ..FieldDecl::default() });
@@ -618,7 +703,7 @@ mod tests {
         assert_eq!((d.precision, d.scale), (Some(24), Some(15)));
         assert_eq!(
             read(&bytes, Encoding::Utf8, true).unwrap()[0].properties[0].1,
-            JsonValue::Number { value: 1.5, is_int: false }
+            JsonValue::Float(1.5)
         );
     }
 
@@ -636,14 +721,14 @@ mod tests {
         let feats = features(&[
             &[
                 ("name", JsonValue::String("Alice".into())),
-                ("age", JsonValue::Number { value: 30.0, is_int: true }),
-                ("score", JsonValue::Number { value: 1.5, is_int: false }),
+                ("age", JsonValue::Int(30)),
+                ("score", JsonValue::Float(1.5)),
                 ("active", JsonValue::Bool(true)),
             ],
             &[
                 ("name", JsonValue::String("Bob".into())),
-                ("age", JsonValue::Number { value: -5.0, is_int: true }),
-                ("score", JsonValue::Number { value: -2.25, is_int: false }),
+                ("age", JsonValue::Int(-5)),
+                ("score", JsonValue::Float(-2.25)),
                 ("active", JsonValue::Bool(false)),
             ],
         ]);
@@ -669,7 +754,7 @@ mod tests {
     #[test]
     fn null_cells_round_trip_as_null() {
         let feats = features(&[
-            &[("a", JsonValue::Number { value: 1.0, is_int: true })],
+            &[("a", JsonValue::Int(1))],
             &[], // "a" missing -> Null
         ]);
         let columns = infer_columns(&feats);
@@ -755,7 +840,7 @@ mod tests {
         // but doesn't truncate, so this used to silently emit more bytes
         // than the field's declared width, desyncing every field/row after
         // it. Now a clear error instead.
-        let feats = features(&[&[("v", JsonValue::Number { value: 1e300, is_int: false })]]);
+        let feats = features(&[&[("v", JsonValue::Float(1e300))]]);
         let columns = infer_columns(&feats);
         let msg = match write(&columns) {
             Ok(_) => panic!("an oversized numeric value should error rather than corrupt the file"),
@@ -770,7 +855,7 @@ mod tests {
         // epoch-nanoseconds timestamp — should round-trip exactly, not just
         // avoid erroring. Confirms the raised cap (32 -> 255) actually fixed
         // the realistic case, not just widened the error threshold.
-        let feats = features(&[&[("v", JsonValue::Number { value: 123_456_789_012.5, is_int: false })]]);
+        let feats = features(&[&[("v", JsonValue::Float(123_456_789_012.5))]]);
         let columns = infer_columns(&feats);
         let (bytes, warnings) = write(&columns).unwrap();
         assert!(warnings.is_empty());

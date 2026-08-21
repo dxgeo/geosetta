@@ -46,7 +46,7 @@ Empirically confirmed this session:
   'x.parquet' (FORMAT PARQUET)= produces a real =geo= metadata block naming
   both columns, each an ordinary =BYTE_ARRAY= WKB column (no
   dictionary/logical-type wrinkle at small scale). Fixture:
-  =tests/fixtures/duckdb_multi_geometry.parquet= (not yet committed).
+  =tests/fixtures/duckdb_multi_geometry.parquet=.
 - *GDAL's Parquet driver* (3.13.2) does *not* support writing more than one
   geometry column — confirmed by feeding =ogr2ogr -f Parquet= an OGR VRT
   layer with two =<GeometryField>= elements (VRT itself represents this
@@ -59,7 +59,7 @@ Empirically confirmed this session:
 - *pyarrow* has no geometry concept at all — a multi-geometry-column
   pyarrow file can only be produced by hand-authoring the =geo= key/value
   metadata over real WKB byte columns (fixture:
-  =tests/fixtures/pyarrow_multi_geometry.parquet=, not yet committed) — the
+  =tests/fixtures/pyarrow_multi_geometry.parquet=) — the
   same technique =arbitrary-geoparquet.org='s 6b section anticipated needing.
 
 *** Current behavior (as of this session)
@@ -244,8 +244,10 @@ Neither blocks M1–M4; both are additive CLI sugar on top of the IR the
 earlier milestones establish.
 
 ** TESTING
-- Fixtures already generated and DuckDB-oracle-verified this session (real
-  round trip through =ST_AsText=), not yet committed:
+- Fixtures, generated and DuckDB-oracle-verified (real round trip through
+  =ST_AsText=). /Committed in =028314a=; this section said "not yet committed"
+  until 2026-08-21, which is the kind of pending-state claim that goes stale
+  the moment it is written./
   - =tests/fixtures/duckdb_multi_geometry.parquet= — real, unmodified
     DuckDB spatial-extension output, 3 rows, a =LineString= in the primary
     column, a null in the second column's middle row.

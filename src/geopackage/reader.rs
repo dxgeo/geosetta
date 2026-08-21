@@ -5,6 +5,8 @@ use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::from_wkb;
 use crate::json::JsonValue;
+use crate::format::Format;
+use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, Native, NativePayload};
 use crate::schema::{DeclType, FieldDecl};
 use crate::sqlite::{Database, Table, Value};
 use std::rc::Rc;
@@ -20,6 +22,13 @@ pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
     // table; gpkg_spatial_ref_sys defines each SRS.
     let geom_columns = geometry_columns(&db, &tables)?;
     let srs = spatial_ref_systems(&db, &tables)?;
+
+    // The layer-level unmodelled members (M3's GeoPackage spoke): the
+    // `gpkg_contents` title/description and the `gpkg_data_columns` rows. Both
+    // tables are read once for the whole file rather than per layer.
+    let contents_meta = contents_metadata(&db, &tables)?;
+    let data_columns = data_columns(&db, &tables)?;
+    let constraints = data_column_constraints(&db, &tables)?;
 
     let mut layers = Vec::new();
     for name in feature_tables {
@@ -39,6 +48,7 @@ pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
         // table called `layer` and leaves the pre-edit features standing in the
         // original — see `plans/edit-composability.org` D4.
         fc.name = Some(name.clone());
+        fc.native = layer_native(&name, &contents_meta, &data_columns, &constraints);
         layers.push((name, fc));
     }
     Ok(layers)
@@ -180,8 +190,15 @@ fn decl_type(sql: &str) -> Option<DeclType> {
         "SMALLINT" | "INT2" => DeclType::Int16,
         "MEDIUMINT" | "INT4" => DeclType::Int32,
         "INT" | "INTEGER" | "BIGINT" | "INT8" => DeclType::Int64,
-        "FLOAT" | "REAL" => DeclType::Float32,
-        "DOUBLE" | "DOUBLEPRECISION" | "NUMERIC" | "DECIMAL" => DeclType::Float64,
+        "FLOAT" => DeclType::Float32,
+        // `REAL` is 64-bit, in both the GeoPackage spec's table 1 and SQLite's
+        // own storage classes — it belongs with `DOUBLE`, not with `FLOAT`.
+        // It was grouped with `FLOAT` until 2026-08-21, which narrowed a
+        // `price REAL` column to 32 bits and made the writer emit `FLOAT`, so
+        // the loss was visible on disk and to GDAL (`Real` in, `Real(Float32)`
+        // out) on a *same-format* run. Found while measuring the GeoPackage
+        // spoke's round trip; it is defect 5's shape, one spelling later.
+        "REAL" | "DOUBLE" | "DOUBLEPRECISION" | "NUMERIC" | "DECIMAL" => DeclType::Float64,
         "TEXT" | "VARCHAR" | "CHARACTER" | "CLOB" => DeclType::String,
         "JSON" => DeclType::Json,
         "DATETIME" | "TIMESTAMP" => DeclType::DateTime,
@@ -189,6 +206,177 @@ fn decl_type(sql: &str) -> Option<DeclType> {
         "BLOB" | "BINARY" => DeclType::Binary,
         _ => return None,
     })
+}
+
+/// A `gpkg_contents` row's descriptive columns, by table name.
+struct ContentsMeta {
+    table: String,
+    identifier: Option<String>,
+    description: Option<String>,
+}
+
+/// Assemble one layer's [`GpkgNative`], or `None` when it carries nothing
+/// (D3 — the common case, and what every file this crate writes produces).
+///
+/// `identifier` is dropped when it merely repeats the layer name: GDAL writes
+/// that for every layer it creates, so keeping it would put a payload on
+/// essentially every GeoPackage and replay a stale title through a rename. See
+/// [`GpkgNative`]'s own doc for the D4 reasoning.
+fn layer_native(
+    name: &str,
+    contents: &[ContentsMeta],
+    data_columns: &[(String, GpkgDataColumn)],
+    constraints: &[(String, GpkgConstraint)],
+) -> Option<Native> {
+    let meta = contents.iter().find(|c| c.table == name);
+    let columns: Vec<GpkgDataColumn> = data_columns
+        .iter()
+        .filter(|(table, _)| table == name)
+        .map(|(_, column)| column.clone())
+        .collect();
+    // Only the constraints this layer's columns actually name. A constraint
+    // nothing refers to describes nothing, and carrying it would make the
+    // payload a copy of a container-level table rather than a layer's content.
+    let named: Vec<GpkgConstraint> = constraints
+        .iter()
+        .filter(|(constraint_name, _)| {
+            columns.iter().any(|c| c.constraint_name.as_deref() == Some(constraint_name.as_str()))
+        })
+        .map(|(_, constraint)| constraint.clone())
+        .collect();
+    let native = GpkgNative {
+        identifier: meta
+            .and_then(|m| m.identifier.clone())
+            .filter(|identifier| identifier != name),
+        description: meta
+            .and_then(|m| m.description.clone())
+            .filter(|description| !description.is_empty()),
+        data_columns: columns,
+        constraints: named,
+    };
+    (!native.is_empty()).then(|| Native::new(Format::Gpkg, NativePayload::Gpkg(native)))
+}
+
+/// Every `gpkg_contents` row's `identifier`/`description`.
+fn contents_metadata(db: &Database, tables: &[Table]) -> Result<Vec<ContentsMeta>> {
+    let Some(contents) = tables.iter().find(|t| t.name == "gpkg_contents") else {
+        return Ok(Vec::new());
+    };
+    let table_col = column_index(contents, "table_name")?;
+    // Both are optional in the spec, so a file missing either column is not
+    // malformed — it just has nothing here to carry.
+    let identifier_col = contents.columns.iter().position(|c| c == "identifier");
+    let description_col = contents.columns.iter().position(|c| c == "description");
+    Ok(db
+        .read_rows(contents)?
+        .iter()
+        .filter_map(|row| match row.get(table_col) {
+            Some(Value::Text(table)) => Some(ContentsMeta {
+                table: table.clone(),
+                identifier: identifier_col.and_then(|i| text_at(row, i)),
+                description: description_col.and_then(|i| text_at(row, i)),
+            }),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Every `gpkg_data_columns` row, paired with the table it describes. Absent
+/// from most GeoPackages: the table exists only where the Schema extension is
+/// in use.
+fn data_columns(db: &Database, tables: &[Table]) -> Result<Vec<(String, GpkgDataColumn)>> {
+    let Some(table) = tables.iter().find(|t| t.name == "gpkg_data_columns") else {
+        return Ok(Vec::new());
+    };
+    let table_col = column_index(table, "table_name")?;
+    let column_col = column_index(table, "column_name")?;
+    let at = |name: &str| table.columns.iter().position(|c| c == name);
+    let (name, title, description) = (at("name"), at("title"), at("description"));
+    let (mime_type, constraint_name) = (at("mime_type"), at("constraint_name"));
+    Ok(db
+        .read_rows(table)?
+        .iter()
+        .filter_map(|row| match (row.get(table_col), row.get(column_col)) {
+            (Some(Value::Text(owner)), Some(Value::Text(column))) => Some((
+                owner.clone(),
+                GpkgDataColumn {
+                    column_name: column.clone(),
+                    name: name.and_then(|i| text_at(row, i)),
+                    title: title.and_then(|i| text_at(row, i)),
+                    description: description.and_then(|i| text_at(row, i)),
+                    mime_type: mime_type.and_then(|i| text_at(row, i)),
+                    constraint_name: constraint_name.and_then(|i| text_at(row, i)),
+                },
+            )),
+            _ => None,
+        })
+        .collect())
+}
+
+/// Every `gpkg_data_column_constraints` row, keyed by `constraint_name`.
+fn data_column_constraints(
+    db: &Database,
+    tables: &[Table],
+) -> Result<Vec<(String, GpkgConstraint)>> {
+    let Some(table) = tables.iter().find(|t| t.name == "gpkg_data_column_constraints") else {
+        return Ok(Vec::new());
+    };
+    let name_col = column_index(table, "constraint_name")?;
+    let type_col = column_index(table, "constraint_type")?;
+    let at = |name: &str| table.columns.iter().position(|c| c == name);
+    let (value, description) = (at("value"), at("description"));
+    let (min, min_inc) = (at("min"), at("min_is_inclusive"));
+    let (max, max_inc) = (at("max"), at("max_is_inclusive"));
+    Ok(db
+        .read_rows(table)?
+        .iter()
+        .filter_map(|row| match (row.get(name_col), row.get(type_col)) {
+            (Some(Value::Text(name)), Some(Value::Text(kind))) => Some((
+                name.clone(),
+                GpkgConstraint {
+                    constraint_name: name.clone(),
+                    constraint_type: kind.clone(),
+                    value: value.and_then(|i| text_at(row, i)),
+                    min: min.and_then(|i| number_at(row, i)),
+                    min_is_inclusive: min_inc.and_then(|i| bool_at(row, i)),
+                    max: max.and_then(|i| number_at(row, i)),
+                    max_is_inclusive: max_inc.and_then(|i| bool_at(row, i)),
+                    description: description.and_then(|i| text_at(row, i)),
+                },
+            )),
+            _ => None,
+        })
+        .collect())
+}
+
+/// The text at `index`, or `None` where the cell is NULL or another storage
+/// class. SQLite is dynamically typed, so a cell in a `TEXT` column need not
+/// hold text; a non-text cell here is not something to guess at.
+fn text_at(row: &[Value], index: usize) -> Option<String> {
+    match row.get(index) {
+        Some(Value::Text(text)) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+/// The number at `index`. `NUMERIC` accepts either storage class, and GDAL
+/// writes integers for whole bounds.
+fn number_at(row: &[Value], index: usize) -> Option<f64> {
+    match row.get(index) {
+        Some(Value::Int(n)) => Some(*n as f64),
+        Some(Value::Real(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+/// The boolean at `index`. GeoPackage `BOOLEAN` is an `INTEGER` 0/1, the same
+/// storage the declared-type work (M4, defect 2) already turns back into a
+/// boolean for feature columns.
+fn bool_at(row: &[Value], index: usize) -> Option<bool> {
+    match row.get(index) {
+        Some(Value::Int(n)) => Some(*n != 0),
+        _ => None,
+    }
 }
 
 /// Names of tables whose `gpkg_contents.data_type` is `features`.
@@ -282,22 +470,101 @@ fn value_to_json(v: &Value, declared: Option<DeclType>) -> JsonValue {
     }
     match v {
         Value::Null => JsonValue::Null,
-        Value::Int(n) => JsonValue::Number {
-            value: *n as f64,
-            is_int: true,
-        },
-        Value::Real(f) => JsonValue::Number {
-            value: *f,
-            is_int: false,
-        },
+        // Exactly, not through an `f64`. A GeoPackage `INTEGER` is 64-bit, and
+        // routing it through a double turned `9007199254740993` into
+        // `...992` on a *same-format* run until 2026-08-21.
+        Value::Int(n) => JsonValue::Int(*n),
+        Value::Real(f) => JsonValue::Float(*f),
         Value::Text(s) => JsonValue::String(s.clone()),
-        // Non-geometry blobs have no GeoJSON representation.
-        Value::Blob(_) => JsonValue::Null,
+        // Carried as bytes. This returned `Null` until 2026-08-21, which meant
+        // a `gpkg -> gpkg` run *destroyed every blob in the file* while its
+        // BLOB declaration survived intact — so the schema looked right and the
+        // data was gone. Measured: `X'0102'` in, `NULL` out, no warning.
+        Value::Blob(b) => JsonValue::Binary(b.clone()),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// **Every SQL spelling this reader claims to accept, and what it means.**
+    ///
+    /// Not "does it parse" — *how wide is it*. This is the test that was
+    /// missing when `REAL` was grouped with `FLOAT` as 32-bit: the arm was
+    /// written, reviewed and shipped, and nothing anywhere asserted that `REAL`
+    /// is a double. Every entry below cites its width so a future edit has to
+    /// argue with the spec rather than with a name that looks plausible.
+    ///
+    /// Widths are GeoPackage spec table 1 (*GeoPackage Data Types*), which
+    /// agrees with SQLite's own storage classes on the two that matter here:
+    /// `REAL` is 8 bytes, `FLOAT` is 4.
+    #[test]
+    fn every_accepted_sql_spelling_declares_the_width_the_spec_gives_it() {
+        use DeclType::*;
+        let cases: &[(&str, DeclType)] = &[
+            ("BOOLEAN", Bool),
+            ("BOOL", Bool),
+            ("TINYINT", Int8),
+            ("SMALLINT", Int16),
+            ("INT2", Int16),
+            ("MEDIUMINT", Int32),
+            ("INT4", Int32),
+            ("INT", Int64),
+            ("INTEGER", Int64),
+            ("BIGINT", Int64),
+            ("INT8", Int64),
+            // 4-byte.
+            ("FLOAT", Float32),
+            // 8-byte, all five of them. `REAL` sat in the line above until
+            // 2026-08-21 and narrowed every column declared with it.
+            ("REAL", Float64),
+            ("DOUBLE", Float64),
+            ("DOUBLEPRECISION", Float64),
+            ("NUMERIC", Float64),
+            ("DECIMAL", Float64),
+            ("TEXT", String),
+            ("VARCHAR", String),
+            ("CHARACTER", String),
+            ("CLOB", String),
+            ("JSON", Json),
+            ("DATETIME", DateTime),
+            ("TIMESTAMP", DateTime),
+            ("DATE", Date),
+            ("BLOB", Binary),
+            ("BINARY", Binary),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(decl_type(sql), Some(*expected), "{sql}");
+            // The size suffix and case-insensitivity the doc comment promises.
+            assert_eq!(decl_type(&sql.to_ascii_lowercase()), Some(*expected), "{sql} lowercased");
+            assert_eq!(decl_type(&format!("{sql}(80)")), Some(*expected), "{sql}(80)");
+            assert_eq!(decl_type(&format!("  {sql}  ")), Some(*expected), "{sql} padded");
+        }
+        // SQLite permits a column with no declared type at all, and a
+        // declaration nobody recognises must not be guessed at.
+        assert_eq!(decl_type(""), None);
+        assert_eq!(decl_type("GEOMETRY"), None);
+        assert_eq!(decl_type("WHATEVER"), None);
+    }
+
+    /// The other half of the same claim: what the *writer* spells each declared
+    /// type, read back through the table above, must land on a type that admits
+    /// the original. Pairs with `every_declared_type_survives_or_is_admitted`
+    /// in `convert.rs`, but names the on-disk spelling, which is what a person
+    /// inspecting the file with `sqlite3` actually sees.
+    #[test]
+    fn every_declared_type_is_written_with_a_spelling_that_reads_back_wide_enough() {
+        for ty in DeclType::ALL {
+            let spelling = super::super::writer::sql_type_for(ty);
+            let back = decl_type(spelling).unwrap_or_else(|| {
+                panic!("writer emits {spelling:?} for {ty:?}, which this reader does not accept")
+            });
+            assert!(
+                back.admits(ty),
+                "{ty:?} is written {spelling:?}, which reads back as {back:?} — a narrowing"
+            );
+        }
+    }
+
     use super::*;
     use crate::geometry::{Geometry, Position};
 

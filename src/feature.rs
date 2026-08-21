@@ -143,6 +143,51 @@ impl FeatureCollection {
         ))
     }
 
+    /// The declared column types `target` cannot hold, and what it will
+    /// declare instead.
+    ///
+    /// Silent when every declaration survives, or is replaced by one that
+    /// [`DeclType::admits`] it — a Shapefile writing every integer as its one
+    /// numeric field type loses nothing, and neither does a GeoPackage writing
+    /// `UInt16` as `MEDIUMINT`. It fires on anything `admits` does not
+    /// cover, which is a narrowing (a `DateTime` becoming text, a `Json` column
+    /// losing the fact that it is JSON) *or* a lateral move (a `Date` written
+    /// to FlatGeobuf, which has only `DATETIME`). The message shows both types
+    /// rather than claiming which is worse, because `Date → DateTime` is not
+    /// narrower and is still not what went in.
+    ///
+    /// Silent, too, when the target carries no declaration at all — that whole
+    /// loss belongs to [`Self::schema_drop_warning`], and reporting it twice
+    /// would make the more specific message the noisier one.
+    ///
+    /// This closes the gap that let three recasts ship silently: the checks
+    /// beside it ask whether the target has *a* schema, and none asked whether
+    /// the type it holds is still the type that went in. See
+    /// `plans/lossy-conversion-warnings.org`.
+    pub fn decl_recast_warning(&self, target: Format) -> Option<String> {
+        if !target.carries_column_schema() {
+            return None;
+        }
+        let mut recast: Vec<String> = Vec::new();
+        for decl in &self.schema {
+            let Some(ty) = decl.ty else { continue };
+            let Some(landed) = target.recast(ty) else { continue };
+            if !landed.admits(ty) {
+                recast.push(format!("{} ({ty:?} → {landed:?})", decl.name));
+            }
+        }
+        if recast.is_empty() {
+            return None;
+        }
+        recast.sort_unstable();
+        Some(format!(
+            "{} cannot hold the declared type of {}; the output declares the type shown \
+             instead, which is not the type that went in.",
+            target.display_name(),
+            recast.join(", ")
+        ))
+    }
+
     /// Visit every coordinate across every feature's geometry by mutable
     /// reference (features with no geometry are skipped).
     ///
@@ -240,6 +285,25 @@ mod tests {
         for target in [Format::FlatGeobuf, Format::Shapefile, Format::Gpkg, Format::Parquet] {
             assert_eq!(fc.schema_drop_warning(target), None, "{target:?} should not warn");
         }
+    }
+
+    #[test]
+    fn the_recast_message_states_the_change_without_ranking_it() {
+        // A `Date` written to FlatGeobuf lands as `DATETIME`, which is *wider*
+        // — the message may not call it a narrowing. It fires because it is not
+        // what went in, which is a different claim and the only one both cases
+        // support. (`Json -> String` in Shapefile is a genuine narrowing, and
+        // gets the same wording: the message shows both types and lets the
+        // reader judge.)
+        let mut fc = FeatureCollection::new(vec![]);
+        fc.schema = vec![FieldDecl {
+            name: "when".into(),
+            ty: Some(crate::schema::DeclType::Date),
+            ..FieldDecl::default()
+        }];
+        let w = fc.decl_recast_warning(Format::FlatGeobuf).unwrap();
+        assert!(w.contains("when (Date → DateTime)"), "{w}");
+        assert!(!w.contains("narrower"), "a lateral recast must not be called a narrowing: {w}");
     }
 
     #[test]

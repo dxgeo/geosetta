@@ -6,9 +6,11 @@
 //! GeoPackage Binary — a small header wrapping standard WKB, which we already
 //! decode. See `plans/geopackage.org`.
 
+mod container;
 mod reader;
 mod rtree;
 mod writer;
 
+pub use container::container_drop_warnings;
 pub use reader::read_layers;
 pub use writer::write_layers;

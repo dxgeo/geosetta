@@ -6,3 +6,4 @@ mod value;
 pub(crate) use parser::Parser;
 pub use parser::{parse, raw_at};
 pub use value::{escape_into, JsonValue};
+pub(crate) use value::write_json_f64;

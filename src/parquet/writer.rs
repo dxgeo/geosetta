@@ -101,6 +101,10 @@ enum Plan {
     Double,
     /// Physical `BYTE_ARRAY`, from a `Cell::Str`.
     Text(Option<i32>),
+    /// Physical `BYTE_ARRAY` with *no* annotation, from a `Cell::Bytes`.
+    /// Unannotated is what makes it bytes rather than text — the reader's
+    /// `decl_type` reads the absence as `Binary`.
+    Bytes,
     /// `INT32` days since the epoch, parsed from an ISO date string.
     DateDays,
     /// `INT64` milliseconds since the epoch, parsed from an ISO date-time.
@@ -115,7 +119,7 @@ impl Plan {
             Plan::Int64(_) | Plan::TimestampMillis => ptype::INT64,
             Plan::Float => ptype::FLOAT,
             Plan::Double => ptype::DOUBLE,
-            Plan::Text(_) => ptype::BYTE_ARRAY,
+            Plan::Text(_) | Plan::Bytes => ptype::BYTE_ARRAY,
         }
     }
 
@@ -142,6 +146,7 @@ fn plan_for(col: &Column) -> Plan {
         ColumnType::Int64 => Plan::Int64(None),
         ColumnType::Double => Plan::Double,
         ColumnType::String => Plan::Text(Some(converted::UTF8)),
+        ColumnType::Binary => Plan::Bytes,
     };
     let Some(declared) = col.declared_type() else {
         return text_default();
@@ -163,13 +168,15 @@ fn plan_for(col: &Column) -> Plan {
         DeclType::Float32 => Plan::Float,
         DeclType::Float64 => Plan::Double,
         DeclType::Json => Plan::Text(Some(converted::JSON)),
+        // Unannotated BYTE_ARRAY, which is what makes it bytes rather than
+        // text; the reader reads the absent annotation back as `Binary`.
+        DeclType::Binary => Plan::Bytes,
         DeclType::Date if strs().all(|s| parse_date_days(s).is_some()) => Plan::DateDays,
         DeclType::DateTime if strs().all(|s| parse_timestamp_millis(s).is_some()) => {
             Plan::TimestampMillis
         }
-        // `String`, a temporal type whose text this writer cannot parse back,
-        // and `Binary` (whose cells are hex text, not bytes — see the reader's
-        // `decl_type`) all land on plain UTF8.
+        // `String` and any temporal type whose text this writer cannot parse
+        // back land on plain UTF8.
         _ => Plan::Text(Some(converted::UTF8)),
     }
 }
@@ -196,6 +203,7 @@ fn prepare_property(col: &Column) -> Prepared {
             }
             (Plan::Double, Cell::Double(d)) => values.extend_from_slice(&d.to_le_bytes()),
             (Plan::Text(_), Cell::Str(s)) => plain_byte_array(&mut values, s.as_bytes()),
+            (Plan::Bytes, Cell::Bytes(b)) => plain_byte_array(&mut values, b),
             // `plan_for` only chooses these when every cell parses.
             (Plan::DateDays, Cell::Str(s)) => {
                 values.extend_from_slice(&(parse_date_days(s).unwrap_or(0) as i32).to_le_bytes())
@@ -260,6 +268,16 @@ fn parse_date_days(s: &str) -> Option<i64> {
 fn parse_timestamp_millis(s: &str) -> Option<i64> {
     let (date, rest) = s.split_once(['T', ' '])?;
     let days = parse_date_days(date)?;
+    // A trailing `Z` is the UTC designator, and every timestamp GeoPackage
+    // stores carries one (its own `last_change` is written
+    // `1970-01-01T00:00:00.000Z`). Rejecting it degraded a `gpkg -> parquet`
+    // DATETIME column to text *silently* — defect 5's complaint exactly, on
+    // the parse side. Found 2026-08-21 by the recast sweep.
+    //
+    // A numeric offset (`+02:00`) is still declined rather than guessed at:
+    // honouring one means shifting the instant to UTC, which changes the value
+    // this crate was handed, and geosetta does not reinterpret data.
+    let rest = rest.strip_suffix('Z').unwrap_or(rest);
     let (time, frac) = match rest.split_once('.') {
         Some((t, f)) => (t, Some(f)),
         None => (rest, None),

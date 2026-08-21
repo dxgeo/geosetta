@@ -20,6 +20,10 @@ pub enum ColumnType {
     Int64,
     Double,
     String,
+    /// Raw bytes. The one hub type with no JSON counterpart — see
+    /// [`crate::json::JsonValue::Binary`] for why it exists and what it cost
+    /// not to have it.
+    Binary,
 }
 
 /// A column type *as the source declared it*, in a vocabulary wide enough to
@@ -41,7 +45,15 @@ pub enum ColumnType {
 /// Nothing is invented for symmetry: there is no `Decimal` or `List` because
 /// no spoke this crate reads declares one today, and a variant no reader
 /// produces is a variant every writer must handle for nothing.
+/// # `#[non_exhaustive]`
+///
+/// Consumers must include a wildcard arm when matching. The vocabulary is
+/// explicitly open: this type's own doc says there is no `Decimal` or `List`
+/// "because no spoke this crate reads declares one today", and four spokes are
+/// still unbuilt. Freezing sixteen variants into the public API would make
+/// each of those a breaking change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum DeclType {
     Bool,
     Int8,
@@ -66,18 +78,74 @@ pub enum DeclType {
 }
 
 impl DeclType {
+    /// Every variant, so a test can sweep the whole vocabulary rather than the
+    /// handful someone thought to write down.
+    ///
+    /// Completeness is enforced by `position_of` in this module's tests: it
+    /// matches on `DeclType` with no catch-all arm, so a seventeenth variant
+    /// stops the build until it is added here too. That is D6's device from
+    /// `plans/same-format-fidelity.org`, pointed at the type vocabulary instead
+    /// of the fixture registry.
+    pub const ALL: [DeclType; 16] = [
+        DeclType::Bool,
+        DeclType::Int8,
+        DeclType::UInt8,
+        DeclType::Int16,
+        DeclType::UInt16,
+        DeclType::Int32,
+        DeclType::UInt32,
+        DeclType::Int64,
+        DeclType::UInt64,
+        DeclType::Float32,
+        DeclType::Float64,
+        DeclType::String,
+        DeclType::Json,
+        DeclType::DateTime,
+        DeclType::Date,
+        DeclType::Binary,
+    ];
+
     /// The hub type a value of this declared type is stored as.
     ///
     /// Many-to-one: every integer width collapses to [`ColumnType::Int64`] and
     /// every text-ish type to [`ColumnType::String`], because that is all the
     /// IR's cells can hold. The declaration is what remembers the difference.
-    pub fn hub(self) -> ColumnType {
+    pub(crate) fn hub(self) -> ColumnType {
         use DeclType::*;
         match self {
             Bool => ColumnType::Bool,
             Int8 | UInt8 | Int16 | UInt16 | Int32 | UInt32 | Int64 | UInt64 => ColumnType::Int64,
             Float32 | Float64 => ColumnType::Double,
-            String | Json | DateTime | Date | Binary => ColumnType::String,
+            String | Json | DateTime | Date => ColumnType::String,
+            Binary => ColumnType::Binary,
+        }
+    }
+
+    /// Whether a column declared `self` can hold everything a column declared
+    /// `other` can — the widening relation the recast checks are stated
+    /// against.
+    ///
+    /// A reflexive partial order, deliberately *narrow*. It holds within the
+    /// integer family (by range, so `Int32` admits `UInt16` and `Int64` admits
+    /// `UInt32`) and from `Float64` to `Float32`, and nowhere else. In
+    /// particular **`String` does not admit `DateTime`, `Date`, `Json` or
+    /// `Binary`**, even though the text of any of them fits in a string: that
+    /// degradation is defect 5's original complaint (*"a temporal column
+    /// silently becoming text"*), and a relation that called it lossless would
+    /// define the bug away.
+    ///
+    /// Integers are not admitted by floats either. An `Int64` above 2^53 does
+    /// not survive an `f64`, and the cross-kind cases that would be exact are
+    /// not worth the special-casing when no spoke needs them.
+    pub fn admits(self, other: DeclType) -> bool {
+        if self == other {
+            return true;
+        }
+        match (self.int_range(), other.int_range()) {
+            // Derived from the ranges rather than listed, so a new integer
+            // width joins the order by declaring its range and nothing else.
+            (Some((lo, hi)), Some((other_lo, other_hi))) => lo <= other_lo && other_hi <= hi,
+            _ => (self, other) == (DeclType::Float64, DeclType::Float32),
         }
     }
 
@@ -111,6 +179,7 @@ pub enum Cell {
     Int(i64),
     Double(f64),
     Str(String),
+    Bytes(Vec<u8>),
 }
 
 /// A fully materialized property column.
@@ -247,7 +316,7 @@ impl FieldDecl {
     /// against the *values*, not just the inferred type: a middle stage that
     /// writes `40000` into a declared `Int16` column has outgrown the
     /// declaration, and writing it as a 16-bit field would corrupt the number.
-    pub fn type_for(&self, inferred: ColumnType, values: &[Cell]) -> Option<DeclType> {
+    pub(crate) fn type_for(&self, inferred: ColumnType, values: &[Cell]) -> Option<DeclType> {
         let declared = self.ty?;
         // A declaration only speaks for cells the hub stores the same way. An
         // all-null column infers as `String` but has no value to contradict
@@ -276,6 +345,7 @@ enum Infer {
     Int,
     Double,
     Str,
+    Bin,
 }
 
 impl Infer {
@@ -285,6 +355,9 @@ impl Infer {
         match (self, other) {
             (a, b) if a == b => a,
             (Int, Double) | (Double, Int) => Double,
+            // A column holding bytes *and* something else has no byte-level
+            // type left: `Str` is the fallback for every heterogeneous column
+            // and this is no different.
             _ => Str,
         }
     }
@@ -293,9 +366,10 @@ impl Infer {
         match value {
             JsonValue::Null => None,
             JsonValue::Bool(_) => Some(Infer::Bool),
-            JsonValue::Number { is_int: true, .. } => Some(Infer::Int),
-            JsonValue::Number { is_int: false, .. } => Some(Infer::Double),
+            JsonValue::Int(_) => Some(Infer::Int),
+            JsonValue::Float(_) => Some(Infer::Double),
             JsonValue::String(_) => Some(Infer::Str),
+            JsonValue::Binary(_) => Some(Infer::Bin),
             // Arrays/objects can only be represented as JSON text.
             JsonValue::Array(_) | JsonValue::Object(_) => Some(Infer::Str),
         }
@@ -307,6 +381,7 @@ impl Infer {
             Infer::Int => ColumnType::Int64,
             Infer::Double => ColumnType::Double,
             Infer::Str => ColumnType::String,
+            Infer::Bin => ColumnType::Binary,
         }
     }
 }
@@ -426,10 +501,23 @@ fn materialize(ty: ColumnType, value: Option<&JsonValue>) -> Cell {
             JsonValue::Bool(b) => Cell::Bool(*b),
             _ => Cell::Null,
         },
-        ColumnType::Int64 => match value.as_f64() {
-            Some(n) => Cell::Int(n as i64),
+        // The exact integer where there is one. Going through `as_f64` cost
+        // every value past 2^53 its low bits, and every value past `i64::MAX`
+        // became `i64::MAX` — on a same-format run, for a plain 64-bit column.
+        // A `Float` in an integer column is a genuine narrowing (the column
+        // holds integers because everything else in it was one), so it still
+        // truncates; that is the inference's judgement, not a lost bit.
+        ColumnType::Int64 => match value.as_i64().or_else(|| value.as_f64().map(|n| n as i64)) {
+            Some(n) => Cell::Int(n),
             None => Cell::Null,
         },
+        // An `Int` reaching a `Double` column loses its low bits above 2^53,
+        // and that is inference's judgement rather than a lost guarantee: the
+        // column is a double because some *other* value in it was fractional,
+        // so a mixed column of `[9007199254740993, 1.5]` cannot hold both
+        // exactly in any format this crate writes. GDAL's `OFTReal` does the
+        // same. The path that must stay exact is `Int64` above, where every
+        // value is an integer and the format has a 64-bit column to put it in.
         ColumnType::Double => match value.as_f64() {
             Some(n) => Cell::Double(n),
             None => Cell::Null,
@@ -437,13 +525,76 @@ fn materialize(ty: ColumnType, value: Option<&JsonValue>) -> Cell {
         ColumnType::String => match value {
             JsonValue::String(s) => Cell::Str(s.clone()),
             // Numbers, bools, arrays, objects in a string column: stringify.
+            // Bytes render as hex here, same as the JSON serializer, since a
+            // string column is exactly where a byte column goes when the target
+            // has no byte-level type of its own.
             other => Cell::Str(other.to_json_string()),
+        },
+        ColumnType::Binary => match value {
+            JsonValue::Binary(bytes) => Cell::Bytes(bytes.clone()),
+            _ => Cell::Null,
         },
     }
 }
 
 #[cfg(test)]
 mod tests {
+    /// `DeclType::ALL` really is all of them. The `match` below has no
+    /// catch-all, so adding a variant fails to compile here first — which is
+    /// the point: every recast test sweeps `ALL`, and a variant missing from it
+    /// would be a type nobody ever checked.
+    #[test]
+    fn all_lists_every_variant_exactly_once() {
+        fn position_of(ty: DeclType) -> usize {
+            match ty {
+                DeclType::Bool => 0,
+                DeclType::Int8 => 1,
+                DeclType::UInt8 => 2,
+                DeclType::Int16 => 3,
+                DeclType::UInt16 => 4,
+                DeclType::Int32 => 5,
+                DeclType::UInt32 => 6,
+                DeclType::Int64 => 7,
+                DeclType::UInt64 => 8,
+                DeclType::Float32 => 9,
+                DeclType::Float64 => 10,
+                DeclType::String => 11,
+                DeclType::Json => 12,
+                DeclType::DateTime => 13,
+                DeclType::Date => 14,
+                DeclType::Binary => 15,
+            }
+        }
+        for (i, ty) in DeclType::ALL.iter().enumerate() {
+            assert_eq!(position_of(*ty), i, "ALL is out of order or has a duplicate at {i}");
+        }
+    }
+
+    /// The widening relation's own contract, since every recast assertion is
+    /// stated against it.
+    #[test]
+    fn admits_is_reflexive_and_widens_only_where_the_range_covers() {
+        for ty in DeclType::ALL {
+            assert!(ty.admits(ty), "{ty:?} must admit itself");
+        }
+        assert!(DeclType::Int64.admits(DeclType::Int32));
+        assert!(DeclType::Int32.admits(DeclType::UInt16));
+        assert!(DeclType::Int64.admits(DeclType::UInt32));
+        assert!(DeclType::Int16.admits(DeclType::UInt8));
+        assert!(DeclType::Float64.admits(DeclType::Float32));
+
+        // And the directions that must *not* hold.
+        assert!(!DeclType::Int32.admits(DeclType::UInt32), "same width is not wider");
+        assert!(!DeclType::UInt32.admits(DeclType::Int32), "unsigned cannot hold negatives");
+        assert!(!DeclType::Float32.admits(DeclType::Float64));
+        // The degradations defect 5 exists to prevent: text holds the bytes of
+        // any of these and holds none of their meaning.
+        for ty in [DeclType::DateTime, DeclType::Date, DeclType::Json, DeclType::Binary] {
+            assert!(!DeclType::String.admits(ty), "String must not admit {ty:?}");
+        }
+        assert!(!DeclType::Float64.admits(DeclType::Int64), "no cross-kind widening");
+    }
+
     use super::*;
     use crate::json::parse;
 

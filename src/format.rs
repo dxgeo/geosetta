@@ -27,6 +27,7 @@
 //! sibling files), I/O handling in `main.rs`.
 
 use crate::error::{Error, Result};
+use crate::schema::DeclType;
 
 /// A supported vector format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,6 +140,82 @@ impl Format {
     /// both warn — see `plans/lossy-conversion-warnings.org` § OWED WARNING.
     pub fn carries_column_schema(self) -> bool {
         matches!(self, Format::FlatGeobuf | Format::Shapefile | Format::Gpkg | Format::Parquet)
+    }
+
+    /// What a column declared `ty` comes back as after being written to this
+    /// format and read again — the *composition* of this spoke's writer and
+    /// reader type mappings.
+    ///
+    /// `None` when the format carries no declaration at all; that loss is
+    /// [`crate::FeatureCollection::schema_drop_warning`]'s, not this one's.
+    ///
+    /// # This table is a claim, and a test proves it
+    ///
+    /// The mapping lives in the spokes, in eight separate `match` arms (a
+    /// reader and a writer for each of the four declaring formats). Stating it
+    /// a ninth time here would be exactly the duplication that let `REAL` mean
+    /// 32 bits in one place and 64 in another for a day. It is safe only
+    /// because `convert.rs`'s `every_declared_type_survives_or_is_admitted`
+    /// round-trips *every* variant through *every* declaring format and
+    /// asserts the real answer equals this one. Change a spoke's mapping
+    /// without changing this and that test fails; change this without the
+    /// spoke and it fails too.
+    ///
+    /// # Where the answers come from
+    ///
+    /// - **Shapefile** has one numeric field type, sized by width/decimals, so
+    ///   every integer widens to `Int64` and every float to `Float64`. That is
+    ///   dBase's design, not a defect.
+    /// - **FlatGeobuf** has no `DATE`, only `DATETIME`, so a date lands there:
+    ///   still a recast, but temporal rather than text, and it matches what
+    ///   `ogr2ogr` writes for the same hop.
+    /// - **`Binary` degrades only in Shapefile now.** It used to degrade
+    ///   everywhere but GeoPackage, because the IR had no byte-level cell and
+    ///   binary arrived as hex text no writer could tell from a string. Adding
+    ///   `JsonValue::Binary` (2026-08-21) retired that for GeoParquet and
+    ///   FlatGeobuf; dBase genuinely has no blob field type, and neither does
+    ///   GDAL's shapefile driver.
+    /// - **GeoParquet** answers here for well-formed values. A `Date` or
+    ///   `DateTime` whose *text does not parse* falls back to UTF8 and comes
+    ///   back `String`; that is value-dependent, so it belongs to the
+    ///   post-write mechanism (`plans/lossy-conversion-warnings.org` § 2) and
+    ///   is not predicted here.
+    pub fn recast(self, ty: DeclType) -> Option<DeclType> {
+        use DeclType::*;
+        if !self.carries_column_schema() {
+            return None;
+        }
+        Some(match self {
+            Format::Shapefile => match ty {
+                Bool | Date | String => ty,
+                Int8 | UInt8 | Int16 | UInt16 | Int32 | UInt32 | Int64 | UInt64 => Int64,
+                Float32 | Float64 => Float64,
+                // dBase has no JSON, no timestamp and no blob field type.
+                Json | DateTime | Binary => String,
+            },
+            // FlatGeobuf names every variant but `Date`, which it writes as
+            // `DATETIME` — temporal rather than text, which is what `ogr2ogr`
+            // does with the same hop.
+            Format::FlatGeobuf => match ty {
+                Date => DateTime,
+                other => other,
+            },
+            // GeoPackage and GeoParquet both name every variant. GeoPackage's
+            // unsigned spellings are its signed ones widened a step, since the
+            // format has no unsigned type: `UInt16` is written `MEDIUMINT` and
+            // so returns `Int32`, which admits it.
+            Format::Gpkg => match ty {
+                UInt8 => Int16,
+                UInt16 => Int32,
+                UInt32 | UInt64 => Int64,
+                other => other,
+            },
+            Format::Parquet => ty,
+            // `carries_column_schema` already returned for these.
+            Format::GeoJson | Format::Csv | Format::Wkt | Format::Kml | Format::Kmz => {
+                unreachable!("no column schema")
+            }
+        })
     }
 }
 

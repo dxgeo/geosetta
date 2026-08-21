@@ -525,14 +525,17 @@ fn write_geometry(out: &mut String, g: &Geometry) {
 }
 
 fn write_position(out: &mut String, p: Position) {
-    use std::fmt::Write;
+    // Through `write_json_f64`, not `write!`, so this agrees with the tree
+    // serializer in `json::value` — `direct_writer_matches_tree_serialization`
+    // is the test that holds them together, and it caught them diverging the
+    // moment whole floats started keeping their `.0`.
     out.push('[');
-    let _ = write!(out, "{}", p.x);
+    crate::json::write_json_f64(p.x, out);
     out.push(',');
-    let _ = write!(out, "{}", p.y);
+    crate::json::write_json_f64(p.y, out);
     if let Some(z) = p.z {
         out.push(',');
-        let _ = write!(out, "{z}");
+        crate::json::write_json_f64(z, out);
     }
     out.push(']');
 }
@@ -663,10 +666,7 @@ fn rings_to_json(rings: &[Vec<Position>]) -> JsonValue {
 /// A coordinate ordinate as a (non-integer) JSON number.
 #[cfg(test)]
 fn coord(v: f64) -> JsonValue {
-    JsonValue::Number {
-        value: v,
-        is_int: false,
-    }
+    JsonValue::Float(v)
 }
 
 /// Build an object from `&str` keys, saving `.to_string()` at each call site.

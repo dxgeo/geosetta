@@ -306,14 +306,25 @@ why, not to implement the spec's table from symmetry.
   *derived*, the last never replayed (a stale =bbox= is the =envelope.org=
   failure mode, where GDAL trusts the cache on the spatial-filter path).
   *Gates* [[file:same-format-output.org][same-format-output.org]] and inverts
-  part of its scope. Carries three confirmed defects that become bugs the
+  part of its scope. Carried three confirmed defects that become bugs the
   moment the rule is adopted -- the FlatGeobuf reader not restoring an omitted
   cell to null, the GeoPackage reader ignoring a =BOOLEAN= declaration its own
   writer emits correctly, and a =gpkg= → =gpkg= run destroying the container
-  around the layers (measured: user tables, metadata, extensions and every
-  R*Tree gone, exit 0, no warning). *Scoping only.*
+  around the layers.
+
+  *In progress, not scoping.* M1, M2 and M4 are done and M3 has four spokes of
+  eight (GeoJSON, FlatGeobuf, GeoParquet, GeoPackage). The first two defects
+  shipped with M4; the container one *now warns* and still destroys. Four more
+  same-format losses were found and closed on 2026-08-21, none of them in the
+  original list: a GeoPackage =REAL= column read back 32-bit, every unsigned
+  width written as its same-width *signed* spelling, **every blob destroyed on
+  read**, and 64-bit integers routed through an =f64=. What found them was a
+  *recast matrix* -- every declared type through every declaring format,
+  checked for types *and values*, against GDAL as a second opinion. Remaining:
+  M3's four spokes, both containers (M3b/M3c), defect 3's fix, D6's registry.
 - [[file:native-inventory.org][native-inventory.org]] :: *Reference, not a
-  plan.* What each of the nine readers discards, classified per
+  plan.* What each of the nine readers discards -- and, since 2026-08-21, what
+  the *IR itself* discarded -- classified per
   [[file:same-format-fidelity.org][same-format-fidelity.org]] D4
   (opaque / identity / derived). M1's deliverable, and the thing
   [[file:same-format-output.org][same-format-output.org]] M2 and

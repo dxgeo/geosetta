@@ -621,6 +621,18 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
                 return Err(Error::Usage(format!("no layer named \"{name}\"")));
             }
         }
+        // Defect 3: the write below reproduces the layers and the tables they
+        // require, and nothing else the source container holds. Reported here,
+        // where the source's bytes are still in hand.
+        print_warnings(
+            &geopackage::container_drop_warnings(
+                &input,
+                io_label(&args.input, "stdin"),
+                &names_of(&ls),
+                args.rtree,
+            ),
+            args.quiet,
+        );
         ls
     } else {
         // Shapefile input's siblings are located via read_input; every other
@@ -658,6 +670,23 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
     // (stdout) is never "existing" — there's nothing to read back from a pipe
     // you're about to write to, so piping to a .gpkg always starts fresh.
     let existing = if out.path == "-" { None } else { std::fs::read(out.path).ok() };
+    // The append is a read-modify-write of the *destination* too, so its own
+    // non-layer content is destroyed on the same terms (its layers survive:
+    // `write_layers` reads and re-emits them). Skipped when the destination is
+    // the source, already reported above rather than reported twice.
+    if let Some(bytes) = existing.as_deref()
+        && !(args.from == Format::Gpkg && args.input == out.path)
+    {
+        print_warnings(
+            &geopackage::container_drop_warnings(
+                bytes,
+                io_label(out.path, "stdout"),
+                &names_of(&new_layers),
+                args.rtree,
+            ),
+            args.quiet,
+        );
+    }
     if args.progress {
         let verb = if existing.is_some() { "appending to" } else { "writing" };
         let idx = if args.rtree { " (+rtree index)" } else { "" };
@@ -686,6 +715,9 @@ fn collect_conversion_warnings(fc: &FeatureCollection, target: Format) -> Vec<St
         warnings.push(w);
     }
     if let Some(w) = fc.schema_drop_warning(target) {
+        warnings.push(w);
+    }
+    if let Some(w) = fc.decl_recast_warning(target) {
         warnings.push(w);
     }
     warnings
@@ -726,6 +758,12 @@ fn print_warnings(warnings: &[String], quiet: bool) {
     for w in warnings {
         eprintln!("warning: {w}");
     }
+}
+
+/// The layer names of a `(name, collection)` list, which is the shape both
+/// GeoPackage warning call sites need and neither should spell out inline.
+fn names_of(layers: &[(String, FeatureCollection)]) -> Vec<String> {
+    layers.iter().map(|(n, _)| n.clone()).collect()
 }
 
 /// The file stem of `path`, used as a default layer name of *last* resort:

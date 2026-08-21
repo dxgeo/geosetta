@@ -55,6 +55,17 @@ nothing from this plan. =read_features= → mutate → =write_features=, with th
 IR fully exposed (=Feature.geometry=, =Feature.properties=, =crs=). A Rust
 caller wanting to edit a collection should do that.
 
+*"Fully exposed" was not true when this was written, and is now.* /Corrected
+2026-08-21./ =Feature.properties= is a public field of type =JsonValue=, and
+=FieldDecl.ty= one of type =DeclType=, and both types sat in =pub(crate)=
+modules -- so an external caller could *read* a collection and could not
+*build* one. Route (a) was a read-and-convert story described as an editing
+story, and the mistake survived because every test lived inside the crate,
+where everything is nameable. Both types are now exported =#[non_exhaustive]=
+(=same-format-fidelity.org= D7), and =tests/public_api.rs= runs this
+paragraph's exact sequence from outside the crate, including a middle stage
+that widens a declaration.
+
 Route (b) exists for the tool that is *not* a Rust caller: =jq=, a Python
 script, an existing CLI, a sibling binary. Under
 [[file:../../architecture.org][../../architecture.org]] no sibling crate may

@@ -404,10 +404,15 @@ mod tests {
         };
         let f0 = &fc.features[0];
         assert_eq!(prop(f0, "d").as_str(), Some("2020-01-01"));
-        assert_eq!(prop(f0, "ts").as_str(), Some("2020-01-01T00:00:00"));
+        // The `Z` is deliberate: `TIMESTAMP_MICROS` counts from the Unix
+        // epoch, so it *is* UTC, and a bare `2020-01-01T00:00:00` is an
+        // unzoned local time — a different fact. Added 2026-08-21, after a
+        // `gpkg -> parquet -> gpkg` round trip was found to be quietly
+        // dropping the designator GeoPackage requires.
+        assert_eq!(prop(f0, "ts").as_str(), Some("2020-01-01T00:00:00Z"));
         let f2 = &fc.features[2];
         assert_eq!(prop(f2, "d").as_str(), Some("2020-01-03"));
-        assert_eq!(prop(f2, "ts").as_str(), Some("2020-01-01T02:00:00"));
+        assert_eq!(prop(f2, "ts").as_str(), Some("2020-01-01T02:00:00Z"));
     }
 
     #[test]
@@ -1562,7 +1567,7 @@ mod tests {
     #[test]
     fn flatgeobuf_preserves_every_declared_column_type() {
         use crate::schema::DeclType::*;
-        let int = |n: f64| json::JsonValue::Number { value: n, is_int: true };
+        let int = |n: f64| json::JsonValue::Int((n) as i64);
         let cases = [
             (Bool, json::JsonValue::Bool(true)),
             (Int8, int(-7.0)),
@@ -1573,11 +1578,11 @@ mod tests {
             (UInt32, int(3_000_000_000.0)),
             (Int64, int(9_000_000_000.0)),
             (UInt64, int(9_000_000_001.0)),
-            (Float32, json::JsonValue::Number { value: 1.5, is_int: false }),
-            (Float64, json::JsonValue::Number { value: 1.25, is_int: false }),
+            (Float32, json::JsonValue::Float(1.5)),
+            (Float64, json::JsonValue::Float(1.25)),
             (String, json::JsonValue::String("x".into())),
             (Json, json::JsonValue::String("{\"a\":1}".into())),
-            (DateTime, json::JsonValue::String("2024-03-01T10:30:00".into())),
+            (DateTime, json::JsonValue::String("2024-03-01T10:30:00Z".into())),
         ];
         for (ty, value) in cases {
             let fc = declared("v", ty, value.clone());
@@ -1612,7 +1617,7 @@ mod tests {
     /// asymmetry `declared_or` applies to widths.
     #[test]
     fn a_declared_type_the_data_outgrew_is_declined_not_obeyed() {
-        let big = json::JsonValue::Number { value: 40_000.0, is_int: true };
+        let big = json::JsonValue::Int(40_000);
         let fc = declared("v", crate::schema::DeclType::Int16, big.clone());
         let back = flatgeobuf::read(&flatgeobuf::write(&fc)).unwrap();
         // Written as a wider type, so the value survives intact...
@@ -1646,14 +1651,14 @@ mod tests {
     #[test]
     fn geopackage_preserves_declared_column_types() {
         use crate::schema::DeclType::*;
-        let int = |n: f64| json::JsonValue::Number { value: n, is_int: true };
+        let int = |n: f64| json::JsonValue::Int((n) as i64);
         let cases = [
             (Int16, int(-3000.0)),
             (Int32, int(-70000.0)),
             (Int64, int(9_000_000_000.0)),
-            (Float64, json::JsonValue::Number { value: 1.25, is_int: false }),
+            (Float64, json::JsonValue::Float(1.25)),
             (String, json::JsonValue::String("x".into())),
-            (DateTime, json::JsonValue::String("2024-03-01T10:30:00".into())),
+            (DateTime, json::JsonValue::String("2024-03-01T10:30:00Z".into())),
             (Date, json::JsonValue::String("2024-03-01".into())),
         ];
         for (ty, value) in cases {
@@ -1678,7 +1683,7 @@ mod tests {
             (String, json::JsonValue::String("x".into()), String),
             // dBase has one numeric field type; an integer is a zero-scale
             // numeric, which is what comes back.
-            (Int64, json::JsonValue::Number { value: 42.0, is_int: true }, Int64),
+            (Int64, json::JsonValue::Int(42), Int64),
         ];
         for (ty, value, expected) in cases {
             let fc = declared("v", ty, value);
@@ -1695,7 +1700,7 @@ mod tests {
     #[test]
     fn formats_without_a_schema_slot_drop_the_declaration_and_say_so() {
         let fc = declared("cnt", crate::schema::DeclType::Int16,
-            json::JsonValue::Number { value: 7.0, is_int: true });
+            json::JsonValue::Int(7));
 
         for target in [Format::GeoJson, Format::Csv, Format::Wkt, Format::Kml] {
             assert!(!target.carries_column_schema(), "{target:?}");
@@ -1714,7 +1719,7 @@ mod tests {
     #[test]
     fn formats_with_a_schema_slot_do_not_warn() {
         let fc = declared("cnt", crate::schema::DeclType::Int16,
-            json::JsonValue::Number { value: 7.0, is_int: true });
+            json::JsonValue::Int(7));
         for target in [Format::FlatGeobuf, Format::Shapefile, Format::Gpkg, Format::Parquet] {
             assert!(target.carries_column_schema(), "{target:?}");
             assert_eq!(fc.schema_drop_warning(target), None, "{target:?}");
@@ -1730,7 +1735,7 @@ mod tests {
     #[test]
     fn geoparquet_preserves_every_declared_column_type() {
         use crate::schema::DeclType::*;
-        let int = |n: f64| json::JsonValue::Number { value: n, is_int: true };
+        let int = |n: f64| json::JsonValue::Int((n) as i64);
         let cases = [
             (Bool, json::JsonValue::Bool(true)),
             (Int8, int(-7.0)),
@@ -1740,8 +1745,8 @@ mod tests {
             (Int32, int(-70000.0)),
             (UInt32, int(3_000_000_000.0)),
             (Int64, int(9_000_000_000.0)),
-            (Float32, json::JsonValue::Number { value: 1.5, is_int: false }),
-            (Float64, json::JsonValue::Number { value: 1.25, is_int: false }),
+            (Float32, json::JsonValue::Float(1.5)),
+            (Float64, json::JsonValue::Float(1.25)),
             (String, json::JsonValue::String("x".into())),
             // A JSON-annotated column decodes to *structured* JSON, not text
             // (`push_json_embedded`), so the round trip is Object -> Object:
@@ -1751,11 +1756,11 @@ mod tests {
                 Json,
                 json::JsonValue::Object(vec![(
                     "a".into(),
-                    json::JsonValue::Number { value: 1.0, is_int: true },
+                    json::JsonValue::Int(1),
                 )]),
             ),
             (Date, json::JsonValue::String("2024-03-01".into())),
-            (DateTime, json::JsonValue::String("2024-03-01T10:30:00".into())),
+            (DateTime, json::JsonValue::String("2024-03-01T10:30:00Z".into())),
         ];
         for (ty, value) in cases {
             let fc = declared("v", ty, value.clone());
@@ -1843,6 +1848,423 @@ mod tests {
         assert!(!keys.contains(&"ARROW:schema"), "a stale schema was replayed: {keys:?}");
         // The opaque key is not schema-derived, so it still travels.
         assert!(keys.contains(&"gdal:metadata"), "{keys:?}");
+    }
+
+    // --- the recast matrix ------------------------------------------------
+    //
+    // Every declared type, through every format that carries a declaration.
+    // These exist because the type surface is eight `match` tables (a reader
+    // and a writer per declaring spoke) and every test that touched it before
+    // 2026-08-21 was an *example* test — one type someone thought of. Three
+    // silent recasts survived that regime: `REAL` read back 32-bit, GeoPackage
+    // writing every unsigned width as the same-width *signed* spelling (GDAL
+    // read 3000000000 back as -1294967296), and FlatGeobuf turning a `Binary`
+    // column into text. See `plans/lossy-conversion-warnings.org`.
+
+    /// A value of the right kind for `ty`, so the declaration is not
+    /// contradicted by the data.
+    ///
+    /// **Catch-all-free on purpose.** `FieldDecl::type_for` lets the data win
+    /// where it *contradicts* the declaration (decision 11), so handing an
+    /// integer to a `Date` column measures that rule instead of the recast and
+    /// reports a loss that is not there — which is exactly what the first draft
+    /// of this sweep did. A seventeenth `DeclType` stops the build here until
+    /// someone says what a value of it looks like.
+    fn representative_value(ty: crate::schema::DeclType) -> json::JsonValue {
+        use crate::schema::DeclType::*;
+        let int = json::JsonValue::Int;
+        let text = |s: &str| json::JsonValue::String(s.into());
+        match ty {
+            Bool => json::JsonValue::Bool(true),
+            Int8 => int(-42),
+            UInt8 => int(200),
+            Int16 => int(-9000),
+            UInt16 => int(60_000),
+            Int32 => int(-2_000_000_000),
+            // Above `i32::MAX`, so a declaration narrowed to `Int32` is not
+            // merely wrong on paper — it cannot hold the value beside it.
+            UInt32 => int(3_000_000_000),
+            // Past 2^53, where an `f64` stops carrying integers exactly. These
+            // used to be small enough to survive a double, which is how a
+            // `gpkg -> gpkg` run turning 9007199254740993 into ...992 went
+            // unnoticed by a sweep that tested every type and every format.
+            Int64 => int(9_007_199_254_740_993),
+            UInt64 => int(9_007_199_254_740_993),
+            Float32 => json::JsonValue::Float(1.5),
+            // Enough digits to need 64 bits, but not so large that its
+            // fixed-point decimal text overruns a `.dbf` field — a magnitude
+            // like 1e300 is 308 characters and the Shapefile writer refuses it,
+            // correctly, which measures the width rule rather than the recast.
+            Float64 => json::JsonValue::Float(1.234_567_890_123_45),
+            String => text("plain"),
+            Json => text("{\"a\":1}"),
+            DateTime => text("2019-05-01T12:00:00Z"),
+            Date => text("2019-05-01"),
+            // Real bytes, not text that looks like bytes: the whole point of
+            // `JsonValue::Binary` is that a writer can tell the difference.
+            Binary => json::JsonValue::Binary(vec![0x00, 0x01, 0xfe, 0xff]),
+        }
+    }
+
+    /// A one-column collection declaring `ty`, with a value that fits it.
+    fn one_declared_column(ty: crate::schema::DeclType) -> FeatureCollection {
+        let mut fc = FeatureCollection::new(vec![crate::feature::Feature {
+            geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
+            properties: vec![("v".into(), representative_value(ty))],
+            native: None,
+        }]);
+        fc.schema = vec![crate::schema::FieldDecl {
+            name: "v".into(),
+            ty: Some(ty),
+            ..Default::default()
+        }];
+        fc
+    }
+
+    /// Write `fc` as `format`, read it back, and return the column's value.
+    ///
+    /// The companion to [`declared_after`], and it exists because for a day
+    /// this file checked only declarations: a GeoPackage round trip that
+    /// turned every blob into `Null` passed the whole sweep cleanly, because
+    /// the `BLOB` *declaration* survived intact. **A type-fidelity test that
+    /// never looks at a value can be green while the values are destroyed.**
+    fn value_after(format: Format, fc: &FeatureCollection) -> json::JsonValue {
+        let back = round_trip(format, fc);
+        back.features[0]
+            .properties
+            .iter()
+            .find(|(k, _)| &**k == "v")
+            .map(|(_, v)| v.clone())
+            .unwrap_or(json::JsonValue::Null)
+    }
+
+    /// Write `fc` as `format`, read it back, and return what the column is
+    /// declared as on the far side. Every declaring spoke, one seam.
+    fn declared_after(format: Format, fc: &FeatureCollection) -> Option<crate::schema::DeclType> {
+        round_trip(format, fc).schema.iter().find(|d| d.name == "v").and_then(|d| d.ty)
+    }
+
+    fn round_trip(format: Format, fc: &FeatureCollection) -> FeatureCollection {
+        match format {
+            Format::Gpkg => {
+                let layers = vec![("l".to_string(), fc.clone())];
+                let bytes = crate::geopackage::write_layers(None, &layers, false, false).unwrap();
+                crate::geopackage::read_layers(&bytes).unwrap().remove(0).1
+            }
+            Format::FlatGeobuf => {
+                crate::flatgeobuf::read(&crate::flatgeobuf::write(fc)).unwrap()
+            }
+            Format::Parquet => parquet_to_features(&features_to_parquet(fc)).unwrap(),
+            Format::Shapefile => {
+                let encoded = crate::shapefile::write(fc).unwrap();
+                crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None).unwrap()
+            }
+            other => panic!("{other:?} carries no column schema"),
+        }
+    }
+
+    fn declaring_formats() -> Vec<Format> {
+        [
+            Format::GeoJson,
+            Format::Parquet,
+            Format::FlatGeobuf,
+            Format::Csv,
+            Format::Wkt,
+            Format::Gpkg,
+            Format::Shapefile,
+            Format::Kml,
+            Format::Kmz,
+        ]
+        .into_iter()
+        .filter(|f| f.carries_column_schema())
+        .collect()
+    }
+
+    /// **The sweep.** For every declared type and every declaring format:
+    /// what comes back must be what `Format::recast` says, and that must
+    /// either admit the original or warn.
+    ///
+    /// This is what makes `Format::recast` safe to consult — it is a ninth
+    /// statement of a mapping that lives in eight `match` arms, and this test
+    /// is the only thing keeping it honest.
+    #[test]
+    fn every_declared_type_survives_or_is_admitted() {
+        let mut narrowed = Vec::new();
+        for format in declaring_formats() {
+            for ty in crate::schema::DeclType::ALL {
+                let fc = one_declared_column(ty);
+                let landed = declared_after(format, &fc);
+                let predicted = format.recast(ty);
+                assert_eq!(
+                    landed,
+                    predicted,
+                    "{format:?} recast {ty:?} to {landed:?}, but Format::recast predicts \
+                     {predicted:?} — one of the two is wrong, and they must not drift"
+                );
+
+                let Some(landed) = landed else { continue };
+                let warned = fc.decl_recast_warning(format).is_some();
+                if landed.admits(ty) {
+                    assert!(!warned, "{format:?} keeps {ty:?} as {landed:?} but warned anyway");
+                } else {
+                    assert!(warned, "{format:?} narrowed {ty:?} to {landed:?} *silently*");
+                    narrowed.push(format!("{format:?} {ty:?}->{landed:?}"));
+                }
+            }
+        }
+        // Pinned so a *new* narrowing cannot be added without appearing here.
+        // Each entry is a genuine capability gap, not a mapping bug: dBase has
+        // one numeric field type and no JSON/timestamp/blob, and FlatGeobuf has
+        // no DATE and cannot materialize a BINARY cell.
+        assert_eq!(
+            narrowed,
+            [
+                // FlatGeobuf has no DATE. DATETIME keeps it temporal, which is
+                // what ogr2ogr does, but a date is not an instant.
+                "FlatGeobuf Date->DateTime",
+                // dBase has no JSON, no timestamp and no blob field type, and
+                // neither does GDAL's shapefile driver.
+                "Shapefile Json->String",
+                "Shapefile DateTime->String",
+                "Shapefile Binary->String",
+            ]
+        );
+    }
+
+    /// **Values, not declarations.** Every declared type through every
+    /// declaring format, asserting the *value* comes back unchanged wherever
+    /// the format kept the type.
+    ///
+    /// This is the assertion whose absence let a GeoPackage round trip destroy
+    /// every blob in a file while the sweep above stayed green: `BLOB` in,
+    /// `BLOB` out, and `X'0102'` silently replaced by `NULL` in between,
+    /// because the IR had nowhere to put bytes and the reader returned `Null`.
+    #[test]
+    fn a_value_survives_wherever_its_declared_type_does() {
+        for format in declaring_formats() {
+            for ty in crate::schema::DeclType::ALL {
+                // Where the type is recast the value may legitimately be
+                // re-rendered (bytes become hex in a format with no blob
+                // column), and `decl_recast_warning` announces it. Where the
+                // type survives, nothing may touch the value.
+                if format.recast(ty) != Some(ty) {
+                    continue;
+                }
+                let fc = one_declared_column(ty);
+                let before = fc.features[0].properties[0].1.clone();
+                let after = value_after(format, &fc);
+
+                // A `Json` column is compared *as JSON*, not as text: the
+                // GeoParquet reader parses one, deliberately, so an object
+                // comes back an object rather than a quoted string. That is a
+                // change of representation and not of content — but it is also
+                // not byte-preserving (a source with `{"a": 1}` loses the
+                // space), which makes it an instance of the open
+                // canonicalisation question in `native-inventory.org`
+                // § QUESTIONS. Left as-is here rather than settled in passing.
+                if ty == crate::schema::DeclType::Json {
+                    let parse = |v: &json::JsonValue| match v {
+                        json::JsonValue::String(text) => json::parse(text).unwrap(),
+                        other => other.clone(),
+                    };
+                    assert_eq!(
+                        parse(&after),
+                        parse(&before),
+                        "{format:?} changed the content of a Json column"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    after, before,
+                    "{format:?} kept the {ty:?} declaration but changed the value"
+                );
+            }
+        }
+    }
+
+    /// The same sweep with *no* declaration, which is where the `REAL` bug
+    /// actually lived: the GeoPackage writer emits `REAL` for an undeclared
+    /// double, and the reader read `REAL` as `Float32` — so a plain double
+    /// acquired a `Float32` declaration out of nowhere. The declared path
+    /// (`Float32` → `FLOAT` → `Float32`) was closed the whole time, so no
+    /// amount of declared-only testing could have found it.
+    #[test]
+    fn an_undeclared_column_never_acquires_a_narrower_declaration() {
+        for format in declaring_formats() {
+            for ty in crate::schema::DeclType::ALL {
+                let mut fc = one_declared_column(ty);
+                let hub = ty.hub();
+                fc.schema.clear();
+                let landed = declared_after(format, &fc);
+                let Some(landed) = landed else { continue };
+                // The hub must survive *unless* the format genuinely has no
+                // such column, which `Format::recast` already states: Shapefile
+                // has no blob field type, so bytes become text there and the
+                // hub legitimately changes. Deriving the expectation from
+                // `recast` rather than exempting a case by name keeps the two
+                // from disagreeing.
+                let expected_hub = format.recast(ty).map(|t| t.hub()).unwrap_or(hub);
+                assert!(
+                    landed.hub() == expected_hub,
+                    "{format:?} read an undeclared {hub:?} column back as {landed:?}, \
+                     but recast predicts a {expected_hub:?} column"
+                );
+                // Whatever it invents must hold every value the hub type can.
+                if let Some(widest) = match hub {
+                    crate::schema::ColumnType::Int64 => Some(crate::schema::DeclType::Int64),
+                    crate::schema::ColumnType::Double => Some(crate::schema::DeclType::Float64),
+                    _ => None,
+                } {
+                    assert!(
+                        landed.admits(widest),
+                        "{format:?} gave an undeclared {hub:?} column the narrower \
+                         declaration {landed:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// **A documented open case, not a regression.** `#[ignore]`d on purpose:
+    /// it passes, and it is here to state a behaviour rather than to guard one.
+    ///
+    /// A column holding *both* a large integer and a fractional value infers as
+    /// `Double`, so the integer loses its low bits above 2^53. That is
+    /// inference's judgement rather than a lost guarantee — the column is a
+    /// double because something *else* in it was fractional, and no format this
+    /// crate writes can hold both exactly. GDAL's `OFTReal` behaves the same.
+    ///
+    /// **So the thing that is missing is not exactness, it is the warning.**
+    /// Anyone picking this up should not try to make the value survive; they
+    /// should add a fifth check to `collect_conversion_warnings` and then
+    /// replace the assertions below with one that the warning fired. The reason
+    /// it has not been written is the noise bar in
+    /// `plans/lossy-conversion-warnings.org` § THE RULE: this fires only for a
+    /// genuinely mixed column *and* an integer past 2^53, which may be rare
+    /// enough that the check costs more than it returns. That is a judgement
+    /// call, and it is recorded as one.
+    ///
+    /// The fixture carries the contrast in one file: `pure_int` is every-value-
+    /// an-integer and survives exactly, `mixed` does not.
+    #[test]
+    #[ignore = "documents a known, inherent case; see the doc comment"]
+    fn a_mixed_number_column_loses_precision_above_2_53() {
+        let text = include_str!("../tests/fixtures/hand_mixed_number.geojson");
+        let fc = geojson::from_json(&json::parse(text).unwrap()).unwrap();
+        let round_tripped = crate::flatgeobuf::read(&crate::flatgeobuf::write(&fc)).unwrap();
+
+        let column = |name: &str| -> Vec<json::JsonValue> {
+            round_tripped
+                .features
+                .iter()
+                .map(|f| f.properties.iter().find(|(k, _)| &**k == name).unwrap().1.clone())
+                .collect()
+        };
+
+        // Every value an integer: the column is `Int64` and 2^53 is no barrier.
+        // This is what the number model was split for, and it holds.
+        assert!(
+            column("pure_int").contains(&json::JsonValue::Int(9_007_199_254_740_993)),
+            "a pure-integer column must survive exactly: {:?}",
+            column("pure_int")
+        );
+
+        // The same integer beside a fractional value: the column is `Double`,
+        // and the integer arrives one short.
+        let mixed = column("mixed");
+        assert!(
+            mixed.contains(&json::JsonValue::Float(9_007_199_254_740_992.0)),
+            "expected the documented loss, got {mixed:?}"
+        );
+        assert!(
+            !mixed.contains(&json::JsonValue::Int(9_007_199_254_740_993)),
+            "the mixed column became exact — good news, and this test needs rewriting"
+        );
+    }
+
+    fn gpkg_native(fc: &FeatureCollection) -> &crate::native::GpkgNative {
+        match fc.native.as_ref().and_then(|n| n.payload_for(Format::Gpkg)) {
+            Some(crate::native::NativePayload::Gpkg(g)) => g,
+            _ => panic!("expected a GeoPackage native"),
+        }
+    }
+
+    /// One layer of `gdal_hostile.gpkg`, by name.
+    fn hostile_layer(name: &str) -> FeatureCollection {
+        let bytes = include_bytes!("../tests/fixtures/gdal_hostile.gpkg");
+        crate::geopackage::read_layers(bytes)
+            .unwrap()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, fc)| fc)
+            .unwrap_or_else(|| panic!("no layer {name}"))
+    }
+
+    /// The invariant for the GeoPackage spoke: a layer's title, description and
+    /// column descriptions are members the format models first-class and this
+    /// crate used to overwrite — `gpkg_contents.identifier` was hardcoded to the
+    /// table name and `description` to the empty string, the same shape as
+    /// defect 4's hardcoded FlatGeobuf header name.
+    #[test]
+    fn a_geopackage_layers_own_description_survives_its_own_format() {
+        let source = hostile_layer("cities");
+        let native = gpkg_native(&source).clone();
+        assert_eq!(native.identifier.as_deref(), Some("Bykerne — København og Zürich"));
+        assert!(native.description.as_deref().unwrap().starts_with("Hostile fixture"));
+        assert_eq!(native.data_columns.len(), 2);
+        assert_eq!(native.constraints.len(), 1);
+
+        // Out and back through this crate's own writer.
+        let layers = vec![("cities".to_string(), source.clone())];
+        let bytes = crate::geopackage::write_layers(None, &layers, false, false).unwrap();
+        let back = crate::geopackage::read_layers(&bytes).unwrap();
+        assert_eq!(*gpkg_native(&back[0].1), native, "the layer's members did not survive");
+    }
+
+    /// D3: a spoke that recovered nothing constructs no payload. `ogr2ogr`
+    /// writes `identifier = table_name` for every layer it creates, so treating
+    /// that as content would put a native on essentially every GeoPackage.
+    #[test]
+    fn an_identifier_that_only_repeats_the_layer_name_is_not_carried() {
+        // `second` is the fixture's untouched layer: ogr2ogr's defaults.
+        assert!(hostile_layer("second").native.is_none());
+    }
+
+    /// D4, decision 14's shape: an opaque member can also be derived. A
+    /// `gpkg_data_columns` row naming a column the layer no longer has is a
+    /// description of nothing, and GDAL would report it as an alias on a
+    /// missing field.
+    #[test]
+    fn a_data_column_row_is_dropped_when_its_column_goes() {
+        let mut fc = hostile_layer("cities");
+        for feature in &mut fc.features {
+            feature.properties.retain(|(key, _)| &**key != "price");
+        }
+        fc.schema.retain(|decl| decl.name != "price");
+        let layers = vec![("cities".to_string(), fc)];
+        let bytes = crate::geopackage::write_layers(None, &layers, false, false).unwrap();
+        let back = crate::geopackage::read_layers(&bytes).unwrap();
+        let native = gpkg_native(&back[0].1);
+
+        // `name`'s row stays; `price`'s goes, and the constraint only `price`
+        // referred to goes with it rather than lingering as an unused domain.
+        assert_eq!(native.data_columns.len(), 1);
+        assert_eq!(native.data_columns[0].column_name, "name");
+        assert!(native.constraints.is_empty(), "{:?}", native.constraints);
+    }
+
+    /// The tag check, per spoke: a GeoPackage payload must not reach another
+    /// format's writer.
+    #[test]
+    fn a_geopackage_native_is_inert_in_another_format() {
+        let source = hostile_layer("cities");
+        let mut stripped = source.clone();
+        stripped.native = None;
+        assert_eq!(
+            crate::flatgeobuf::write(&source),
+            crate::flatgeobuf::write(&stripped),
+            "a GeoPackage payload changed FlatGeobuf output"
+        );
     }
 
     /// The tag check, for the newest payload: a GeoParquet native must be

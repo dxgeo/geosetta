@@ -753,6 +753,14 @@ mod tests {
     /// *declared*; the index half asserts the b-tree it obliges is *there*,
     /// because declaring one without the other is precisely the malformed
     /// database of `handoff.org` § BUGS FOUND entry 15.
+    ///
+    /// **The DDL half below is a weaker check than it looks**, and
+    /// `the_registry_ddl_is_what_the_standard_says` is the one that closes the
+    /// gap: a substring assertion can only confirm what somebody thought to
+    /// assert. It cannot see a constraint nobody knew was missing — which is
+    /// exactly how `gdc_tn` survived this test's first pass — and it cannot
+    /// see an *extra* column or constraint at all, though the standard forbids
+    /// those in the same sentence.
     #[test]
     fn the_registry_tables_are_written_as_the_specification_defines_them() {
         // Declared: the constraints the specification states, by name where it
@@ -808,6 +816,183 @@ mod tests {
             !objects.iter().any(|o| o.name.starts_with("sqlite_autoindex_gpkg_spatial_ref_sys")),
             "a rowid alias needs no index of its own"
         );
+    }
+
+    /// Normalise DDL for comparison: layout differs between the standard's
+    /// wrapped text and this crate's one-line constants, and layout is the one
+    /// thing that is genuinely not being tested.
+    ///
+    /// Whitespace *inside* a string literal is data and is left alone —
+    /// `DEFAULT ''` and `strftime('%Y-%m-%dT%H:%M:%fZ','now')` both appear in
+    /// the registry DDL, and collapsing runs blindly would rewrite them.
+    fn normalize_ddl(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut chars = sql.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c == '\'' {
+                out.push(c);
+                // Copy the literal through verbatim, honouring the `''` escape.
+                while let Some(q) = chars.next() {
+                    out.push(q);
+                    if q == '\'' {
+                        if chars.peek() == Some(&'\'') {
+                            out.push(chars.next().unwrap());
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            } else if c.is_whitespace() {
+                while chars.peek().is_some_and(|n| n.is_whitespace()) {
+                    chars.next();
+                }
+                // The wrapped form breaks the line after `(`; the one-line
+                // form does not. Dropping the space here rather than by a
+                // `replace` over the finished string is what keeps a literal
+                // containing `( ` safe.
+                if !out.ends_with('(') {
+                    out.push(' ');
+                }
+            } else {
+                // Its closing partner: `\n)` against `)`.
+                if c == ')' && out.ends_with(' ') {
+                    out.pop();
+                }
+                out.push(c);
+            }
+        }
+        // Everything else stays significant, including the standard's own
+        // inconsistency between `gpkg_spatial_ref_sys(srs_id)` and
+        // `gpkg_spatial_ref_sys (srs_id)` — that is what it says.
+        out.trim().trim_end_matches(';').trim().to_string()
+    }
+
+    /// The normaliser collapses layout and *only* layout.
+    ///
+    /// Worth its own test because the property is easy to lose: the obvious
+    /// implementation is a whitespace `replace` over the finished string, and
+    /// it silently rewrites `DEFAULT '  x  '` while every DDL comparison
+    /// keeps passing. Both literals below are real —
+    /// `strftime('%Y-%m-%dT%H:%M:%fZ','now')` is `gpkg_contents.last_change`.
+    #[test]
+    fn normalizing_ddl_does_not_reach_inside_a_string_literal() {
+        let wrapped = "CREATE TABLE t (\n  a DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),\n  b TEXT DEFAULT '  two  spaces  ',\n  c TEXT DEFAULT 'it''s ( quoted )'\n);";
+        let inline = "CREATE TABLE t (a DATETIME DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), b TEXT DEFAULT '  two  spaces  ', c TEXT DEFAULT 'it''s ( quoted )')";
+        assert_eq!(normalize_ddl(wrapped), normalize_ddl(inline));
+        // Not merely equal to each other — equal to the text, spaces intact.
+        assert_eq!(normalize_ddl(wrapped), inline);
+    }
+
+    /// Every registry table this crate writes declares *exactly* what the
+    /// GeoPackage standard says it declares — no constraint missing, and none
+    /// added.
+    ///
+    /// The oracle is `tests/fixtures/spec_conformant.gpkg`, built by `sqlite3`
+    /// from the normative SQL of OGC 12-128r19 with **no GDAL anywhere in its
+    /// provenance**. That is the whole point of it, and the reason this test
+    /// is not simply more assertions about the constants: defect 6's first fix
+    /// was cross-checked against `ogr2ogr`'s own output and therefore
+    /// inherited GDAL's four measured deviations from the standard, three of
+    /// them ours until the spec text was read. A differential test against a
+    /// reference implementation measures agreement, not conformance — see
+    /// `plans/same-format-fidelity.org` § THE ORACLE RULE.
+    ///
+    /// Comparing whole normalised DDL rather than substrings is what makes
+    /// this stronger than its sibling above. The standard's clause is a
+    /// **SHALL** in both directions: *"All `gpkg_*` tables and views ... SHALL
+    /// have only the specified columns and table constraints."* An extra
+    /// column passes every substring assertion ever written and fails here.
+    #[test]
+    fn the_registry_ddl_is_what_the_standard_says() {
+        const SPEC: &[u8] = include_bytes!("../../tests/fixtures/spec_conformant.gpkg");
+        let spec_db = crate::sqlite::Database::open(SPEC).unwrap();
+        let spec_ddl: Vec<_> = spec_db
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == "table" && o.name.starts_with("gpkg_"))
+            .filter_map(|o| o.sql.map(|s| (o.name, normalize_ddl(&s))))
+            .collect();
+
+        // `--rtree` so `gpkg_extensions` is written, and a layer carrying a
+        // schema native so the two Schema extension tables are too. Between
+        // them that reaches every registry table this writer can emit.
+        let mut layer = fc(vec![Feature {
+            geometry: point(1.0, 2.0),
+            properties: vec![("name".into(), JsonValue::String("a".into()))],
+            native: None,
+        }]);
+        layer.native = Some(crate::Native::new(
+            crate::Format::Gpkg,
+            crate::NativePayload::Gpkg(crate::GpkgNative {
+                identifier: None,
+                description: None,
+                data_columns: vec![crate::GpkgDataColumn {
+                    column_name: "name".into(),
+                    name: Some("Name".into()),
+                    title: None,
+                    description: None,
+                    mime_type: None,
+                    constraint_name: Some("nonempty".into()),
+                }],
+                // Non-empty on purpose: `gpkg_data_column_constraints` is
+                // written only when a constraint exists, so an empty vector
+                // here would silently drop that table out of the comparison.
+                constraints: vec![crate::GpkgConstraint {
+                    constraint_name: "nonempty".into(),
+                    constraint_type: "glob".into(),
+                    value: Some("*".into()),
+                    min: None,
+                    min_is_inclusive: None,
+                    max: None,
+                    max_is_inclusive: None,
+                    description: None,
+                }],
+            }),
+        ));
+        let bytes = write_layers(None, &[("places".into(), layer)], true, false).unwrap();
+        let ours = crate::sqlite::Database::open(&bytes).unwrap();
+        let ours_ddl: std::collections::HashMap<String, String> = ours
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == "table" && o.name.starts_with("gpkg_"))
+            .filter_map(|o| o.sql.map(|s| (o.name, normalize_ddl(&s))))
+            .collect();
+
+        // Intersection only. The fixture also carries `gpkg_metadata` and
+        // `gpkg_metadata_reference`, which this crate does not write at all —
+        // a milestone rather than a defect, and M3b's to close when it starts
+        // carrying them. Comparing on absence would assert the wrong thing.
+        let mut compared = 0;
+        for (table, want) in &spec_ddl {
+            let Some(got) = ours_ddl.get(table) else {
+                continue;
+            };
+            assert_eq!(got, want, "{table} does not match the standard's DDL");
+            compared += 1;
+        }
+
+        // Without this the test passes vacuously the day a rename means
+        // nothing intersects. Six tables: the four core ones plus the Schema
+        // extension's two.
+        assert_eq!(compared, 6, "compared {compared} tables, expected 6");
+
+        // And the writer's constants are the same text, which is what makes
+        // the six assertions above statements about this crate's output rather
+        // than about one file it happened to produce.
+        for ddl in [
+            SPATIAL_REF_SYS_DDL,
+            CONTENTS_DDL,
+            GEOMETRY_COLUMNS_DDL,
+            EXTENSIONS_DDL,
+            DATA_COLUMNS_DDL,
+            DATA_COLUMN_CONSTRAINTS_DDL,
+        ] {
+            let name = ddl.trim_start_matches("CREATE TABLE ").split_whitespace().next().unwrap();
+            let want = spec_ddl.iter().find(|(n, _)| n == name).map(|(_, s)| s);
+            assert_eq!(Some(&normalize_ddl(ddl)), want, "{name} constant");
+        }
     }
 
     #[test]

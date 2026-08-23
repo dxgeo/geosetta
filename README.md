@@ -50,7 +50,9 @@ validated against DuckDB / GDAL.
     primary keys, `UNIQUE`s and foreign keys, each with the index SQLite
     requires behind it — so our output passes `integrity_check` and
     `foreign_key_check`, enforces those constraints, and is read and rewritten
-    by GDAL. An opt-in
+    by GDAL. Their DDL is checked against the OGC standard's own normative SQL
+    rather than against another implementation's output, via a fixture built
+    from the published annexes with no GDAL in its provenance. An opt-in
     `--rtree` flag also writes the GeoPackage RTree extension (SQLite's R\*Tree
     virtual table, built from scratch); the index passes `rtreecheck()` and
     answers GDAL/DuckDB bbox queries. A second opt-in flag, `--envelope`, caches

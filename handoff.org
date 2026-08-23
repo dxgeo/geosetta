@@ -31,8 +31,10 @@ still pass =native: None=.*
 - ***Defect 6 was found and fixed on 2026-08-23**, twice over, and it is the
   one to read first if you are new to this work.* /The first fix was checked
   against =ogr2ogr= and inherited two of that tool's own deviations from the
-  standard; reading the specification found them. See § THE ORACLE RULE in the
-  fidelity plan./ Five of the six registry tables were
+  standard; reading the specification found them, and
+  =tests/fixtures/spec_conformant.gpkg= -- built from that specification with
+  no GDAL in its provenance -- is what now checks it without anyone having to
+  read anything. See § THE ORACLE RULE in the fidelity plan./ Five of the six registry tables were
   written with *no table constraints at all* -- no =PRIMARY KEY=, no =UNIQUE=,
   no =FOREIGN KEY= -- so this crate's output did not state the schema the
   GeoPackage specification defines. **It was never a decision**: =sqlite.rs=
@@ -52,14 +54,20 @@ still pass =native: None=.*
   M3b has to honour and rules out dirty-flag invalidation on structural
   grounds (§ THE EDIT LOOP).
 
-540 tests pass (=cargo test -p geosetta=: 492 lib, 47 integration, 1 doc),
+542 tests pass (=cargo test -p geosetta=: 494 lib, 47 integration, 1 doc),
 clippy clean, *and =cargo doc= is green* -- add that third command to your
 verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
-else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). Six
-=#[ignore]=d cross-checks run with =cargo test -p geosetta -- --ignored=, and
-one of them is new: =sqlite_itself_validates_the_index_this_writer_builds=
-hands this crate's b-tree to the =sqlite3= binary and asks *it* whether the
-file is well formed. See
+else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). The
+=#[ignore]=d cross-checks against =sqlite3=, GDAL and the PROJ oracle run with
+=cargo test -p geosetta -- --ignored= and all pass; that command also runs the
+two =perf.rs= benchmarks, which take about ninety seconds and are not
+cross-checks. /Stated without a number on 2026-08-23: it had said "six", which
+counted the lib tests only and had been wrong since =tests/gdal_types.rs=
+added two more on 2026-08-20 -- § THE THREE LESSONS, lesson 1, in this
+document's own change log./ The newest of them is
+=sqlite_itself_validates_the_index_this_writer_builds=, which hands this
+crate's b-tree to the =sqlite3= binary and asks *it* whether the file is well
+formed. See
 [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
 § STATUS for the precise line between done and not.
 
@@ -96,7 +104,9 @@ In this order. The first two are the load-bearing ones:
 5. [[file:tests/fixtures/HOSTILE.org][tests/fixtures/HOSTILE.org]] -- what each
    fixture carries and why. Read before touching any of them, and
    [[file:tests/fixtures/PLANNED.org][PLANNED.org]] beside it for the ones
-   designed on 2026-08-23 and not yet built -- =spec_conformant.gpkg= first.
+   designed on 2026-08-23 and not yet built. /Its first entry,
+   =spec_conformant.gpkg=, was built the same day and has moved to
+   =HOSTILE.org= under a new =spec_= prefix./
 6. =same-format-fidelity.org= § THE ORACLE RULE -- one page, and it is the
    thing this project got wrong most recently: *=ogr2ogr= is evidence of what a
    producer emits and what a consumer accepts, never of what the standard
@@ -814,6 +824,37 @@ kind that expires, which is the point of the rule above: check =git log=
 rather than trusting it.
 
 /Newest first./
+
+*A conformance oracle with no GDAL in it, 2026-08-23 -- code and a fixture.*
+Defect 6's fix was verified against the standard by *reading* it, and the thing
+that had just gone wrong was a fix verified the wrong way -- so reading was not
+a good enough place to stop. =tests/fixtures/spec_conformant.gpkg= is a
+GeoPackage built by =sqlite3= from the annexes' normative SQL with **no GDAL at
+any point in its provenance**, not even as a base file, and
+=build_spec_fixtures.sh= transcribes that DDL *mechanically* from the =.adoc=
+sources at a pinned commit so the independence can be audited rather than
+taken on trust.
+
+- =src/sqlite.rs= -- =MasterObject= gains =sql=, the undecoded
+  =sqlite_master.sql= text. The data was already being read; the struct
+  dropped it, which is part of why the existing test was written out of
+  substrings. Deliberately unparsed: normalising it first would erase the
+  differences the comparison exists to find.
+- =src/geopackage/writer.rs= -- =the_registry_ddl_is_what_the_standard_says=,
+  which compares *whole normalised DDL* per table against the fixture. The
+  normaliser collapses layout but steps over string literals, because
+  =DEFAULT ''= and =strftime('%Y-%m-%dT%H:%M:%fZ','now')= both appear in the
+  registry DDL and blind whitespace collapsing would rewrite them.
+
+***Result: all six registry tables match the standard exactly*** -- the spec
+pass earlier the same day holds up. The value is not the green run, it is that
+the check no longer depends on anyone remembering what to assert: the SHALL is
+/"only the specified columns and table constraints"/, and a substring assertion
+is structurally incapable of seeing an *added* column. **Confirmed by mutation,
+not by reasoning:** dropping =gdc_tn=, adding a spurious column and restoring
+=ogr2ogr='s =NOT NULL= on =srs_id= are each caught by the new test, and the
+extra column is *not* caught by the old one -- which is now documented in the
+old one's own doc comment.
 
 *The three M3b decisions, index b-trees, and defect 6, 2026-08-23 -- code.*
 The three decisions M3b was blocked on (D8, D9, D10) were taken by *measuring

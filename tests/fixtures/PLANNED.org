@@ -14,42 +14,20 @@ and =plans/same-format-fidelity.org= § THE DEFECTS, defect 6.
 that every fixture be *confirmed readable by geosetta without error* before it
 is committed.
 
-** THE ONE THAT MATTERS MOST -- =spec_conformant.gpkg=
-*A GeoPackage built from the specification's own DDL, by =sqlite3=, with no
-GDAL involvement at any point.*
+*** BUILT 2026-08-23: =spec_conformant.gpkg=
+/The entry that stood at the top of this file -- "the one that matters most" --
+has been built and is documented in =HOSTILE.org= under the new =spec_= prefix./
+Its DDL is transcribed mechanically from the annexes at a *pinned commit*
+(=fe83fdd=), by =tests/fixtures/build_spec_fixtures.sh=, which starts from an
+empty file rather than from =gdal_hostile.gpkg= the way
+=build_sqlite_fixtures.sh= does -- that difference is the entire point of it.
 
-*Why it is first.* Every fixture in this tree was produced by =ogr2ogr=,
-DuckDB, pyarrow or hand-authoring. That was already known to bound what the
-SQLite-level fixtures could catch (=HOSTILE.org=, the =sqlite_*= prefix). What
-2026-08-23 established is that **it bounds the /GeoPackage/ level too**:
-=ogr2ogr= itself deviates from the standard in at least four places we have
-measured.
-
-| where =ogr2ogr= differs from the standard | consequence for us |
-|-------------------------------------------+--------------------|
-| omits =CONSTRAINT gdc_tn UNIQUE (table_name, name)= on =gpkg_data_columns= | *we copied the omission* -- caught only by reading the spec |
-| omits =CONSTRAINT gdcc_ntv UNIQUE (...)= on =gpkg_data_column_constraints= | same |
-| writes =srs_id INTEGER NOT NULL PRIMARY KEY=; the spec says =INTEGER PRIMARY KEY= | we had copied the =NOT NULL= |
-| omits the two =crmr_*_fk= foreign keys on =gpkg_metadata_reference= | matters when M3b carries that table |
-
-**A fixture derived from GDAL cannot test conformance to a standard GDAL does
-not follow exactly.** This one is the second opinion.
-
-*Build:* =sqlite3=, applying Annex C's =CREATE TABLE= text verbatim for
-=gpkg_spatial_ref_sys=, =gpkg_contents=, =gpkg_geometry_columns=,
-=gpkg_extensions=, plus the Schema extension's =gpkg_data_columns= and
-=gpkg_data_column_constraints= and the Metadata extension's =gpkg_metadata= and
-=gpkg_metadata_reference=. Then the three required =gpkg_spatial_ref_sys=
-records (=4326=, =-1= undefined cartesian, =0= undefined geographic), one
-feature table, and =PRAGMA application_id = 0x47504B47=, =PRAGMA user_version=
-a five-digit version integer.
-
-*Pins:* that geosetta *reads* a strictly conformant file, and -- once a
-comparison exists -- that what it *writes* matches this DDL. The natural test
-is a set comparison of =sqlite_master= rows between this fixture and geosetta's
-own output, normalised for whitespace, which is a much stronger check than the
-substring assertions =the_registry_tables_are_written_as_the_specification_defines_them=
-uses today. /Those substring assertions are what let =gdc_tn= go missing./
+It closed the substring-assertion gap it was designed for.
+=the_registry_ddl_is_what_the_standard_says= compares *whole normalised DDL*
+per table, and =MasterObject= gained a =sql= field so that comparison could be
+written at all. **All six registry tables this crate emits match the
+standard exactly**, so the 2026-08-23 spec pass holds up under a check that
+does not depend on anyone remembering what to assert.
 
 ** =gpkg_metadata_autoincrement.gpkg=
 =gpkg_metadata= is specified as =id INTEGER PRIMARY KEY AUTOINCREMENT=, so a

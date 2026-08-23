@@ -608,11 +608,14 @@ the mistake is instructive, not clerical.
    this a conformance failure rather than an untidiness:* "All =gpkg_*= tables
    and views ... SHALL have only the specified columns and table constraints."
 
-   /And the fixture set has the same shape as the bug:/ every fixture in the
-   tree came from GDAL, so nothing in it could have caught any of this. The
-   fixture that can is designed in =tests/fixtures/PLANNED.org= --
-   =spec_conformant.gpkg=, built from Annex C's DDL by =sqlite3=, with no GDAL
-   anywhere in its provenance.
+   /And the fixture set had the same shape as the bug:/ every fixture in the
+   tree came from GDAL, so nothing in it could have caught any of this.
+   *Closed the same day:* =tests/fixtures/spec_conformant.gpkg= is built from
+   the annexes' DDL by =sqlite3= with no GDAL anywhere in its provenance, and
+   =the_registry_ddl_is_what_the_standard_says= compares whole normalised DDL
+   against it -- catching, by mutation test, both a dropped constraint and an
+   *added* column that the substring assertions cannot see. See § THE ORACLE
+   RULE.
 
    /Verified:/ =PRAGMA integrity_check= =ok= and =foreign_key_check= clean on
    plain and =--rtree= writes; a duplicate =INSERT= rejected by each restored
@@ -1765,8 +1768,31 @@ output, three of which this crate had inherited by checking against it.
 a deviation the two implementations *share*, and the cheapest way to end up
 sharing one is to build the reference file with the tool you are checking
 against. Every GeoPackage fixture in this tree came from =ogr2ogr=, so the
-whole fixture set was blind to exactly this class. See
-=tests/fixtures/PLANNED.org=, whose first entry exists to break that.
+whole fixture set was blind to exactly this class.
+
+*** The rule now has a fixture behind it -- /2026-08-23/
+=tests/fixtures/spec_conformant.gpkg= is a GeoPackage built by =sqlite3= from
+the annexes' normative SQL, with **no GDAL at any point in its provenance**,
+not even as a base file. =build_spec_fixtures.sh= transcribes the DDL
+mechanically from the =.adoc= sources at a pinned commit, so the independence
+is auditable rather than asserted, and it starts from an empty file rather than
+=cp gdal_hostile.gpkg= the way =build_sqlite_fixtures.sh= does.
+
+=writer.rs='s =the_registry_ddl_is_what_the_standard_says= compares *whole
+normalised DDL* per table against it. That is the part that matters, and not
+only because it is stricter than the substring assertions beside it: the
+standard's clause is a SHALL in *both* directions -- /"SHALL have **only** the
+specified columns and table constraints"/ -- and a substring assertion cannot
+see an added column at all. **Confirmed by mutation** rather than by reasoning:
+dropping =gdc_tn=, adding a spurious column and restoring =ogr2ogr='s
+=NOT NULL= on =srs_id= are each caught by the new test, and the extra column is
+*not* caught by the old one.
+
+/Result: all six registry tables this crate emits match the standard exactly./
+So the spec pass earlier the same day holds up under a check that does not
+depend on anyone remembering what to assert -- which is the only reason to
+trust it, given that what the spec pass was correcting was a fix that had been
+checked the wrong way.
 
 /The normative SQL is small and worth fetching rather than recalling:/ Annex C
 of OGC 12-128r19, plus the extension annexes for the Schema and Metadata

@@ -64,9 +64,10 @@ impl Table {
 }
 
 /// One `sqlite_master` entry, reduced to what a survey of a file's contents
-/// needs: what kind of object it is and what it is attached to. Unlike
-/// [`Table`] this carries no decoded DDL, because it describes entries the
-/// column parser has no opinion about (triggers, views, virtual tables).
+/// needs: what kind of object it is, what it is attached to, and the text that
+/// declared it. Unlike [`Table`] the DDL here is *undecoded*, because this
+/// describes entries the column parser has no opinion about (triggers, views,
+/// virtual tables).
 pub struct MasterObject {
     /// `sqlite_master.type` — `"table"`, `"index"`, `"view"` or `"trigger"`.
     pub kind: String,
@@ -75,6 +76,22 @@ pub struct MasterObject {
     pub tbl_name: String,
     /// The b-tree root page, or 0 for a schema-only entry.
     pub root_page: u32,
+    /// `sqlite_master.sql` — the statement that created this object, stored by
+    /// SQLite exactly as it was written, whitespace and all. `None` for the
+    /// entries SQLite creates on its own behalf, which is every
+    /// `sqlite_autoindex_*`.
+    ///
+    /// Undecoded on purpose: a caller comparing what a file *declares* against
+    /// what some other authority *specifies* needs the text, and parsing it
+    /// first would silently normalise away the difference it is looking for.
+    ///
+    /// Read today only by
+    /// `geopackage::writer::tests::the_registry_ddl_is_what_the_standard_says`,
+    /// which is why it is allowed to be otherwise unread. M3b is the consumer
+    /// in prose: carrying a view or a trigger verbatim means carrying exactly
+    /// this string, since there is nothing else to reconstruct one from.
+    #[allow(dead_code)]
+    pub sql: Option<String>,
 }
 
 pub struct Database<'a> {
@@ -155,6 +172,7 @@ impl<'a> Database<'a> {
                 // Schema-only entries (triggers, views, virtual tables) carry
                 // rootpage 0; a negative value is not something SQLite writes.
                 root_page: as_int(&row, 3).unwrap_or(0).max(0) as u32,
+                sql: as_text(&row, 4),
             });
         }
         Ok(objects)

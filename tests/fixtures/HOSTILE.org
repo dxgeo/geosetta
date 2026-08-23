@@ -23,11 +23,12 @@ and =gdal_hostile.shp='s declared field widths survive a FlatGeobuf transit.
 Everything else is still the target.
 
 *Fixtures designed and not yet built live in
-[[file:PLANNED.org][PLANNED.org]]*, added 2026-08-23. The first entry there is
-the one that matters: **every GeoPackage fixture in this file came from
-=ogr2ogr=, and =ogr2ogr= deviates from the GeoPackage standard in at least four
-measured places** -- so nothing here can test conformance to the standard
-itself. See =plans/same-format-fidelity.org= § THE ORACLE RULE.
+[[file:PLANNED.org][PLANNED.org]]*, added 2026-08-23. Its first entry -- the one
+that mattered -- is now *built*: **every other GeoPackage fixture in this file
+came from =ogr2ogr=, and =ogr2ogr= deviates from the GeoPackage standard in at
+least four measured places**, so nothing here could test conformance to the
+standard itself. =spec_conformant.gpkg= is that second opinion. See
+=plans/same-format-fidelity.org= § THE ORACLE RULE.
 
 ** NAMING
 - =gdal_hostile.*= -- produced by *GDAL 3.13.2 =ogr2ogr=*. Preferred, because a
@@ -42,6 +43,14 @@ itself. See =plans/same-format-fidelity.org= § THE ORACLE RULE.
   =WITHOUT ROWID= table or an =ALTER TABLE ADD COLUMN=, and neither is
   hand-authored -- =sqlite3= writes both, and a GeoPackage is a SQLite database
   that any tool may touch after GDAL is done with it.
+- =spec_*.gpkg= -- /added 2026-08-23/. Built by =sqlite3= from a *published
+  standard's own normative text*, with **no GDAL at any point in the
+  provenance**, not even as a base file. A fourth prefix for the same reason
+  the third exists -- provenance is the point -- but drawn one step further
+  out: =sqlite_*= asks what the *format* permits beyond what GDAL emits, and
+  =spec_*= asks what the *standard requires* whether or not GDAL does it.
+  A fixture derived from a tool cannot test conformance to a standard that
+  tool does not follow exactly.
 
 *Every* fixture here was confirmed *readable by geosetta without error* before
 being committed. A fixture the reader rejects tests nothing. /This read "all
@@ -186,6 +195,49 @@ both plain =Real=. That last pair *is* the bug, written down.
 
 *Do not "simplify" this by dropping =c_real= as a duplicate of =c_double=.*
 They are the same width and that is the entire point.
+
+*** =spec_conformant.gpkg= -- /added 2026-08-23, and not hostile/
+*The only fixture here with no GDAL in its provenance at all*, and the only one
+built from a published standard rather than from a tool's output. Every
+=CREATE TABLE= in it is the normative SQL of OGC 12-128r19 -- Annex C for the
+core tables, the Schema and Metadata extension annexes for the other four --
+transcribed *mechanically* rather than by hand from the =.adoc= sources at
+a pinned commit, by [[file:build_spec_fixtures.sh][=build_spec_fixtures.sh=]].
+
+*Why it is not built the way the =sqlite_*= fixtures are.* Those start
+=cp gdal_hostile.gpkg=. This one starts from an empty file, and that difference
+is its entire reason to exist: on 2026-08-23 defect 6's *first* fix was
+cross-checked against =ogr2ogr='s own output and inherited four measured GDAL
+deviations from the standard, three of which then had to be corrected a second
+time after the spec text was read. **A fixture derived from GDAL cannot test
+conformance to a standard GDAL does not follow exactly.**
+
+| content | what it pins |
+|---------+--------------|
+| the four core registry tables, verbatim from Annex C | that this crate's DDL is the *standard's*, not GDAL's -- compared whole, per table, by =the_registry_ddl_is_what_the_standard_says= |
+| =gpkg_data_columns= + =gpkg_data_column_constraints= from the Schema annex | the two tables carrying the constraints =ogr2ogr= omits (=gdc_tn=, =gdcc_ntv=) |
+| =gpkg_metadata= + =gpkg_metadata_reference= from the Metadata annex | *not yet compared* -- this crate writes neither. Present so they are ready when M3b carries them, along with the two =crmr_*_fk= foreign keys GDAL omits |
+| =sample_features=, two points, =København= / =Zürich= | a dataset for the reader to find at all: =geopackage/reader.rs= errors without =gpkg_contents= and filters on =data_type='features'= |
+
+*Two departures from "verbatim", both recorded in the build script*, because
+the word has to mean something precise: the annex writes
+=gpkg_data_column_constraints= with =//= line comments, which is asciidoc prose
+that SQLite rejects, and ends that one block without a semicolon. Nothing else
+is touched -- including the annex's double space in =definition  TEXT NOT NULL=
+and its inconsistent spacing between =gpkg_spatial_ref_sys(srs_id)= and
+=gpkg_spatial_ref_sys (srs_id)=. Both survive into the comparison, because they
+are what the standard says.
+
+*The geometry and the two names go in as hex literals*, not as text. That is
+=plans/README.org='s "hand-decode the actual bytes" step applied up front
+rather than as a check afterwards, and it sidesteps the heredoc mangling that
+corrupted an earlier generation of these fixtures. The blobs are
+GeoPackageBinary: =GP=, version 0, flags =0x01= (little-endian header, no
+envelope), little-endian =srs_id= 4326, then little-endian WKB.
+
+/Verified: =PRAGMA integrity_check= ok, =foreign_key_check= clean, =ogrinfo=
+opens it and reports both features with the right extent, and geosetta reads it
+and round-trips it to a =.gpkg= that passes =integrity_check= in turn./
 
 *** =sqlite_contents.gpkg= -- /added 2026-08-23, and not hostile/
 Pins *bug 14*: a =gpkg_contents= row whose =data_type= is not =features= used

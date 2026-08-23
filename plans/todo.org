@@ -49,7 +49,10 @@ check it off and remove it once the item ships or is shelved.
   the six =gpkg= registry tables had been written with no table constraints at
   all, so this crate's output did not state the schema the specification
   defines. Defect 3 is once again the only defect left; what remains of M3b is
-  the classification work rather than file-format work.
+  the classification work rather than file-format work. *Also that day:*
+  =tests/fixtures/spec_conformant.gpkg=, the first fixture in this tree with no
+  GDAL in its provenance, and a test comparing whole registry DDL against it --
+  all six tables match the standard exactly.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

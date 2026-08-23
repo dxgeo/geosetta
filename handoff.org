@@ -26,7 +26,17 @@ still pass =native: None=.*
 - *Defect 3 is the only defect left*, and it travels with the GeoPackage
   container (M3b). Its *warning* shipped 2026-08-21 -- a =gpkg= write now says
   what the rewrite destroys instead of exiting 0 in silence -- but the *fix*
-  is still M3b's.
+  is still M3b's. /A second, smaller bug is open beside it as of 2026-08-22:
+  that warning misclassifies =gpkg_ogr_contents=, which is derived. Entry 13 in
+  § BUGS FOUND; it closes with M3b./
+- *Two things changed on 2026-08-22 that a returning reader should not
+  discover by accident.* The format-check deletion's only gating argument
+  *expired*, so its position at the end of the chain is an open call rather
+  than a settled one (§ THE SEQUENCING). And the original ask -- a middle
+  package modifying the collection mid-flight -- was restated as a *constraint
+  on this work* rather than a consumer of it, which adds a third content class
+  M3b has to honour and rules out dirty-flag invalidation on structural
+  grounds (§ THE EDIT LOOP).
 
 535 tests pass (=cargo test -p geosetta=: 487 lib, 47 integration, 1 doc),
 clippy clean, *and =cargo doc= is green* -- add that third command to your
@@ -61,7 +71,9 @@ In this order. The first two are the load-bearing ones:
    of the nine readers actually discards, measured. This is the reference the
    other three plans are written against.
 3. [[file:plans/same-format-output.org][plans/same-format-output.org]] --
-   deleting the =args.from == out.format= check. *Gated* by (1).
+   deleting the =args.from == out.format= check. *Was gated* by (1); the one
+   argument that gated it expired on 2026-08-22 and its position is now an open
+   call -- see § THE SEQUENCING and § THE EDIT LOOP.
 4. [[file:plans/edit-composability.org][plans/edit-composability.org]] -- the
    original ask, now the consumer of the above.
 5. [[file:tests/fixtures/HOSTILE.org][tests/fixtures/HOSTILE.org]] -- what each
@@ -70,8 +82,12 @@ In this order. The first two are the load-bearing ones:
 =plans/lossy-conversion-warnings.org= and =plans/spatial-index.org= were also
 edited; see § WHAT CHANGED IN EXISTING DOCS.
 
-** THE SEQUENCING, WHICH IS FORCED
-This is the one thing spread across two plans and worth having in one place:
+** THE SEQUENCING -- MOSTLY FORCED, WITH ONE LINK NOW LOOSE
+/Titled "WHICH IS FORCED" until 2026-08-22, when the last link stopped being
+forced: the format-check deletion's position rests on an argument that has
+since expired (below). Everything above it in the diagram is still a real
+dependency./ This is the one thing spread across two plans and worth having in
+one place:
 
 *Free-standing, not in the chain:* =spatial-index.org= milestone E --
 GeoParquet's covering bbox column, handed over from M3's GeoParquet spoke
@@ -107,13 +123,109 @@ time. *Not started.*
   atomic write-and-rename
 #+end_src
 
-*Why the deletion comes last, not first.* Decided deliberately: M2's
-=Format::unmodelled_members= inventory is the same pass the natives need, so
-shipping the deletion first produces nine constants that are dead code the
-moment natives replace them. An earlier draft argued the warning "could not be
-phrased honestly" -- *that argument was withdrawn* and should not be
-resurrected; a statement of current fact is perfectly sayable. The decision
-rests on the duplicated inventory pass alone.
+*Why the deletion came last -- and why that reason has now expired.* Decided
+deliberately in 2026-08-20: M2's =Format::unmodelled_members= inventory is the
+same pass the natives need, so shipping the deletion first produces nine
+constants that are dead code the moment natives replace them. An earlier draft
+also argued the warning "could not be phrased honestly" -- *that argument was
+withdrawn* and should not be resurrected; a statement of current fact is
+perfectly sayable. The decision rested on the duplicated inventory pass alone.
+
+*That single argument is spent, as of 2026-08-22.* M1's inventory is complete,
+the natives mechanism exists, and four spokes carry natives. **Nobody would
+write those nine constants today** -- you would use the natives that exist and
+warn for the four spokes that do not, which is a smaller change than the one
+the decision was protecting against. The diagram above is therefore *no longer
+forced below M3*; it is drawn as it was decided, and the position of the
+deletion is now an open call rather than a settled one.
+
+*What makes it worth actually reopening* is § THE EDIT LOOP below: per
+=edit-composability.org= § THE TRANSIT COROLLARY, an edit loop is lossless only
+when the transit format *is* the endpoint format -- so until the deletion
+lands, **no format has a lossless edit loop at all**, including FlatGeobuf,
+which has carried natives and a column schema since 2026-08-20 and still cannot
+be used as its own transit. The deletion converts work already shipped into a
+capability a user can reach.
+
+/The call is genuinely yours and turns on which goal is primary:/ if defect 3's
+data destruction is the priority, M3b still leads; if *composability* is, the
+deletion does, and M3b improves a path (=gpkg -> gpkg= in one invocation) that
+an edit loop does not even use.
+
+** THE EDIT LOOP, AND WHAT IT REQUIRES OF EVERYTHING ELSE
+/Added 2026-08-22, from the question "a middle package should be able to modify
+the contents mid-flight -- reprojection, vector math, metadata rewrite; how
+does that affect us going forward?" It is the original ask
+(=edit-composability.org=), restated as a constraint on the fidelity work
+rather than as a consumer of it, and it changes three things./
+
+*** The frame is already settled -- =edit-composability.org= § THE TRANSIT COROLLARY
+#+begin_quote
+An edit loop is lossless end to end only when the transit format *is* the
+endpoint format.
+#+end_quote
+
+Everything below follows from it. Any other recipe is *two cross-format
+conversions* wearing a round trip's clothing, and each hop is independently
+entitled to drop what its target cannot hold.
+
+*** In-process and piped are opposite cases, and natives behave oppositely
+The "middle package" is two different things, and conflating them is the
+easiest mistake to make here.
+
+- *In-process* -- a Rust consumer holding a =FeatureCollection= (reprojection
+  via =for_each_position_mut=, vector math). **Natives survive**, because
+  nothing is serialized, and D7 made the modelled types nameable so this
+  consumer can read *and construct* declarations. This path works today;
+  =tests/reproject_pipe.rs= exercises it against a real third-party
+  reprojection crate.
+- *Piped* -- an external process. **Natives die at the transit boundary by
+  construction**; that is D5. A =GpkgNative= cannot cross a FlatGeobuf pipe.
+
+*M3b widens that gap rather than closing it*, which is worth knowing before
+starting it: afterwards =gpkg -> gpkg= in one invocation carries the whole
+container, while =gpkg -> fgb -> tool -> fgb -> gpkg= still carries only the
+layers. Not an argument against M3b -- an argument for why the deletion's
+position is now worth reopening (§ THE SEQUENCING).
+
+*** M3b needs a third class, because D4's two are not enough
+D4 splits derived content two ways -- information *recomputed*, capability
+*rebuilt if present*. Editing forces a third distinction, because container
+content divides by *what it depends on*:
+
+| class | example | rule |
+|-------+---------+------|
+| *independent* | =side_notes=, a user's own table | carry unconditionally; survives any edit |
+| *layer-coupled* | =gpkg_metadata_reference= (keyed by =table_name=/=column_name=), triggers on feature tables, =gpkg_data_columns= | **validate against what is actually being written**, never replay blindly |
+| *derived* | R*Tree, =gpkg_ogr_contents=, =gpkg_contents='s bbox | recompute, *never* carry |
+
+The precedent for the middle row already exists and should be followed rather
+than reinvented: decision 14 replays =ARROW:schema= only while the column names
+still match, and decision 16 regenerates a member equal to what the writer
+would emit anyway.
+
+*** Invalidation has to be *computed at write*, not tracked
+The obvious design is a dirty flag -- mark the collection modified, drop the
+natives. **It cannot work, and the reason is structural rather than effort:**
+=Feature::properties= and =FeatureCollection::schema= are *public fields*,
+deliberately, because D7 needed a caller able to name and build them. A
+consumer mutates them directly. There is no method call to intercept and no
+setter to hook.
+
+So validity must be derived at write time, by comparing each native against
+what is actually being written. That is already what the crate does -- the
+format tag in =payload_for=, the column-name gate on =ARROW:schema=, decision
+16's "is this what the writer would emit anyway" -- but it has grown one member
+at a time. *M3b is where it should become one explicit contract*, because
+container content multiplies the number of members that need it.
+
+*** Reprojection is the case that invalidates the most
+Every bbox, every spatial index, and the CRS rows in
+=gpkg_contents=/=gpkg_geometry_columns=/=gpkg_spatial_ref_sys=. A carried
+R*Tree after a reprojection would be *wrong*, not stale -- **worse than
+absent**, because a reader trusts it. D4 already says an index is rebuilt
+rather than carried; editing is what makes that rule load-bearing instead of
+merely tidy.
 
 ** THE DECISIONS
 Each is recorded in full, with rejected alternatives, in the plan that owns it.
@@ -121,13 +233,16 @@ One line each so you know what has already been settled.
 
 /This was "THE NINE DECISIONS" and stopped being nine on 2026-08-20. Rows
 10--15 are M4's and the GeoParquet spoke's; 16--22 are 2026-08-21's -- the
-GeoPackage spoke, the recast matrix, the value-model work and D7. The section
-is an index of what is settled, so it grows rather than freezing at the count
-it happened to start with./
+GeoPackage spoke, the recast matrix, the value-model work and D7. Row 23 is
+2026-08-22's, from the edit-loop question. The section is an index of what is
+settled, so it grows rather than freezing at the count it happened to start
+with. /Row 23 is the only one whose "where" is not a plan file -- it was forced
+by a property of the public API rather than argued in a design document, and it
+should move to =edit-composability.org= when that plan is next opened./
 
 | # | decision | where |
 |---+----------+-------|
-| 1 | Natives channel lands *before* the format-check deletion | =same-format-fidelity.org= § SEQUENCING |
+| 1 | Natives channel lands *before* the format-check deletion -- *REOPENED 2026-08-22*, its one supporting argument is spent | =same-format-fidelity.org= § SEQUENCING; § THE SEQUENCING here |
 | 2a | The invariant binds *the whole container*, not just the layer | § THE DOMAIN OF THE RULE |
 | 2b | It covers *any file the crate reads without rejecting* | § THE DOMAIN OF THE RULE |
 | 3 | CRS dialect is information; the GeoParquet hop owes a warning | =lossy-conversion-warnings.org= § OWED WARNING |
@@ -149,6 +264,7 @@ it happened to start with./
 | 20 | The IR gets a *byte-level value*: a declaration whose values are destroyed is a promise the value side cannot keep | § The blob the schema check could not see |
 | 21 | =JsonValue= and =DeclType= are *exported*, =#[non_exhaustive]= -- a modelled field a caller cannot name is a native with extra steps | D7 |
 | 22 | Numbers are =Int(i64)= / =Float(f64)=, not an =f64= plus a flag; a whole float keeps its =.0=, as =ogr2ogr= writes it | § The number model |
+| 23 | Native validity is *computed at write* by comparing against what is being written, never *tracked* by a dirty flag -- =Feature::properties= and =FeatureCollection::schema= are public fields, so a consumer's mutation cannot be intercepted | =handoff.org= § THE EDIT LOOP; migrate to =edit-composability.org= when that plan is next edited |
 
 *Three later rulings extended D1*, all worth knowing before you design
 anything, and *all three now implemented*. The third is =FieldDecl='s
@@ -228,7 +344,11 @@ of it was planned work* -- each item was found by measuring the one above it:
 - *Defect 3* -- the only entry left in § LIVE BUGS. Note that section's
   numbering is *not* the plan's "five defects"; see its own note.
 - The exhaustive-match fixture registry (D6).
-- The format-check deletion, which is sequenced last.
+- The format-check deletion. *Drawn last in the diagram, no longer forced
+  there*: its only gating argument (the duplicated inventory pass) is spent as
+  of 2026-08-22, and § THE EDIT LOOP argues it is the prerequisite for any
+  lossless edit loop -- until it lands, *no format has one*, not even
+  FlatGeobuf. Position is an open call; see § THE SEQUENCING.
 - *One open call, deliberately not decided*: a column mixing an integer past
   2^53 with a fractional value infers =Double= and the integer loses its low
   bits. The loss is *inherent* -- inference has decided the column is
@@ -255,14 +375,22 @@ out of scope by construction: *WAL* is invisible to a reader that takes bytes
 rather than a path, so an un-checkpointed GeoPackage reads as its last
 checkpoint, silently.
 
-** BUGS FOUND -- ONE STILL LIVE
+** BUGS FOUND -- TWO STILL LIVE
 /Renamed 2026-08-20: this was "LIVE BUGS FOUND, NOT FIXED" when five of its
-six entries were live. Five are now struck through and fixed; **entry 3 is the
-only one left**. The fixed entries stay because each records how it was
-measured and what the fix turned on./
+six entries were live, then "ONE STILL LIVE" once five were fixed. **Entry 3
+(defect 3, the GeoPackage container) and entry 13 (=gpkg_ogr_contents=
+misclassified) are the two open ones**, and they close together -- 13 is a
+classification M3b has to make anyway. The fixed entries stay because each
+records how it was measured and what the fix turned on./
 
-/Four more were found on 2026-08-21 and all four are fixed; they are grouped in
-their own subsection at the end because what found them is the useful part./
+/Four more were found on 2026-08-21 and all four are fixed. Three more on
+2026-08-22, two fixed and one open. Both groups are in their own subsections at
+the end, because in each case what *found* them is the useful part./
+
+*Note the two countings, since they have collided before.* "Defect /n/" is
+=same-format-fidelity.org= § Five defects and is canonical; the numbered
+entries here are reading order. By the *defect* counting there is still exactly
+one left (defect 3) -- entry 13 is not one of the five.
 
 Ordered by how likely they were to bite a real user.
 
@@ -383,12 +511,13 @@ sweep over every *type* misses a class if its *values* are unadventurous (10).
 And a check that compares declarations can be perfectly green while the values
 are being destroyed (8, 9).
 
-*** Two more, found and fixed 2026-08-22 -- by asking what =sqlite.rs= cannot do
-Both were found while scoping *M3b*, by reading =src/sqlite.rs= for the gaps
-M3b would have to close rather than by testing anything. Both turned out to be
-live in shipped code, and *neither is reachable from any existing fixture* --
-=ogr2ogr= writes neither construct, so every fixture in the tree is built out
-of the subset of SQLite that GDAL happens to emit.
+*** Three more, 2026-08-22 -- by asking what =sqlite.rs= cannot do
+/Two fixed, one live./ The first two were found while scoping *M3b*, by reading
+=src/sqlite.rs= for the gaps M3b would have to close rather than by testing
+anything. Both turned out to be live in shipped code, and *neither is reachable
+from any existing fixture* -- =ogr2ogr= writes neither construct, so every
+fixture in the tree is built out of the subset of SQLite that GDAL happens to
+emit. The third (13) came from the edit-loop question and is *still open*.
 
 11. *One =WITHOUT ROWID= table silenced every defect 3 warning in the file.*
     Such a table is stored as an *index* b-tree; =walk_table= handles only
@@ -420,6 +549,29 @@ of the subset of SQLite that GDAL happens to emit.
     =ALTER TABLE ADD COLUMN=, and SQLite rejects a non-constant default there.
     An expression default can never apply to a short record.
 
+13. *=gpkg_ogr_contents= is reported as destroyed content, and it is derived.*
+    **LIVE, found 2026-08-22, not fixed.** Defect 3's warning names it in the
+    loss list -- =gpkg_ogr_contents (2 rows)= -- but the table is
+    =(table_name TEXT PRIMARY KEY, feature_count INTEGER)=, GDAL's *row-count
+    cache*, recomputable from the feature table by definition. Under D4 it
+    belongs in the second message beside the R*Tree ("derived, not rebuilt"),
+    not in the first.
+
+    *This is the =gpkg_extensions= mistake in another table*, which the entry
+    below in § WHAT CHANGED already records as caught once: counting derived
+    content as a loss names one loss twice and inflates the message. The
+    warning is not *false* -- the table genuinely is not carried -- so this is
+    a misclassification rather than a wrong statement, and the severity is
+    correspondingly modest. Fix it with M3b, which has to classify the table
+    anyway.
+
+    *Why it is worth the entry rather than a footnote:* under editing it is the
+    sharpest illustration in the whole container. Carry that table verbatim
+    after a middle stage deletes a feature and you have written a **count that
+    is a lie** -- strictly worse than the loss it was meant to repair. See
+    § THE EDIT LOOP. =gpkg_contents='s =min_x/min_y/max_x/max_y= is the same
+    shape and is already handled: the writer recomputes it.
+
 *The lesson these two add*, which is the type-vs-value one turned outward:
 **the fixture set is only as wide as the tools that built it.** Every fixture
 in the tree came from =ogr2ogr=, DuckDB, pyarrow or hand-authoring, so the
@@ -432,10 +584,15 @@ reading the *format* for what it allows instead of the *tool* for what it
 writes.
 
 ** WHAT CHANGED IN EXISTING DOCS
-Listed explicitly because they were written before this work was committed.
-/Now that it is committed, =git log= is the better source where the two
-disagree -- see § THE ONE REAL GAP, whose "no commits" claim was itself an
-error and is retracted there./
+Listed explicitly because each entry was written before its work was committed.
+/=git log= is the better source wherever the two disagree -- see § THE ONE REAL
+GAP, whose "no commits" claim was itself an error and is retracted there, and
+which explains why this section must never be read as a statement about what is
+committed./
+
+*As of 2026-08-22 every entry below has landed*, through =c789447=. That
+sentence is exactly the kind that expires, which is the point of the rule above:
+check =git log= rather than trusting it.
 
 /Newest first./
 
@@ -860,7 +1017,9 @@ each measured against real =ogr2ogr= output rather than argued:
    whole time and would have answered it in one command./
 - =plans/same-format-output.org= -- gained a backlink recording that it is
   *gated*, its M1 resequenced, its atomic-writes scope item updated, and one
-  OPEN QUESTION moved out.
+  OPEN QUESTION moved out. /That backlink is stale as of 2026-08-22: the gate's
+  supporting argument expired -- see § THE SEQUENCING. The plan file has not
+  been edited to say so, so believe this note over the backlink./
 - =plans/lossy-conversion-warnings.org= -- gained § OWED WARNING (decision 3)
   and § OPEN QUESTION (the consolidated warning-scope question).
 - =plans/spatial-index.org= -- its =--rtree=-by-default question *narrowed*,
@@ -1012,6 +1171,18 @@ again./
 
 ** OPEN QUESTIONS WORTH KNOWING
 Not blockers, but they will come up:
+- *Where does the format-check deletion go now?* /Added 2026-08-22./ It is
+  drawn last and is no longer forced there -- the duplicated-inventory-pass
+  argument that put it there is spent. Argued in full in § THE SEQUENCING; the
+  call turns on whether defect 3's destruction or *composability* is the
+  priority, because per § THE EDIT LOOP no format has a lossless edit loop
+  until the deletion lands.
+- *Does M3b carry an index, or rebuild it?* /Added 2026-08-22./ Carrying is far
+  cheaper than it looks -- an index b-tree on disk is *already sorted*, so an
+  in-order read re-packs without any comparison or collation logic, which is
+  the expensive part of building one. But § THE EDIT LOOP says a carried index
+  is *wrong* rather than stale once a middle stage has touched the geometry.
+  The two pull opposite ways and the plan's M3b entry records both.
 - *Is canonicalisation a loss?* =MULTIPOINT ((1 2))= → =MULTIPOINT (1 2)=,
   =linestring= → =LINESTRING=. Decides whether the CSV/WKT lexeme problem is
   two bugs or a whole class. (=native-inventory.org= § QUESTIONS, item 1.)

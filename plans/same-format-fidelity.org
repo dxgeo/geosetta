@@ -1300,6 +1300,28 @@ travels with D1's =name= modelling.
   -- which is substantially harder file-format work than anything currently in
   it. Enumerating what to carry is the cheaper path by a wide margin.
 
+  *A third content class, forced by the edit loop -- added 2026-08-22.* D4
+  splits derived content two ways; carrying a container needs a third, because
+  its content divides by *what it depends on*: *independent* (a user's own
+  table, survives any edit, carry unconditionally), *layer-coupled*
+  (=gpkg_metadata_reference= keyed by =(table_name, column_name)=, triggers on
+  feature tables -- **validate against what is actually written**, never
+  replay blindly, following decision 14's =ARROW:schema= precedent), and
+  *derived* (recompute, never carry).
+
+  Two consequences, both concrete:
+  - *=gpkg_ogr_contents= is currently misclassified.* Defect 3's warning names
+    it as destroyed content; it is =(table_name TEXT PRIMARY KEY,
+    feature_count INTEGER)=, a row-count cache, and belongs in the second
+    message beside the R*Tree. Same shape as the =gpkg_extensions= mistake
+    caught on 2026-08-21. /Found 2026-08-22, live, fix it here./ Under editing
+    it is the sharpest case in the container: carry it after a middle stage
+    deletes a feature and the output states a count that is a lie.
+  - *A carried index is =wrong=, not stale, once geometry has been touched.*
+    That cuts directly against the "carrying is cheaper than building"
+    finding above, and the two have to be decided together rather than
+    separately. See =handoff.org= § THE EDIT LOOP for the full argument.
+
   *Finally, =container.rs= should invert.* =REPRODUCED= is a hand-maintained
   constant that must move whenever =writer::build= does, which its module doc
   flags twice because the coupling goes unnoticed until it is wrong. After M3b

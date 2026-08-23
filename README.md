@@ -353,8 +353,33 @@ one row group, and property columns typed by scanning all features
     # not supported for Shapefile (sibling .shp/.shx/.dbf/.prj files, no single
     # byte stream to pipe) — route it through a single-buffer format instead:
     geosetta in.shp - --to fgb | reproject-tool --to EPSG:3857 | geosetta - out.shp --from fgb
+    # input and output may be the same format — a same-format run re-encodes
+    # through the feature model (normalising and validating; a parse failure is
+    # the finding), and it is the only shape in which an edit loop is lossless:
+    geosetta in.fgb - --to fgb | your-editor | geosetta - out.fgb --from fgb
+    # they may not be the same *file*: that is refused, because a failed write
+    # would leave no original to retry from.
 
 A runnable example lives in [examples/sample.geojson](examples/sample.geojson).
+
+### Editing in the middle
+
+Geosetta stands at both ends of any pipeline it takes part in, so the transit
+format and the endpoint format colliding is the ordinary case, not a mistake.
+It is also the only lossless one: a transit format that differs from the
+endpoint is entitled to drop whatever it cannot hold, so `gpkg → fgb → tool →
+fgb → gpkg` loses what FlatGeobuf cannot carry, twice.
+
+Where a same-format re-encode still loses something, the run says so on stderr
+rather than leaving you to find out. Today Shapefile is the only format that
+round-trips with nothing to report; GeoJSON drops both `bbox` members, CSV
+normalises the text it inferred a type from, GeoParquet drops the covering-bbox
+column, and KML keeps little more than placemarks. Those are measured, not
+predicted, and each is a gap being closed rather than a design position.
+
+In-process, none of this applies: a Rust consumer holding a `FeatureCollection`
+between `read_features` and `write_features` never serialises it, so nothing is
+in a position to be lost.
 
 
 ## PRIOR ART / POSITIONING

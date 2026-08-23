@@ -237,9 +237,12 @@ fn pipes_through_proj_cs2cs() {
 
     // Feed the reconstructed WKT back into geosetta via stdin -> stdout, to
     // prove the piped-back data re-enters geosetta's own reader/writer fine.
-    // Bounced through GeoJSON and back to WKT (geosetta refuses a same-format
-    // no-op conversion, and GeoJSON's round trip is already covered
-    // elsewhere, so this doubles as free coverage of that hop too).
+    // Bounced through GeoJSON and back to WKT. That detour was originally
+    // forced — geosetta refused a same-format conversion, so `wkt -> wkt` was
+    // not a run you could make — and since `same-format-output.org` M1 it is
+    // no longer. It stays because it earns its place on the original secondary
+    // grounds: it doubles as coverage of the WKT/GeoJSON hop in both
+    // directions, which a `wkt -> wkt` pass-through would not exercise.
     let mut wkt_to_geojson = Command::new(GEOSETTA);
     wkt_to_geojson.args(["--from", "wkt", "--to", "geojson"]).arg("-").arg("-");
     let geojson_roundtrip = run_with_stdin(wkt_to_geojson, reprojected_wkt.as_bytes());

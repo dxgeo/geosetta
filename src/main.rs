@@ -21,8 +21,32 @@
 //! not a single byte stream, so there's nothing to pipe. Route it through a
 //! single-buffer format instead (FlatGeobuf and GeoParquet both carry the CRS
 //! faithfully): `geosetta in.shp - --to fgb | ... | geosetta - out.shp --from fgb`.
+//!
+//! # Input and output may be the same format
+//!
+//! They may not be the same *file*. Both halves of that are recent, and they
+//! arrived together (`plans/same-format-output.org`).
+//!
+//! A same-format run is not a no-op: it re-encodes through the feature model,
+//! which normalises the file and validates it end to end — a parse failure is
+//! the finding. It is also the *only* shape in which an edit loop is lossless,
+//! because a transit format that differs from the endpoint format is entitled
+//! to drop whatever it cannot hold:
+//! ```text
+//! geosetta in.fgb - --to fgb | your-editor | geosetta - out.fgb --from fgb
+//! ```
+//! Where the re-encode still loses something, the run says so — the
+//! cross-format defence ("the target has no slot for it") does not apply when
+//! the target *is* the source's format. See `same_format_warning`.
+//!
+//! The same-file refusal ([`refuse_same_file`]) is the other half, and it is
+//! not merely tidiness: the format check that used to reject `a.fgb a.fgb` had
+//! been serving as an accidental in-place guard, and removing it without
+//! replacing it would newly expose a run that truncates its only copy before
+//! writing.
 
 use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
 use geosetta::{cli, convert, geopackage, shapefile};
 use geosetta::Crs;
@@ -84,6 +108,10 @@ fn run() -> Result<()> {
         cli::Mode::Convert { output, to } => Output { path: output, format: *to },
     };
 
+    // Before anything is read or written: an output that would overwrite its
+    // own input is refused outright (D4).
+    refuse_same_file(&args.input, args.from, &out)?;
+
     // Read the `--crs` override up front: a malformed one should fail before
     // anything has been read or written, not midway through.
     let crs_override = load_crs_override(&args)?;
@@ -94,13 +122,6 @@ fn run() -> Result<()> {
         (_, Format::Gpkg) => return run_geopackage_write(&args, &out, crs_override.as_ref()),
         (Format::Gpkg, _) => return run_geopackage_read(&args, &out, crs_override.as_ref()),
         _ => {}
-    }
-
-    if args.from == out.format {
-        return Err(Error::Usage(format!(
-            "input and output are the same format ({:?}); nothing to convert",
-            args.from
-        )));
     }
 
     // Everything else routes through the shared feature IR, so any input format
@@ -125,6 +146,7 @@ fn run() -> Result<()> {
     if let Some(crs) = &crs_override {
         install_crs_override(&mut fc, crs);
     }
+    print_warnings(&same_format_warning(args.from, out.format), args.quiet);
     print_warnings(&collect_conversion_warnings(&fc, out.format), args.quiet);
     if args.progress {
         eprintln!("writing {}...", out.format.extension());
@@ -492,6 +514,75 @@ fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<FeatureCol
     shapefile::read(&shp, &dbf_bytes, prj.as_deref(), cpg.as_deref())
 }
 
+/// Every path a side of the conversion touches, canonicalised for comparison.
+///
+/// A Shapefile is a *file set*, not a path, so it contributes all its
+/// siblings: the collision `plans/same-format-output.org` D4 is about is
+/// `geosetta roads.shp roads.dbf` as much as `roads.shp roads.shp`.
+///
+/// `-` contributes nothing — stdin and stdout are different streams even when
+/// both are the same terminal.
+fn touched_paths(path: &str, format: Format) -> Vec<PathBuf> {
+    if path == "-" {
+        return Vec::new();
+    }
+    let raw = if format == Format::Shapefile {
+        let stem = strip_shp_extension(path);
+        ["shp", "shx", "dbf", "prj", "cpg"].iter().map(|e| format!("{stem}.{e}")).collect()
+    } else {
+        vec![path.to_string()]
+    };
+    raw.iter().filter_map(|p| canonical_for_compare(p)).collect()
+}
+
+/// Canonicalise `path` even when it does not exist yet.
+///
+/// The output usually does not, which is the whole difficulty: `canonicalize`
+/// fails on a missing file, so fall back to canonicalising the *parent* — which
+/// does exist — and rejoining the file name. That still resolves `./a.fgb`,
+/// `a.fgb` and a symlinked directory to one answer, which is the point.
+fn canonical_for_compare(path: &str) -> Option<PathBuf> {
+    let p = Path::new(path);
+    if let Ok(c) = p.canonicalize() {
+        return Some(c);
+    }
+    let parent = match p.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    };
+    Some(parent.canonicalize().ok()?.join(p.file_name()?))
+}
+
+/// Refuse a run whose output would overwrite its own input.
+///
+/// `plans/same-format-output.org` D4, and it is the load-bearing half of
+/// deleting the format check: same format almost always meant same extension,
+/// so `geosetta a.fgb a.fgb` was refused *for the wrong reason* and became
+/// reachable the moment that check went.
+///
+/// The happy path would survive it — every reader completes before any writer
+/// opens a file — but the unhappy path does not. `std::fs::write` truncates
+/// first, so any write-side failure after that point has destroyed the only
+/// copy, and a Shapefile write is *four* files in sequence: a failure at
+/// `.dbf` leaves a `.shp` of new data, a `.dbf` of neither, and no original to
+/// retry from. There is no atomic write in this crate to fall back on.
+///
+/// This deliberately changes the GeoPackage path's behaviour, which used to
+/// permit an in-place run. That permissiveness rested on the append path
+/// reading the output before overwriting it — luck, not design.
+fn refuse_same_file(input: &str, from: Format, out: &Output) -> Result<()> {
+    let ins = touched_paths(input, from);
+    let outs = touched_paths(out.path, out.format);
+    let Some(clash) = outs.iter().find(|o| ins.contains(o)) else {
+        return Ok(());
+    };
+    Err(Error::Usage(format!(
+        "input and output are the same file ({}); write to a different path, \
+         since a failed write would leave no original to retry from",
+        clash.display()
+    )))
+}
+
 /// Write a Shapefile's sibling files under `output_path`'s stem (a trailing
 /// `.shp`/`.SHP`, if present, is stripped so `roads.shp` and `roads` both name
 /// the same `roads.{shp,shx,dbf,prj}` set).
@@ -706,6 +797,34 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
 /// [`FeatureCollection::m_downgrade_warning`]) — adding a new kind of loss
 /// (a new format spoke's capability gap, a new IR field) is one line here,
 /// not a new wrapper-function pair. See `plans/lossy-conversion-warnings.org`.
+/// The warning that has to ship with the same-format deletion, not after it.
+///
+/// `plans/same-format-output.org` D3: M1 alone is a working feature that
+/// silently drops data, which the crate's own convention forbids. On a
+/// cross-format run a drop has a defence — the target may have no slot — and
+/// `collect_conversion_warnings` handles that case. Here there is none: the
+/// target is the source's own format, so it provably can hold what the source
+/// held.
+///
+/// Silent by design when the formats differ, and when the format round-trips
+/// clean (Shapefile), so this does not become furniture on every run.
+fn same_format_warning(from: Format, target: Format) -> Vec<String> {
+    if from != target {
+        return Vec::new();
+    }
+    let losses = target.same_format_losses();
+    if losses.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{} to {} is a re-encode through the feature model, not a copy, so it does not preserve: \
+         {}. (plans/same-format-output.org)",
+        target.display_name(),
+        target.display_name(),
+        losses.join("; "),
+    )]
+}
+
 fn collect_conversion_warnings(fc: &FeatureCollection, target: Format) -> Vec<String> {
     let mut warnings = Vec::new();
     if let Some(w) = fc.crs.as_ref().and_then(|c| c.downgrade_warning(target)) {

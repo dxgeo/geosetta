@@ -142,6 +142,86 @@ impl Format {
         matches!(self, Format::FlatGeobuf | Format::Shapefile | Format::Gpkg | Format::Parquet)
     }
 
+    /// What a **same-format** run still fails to preserve, as phrases naming
+    /// the losses. Empty when a round trip through this format loses nothing
+    /// worth saying.
+    ///
+    /// # Why this exists
+    ///
+    /// On a cross-format run, dropping something has a defence: the target may
+    /// have no slot for it, and that is
+    /// [`crate::Crs::downgrade_warning`]'s department. On a same-format run
+    /// the defence evaporates — the target *is* the source's format, so it
+    /// provably can hold the member, because the source did. Under the crate's
+    /// standing rule that any silent drop must warn, a same-format run that
+    /// loses something and says nothing is a bug.
+    ///
+    /// # These are measured, and the measurement overturned the plan
+    ///
+    /// `handoff.org` § THE SEQUENCING predicted this would reduce to "warn for
+    /// the four spokes that do not carry natives". It does not. Measured
+    /// 2026-08-23 by running each fixture to its own format, **three of the
+    /// four spokes that *do* carry natives still lose something**: the natives
+    /// channel made them less lossy, not lossless. Guessing this list is what
+    /// the plan originally did, and it guessed WKT had nothing to lose.
+    ///
+    /// # Format granularity is deliberate
+    ///
+    /// This says what a format *can* lose, not what a given file *did* lose,
+    /// so it over-fires on an input that happened to carry none of it. The
+    /// alternative is threading a "what did I skip" channel out of every
+    /// reader, which is a far larger change for a warning already actionable
+    /// at this granularity.
+    pub fn same_format_losses(self) -> &'static [&'static str] {
+        match self {
+            // Measured: `/bbox` and `/features/[]/bbox` vanish, and a foreign
+            // member on a *geometry* is dropped where one on the feature or
+            // the collection survives. The `id` half was closed by M2.
+            Format::GeoJson => {
+                &["the collection and feature `bbox` members", "foreign members on a geometry"]
+            }
+            // Measured: `007` -> `7`, `1.50` -> `1.5`, `TRUE` -> `true`, and
+            // `12345678901234567890` -> `12345678901234567000`. The last is a
+            // *different number*, not a reformat; the rest are the lexeme the
+            // reader inferred a type from and then discarded.
+            Format::Csv => &[
+                "the exact text of every cell (leading zeros, trailing zeros, letter case)",
+                "integer precision beyond 64 bits",
+            ],
+            // Measured: `POINT (1.50 2.00)` -> `POINT (1.5 2)` and
+            // `MULTIPOINT ((1 2), (3 4))` -> `MULTIPOINT (1 2, 3 4)`. Both
+            // forms are valid OGC WKT; this writer emits one of them.
+            Format::Wkt => &["the exact spelling of every coordinate and the MULTIPOINT dialect"],
+            // Measured: the source's `Unknown (any)` declaration comes back as
+            // `Point`. Narrowing, not data loss — but a consumer that could
+            // have appended a LineString to the source cannot append one to
+            // the output.
+            Format::FlatGeobuf => &["the declared geometry type, which is narrowed to what is present"],
+            // Measured: the GeoParquet 1.1 covering-bbox column is read and
+            // not written (`plans/spatial-index.org` milestone E), and the
+            // primary geometry column is renamed to `geometry`.
+            Format::Parquet => {
+                &["the covering-bbox column", "the geometry column's name"]
+            }
+            // Measured: of everything in `hand_hostile.kml`, the output keeps
+            // Placemark, Point, name, description and ExtendedData. Styles,
+            // folders, overlays, models, timestamps and altitude modes all go.
+            Format::Kml | Format::Kmz => &[
+                "styles and styleUrls",
+                "folders, overlays and models",
+                "timestamps and altitude modes",
+            ],
+            // Measured clean: the `.dbf` field declarations and `.prj` survive
+            // intact, and only `DBF_DATE_LAST_UPDATE` differs.
+            Format::Shapefile => &[],
+            // Not this warning's job. A `gpkg` run never reaches the plain
+            // convert path, and what its container rewrite destroys is
+            // reported in far more detail by
+            // `geopackage::container_drop_warnings` — defect 3.
+            Format::Gpkg => &[],
+        }
+    }
+
     /// What a column declared `ty` comes back as after being written to this
     /// format and read again — the *composition* of this spoke's writer and
     /// reader type mappings.

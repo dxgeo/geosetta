@@ -54,7 +54,7 @@ still pass =native: None=.*
   M3b has to honour and rules out dirty-flag invalidation on structural
   grounds (§ THE EDIT LOOP).
 
-542 tests pass (=cargo test -p geosetta=: 494 lib, 47 integration, 1 doc),
+551 tests pass (=cargo test -p geosetta=: 494 lib, 56 integration, 1 doc),
 clippy clean, *and =cargo doc= is green* -- add that third command to your
 verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
 else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). The
@@ -151,9 +151,10 @@ time. *Not started.*
             |
   M3b GeoPackage container   M3c KMZ container
             |
-  same-format-output.org M1: delete the format check
-            |
-  atomic write-and-rename
+  same-format-output.org M1: delete the format check   [DONE 2026-08-23 --
+            |                                           taken *out* of this
+  atomic write-and-rename                               order and shipped
+                                                        first; see below]
 #+end_src
 
 *Why the deletion came last -- and why that reason has now expired.* Decided
@@ -171,6 +172,26 @@ warn for the four spokes that do not, which is a smaller change than the one
 the decision was protecting against. The diagram above is therefore *no longer
 forced below M3*; it is drawn as it was decided, and the position of the
 deletion is now an open call rather than a settled one.
+
+*** SHIPPED 2026-08-23, and the prediction in the paragraph above was wrong
+/The deletion landed first, ahead of M3b, on the composability reading of the
+call below./ The conclusion -- that the deletion was small and worth doing --
+held. **The sentence "warn for the four spokes that do not" did not.**
+
+Once the check was gone, every format could be run against itself and measured
+rather than reasoned about. *Three of the four spokes that carry natives still
+lose something:* GeoJSON drops both =bbox= members and any foreign member on a
+*geometry*, GeoParquet drops the covering-bbox column and renames the primary
+geometry column, and FlatGeobuf narrows the source's declared geometry type
+from =Unknown (any)= to what is present. Add CSV, WKT and KML/KMZ and the
+warning covers *seven* of nine formats, not four. Shapefile is the only one
+that round-trips clean; =gpkg= belongs to =container_drop_warnings=.
+
+So the per-format table survived, in =Format::same_format_losses=, with
+contents that are measured. **The natives channel made three spokes less lossy
+and none of them lossless**, which is the fact the prediction was missing --
+and it is a useful correction to carry into M3b, whose job is exactly the
+remaining half for GeoPackage.
 
 *What makes it worth actually reopening* is § THE EDIT LOOP below: per
 =edit-composability.org= § THE TRANSIT COROLLARY, an edit loop is lossless only

@@ -1066,8 +1066,11 @@ fn the_pipeline_carries_an_id_less_geoparquet_definition() {
     let (definition, status) = geoscribe(&["--identify", "--projjson"], &printed.stdout);
     assert_eq!(status, 0, "geoscribe could not identify the PROJJSON");
 
-    // FlatGeobuf, not Parquet: geosetta refuses a same-format conversion, and the
-    // point here is the CRS crossing a format boundary intact anyway.
+    // FlatGeobuf, not Parquet: this was written when geosetta refused a
+    // same-format conversion. That refusal is gone (`same-format-output.org`
+    // M1), so the choice is now arbitrary — but the point being tested was
+    // always the CRS crossing a *format boundary* intact, so a cross-format
+    // target still says it best.
     let out = dir.join("identified.fgb");
     let r = run(
         &[src, out.to_str().unwrap(), "--crs", "-"],
@@ -1135,12 +1138,14 @@ fn a_full_two_stage_pipeline_carries_the_override_through() {
     // coexist precisely because only one of them claims stdin — the case the
     // conflict check exists to keep honest.
     //
-    // The stages convert *between* formats (fgb -> parquet -> shp): a stage
-    // whose input and output are the same format is rejected outright as having
-    // nothing to convert, so a pass-through stage isn't a thing you can build.
-    // The bare EPSG:7844 survives the intermediate hop as GeoParquet's id-only
-    // reference — unresolvable downstream, which is exactly what `--crs` fixes
-    // at the end of the pipe.
+    // The stages convert *between* formats (fgb -> parquet -> shp). That used
+    // to be the only kind of stage there was — a same-format stage was rejected
+    // as having nothing to convert — and it no longer is: since
+    // `same-format-output.org` M1 a pass-through stage is buildable, and
+    // `tests/same_format.rs` builds one. This test keeps the cross-format shape
+    // because that is what it is *about*: the bare EPSG:7844 surviving the
+    // intermediate hop as GeoParquet's id-only reference — unresolvable
+    // downstream, which is exactly what `--crs` fixes at the end of the pipe.
     let dir = tmp_dir();
     let fgb = write_code_only_fgb(&dir);
     let wkt_path = dir.join("gda2020.wkt");

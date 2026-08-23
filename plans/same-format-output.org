@@ -4,7 +4,22 @@
 
 * Same-Format Output
 
-** STATUS -- scoping only (2026-08-19). Nothing implemented.
+** STATUS -- M1, M2, M3 and M4 shipped 2026-08-23
+/Was "scoping only (2026-08-19). Nothing implemented." until 2026-08-23./
+
+The check is deleted, the same-format warning ships with it (D3), the same-file
+refusal is in (D4), and the documentation is updated (M4). Coverage is
+=tests/same_format.rs=.
+
+*Two things the measurement overturned, both recorded in place below:*
+1. *§ THE FIDELITY PROBLEM's example is wrong.* It offers =geosetta a.wkt
+   b.wkt= as the run that warns about nothing. WKT loses the *lexeme*, so it
+   warns; *Shapefile* is the format that round-trips clean.
+2. *M2's shape was superseded and then un-superseded.* =handoff.org= § THE
+   SEQUENCING predicted the nine constants would collapse to "warn for the four
+   spokes that do not carry natives". Measured, *three of the four spokes that
+   do carry natives still lose something*, so the per-format table survives --
+   with contents that are now measured rather than reasoned.
 =src/main.rs:97= rejects any conversion whose input and output formats match:
 
 #+begin_src rust
@@ -155,6 +170,21 @@ format could have recorded it.* Both halves matter:
   =read_wkt_lines= recovers geometry only, so a WKT source has no unmodelled
   members and =geosetta a.wkt b.wkt= warns about nothing -- even though the WKT
   *writer* emits geometry alone and would drop every property it were handed.
+
+  ***That example is wrong, and measuring it is what found the flaw in the
+  rule.*** /Corrected 2026-08-23, when M1 made the run possible./ WKT has
+  nothing unmodelled at the *member* level and still loses:
+  =POINT (1.50 2.00)= comes back =POINT (1.5 2)=, and
+  =MULTIPOINT ((1 2), (3 4))= comes back in the bare dialect. The loss is the
+  *lexeme* -- the text the reader parsed and discarded -- which "unmodelled
+  members" does not name. =native-inventory.org= § CSV had already found the
+  same thing one entry earlier ("That reasoning was about /members/. The loss
+  is the /lexeme/"), and this plan was not updated to match.
+
+  *The rule still holds; its vocabulary was too narrow.* Read "something the IR
+  does not model" as including the byte-level form of what it does model, and
+  both CSV and WKT fall out correctly. **Shapefile** is the format that
+  actually warns about nothing.
 - The second half keeps the existing capability logic intact, so a cross-format
   run to a target that genuinely cannot hold the member stays silent-or-warned
   by the same reasoning it uses now.
@@ -282,6 +312,8 @@ is luck rather than design.
 =gpkg= path. Listed only so it is not re-derived: this plan does not touch it.
 
 ** MILESTONES
+/M1--M4 all shipped 2026-08-23; see § STATUS. Left as written, because what
+each one predicted is worth comparing against what it cost./
 - *M1* -- delete the check; the plain convert path handles same-format runs
   with no new branch. Tests for each single-buffer format, plus the
   stdin/stdout pass-through stage (=geosetta - - --from fgb --to fgb=).

@@ -12,17 +12,15 @@ Live list of what's open right now — not the full historical plan index (see
 DONE included). Each entry is just a link to its real plan/section for detail;
 check it off and remove it once the item ships or is shelved.
 
-- [ ] [[file:same-format-output.org][same-format-output.org]] — drop the
-  =args.from == out.format= rejection so a user can write the format they read.
-  Geosetta is now the ecosystem's only reader/writer, so it stands at *both*
-  ends of every pipeline and the transit format colliding with the endpoint
-  format is ordinary. =gpkg= → =gpkg= already works (it returns before the
-  check), so the crate already contains the counterexample. The real work is
-  fidelity, not the deletion: geosetta's round trip drops what =ogr2ogr=
-  keeps (feature =id=, both =bbox=es, collection =name=), and on a same-format
-  run "the target can't hold it" is no longer a defence — so a warning ships
-  with it. Also restores the in-place guard the format check was accidentally
-  providing. Scoping only.
+- [X] [[file:same-format-output.org][same-format-output.org]] — *SHIPPED
+  2026-08-23.* The =args.from == out.format= rejection is gone, so a user can
+  write the format they read. With it: the same-format warning (D3 — seven of
+  nine formats still lose something on a re-encode, *measured*, which is three
+  more than =handoff.org= predicted), the same-file refusal the deleted check
+  had been providing by accident (D4, and it changes =gpkg= behaviour), and
+  =tests/same_format.rs=. **This is what makes an edit loop possible at all**:
+  per the transit corollary, a loop is lossless only when the transit format is
+  the endpoint format, and that was precisely the run being refused.
 - [ ] [[file:native-inventory.org][native-inventory.org]] — M1 of
   =same-format-fidelity.org=: what each reader discards, classified. First pass
   *complete* (all 9 spokes, measured or traced), and the nine hostile fixtures

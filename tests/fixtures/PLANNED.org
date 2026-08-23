@@ -29,16 +29,25 @@ written at all. **All six registry tables this crate emits match the
 standard exactly**, so the 2026-08-23 spec pass holds up under a check that
 does not depend on anyone remembering what to assert.
 
-** =gpkg_metadata_autoincrement.gpkg=
+** =gpkg_metadata_autoincrement.gpkg= -- /narrowed 2026-08-23; still worth building/
 =gpkg_metadata= is specified as =id INTEGER PRIMARY KEY AUTOINCREMENT=, so a
-populated one *requires a =sqlite_sequence= row*. That is the second of the
-three remaining =sqlite.rs= gaps, and this fixture is what makes it concrete
-rather than reasoned.
+populated one *requires a =sqlite_sequence= row*.
 
-*Pins:* M3b carrying =gpkg_metadata= at all. Dropping =sqlite_sequence= lets a
-later insert reuse a retired id -- currently recorded as /reasoned, not
-measured/ in =plans/same-format-fidelity.org= § MILESTONES, M3b, gap 2. **This
-fixture is how it stops being reasoned.**
+***Two thirds of this entry was already covered and nobody had checked.***
+=gdal_hostile.gpkg= and =sqlite_contents.gpkg= both carry a =gpkg_metadata=
+that declares AUTOINCREMENT with a live =sqlite_sequence= row, so "a populated
+=gpkg_metadata= needs a sequence row" needed no new fixture at all -- it needed
+somebody to run =SELECT * FROM sqlite_sequence= against the fixtures already
+here. The gap itself was closed on 2026-08-23 without this file.
+
+*What is still uncovered, and it is the sharp part:* in every fixture in this
+tree the mark **equals** =max(id)=. The state that distinguishes a high-water
+mark from a recomputable maximum -- a mark *above* =max(id)=, left behind by a
+deleted row -- appears nowhere. Until it does, a carrying implementation that
+recomputed the mark from the rows would pass every test here.
+
+*Build:* =sqlite3=, the Metadata extension's DDL, two rows, then delete the
+second. That leaves =seq= at 2 with =max(id)= of 1.
 
 *Build:* =sqlite3=, the Metadata extension's DDL, two rows, then delete one so
 the high-water mark exceeds =max(id)= -- which is the only state that makes

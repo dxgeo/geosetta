@@ -205,18 +205,21 @@ fn serialize(table: &str, levels: &[Vec<Node>]) -> Rtree {
             // Shadow tables are keyed by `INTEGER PRIMARY KEY`, a rowid alias,
             // so none of them owns a separate index b-tree.
             autoindexes: Vec::new(),
+            autoincrement: None,
         },
         TableSpec {
             name: format!("{rtree_name}_rowid"),
             sql: format!("CREATE TABLE \"{rtree_name}_rowid\"(rowid INTEGER PRIMARY KEY,nodeno)"),
             rows: rowid_rows,
             autoindexes: Vec::new(),
+            autoincrement: None,
         },
         TableSpec {
             name: format!("{rtree_name}_parent"),
             sql: format!("CREATE TABLE \"{rtree_name}_parent\"(nodeno INTEGER PRIMARY KEY,parentnode)"),
             rows: parent_rows,
             autoindexes: Vec::new(),
+            autoincrement: None,
         },
     ];
 

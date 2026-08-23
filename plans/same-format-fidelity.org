@@ -1542,12 +1542,49 @@ travels with D1's =name= modelling.
      integrity_check= fails, and every =INSERT= fails. Measured; see D10 and
      =handoff.org= § BUGS FOUND entry 15. Anything M3b carries beyond the
      =INTEGER PRIMARY KEY= shape needs this gap closed first.
-  2. *=sqlite_sequence= carries state, not just DDL.* =container.rs= skips
+  2. ~~*=sqlite_sequence= carries state, not just DDL.*~~ **CLOSED
+     2026-08-23**, write side and read side, ahead of the carrying that needs
+     it. =TableSpec::autoincrement= makes the DDL and its bookkeeping *one
+     decision* -- the same argument =autoindexes= carries, for the same reason
+     -- and =write_database= emits =sqlite_sequence= itself rather than
+     leaving it as a second call a caller may forget.
+     =Database::sequence_numbers= reads the marks back.
+     /The original text follows, because what it got wrong about the severity
+     is the useful part./
+
+     *=sqlite_sequence= carries state, not just DDL.* =container.rs= skips
      =sqlite_*= names on the reasoning that "these follow the DDL rather than
      carrying anything" -- *false* of =sqlite_sequence=, whose rows are
      AUTOINCREMENT high-water marks that no DDL regenerates. Dropping them
      lets a later insert reuse a retired id.
      /Reasoned, not measured: it cannot bite until M3b carries tables./
+
+     ***The severity was understated, and "reasoned, not measured" is why.***
+     Measured on a file shaped the way this writer emits one -- DDL declaring
+     AUTOINCREMENT, no sequence table, no orphaned pages:
+
+     #+begin_src text
+       PRAGMA integrity_check  -> ok
+       SELECT                  -> works
+       INSERT                  -> database disk image is malformed (11)
+     #+end_src
+
+     Not a reused id: a **malformed database**. That is the same class as the
+     missing autoindex of entry 15 and *strictly harder to catch*, because
+     entry 15 fails =integrity_check= and this passes it. Every verification
+     ritual in this tree would have reported green.
+
+     *And it was never going to wait for a later milestone.* Of the fixtures
+     already in the tree, =gpkg_metadata= declares AUTOINCREMENT in both
+     =gdal_hostile.gpkg= and =sqlite_contents.gpkg=, and so does =imagery= --
+     the tile table that *is* D8's carrying case. The first thing M3b carries
+     trips this.
+
+     /Two states, not one, and the API has to say which:/ the
+     =sqlite_sequence= *table* is created when AUTOINCREMENT is *declared*, not
+     on first insert, so a declared-never-inserted table has the table and no
+     row. And a row outlives its rows -- delete every row from the table and
+     the mark stands. Hence [`Autoincrement::Declared`] beside =HighWater=.
 
      *And false of =sqlite_autoindex_*= too, which this entry originally
      offered as the case the reasoning /did/ hold for.* It holds only when

@@ -229,6 +229,7 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
             autoindex_records(&data_column_rows, &[0, 2]),
         ],
         rows: data_column_rows,
+        autoincrement: None,
     }];
     if !constraints.is_empty() {
         specs.push(TableSpec {
@@ -254,6 +255,7 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
                 })
                 .collect(),
             autoindexes: Vec::new(),
+            autoincrement: None,
         });
         // `gdcc_ntv UNIQUE (constraint_name, constraint_type, value)`. Built
         // from the rows just pushed, since `constraints` was consumed above.
@@ -302,6 +304,7 @@ fn extensions_table(rows: Vec<ExtensionRow>) -> TableSpec {
         sql: EXTENSIONS_DDL.into(),
         // `ge_tce UNIQUE (table_name, column_name, extension_name)`.
         autoindexes: vec![autoindex_records(&rows, &[0, 1, 2])],
+        autoincrement: None,
         rows,
     }
 }
@@ -434,7 +437,7 @@ fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
     // `srs_id INTEGER NOT NULL PRIMARY KEY` is a rowid alias, so this table
     // owns no index b-tree — which is why it was the only registry table this
     // writer already emitted exactly as specified (defect 6).
-    TableSpec { name: "gpkg_spatial_ref_sys".into(), sql: sql.into(), rows, autoindexes: Vec::new() }
+    TableSpec { name: "gpkg_spatial_ref_sys".into(), sql: sql.into(), rows, autoindexes: Vec::new(), autoincrement: None }
 }
 
 fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) -> TableSpec {
@@ -483,6 +486,7 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) 
             autoindex_records(&rows, &[2]),
         ],
         rows,
+        autoincrement: None,
     }
 }
 
@@ -515,6 +519,7 @@ fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64
             autoindex_records(&rows, &[0]),
         ],
         rows,
+        autoincrement: None,
     }
 }
 
@@ -558,6 +563,7 @@ fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64, envelope: bool
         // alias, so it owns no index b-tree of its own. Its *spatial* index is
         // a separate opt-in structure — see `super::rtree`.
         autoindexes: Vec::new(),
+        autoincrement: None,
     }
 }
 

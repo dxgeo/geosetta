@@ -54,7 +54,7 @@ still pass =native: None=.*
   M3b has to honour and rules out dirty-flag invalidation on structural
   grounds (§ THE EDIT LOOP).
 
-551 tests pass (=cargo test -p geosetta=: 494 lib, 56 integration, 1 doc),
+554 tests pass (=cargo test -p geosetta=: 497 lib, 56 integration, 1 doc),
 clippy clean, *and =cargo doc= is green* -- add that third command to your
 verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
 else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). The
@@ -451,13 +451,17 @@ of it was planned work* -- each item was found by measuring the one above it:
 2026-08-21, when two shipped: defect 3's container warning and
 =decl_recast_warning=.
 
-*Three =sqlite.rs= gaps remain of the four found while scoping M3b on
-2026-08-22*, all recorded in =plans/same-format-fidelity.org= § MILESTONES,
-M3b. None is a silent data loss today; each is work M3b needs:
-*=sqlite_sequence='s* AUTOINCREMENT high-water marks (state that DDL cannot
-regenerate, currently skipped with the =sqlite_*= prefix), *page size* (read
-faithfully, written as a hardcoded 4096) and *reserved per-page space* (read as
-=usable_size=, written as zero). A fifth is out of scope by construction:
+*Two =sqlite.rs= gaps remain of the four found while scoping M3b on
+2026-08-22*, both recorded in =plans/same-format-fidelity.org= § MILESTONES,
+M3b. Neither is a silent data loss today; each is work M3b needs: *page size*
+(read faithfully, written as a hardcoded 4096) and *reserved per-page space*
+(read as =usable_size=, written as zero).
+
+/=sqlite_sequence= was the third and closed on 2026-08-23, ahead of the
+carrying that needs it, because "reasoned, not measured" had understated it:
+the cost is not a reused id but a **malformed database**, and one that passes
+=integrity_check= while failing every =INSERT=. Every ritual in this tree would
+have called it green./ A fifth is out of scope by construction:
 *WAL* is invisible to a reader that takes bytes rather than a path, so an
 un-checkpointed GeoPackage reads as its last checkpoint, silently.
 

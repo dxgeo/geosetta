@@ -178,6 +178,49 @@ impl<'a> Database<'a> {
         Ok(objects)
     }
 
+    /// The AUTOINCREMENT high-water marks this file records, as
+    /// `(table_name, mark)`.
+    ///
+    /// Empty when the file has no `sqlite_sequence` table, and *also* empty
+    /// when it has one that no table has been inserted into yet — those are
+    /// different states of the file and the same answer here, because a mark
+    /// is all a caller can carry. Whether the table itself must exist is
+    /// decided by the DDL, not by this.
+    ///
+    /// **Not derivable from the rows.** The mark is a high-water mark: delete
+    /// the last row and it stays behind, delete every row and it still stands.
+    /// That is the whole reason `container.rs`'s "these follow the DDL rather
+    /// than carrying anything" is false of `sqlite_sequence`, and why dropping
+    /// it produces a database that passes `integrity_check` and rejects every
+    /// `INSERT`. See [`Autoincrement`].
+    ///
+    /// Read today only by this module's tests, and allowed to be otherwise
+    /// unread on the precedent of `convert::convert`. **The consumer is M3b**:
+    /// the write side landed first deliberately, because the gap is forced by
+    /// the very first table M3b carries — `sqlite_contents.gpkg`'s `imagery`
+    /// tile table and `gpkg_metadata` both declare AUTOINCREMENT — and because
+    /// it is invisible to the verification ritual, so discovering it later
+    /// would mean discovering it from a user.
+    #[allow(dead_code)]
+    pub fn sequence_numbers(&self) -> Result<Vec<(String, i64)>> {
+        let tables = self.tables()?;
+        let Some(seq) = tables.iter().find(|t| t.name == SEQUENCE_TABLE) else {
+            return Ok(Vec::new());
+        };
+        let name_col = seq.columns.iter().position(|c| c == "name");
+        let seq_col = seq.columns.iter().position(|c| c == "seq");
+        let (Some(name_col), Some(seq_col)) = (name_col, seq_col) else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for row in self.read_rows(seq)? {
+            if let (Some(name), Some(n)) = (as_text(&row, name_col), as_int(&row, seq_col)) {
+                out.push((name, n));
+            }
+        }
+        Ok(out)
+    }
+
     /// All ordinary tables (`type = 'table'`) with a real root page.
     pub fn tables(&self) -> Result<Vec<Table>> {
         let master = Self::master_descriptor();
@@ -784,6 +827,59 @@ fn as_int(row: &[Value], i: usize) -> Option<i64> {
 
 const WRITE_PAGE_SIZE: usize = 4096;
 
+/// SQLite's AUTOINCREMENT bookkeeping table.
+pub const SEQUENCE_TABLE: &str = "sqlite_sequence";
+
+/// Its DDL, **verbatim as SQLite stores it** — no space after the table name,
+/// and no type on either column. Read off a `sqlite3`-built file rather than
+/// written from memory, because this string lands in `sqlite_master` and is
+/// what any other reader will compare against.
+const SEQUENCE_DDL: &str = "CREATE TABLE sqlite_sequence(name,seq)";
+
+/// A table's participation in `sqlite_sequence`, SQLite's AUTOINCREMENT
+/// bookkeeping.
+///
+/// # Why this is not derivable
+///
+/// `sqlite_sequence` holds a *high-water mark*, not `max(rowid)`. Measured:
+/// insert three rows and delete the third and the mark stays at 3 while
+/// `max(id)` is 2; delete *every* row and the mark still stands. Nothing in
+/// the DDL or the rows regenerates it, which is why `container.rs`'s reasoning
+/// that `sqlite_*` objects "follow the DDL rather than carrying anything" is
+/// false of this one.
+///
+/// # Why omitting it is worse than losing an id
+///
+/// The recorded cost used to be that a later insert could reuse a retired id.
+/// Measured 2026-08-23, on a file shaped the way this writer emits one — DDL
+/// declaring `AUTOINCREMENT`, no sequence table, no orphaned pages:
+///
+/// ```text
+/// PRAGMA integrity_check  -> ok
+/// SELECT                  -> works
+/// INSERT                  -> database disk image is malformed (11)
+/// ```
+///
+/// So it is the same class of malformation as a missing autoindex
+/// (`handoff.org` § BUGS FOUND entry 15) and **strictly harder to catch**:
+/// entry 15 fails `integrity_check`, and this passes it.
+///
+/// Constructed today only by this module's tests, on the same footing as
+/// [`Database::sequence_numbers`] beside it: the capability landed ahead of
+/// M3b's carrying deliberately, because this is the gap the *first* carried
+/// table trips and the one the verification ritual cannot see.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum Autoincrement {
+    /// The DDL declares `AUTOINCREMENT` and SQLite holds no row for the table
+    /// — nothing has ever been inserted. The `sqlite_sequence` *table* still
+    /// has to exist, because SQLite creates it at `CREATE TABLE` time and
+    /// every `INSERT` fails without it.
+    Declared,
+    /// The mark SQLite recorded for this table.
+    HighWater(i64),
+}
+
 /// A table to write: its DDL (`CREATE TABLE …`, recorded in `sqlite_master`)
 /// and its rows as `(rowid, values)`, rowid-ordered. A value at the
 /// INTEGER PRIMARY KEY column should be `Null` (the rowid carries it).
@@ -806,6 +902,14 @@ pub struct TableSpec {
     /// Empty for a table whose only key is `INTEGER PRIMARY KEY`, which is a
     /// rowid alias and owns no separate b-tree.
     pub autoindexes: Vec<Vec<Vec<u8>>>,
+    /// `Some` when this table's DDL declares `AUTOINCREMENT`.
+    ///
+    /// On the same reasoning as [`Self::autoindexes`], and it is the same
+    /// failure: the DDL and the bookkeeping it obliges are **one decision**,
+    /// so this sits on the spec rather than being a second call a caller may
+    /// forget to make. [`write_database`] emits `sqlite_sequence` when any
+    /// spec sets this, and a row for each that carries a mark.
+    pub autoincrement: Option<Autoincrement>,
 }
 
 /// A `sqlite_master` entry that is not a [`TableSpec`]: a virtual table
@@ -856,6 +960,9 @@ pub fn write_database(
     // immediately — the layout SQLite itself produces.
     let mut master_rows: Vec<(i64, Vec<Value>)> = Vec::new();
     let mut next_rowid = 1i64;
+    // Set once, by the first table declaring AUTOINCREMENT: there is exactly
+    // one `sqlite_sequence` per database however many tables use it.
+    let mut sequence_root: Option<u32> = None;
     for t in tables {
         let cells: Vec<(i64, Vec<u8>)> = t
             .rows
@@ -887,6 +994,49 @@ pub fn write_database(
                     // An implicit index has no `CREATE INDEX` text of its own;
                     // SQLite stores NULL here and re-derives it from the DDL.
                     Value::Null,
+                ],
+            ));
+            next_rowid += 1;
+        }
+
+        // `sqlite_sequence` goes in directly after the *first* table that
+        // declares AUTOINCREMENT, which is where SQLite itself puts it — it
+        // creates the table on the first such `CREATE TABLE`, not on the first
+        // `INSERT`. Verified by reading a `sqlite3`-built file: with tables
+        // `plain`, `a`, `b` and AUTOINCREMENT on the last two, the entry sits
+        // between `a` and `b`.
+        if t.autoincrement.is_some() && sequence_root.is_none() {
+            let rows: Vec<(i64, Vec<Value>)> = tables
+                .iter()
+                .filter_map(|t| match t.autoincrement {
+                    // A table that declares AUTOINCREMENT and has never been
+                    // inserted into holds no row at all — the table's
+                    // existence is what its `INSERT` needs, not a mark.
+                    Some(Autoincrement::HighWater(n)) => Some((t.name.clone(), n)),
+                    _ => None,
+                })
+                .enumerate()
+                .map(|(i, (name, n))| {
+                    ((i + 1) as i64, vec![Value::Text(name), Value::Int(n)])
+                })
+                .collect();
+            let cells: Vec<(i64, Vec<u8>)> = rows
+                .iter()
+                .map(|(rowid, values)| (*rowid, w.leaf_cell(*rowid, &encode_record(values))))
+                .collect();
+            let root = w.build_btree(&cells)?;
+            sequence_root = Some(root);
+            master_rows.push((
+                next_rowid,
+                vec![
+                    Value::Text("table".into()),
+                    Value::Text(SEQUENCE_TABLE.into()),
+                    Value::Text(SEQUENCE_TABLE.into()),
+                    Value::Int(root as i64),
+                    // Verbatim, and the spelling matters: it is what SQLite
+                    // stores, down to having no space after the table name and
+                    // no types on either column.
+                    Value::Text(SEQUENCE_DDL.into()),
                 ],
             ));
             next_rowid += 1;
@@ -1639,6 +1789,7 @@ mod tests {
                 sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT)".into(),
                 rows: Vec::new(),
                 autoindexes: Vec::new(),
+                autoincrement: None,
             };
             let entry = MasterEntry {
                 kind: "index".into(),
@@ -1656,6 +1807,158 @@ mod tests {
             assert_eq!(back.len(), records.len(), "record count (count={count})");
             assert_eq!(back, records, "records and their order (count={count})");
         }
+    }
+
+    /// A table declaring AUTOINCREMENT gets `sqlite_sequence`, with a row per
+    /// table that carries a mark and no row for one that does not.
+    #[test]
+    fn a_declared_autoincrement_produces_the_sequence_table() {
+        let spec = |name: &str, auto: Option<Autoincrement>| TableSpec {
+            name: name.into(),
+            sql: format!("CREATE TABLE {name}(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)"),
+            rows: vec![(1, vec![Value::Null, Value::Text("x".into())])],
+            autoindexes: Vec::new(),
+            autoincrement: auto,
+        };
+        let bytes = write_database(
+            &[
+                // Declared and inserted into.
+                spec("a", Some(Autoincrement::HighWater(7))),
+                // Declared, never inserted into: no row, but its INSERT still
+                // needs the table to be there.
+                spec("b", Some(Autoincrement::Declared)),
+            ],
+            &[],
+            0,
+            0,
+        )
+        .unwrap();
+
+        let db = Database::open(&bytes).unwrap();
+        assert_eq!(db.sequence_numbers().unwrap(), vec![("a".to_string(), 7)]);
+
+        // Placement: directly after the *first* declaring table, which is
+        // where SQLite puts it.
+        let names: Vec<String> =
+            db.master_objects().unwrap().into_iter().map(|o| o.name).collect();
+        assert_eq!(names, vec!["a", SEQUENCE_TABLE, "b"]);
+    }
+
+    /// No AUTOINCREMENT anywhere means no `sqlite_sequence` — the table is not
+    /// furniture every database carries.
+    ///
+    /// This is what keeps the change invisible to every GeoPackage this crate
+    /// writes today: none of its own tables declares AUTOINCREMENT, so none of
+    /// them acquires a sequence table it does not need.
+    #[test]
+    fn a_database_without_autoincrement_has_no_sequence_table() {
+        let bytes = write_database(
+            &[TableSpec {
+                name: "t".into(),
+                sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)".into(),
+                rows: vec![(1, vec![Value::Null, Value::Text("x".into())])],
+                autoindexes: Vec::new(),
+                autoincrement: None,
+            }],
+            &[],
+            0,
+            0,
+        )
+        .unwrap();
+        let db = Database::open(&bytes).unwrap();
+        assert!(db.master_objects().unwrap().iter().all(|o| o.name != SEQUENCE_TABLE));
+        assert!(db.sequence_numbers().unwrap().is_empty());
+    }
+
+    /// A mark read out of a real file is carried back unchanged, **including
+    /// when it exceeds `max(rowid)`**.
+    ///
+    /// That is the case the whole feature turns on: if the mark were
+    /// `max(rowid)` it could be recomputed and none of this would be needed.
+    /// `sqlite_contents.gpkg` supplies real marks written by `sqlite3`.
+    #[test]
+    fn a_high_water_mark_survives_a_read_and_a_write() {
+        const CONTENTS: &[u8] = include_bytes!("../tests/fixtures/sqlite_contents.gpkg");
+        let src = Database::open(CONTENTS).unwrap();
+        let marks = src.sequence_numbers().unwrap();
+        assert!(
+            marks.iter().any(|(n, _)| n == "gpkg_metadata"),
+            "fixture should carry a gpkg_metadata mark: {marks:?}"
+        );
+
+        // Re-emit them through a table that declares AUTOINCREMENT, with a
+        // mark deliberately above its only rowid.
+        let bytes = write_database(
+            &[TableSpec {
+                name: "t".into(),
+                sql: "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT)".into(),
+                rows: vec![(1, vec![Value::Null])],
+                autoindexes: Vec::new(),
+                autoincrement: Some(Autoincrement::HighWater(99)),
+            }],
+            &[],
+            0,
+            0,
+        )
+        .unwrap();
+        let back = Database::open(&bytes).unwrap();
+        assert_eq!(back.sequence_numbers().unwrap(), vec![("t".to_string(), 99)]);
+    }
+
+    /// **SQLite itself** accepts the AUTOINCREMENT bookkeeping this writer
+    /// emits, which is the only check that means anything here.
+    ///
+    /// `PRAGMA integrity_check` cannot answer this question: a file whose DDL
+    /// declares AUTOINCREMENT with no `sqlite_sequence` behind it passes
+    /// `integrity_check` and fails every `INSERT` with "database disk image is
+    /// malformed". Measured 2026-08-23 on a file built exactly that way. So
+    /// this test asks the reference implementation to *insert*, which is the
+    /// operation that actually exercises the table, and checks the new row got
+    /// an id above the mark rather than reusing a retired one.
+    ///
+    /// `#[ignore]`d on the same footing as the index cross-check beside it: it
+    /// needs a `sqlite3` binary on PATH.
+    #[test]
+    #[ignore = "needs the sqlite3 binary; run with --ignored"]
+    fn sqlite_itself_accepts_the_autoincrement_bookkeeping() {
+        use std::process::Command;
+
+        let bytes = write_database(
+            &[TableSpec {
+                name: "t".into(),
+                sql: "CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT)".into(),
+                // Rowids 1 and 2, with the mark left at 41: the state a file
+                // reaches by inserting 41 rows and deleting most of them.
+                rows: vec![
+                    (1, vec![Value::Null, Value::Text("a".into())]),
+                    (2, vec![Value::Null, Value::Text("b".into())]),
+                ],
+                autoindexes: Vec::new(),
+                autoincrement: Some(Autoincrement::HighWater(41)),
+            }],
+            &[],
+            0,
+            0,
+        )
+        .unwrap();
+
+        let path = std::env::temp_dir().join("geosetta_sequence_crosscheck.db");
+        std::fs::write(&path, &bytes).unwrap();
+        let ask = |sql: &str| -> String {
+            let out =
+                Command::new("sqlite3").arg(&path).arg(sql).output().expect("sqlite3 on PATH");
+            assert!(out.status.success(), "sqlite3 {sql}: {}", String::from_utf8_lossy(&out.stderr));
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        assert_eq!(ask("PRAGMA integrity_check;"), "ok");
+        assert_eq!(ask("SELECT seq FROM sqlite_sequence WHERE name='t';"), "41");
+
+        // The operation `integrity_check` cannot vouch for. Without the
+        // sequence table this fails outright; with a wrong mark it returns 3.
+        assert_eq!(ask("INSERT INTO t(v) VALUES('c'); SELECT id FROM t WHERE v='c';"), "42");
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The index this writer builds is checked by **SQLite itself**, not by
@@ -1695,6 +1998,7 @@ mod tests {
             sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT)".into(),
             rows,
             autoindexes: Vec::new(),
+            autoincrement: None,
         };
         // Index order is by `k`, which reverses the rowids.
         let records: Vec<Vec<u8>> = (1..=n)
@@ -1872,6 +2176,7 @@ mod tests {
             sql: r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "name" TEXT, "n" INTEGER, "r" REAL, "data" BLOB)"#.into(),
             rows,
             autoindexes: Vec::new(),
+            autoincrement: None,
         };
         let bytes = write_database(&[spec], &[], 0, 0).unwrap();
 

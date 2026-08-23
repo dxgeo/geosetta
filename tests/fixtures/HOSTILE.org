@@ -29,9 +29,18 @@ Everything else is still the target.
   members are the clearest example: any tool that round-trips them would have
   had to model them, and a tool that models them will not emit an unmodelled
   one on demand.
+- =sqlite_*.gpkg= -- /added 2026-08-22/. An =ogr2ogr= base with *SQLite's own*
+  DDL applied on top. A third prefix rather than a stretch of the other two,
+  because the provenance is the point: =ogr2ogr= will not emit a
+  =WITHOUT ROWID= table or an =ALTER TABLE ADD COLUMN=, and neither is
+  hand-authored -- =sqlite3= writes both, and a GeoPackage is a SQLite database
+  that any tool may touch after GDAL is done with it.
 
-All nine were confirmed *readable by geosetta without error* before being
-committed. A fixture the reader rejects tests nothing.
+*Every* fixture here was confirmed *readable by geosetta without error* before
+being committed. A fixture the reader rejects tests nothing. /This read "all
+nine" until 2026-08-22, which stopped being the count on 2026-08-21 and was
+wrong again the moment it was corrected -- the rule is per-fixture, so it is
+now stated that way rather than as a number that expires./
 
 ** THE COMMON SOURCE
 The four GDAL-produced fixtures all derive from one two-row table, chosen so a
@@ -170,6 +179,30 @@ both plain =Real=. That last pair *is* the bug, written down.
 
 *Do not "simplify" this by dropping =c_real= as a duplicate of =c_double=.*
 They are the same width and that is the entire point.
+
+*** =sqlite_altered.gpkg= -- /added 2026-08-22, and not hostile/
+Not a fixture that fails the invariant. It pins *two bugs found on 2026-08-22*,
+both of which were live in shipped code and neither of which any existing
+fixture could have caught -- =ogr2ogr= writes neither construct.
+
+| content | what it pins |
+|---------+--------------|
+| =cities.grade TEXT DEFAULT 'B'=, added by =ALTER TABLE= *after* the rows existed | the rows keep *short records*, so =B= lives only in the DDL. =read_rows= padded with NULL and returned an empty column, on every output format |
+| =cities.rank INT DEFAULT 5=, same | the same bug with a numeric literal, so the fix is not text-only |
+| =kv=, a =WITHOUT ROWID= user table | stored as an *index* b-tree, which =sqlite.rs= cannot walk. The resulting =Err= used to abort the whole container survey, and =container_drop_warnings= swallowed it -- so this one table silenced *every* defect 3 warning for the file |
+
+*The =cities= layer is the common source's two rows*, so the non-ASCII and
+leading-zero cases come along for free.
+
+*Why the two live in one file:* they were found together, they are both
+"the declaration survived and the value did not", and both are things a
+GeoPackage acquires *after* GDAL wrote it -- which is the class the fixture
+set had no member of at all.
+
+/Rebuilding it:/ =ogr2ogr -f GPKG sqlite_altered.gpkg gdal_hostile.gpkg cities=,
+then the three =sqlite3= statements above. Note =VACUUM= fails on this file
+("attempt to write a readonly database"); the 128 KB size is in line with the
+other =.gpkg= fixtures and was left alone.
 
 *** =gdal_hostile.gpkg=
 =ogr2ogr= plus =sqlite3= for the container content. Carries:

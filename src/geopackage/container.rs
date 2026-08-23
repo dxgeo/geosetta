@@ -89,6 +89,10 @@ pub fn container_drop_warnings(
         // Not the error path. Every caller has already read this container (or
         // is about to), so a file this cannot open is reported — with a better
         // message than a warning could give — by the read that follows.
+        //
+        // Only a file that is not a readable database at all arrives here: a
+        // *table* this cannot decode is classified by `survey` instead, because
+        // swallowing that one would drop the warning for the whole container.
         Err(_) => Vec::new(),
     }
 }
@@ -97,8 +101,12 @@ pub fn container_drop_warnings(
 #[derive(Default)]
 struct Survey {
     /// Tables holding rows that the write will not reproduce, as
-    /// `(name, rows)` — the actual data loss.
-    populated: Vec<(String, usize)>,
+    /// `(name, rows)` — the actual data loss. A `None` count is a table whose
+    /// rows this crate cannot decode (a `WITHOUT ROWID` table is stored as an
+    /// index b-tree, which [`crate::sqlite`] does not walk): it is still
+    /// content that will not survive, and is reported without a number rather
+    /// than not reported at all.
+    populated: Vec<(String, Option<usize>)>,
     /// Tables the write will not reproduce that hold no rows: registry tables
     /// a producer created and never filled. Their *existence* is information
     /// (it records which extensions a file was prepared for) but no row of a
@@ -152,12 +160,13 @@ fn survey(bytes: &[u8], written: &[String]) -> Result<Survey> {
         // other extension are a real loss and are what gets named.
         if object.name == "gpkg_extensions" {
             match tables.iter().find(|t| t.name == object.name) {
-                Some(table) => match foreign_extension_rows(&db, table)? {
+                Some(table) => match foreign_extension_rows(&db, table) {
                     // Nothing but R*Tree registrations (or nothing at all):
                     // wholly derived, so not a loss of its own in either the
                     // populated or the empty sense.
-                    0 => {}
-                    n => survey.populated.push((object.name.clone(), n)),
+                    Ok(0) => {}
+                    Ok(n) => survey.populated.push((object.name.clone(), Some(n))),
+                    Err(_) => survey.populated.push((object.name.clone(), None)),
                 },
                 None => survey.schema += 1,
             }
@@ -167,9 +176,14 @@ fn survey(bytes: &[u8], written: &[String]) -> Result<Survey> {
             // Reading rows costs a b-tree walk, which is why it happens only
             // for tables already known not to survive: registry tables and the
             // occasional user table, never the layers.
-            Some(table) => match db.read_rows(table)?.len() {
-                0 => survey.empty += 1,
-                n => survey.populated.push((object.name.clone(), n)),
+            // A table this cannot decode is *not* an error here. It is
+            // container content like any other, and aborting the survey would
+            // trade one unreadable table for silence about the whole file —
+            // which is what `container_drop_warnings` would do with the `Err`.
+            Some(table) => match db.read_rows(table).map(|r| r.len()) {
+                Ok(0) => survey.empty += 1,
+                Ok(n) => survey.populated.push((object.name.clone(), Some(n))),
+                Err(_) => survey.populated.push((object.name.clone(), None)),
             },
             None => survey.schema += 1,
         }
@@ -204,7 +218,10 @@ impl Survey {
                 .populated
                 .iter()
                 .take(MAX_NAMED)
-                .map(|(name, rows)| format!("{name} ({rows} {})", plural(*rows, "row")))
+                .map(|(name, rows)| match rows {
+                    Some(n) => format!("{name} ({n} {})", plural(*n, "row")),
+                    None => format!("{name} (rows not counted)"),
+                })
                 .collect();
             if self.populated.len() > MAX_NAMED {
                 text.push(format!("and {} more", self.populated.len() - MAX_NAMED));
@@ -333,6 +350,10 @@ mod tests {
     /// `tests/fixtures/HOSTILE.org`.
     const HOSTILE: &[u8] = include_bytes!("../../tests/fixtures/gdal_hostile.gpkg");
 
+    /// The same `cities` layer plus a `WITHOUT ROWID` user table, which SQLite
+    /// stores as an *index* b-tree. See `tests/fixtures/HOSTILE.org`.
+    const ALTERED: &[u8] = include_bytes!("../../tests/fixtures/sqlite_altered.gpkg");
+
     fn layer(name: &str) -> (String, FeatureCollection) {
         let fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
@@ -344,6 +365,34 @@ mod tests {
 
     fn names(layers: &[(String, FeatureCollection)]) -> Vec<String> {
         layers.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// A table whose rows this crate cannot decode must still be *reported*.
+    ///
+    /// `WITHOUT ROWID` tables live in index b-trees, which `crate::sqlite`
+    /// does not walk. Until 2026-08-22 the resulting `Err` propagated out of
+    /// `survey` and `container_drop_warnings` swallowed it, so **one such
+    /// table anywhere in the file silenced the warning for the entire
+    /// container** — including the R*Tree message, which has nothing to do
+    /// with it. Defect 3 went back to being exactly as silent as it was before
+    /// this module shipped, on a file that converts at exit 0.
+    #[test]
+    fn a_table_this_cannot_decode_is_reported_rather_than_silencing_the_survey() {
+        let written = vec!["cities".to_string()];
+        let warnings = container_drop_warnings(ALTERED, "in.gpkg", &written, false);
+        let loss = &warnings[0];
+        // Named, without a count — the rows are real and this cannot count them,
+        // and inventing a number would be worse than admitting that.
+        assert!(loss.contains("kv (rows not counted)"), "{loss}");
+        // The rest of the survey is unaffected: the tables it *can* read are
+        // still counted, which is what the abort used to take down with it.
+        assert!(loss.contains("gpkg_ogr_contents (1 row)"), "{loss}");
+        assert!(loss.contains("gpkg_metadata (1 row)"), "{loss}");
+        // And the second warning still fires. This is the one that proves the
+        // bug was scope rather than formatting: an undecodable table has no
+        // bearing on whether the source carries a spatial index.
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
+        assert!(warnings[1].contains("R*Tree spatial index on cities"), "{warnings:?}");
     }
 
     #[test]

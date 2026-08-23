@@ -61,7 +61,7 @@ pub struct FeatureCollection {
     ///
     /// Entries are matched to properties by exact name; one that names no
     /// property is inert. This is a declaration *about* the data, never a
-    /// substitute for it — [`crate::schema::columns_for`] attaches these to
+    /// substitute for it — the crate-internal `columns_for` attaches these to
     /// inferred columns, and a writer treats a declared size as a floor rather
     /// than a ceiling.
     pub schema: Vec<FieldDecl>,
@@ -147,7 +147,7 @@ impl FeatureCollection {
     /// declare instead.
     ///
     /// Silent when every declaration survives, or is replaced by one that
-    /// [`DeclType::admits`] it — a Shapefile writing every integer as its one
+    /// [`crate::DeclType::admits`] it — a Shapefile writing every integer as its one
     /// numeric field type loses nothing, and neither does a GeoPackage writing
     /// `UInt16` as `MEDIUMINT`. It fires on anything `admits` does not
     /// cover, which is a narrowing (a `DateTime` becoming text, a `Json` column

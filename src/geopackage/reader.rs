@@ -568,6 +568,28 @@ mod tests {
     use super::*;
     use crate::geometry::{Geometry, Position};
 
+    /// A row that predates an `ALTER TABLE … ADD COLUMN` keeps a *short*
+    /// record, so the added column's value exists only as the `DEFAULT` in the
+    /// DDL. Padding those rows with NULL — which `read_rows` did until
+    /// 2026-08-22 — reads back a value SQLite never stored.
+    ///
+    /// This is the type-vs-value blind spot again, one turn further out: the
+    /// column's *declaration* survived perfectly, so every schema assertion in
+    /// the suite stayed green while the values came back empty. `sqlite3` and
+    /// `ogrinfo` both report `B` on this fixture; geosetta reported nothing.
+    #[test]
+    fn a_column_added_by_alter_table_reads_back_its_declared_default() {
+        let bytes = include_bytes!("../../tests/fixtures/sqlite_altered.gpkg");
+        let layers = read_layers(bytes).unwrap();
+        let (_, fc) = &layers[0];
+        assert_eq!(fc.features.len(), 2);
+        for f in &fc.features {
+            let get = |k: &str| f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v);
+            assert_eq!(get("grade"), Some(&JsonValue::String("B".into())));
+            assert_eq!(get("rank"), Some(&JsonValue::Int(5)));
+        }
+    }
+
     #[test]
     fn reads_a_geopackage_layer() {
         // DuckDB-written GPKG, layer "places" (fid/geom/name/pop/score).

@@ -46,6 +46,14 @@ pub struct Table {
     /// Index of the `INTEGER PRIMARY KEY` column (a rowid alias), if any: its
     /// stored value is NULL and the real value is the rowid.
     rowid_alias: Option<usize>,
+    /// Each column's `DEFAULT` literal, parallel to [`Self::columns`].
+    ///
+    /// This is not decoration: `ALTER TABLE … ADD COLUMN` does not rewrite the
+    /// rows that already exist, so their records stay *short* and the added
+    /// column's value lives only in the DDL. Padding those rows with NULL
+    /// instead reads back a value SQLite never stored and no other reader
+    /// reports — see [`Database::read_rows`].
+    defaults: Vec<Option<Value>>,
 }
 
 impl Table {
@@ -122,6 +130,7 @@ impl<'a> Database<'a> {
             column_types: Vec::new(),
             root_page: 1,
             rowid_alias: None,
+            defaults: Vec::new(),
         }
     }
 
@@ -163,13 +172,14 @@ impl<'a> Database<'a> {
                 && let (Some(name), Some(root), Some(sql)) = (as_text(&row, 1), root, sql)
                 && root > 0
             {
-                let (columns, column_types, rowid_alias) = parse_columns(&sql);
+                let ddl = parse_columns(&sql);
                 tables.push(Table {
                     name,
-                    columns,
-                    column_types,
+                    columns: ddl.names,
+                    column_types: ddl.types,
                     root_page: root as u32,
-                    rowid_alias,
+                    rowid_alias: ddl.rowid_alias,
+                    defaults: ddl.defaults,
                 });
             }
         }
@@ -185,7 +195,20 @@ impl<'a> Database<'a> {
         let mut rows = Vec::with_capacity(cells.len());
         for (rowid, payload) in cells {
             let mut values = decode_record(&payload)?;
-            values.resize(ncols, Value::Null); // pad/truncate to the column count
+            // Pad a short record — a row that predates an `ALTER TABLE … ADD
+            // COLUMN` — with each missing column's declared default, which is
+            // where SQLite keeps the value for exactly these rows. Columns with
+            // no literal default fall back to NULL, as SQLite does.
+            for i in values.len()..ncols {
+                values.push(
+                    table
+                        .defaults
+                        .get(i)
+                        .cloned()
+                        .flatten()
+                        .unwrap_or(Value::Null),
+                );
+            }
             values.truncate(ncols);
             if let Some(i) = table.rowid_alias
                 && matches!(values.get(i), Some(Value::Null))
@@ -357,20 +380,27 @@ fn varint(data: &[u8], pos: usize) -> Result<(i64, usize)> {
 
 // --- CREATE TABLE column parsing -------------------------------------------
 
-/// Extract column names (in order), their declared types, and the rowid-alias
-/// column index from a `CREATE TABLE` statement.
-fn parse_columns(sql: &str) -> (Vec<String>, Vec<Option<String>>, Option<usize>) {
+/// One `CREATE TABLE` statement, decoded into what the row reader needs.
+#[derive(Default)]
+struct ColumnDdl {
+    names: Vec<String>,
+    types: Vec<Option<String>>,
+    defaults: Vec<Option<Value>>,
+    rowid_alias: Option<usize>,
+}
+
+/// Extract column names (in order), their declared types, their `DEFAULT`
+/// literals and the rowid-alias column index from a `CREATE TABLE` statement.
+fn parse_columns(sql: &str) -> ColumnDdl {
     let Some(open) = sql.find('(') else {
-        return (Vec::new(), Vec::new(), None);
+        return ColumnDdl::default();
     };
     let Some(close) = sql.rfind(')') else {
-        return (Vec::new(), Vec::new(), None);
+        return ColumnDdl::default();
     };
     let body = &sql[open + 1..close];
 
-    let mut names = Vec::new();
-    let mut types = Vec::new();
-    let mut rowid_alias = None;
+    let mut ddl = ColumnDdl::default();
     for part in split_top_level(body) {
         let part = part.trim();
         if part.is_empty() || is_table_constraint(part) {
@@ -381,12 +411,125 @@ fn parse_columns(sql: &str) -> (Vec<String>, Vec<Option<String>>, Option<usize>)
         };
         let upper = part.to_ascii_uppercase();
         if upper.contains("INTEGER") && upper.contains("PRIMARY KEY") {
-            rowid_alias = Some(names.len());
+            ddl.rowid_alias = Some(ddl.names.len());
         }
-        types.push(declared_type(part, &name));
-        names.push(name);
+        ddl.types.push(declared_type(part, &name));
+        ddl.defaults.push(default_literal(part, &name));
+        ddl.names.push(name);
     }
-    (names, types, rowid_alias)
+    ddl
+}
+
+/// The `DEFAULT` literal of one column definition, or `None` where there is
+/// none this can evaluate.
+///
+/// Only *literals* are decoded, which is sufficient: the sole path by which a
+/// default reaches an already-stored row is `ALTER TABLE … ADD COLUMN`, and
+/// SQLite rejects a non-constant default there ("Cannot add a column with
+/// non-constant default"). So an expression default — `DEFAULT (…)`,
+/// `CURRENT_TIMESTAMP` — can never apply to a short record, and returning
+/// `None` for it is correct rather than a shortfall.
+fn default_literal(part: &str, name: &str) -> Option<Value> {
+    // Step over the column name however it was quoted, exactly as
+    // `declared_type` does: leaving the closing quote in place would open a
+    // string that swallows the rest of the definition.
+    let rest = part.get(part.find(name)? + name.len()..)?;
+    let rest = rest.trim_start_matches(['"', '\'', '`', ']']);
+    let bytes = rest.as_bytes();
+    let mut i = 0;
+    let mut depth = 0i32;
+    let mut quote: Option<u8> = None;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if let Some(q) = quote {
+            if c == q {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' | b'\'' | b'`' => quote = Some(c),
+            b'[' => quote = Some(b']'),
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            _ if depth == 0 && starts_word(bytes, i, b"DEFAULT") => {
+                return parse_literal(rest[i + 7..].trim_start());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Whether `word` sits at `i` in `bytes` as a whole word, case-insensitively.
+fn starts_word(bytes: &[u8], i: usize, word: &[u8]) -> bool {
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    bytes
+        .get(i..i + word.len())
+        .is_some_and(|s| s.eq_ignore_ascii_case(word))
+        && (i == 0 || !is_word(bytes[i - 1]))
+        && bytes.get(i + word.len()).is_none_or(|b| !is_word(*b))
+}
+
+/// One SQLite literal, as written in a `DEFAULT` clause. `NULL` returns `None`,
+/// which is the same padding this produces anyway.
+fn parse_literal(s: &str) -> Option<Value> {
+    let bytes = s.as_bytes();
+    if starts_word(bytes, 0, b"NULL") {
+        return None;
+    }
+    if starts_word(bytes, 0, b"TRUE") {
+        return Some(Value::Int(1));
+    }
+    if starts_word(bytes, 0, b"FALSE") {
+        return Some(Value::Int(0));
+    }
+    if s.starts_with('\'') {
+        return text_literal(s);
+    }
+    // `X'0102'` — a blob literal, in either case.
+    if bytes.len() > 2 && (bytes[0] | 0x20) == b'x' && bytes[1] == b'\'' {
+        let hex = s[2..].strip_suffix('\'')?;
+        if hex.len() % 2 != 0 {
+            return None;
+        }
+        let mut out = Vec::with_capacity(hex.len() / 2);
+        for pair in hex.as_bytes().chunks(2) {
+            out.push(u8::from_str_radix(std::str::from_utf8(pair).ok()?, 16).ok()?);
+        }
+        return Some(Value::Blob(out));
+    }
+    // A number, possibly signed. `split_top_level` has already cut the
+    // definition at its comma, so the token runs to whitespace or end.
+    let token = s.split_whitespace().next()?;
+    if let Ok(i) = token.parse::<i64>() {
+        return Some(Value::Int(i));
+    }
+    token.parse::<f64>().ok().map(Value::Real)
+}
+
+/// A single-quoted SQLite string literal, in which `''` is an escaped quote.
+fn text_literal(s: &str) -> Option<Value> {
+    let mut out = String::new();
+    let mut chars = s[1..].chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\'' {
+            out.push(c);
+            continue;
+        }
+        match chars.peek() {
+            Some('\'') => {
+                out.push('\'');
+                chars.next();
+            }
+            // The closing quote.
+            _ => return Some(Value::Text(out)),
+        }
+    }
+    // Unterminated: not a literal this should guess at.
+    None
 }
 
 /// The type token of one column definition: everything between the column name
@@ -954,12 +1097,12 @@ mod tests {
     #[test]
     fn parses_column_ddl() {
         let sql = r#"CREATE TABLE "places" ( "fid" INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL, "geom" GEOMETRY, "name" TEXT, "pop" MEDIUMINT, "score" DOUBLE)"#;
-        let (cols, types, alias) = parse_columns(sql);
-        assert_eq!(cols, vec!["fid", "geom", "name", "pop", "score"]);
-        assert_eq!(alias, Some(0));
+        let ddl = parse_columns(sql);
+        assert_eq!(ddl.names, vec!["fid", "geom", "name", "pop", "score"]);
+        assert_eq!(ddl.rowid_alias, Some(0));
         // The declared type is everything between the name and the first
         // constraint keyword — `INTEGER`, not `INTEGER PRIMARY KEY ...`.
-        let types: Vec<Option<&str>> = types.iter().map(|t| t.as_deref()).collect();
+        let types: Vec<Option<&str>> = ddl.types.iter().map(|t| t.as_deref()).collect();
         assert_eq!(
             types,
             vec![Some("INTEGER"), Some("GEOMETRY"), Some("TEXT"), Some("MEDIUMINT"), Some("DOUBLE")]
@@ -971,10 +1114,59 @@ mod tests {
     #[test]
     fn parses_sized_and_untyped_column_ddl() {
         let sql = r#"CREATE TABLE "t" ("a" VARCHAR(80) NOT NULL, "b", "c" DOUBLE PRECISION DEFAULT 0)"#;
-        let (cols, types, _) = parse_columns(sql);
-        assert_eq!(cols, vec!["a", "b", "c"]);
-        let types: Vec<Option<&str>> = types.iter().map(|t| t.as_deref()).collect();
+        let ddl = parse_columns(sql);
+        assert_eq!(ddl.names, vec!["a", "b", "c"]);
+        let types: Vec<Option<&str>> = ddl.types.iter().map(|t| t.as_deref()).collect();
         assert_eq!(types, vec![Some("VARCHAR(80)"), None, Some("DOUBLE PRECISION")]);
+        // The `DEFAULT` follows the type without ending it.
+        assert_eq!(ddl.defaults, vec![None, None, Some(Value::Int(0))]);
+    }
+
+    /// Every literal form SQLite writes into a `DEFAULT` clause. These are the
+    /// values a row predating an `ALTER TABLE … ADD COLUMN` reads back as.
+    #[test]
+    fn parses_default_literals() {
+        let sql = "CREATE TABLE t(a, b TEXT DEFAULT 'B', c INT DEFAULT 5, d REAL DEFAULT -1.5, \
+                   e BLOB DEFAULT X'0102', f BOOLEAN DEFAULT TRUE, g TEXT DEFAULT 'it''s', \
+                   h TEXT, i TEXT DEFAULT NULL, j TEXT DEFAULT 'a, b')";
+        let ddl = parse_columns(sql);
+        assert_eq!(
+            ddl.defaults,
+            vec![
+                None,
+                Some(Value::Text("B".into())),
+                Some(Value::Int(5)),
+                Some(Value::Real(-1.5)),
+                Some(Value::Blob(vec![0x01, 0x02])),
+                // SQLite stores TRUE as the integer 1.
+                Some(Value::Int(1)),
+                Some(Value::Text("it's".into())),
+                None,
+                // An explicit NULL default is the same padding as no default.
+                None,
+                // A comma inside the literal does not split the definition.
+                Some(Value::Text("a, b".into())),
+            ]
+        );
+    }
+
+    /// A default this cannot evaluate must read back NULL rather than a guess.
+    /// SQLite forbids these on `ALTER TABLE … ADD COLUMN`, so no stored row can
+    /// depend on one.
+    #[test]
+    fn declines_non_constant_defaults() {
+        let sql = "CREATE TABLE t(a TEXT DEFAULT CURRENT_TIMESTAMP, b INT DEFAULT (1 + 1))";
+        assert_eq!(parse_columns(sql).defaults, vec![None, None]);
+    }
+
+    /// `DEFAULT` inside a quoted name or a `CHECK` expression is not this
+    /// column's default.
+    #[test]
+    fn ignores_default_that_is_not_a_clause() {
+        let sql = r#"CREATE TABLE t("default" TEXT, b INT CHECK (b <> 7) DEFAULT 3)"#;
+        let ddl = parse_columns(sql);
+        assert_eq!(ddl.names, vec!["default", "b"]);
+        assert_eq!(ddl.defaults, vec![None, Some(Value::Int(3))]);
     }
 
     #[test]

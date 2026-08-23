@@ -1242,6 +1242,70 @@ travels with D1's =name= modelling.
   derived tables recomputed, and the raster question from § The collision
   answered. Largest item in the plan; sequence it last, and expect it to
   reopen whether =run_geopackage_write= should rewrite the file at all.
+
+  *What =src/sqlite.rs= is missing, surveyed 2026-08-22 before starting.* The
+  survey found two live bugs, fixed the same day and written up in
+  =handoff.org= § BUGS FOUND entries 11--12; what follows is what remains.
+
+  *The good news first, because it changes the shape of the milestone:*
+  =write_database= is already a *general* SQLite writer, not a GeoPackage one.
+  It takes =TableSpec= (name, DDL, rows) plus =MasterEntry= (schema-only
+  objects), so *carrying an arbitrary user table verbatim is already an
+  expressible operation* -- read its DDL and its rows, push a =TableSpec=. That
+  covers most of defect 3's damage (=side_notes=, =gpkg_metadata=,
+  =gpkg_metadata_reference=, =gpkg_ogr_contents=) with no new file-format work.
+
+  Four gaps stand between that and a faithful container:
+  1. *Index b-trees are supported by neither side.* =walk_table= handles
+     =0x0d=/=0x05= and errors on anything else; the writer's =leaf_cell=
+     writes a rowid varint, which is table-cell format. Index pages
+     (=0x0a=/=0x02=) are payload-only. This is also why a =WITHOUT ROWID=
+     table -- stored *as* an index b-tree -- cannot be decoded at all.
+
+     *Carrying an index is much cheaper than building one*, and the difference
+     is worth stating because it is not obvious: building requires SQLite's
+     comparison semantics (the NULL < INT/REAL < TEXT < BLOB type ordering,
+     plus BINARY/NOCASE/RTRIM collations), which is the genuinely expensive
+     part. But *an index on disk is already sorted*, so an in-order read
+     yields records that can be re-packed into fresh pages without ever
+     comparing two keys. M3b needs only the carrying case. The catch: a
+     carried index needs a real root page, so =write_database='s hardcoded
+     =rootpage: 0= for every =MasterEntry= has to become a per-entry choice.
+  2. *=sqlite_sequence= carries state, not just DDL.* =container.rs= skips
+     =sqlite_*= names on the reasoning that "these follow the DDL rather than
+     carrying anything" -- true of =sqlite_autoindex_*=, *false* of
+     =sqlite_sequence=, whose rows are AUTOINCREMENT high-water marks that no
+     DDL regenerates. Dropping them lets a later insert reuse a retired id.
+     /Reasoned, not measured: it cannot bite until M3b carries tables./
+  3. *Page size is not preserved.* The reader honours the header's value
+     including the =1= → 65536 encoding; the writer hardcodes
+     =WRITE_PAGE_SIZE = 4096=. Content-preserving, not byte-preserving --
+     consistent with what § MILESTONES M3 already records about normalized DDL
+     spelling, but worth stating before someone assumes otherwise.
+  4. *Reserved per-page space is dropped.* =open= computes =usable_size= from
+     header byte 20; the writer always assumes zero. A file using reserved
+     space (checksum VFS, SEE) round-trips into one that does not.
+
+  *And one that is out of scope by construction:* WAL is invisible, because
+  =Database::open= takes bytes rather than a path. A GeoPackage with
+  un-checkpointed changes reads as its last checkpointed state, silently. The
+  refusal has to happen at the layer that *has* the path, not here.
+
+  *Two decisions to take before writing any of it:* the raster question
+  (§ The collision -- recommendation is to reject a populated tile container,
+  and note it is a *reader* change that makes previously-readable files fail),
+  and whether =run_geopackage_write= should rewrite at all. On the second, the
+  in-place alternative is not a refactor of GeoPackage code: it asks
+  =sqlite.rs= to gain incremental mutation -- free-list management, page reuse
+  -- which is substantially harder file-format work than anything currently in
+  it. Enumerating what to carry is the cheaper path by a wide margin.
+
+  *Finally, =container.rs= should invert.* =REPRODUCED= is a hand-maintained
+  constant that must move whenever =writer::build= does, which its module doc
+  flags twice because the coupling goes unnoticed until it is wrong. After M3b
+  the survey should compute its warning from *what the write actually
+  carried*. Budget that rewrite as part of the milestone rather than leaving
+  the constant limping along behind a growing exception list.
 - *M4* -- *DONE 2026-08-20*, closing defects 1, 2 and 5. Defect 3 travels with
   M3b; defect 4 was done earlier, with M3's FlatGeobuf spoke.
 

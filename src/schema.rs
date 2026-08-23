@@ -29,7 +29,7 @@ pub enum ColumnType {
 /// A column type *as the source declared it*, in a vocabulary wide enough to
 /// carry what the declaring spokes name.
 ///
-/// Distinct from [`ColumnType`], and deliberately so. `ColumnType` is the
+/// Distinct from `ColumnType`, and deliberately so. `ColumnType` is the
 /// hub's four-value lattice — what a cell is *stored as* in memory, inferred
 /// from values. `DeclType` is what a *file* said the column is, which is a
 /// richer thing: FlatGeobuf's `Column.type` names fifteen types, GeoPackage
@@ -152,7 +152,7 @@ impl DeclType {
     /// The inclusive range an integer type admits, if it is one.
     ///
     /// Used to decline a declaration the data has outgrown — see
-    /// [`FieldDecl::type_for`].
+    /// `FieldDecl::type_for`, which is crate-internal.
     pub fn int_range(self) -> Option<(i64, i64)> {
         use DeclType::*;
         Some(match self {
@@ -260,12 +260,13 @@ pub fn declared_or(declared: Option<u32>, required: usize) -> usize {
 /// re-derived from the data.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FieldDecl {
-    /// The property this describes, matched to [`Column::name`] exactly.
+    /// The property this describes, matched to the inferred column's name
+    /// exactly.
     pub name: String,
     /// The type the source declared this column to be, in that source's own
-    /// vocabulary rather than the hub's — see [`DeclType`], and
-    /// [`FieldDecl::type_for`] for the rule that decides whether it still
-    /// applies to the data at hand.
+    /// vocabulary rather than the hub's — see [`DeclType`]. The rule deciding
+    /// whether a declaration still applies to the data at hand lives in
+    /// `FieldDecl::type_for`, which is crate-internal.
     pub ty: Option<DeclType>,
     /// Encoded width of a value — a string field's declared length.
     pub width: Option<u32>,

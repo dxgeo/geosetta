@@ -28,8 +28,10 @@ still pass =native: None=.*
   what the rewrite destroys instead of exiting 0 in silence -- but the *fix*
   is still M3b's.
 
-530 tests pass (=cargo test -p geosetta=: 482 lib, 47 integration, 1 doc),
-clippy clean. Two further GDAL cross-checks are =#[ignore]=d by default:
+535 tests pass (=cargo test -p geosetta=: 487 lib, 47 integration, 1 doc),
+clippy clean, *and =cargo doc= is green* -- add that third command to your
+verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
+else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). Two further GDAL cross-checks are =#[ignore]=d by default:
 =cargo test --test gdal_types -- --ignored=. See
 [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
 § STATUS for the precise line between done and not.
@@ -241,6 +243,18 @@ of it was planned work* -- each item was found by measuring the one above it:
 2026-08-21, when two shipped: defect 3's container warning and
 =decl_recast_warning=.
 
+*Four =sqlite.rs= gaps are known and unclosed*, all found while scoping M3b on
+2026-08-22 and all recorded in =plans/same-format-fidelity.org= § MILESTONES,
+M3b. None is a silent data loss today; each is work M3b needs:
+*index b-trees* (neither read nor written, which is also why =WITHOUT ROWID=
+tables cannot be decoded), *=sqlite_sequence='s* AUTOINCREMENT high-water marks
+(state that DDL cannot regenerate, currently skipped with the =sqlite_*=
+prefix), *page size* (read faithfully, written as a hardcoded 4096) and
+*reserved per-page space* (read as =usable_size=, written as zero). A fifth is
+out of scope by construction: *WAL* is invisible to a reader that takes bytes
+rather than a path, so an un-checkpointed GeoPackage reads as its last
+checkpoint, silently.
+
 ** BUGS FOUND -- ONE STILL LIVE
 /Renamed 2026-08-20: this was "LIVE BUGS FOUND, NOT FIXED" when five of its
 six entries were live. Five are now struck through and fixed; **entry 3 is the
@@ -369,6 +383,54 @@ sweep over every *type* misses a class if its *values* are unadventurous (10).
 And a check that compares declarations can be perfectly green while the values
 are being destroyed (8, 9).
 
+*** Two more, found and fixed 2026-08-22 -- by asking what =sqlite.rs= cannot do
+Both were found while scoping *M3b*, by reading =src/sqlite.rs= for the gaps
+M3b would have to close rather than by testing anything. Both turned out to be
+live in shipped code, and *neither is reachable from any existing fixture* --
+=ogr2ogr= writes neither construct, so every fixture in the tree is built out
+of the subset of SQLite that GDAL happens to emit.
+
+11. *One =WITHOUT ROWID= table silenced every defect 3 warning in the file.*
+    Such a table is stored as an *index* b-tree; =walk_table= handles only
+    table b-trees (=0x0d=/=0x05=) and errors on the page type. That =Err=
+    propagated out of =survey=, and =container_drop_warnings= swallowed it on
+    the documented reasoning that "every caller has already read this
+    container" -- true of feature layers, false of a user table nothing else
+    ever reads. /Measured on =gdal_hostile.gpkg= with one table added and
+    nothing else changed:/ both warnings present with a rowid, *both absent*
+    with =WITHOUT ROWID=, exit 0 either way. Defect 3 was returned to exactly
+    the silence its warning shipped to end, one day after it shipped.
+
+    Fixed by classifying rather than aborting: a table whose rows cannot be
+    decoded is reported by name, without a count (=kv (rows not counted)=).
+    Naming it without a number is the honest form -- the rows are real and this
+    cannot count them.
+12. *A column added by =ALTER TABLE= read back NULL instead of its default.*
+    SQLite does not rewrite existing rows on =ADD COLUMN=; their records stay
+    *short*, and the added column's value for those rows lives only as the
+    =DEFAULT= in the DDL. =read_rows= padded short records with
+    =Value::Null= and =parse_columns= discarded =DEFAULT= as a constraint
+    keyword. /Measured:/ =sqlite3= and =ogrinfo= both report =B=; geosetta
+    reported an empty cell -- **on every output format**, needing no
+    same-format run to fire. Fixed by decoding the literal (text with =''=
+    escapes, integers, reals, blobs, =TRUE=/=FALSE=) and padding with it.
+
+    *Only literals are decoded, and that is sufficient rather than partial:*
+    the sole path by which a default reaches a stored row is
+    =ALTER TABLE ADD COLUMN=, and SQLite rejects a non-constant default there.
+    An expression default can never apply to a short record.
+
+*The lesson these two add*, which is the type-vs-value one turned outward:
+**the fixture set is only as wide as the tools that built it.** Every fixture
+in the tree came from =ogr2ogr=, DuckDB, pyarrow or hand-authoring, so the
+whole crate had been tested against the subset of SQLite that GDAL emits --
+and a GeoPackage is a general SQLite database that anything may touch after
+GDAL is done. Both bugs sat in the gap between "what our fixtures contain" and
+"what the format permits", which is a gap no amount of testing the fixtures
+can close. The new =sqlite_altered.gpkg= is the first fixture built by
+reading the *format* for what it allows instead of the *tool* for what it
+writes.
+
 ** WHAT CHANGED IN EXISTING DOCS
 Listed explicitly because they were written before this work was committed.
 /Now that it is committed, =git log= is the better source where the two
@@ -376,6 +438,77 @@ disagree -- see § THE ONE REAL GAP, whose "no commits" claim was itself an
 error and is retracted there./
 
 /Newest first./
+
+*Two =sqlite.rs= bugs and the M3b survey, 2026-08-22 -- code.* Scoping M3b
+meant reading =src/sqlite.rs= for what it cannot do; the reading turned up two
+live bugs before any of the scoping was written down. Both are in
+§ BUGS FOUND, entries 11--12, with what measured them.
+
+- =src/sqlite.rs= -- =Table::defaults=, =ColumnDdl= (=parse_columns= now
+  returns a struct rather than a widening tuple), =default_literal=,
+  =parse_literal=, =text_literal=, =starts_word=; =read_rows= pads a short
+  record with the declared default instead of NULL. Four new tests, including
+  the full literal matrix and the two cases that must *not* be read as a
+  default (=CURRENT_TIMESTAMP=, =DEFAULT (1 + 1)=).
+- =src/geopackage/container.rs= -- =Survey::populated= holds
+  =Option<usize>=, so a table whose rows cannot be decoded is *classified*
+  rather than aborting the survey. One new test, and it asserts on
+  =warnings.len() == 2= deliberately: the bug's damage was *scope*, not
+  wording, and the R*Tree message disappearing alongside the loss message is
+  what shows that.
+- =tests/fixtures/sqlite_altered.gpkg= -- *new*, and it introduces a third
+  fixture prefix (=sqlite_*=) documented in =HOSTILE.org= § NAMING. Neither
+  construct it carries is something =ogr2ogr= will emit, which is the whole
+  point: see the lesson under entries 11--12.
+- =plans/same-format-fidelity.org= -- M3b gained the =sqlite.rs= gap survey:
+  what the writer can already do, the four gaps, the two decisions to take
+  first, and the note that =container.rs= should *invert* rather than keep
+  maintaining =REPRODUCED= by hand.
+
+/Worth carrying forward from the survey itself:/ =write_database= is already a
+general SQLite writer, so *carrying an arbitrary user table is an operation the
+crate can already express*. M3b is mostly classification work, not
+file-format work -- with one real exception (index b-trees), and even that is
+far cheaper for *carrying* an index than for *building* one, because a b-tree
+on disk is already sorted. Both are argued in the plan.
+
+*=cargo doc= had been failing for four commits, 2026-08-22 -- docs only.* Found
+while verifying the two fixes above. =Cargo.toml= denies
+=broken_intra_doc_links= and =private_intra_doc_links=, with a stated reason:
+"a link that silently stops resolving ... is the same class of drift as prose
+going stale, so it fails the build rather than scrolling past as a warning."
+Six links had stopped resolving. /Bisected:/
+
+#+begin_src text
+  2a12bab  0 errors   <- last green
+  4e29eea  3 errors   the column-schema pass (FieldDecl lands)
+  e27163c  5 errors   M4
+  16bd5dd  5 errors
+  c9d4932  6 errors   <- HEAD before this fix
+#+end_src
+
+Five were =private_intra_doc_links= -- a *public* item documenting itself in
+terms of something the reader of those docs cannot see (=columns_for=,
+=ColumnType=, =Column::name=, =FieldDecl::type_for= twice). All are now plain
+code spans, which is what the lint's own note recommends. The sixth, the
+=DeclType::admits= link in =feature.rs=, simply lacked a path and is now
+=crate::DeclType::admits=; =DeclType= is exported, so that one stays a link.
+
+*Two things worth knowing, and the second is the actual finding:*
+1. *This is not D7's doing*, despite landing in the same area. Comparing the
+   error *sets* across commits, D7 *fixed* one (=ty= → =DeclType=, by
+   exporting =DeclType=) while its =pub(crate)= demotions broke others -- net
+   zero at =c9d4932=. It broke at *=4e29eea=*, the first commit where a public
+   type in =feature.rs=/=schema.rs= documented itself by pointing into the
+   private =schema= module.
+2. **A deny-level lint that nothing runs is not a tripwire.** These lints were
+   configured precisely to catch "a module demoted to =pub(crate)=" -- which is
+   exactly what happened -- and they caught nothing for four commits, because
+   the verification ritual recorded everywhere in these documents is
+   =cargo test= plus =cargo clippy=, and neither runs rustdoc. There is no CI
+   in this repo. The header's verification line now names =cargo doc= as the
+   third command; that is the whole fix, and it is a process fix rather than a
+   code one.
 
 *A review pass over the uncommitted work, 2026-08-21 -- code.* Everything since
 =16bd5dd= re-read and re-measured rather than taken on trust. The test count,

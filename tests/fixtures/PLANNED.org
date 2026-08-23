@@ -1,0 +1,121 @@
+#+TITLE: Fixtures Designed But Not Built
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: 2026-08-23
+
+* Designed 2026-08-23, to be built next session
+
+Each entry below is a fixture this tree *needs* and does not have, with what it
+pins and how to build it. They came out of reading the GeoPackage Encoding
+Standard's normative SQL (OGC 12-128r19, Annex C and the extension annexes)
+against what this crate writes -- see =handoff.org= § BUGS FOUND entries 16--18
+and =plans/same-format-fidelity.org= § THE DEFECTS, defect 6.
+
+*Read =HOSTILE.org= first* for the naming rules and the standing requirement
+that every fixture be *confirmed readable by geosetta without error* before it
+is committed.
+
+** THE ONE THAT MATTERS MOST -- =spec_conformant.gpkg=
+*A GeoPackage built from the specification's own DDL, by =sqlite3=, with no
+GDAL involvement at any point.*
+
+*Why it is first.* Every fixture in this tree was produced by =ogr2ogr=,
+DuckDB, pyarrow or hand-authoring. That was already known to bound what the
+SQLite-level fixtures could catch (=HOSTILE.org=, the =sqlite_*= prefix). What
+2026-08-23 established is that **it bounds the /GeoPackage/ level too**:
+=ogr2ogr= itself deviates from the standard in at least four places we have
+measured.
+
+| where =ogr2ogr= differs from the standard | consequence for us |
+|-------------------------------------------+--------------------|
+| omits =CONSTRAINT gdc_tn UNIQUE (table_name, name)= on =gpkg_data_columns= | *we copied the omission* -- caught only by reading the spec |
+| omits =CONSTRAINT gdcc_ntv UNIQUE (...)= on =gpkg_data_column_constraints= | same |
+| writes =srs_id INTEGER NOT NULL PRIMARY KEY=; the spec says =INTEGER PRIMARY KEY= | we had copied the =NOT NULL= |
+| omits the two =crmr_*_fk= foreign keys on =gpkg_metadata_reference= | matters when M3b carries that table |
+
+**A fixture derived from GDAL cannot test conformance to a standard GDAL does
+not follow exactly.** This one is the second opinion.
+
+*Build:* =sqlite3=, applying Annex C's =CREATE TABLE= text verbatim for
+=gpkg_spatial_ref_sys=, =gpkg_contents=, =gpkg_geometry_columns=,
+=gpkg_extensions=, plus the Schema extension's =gpkg_data_columns= and
+=gpkg_data_column_constraints= and the Metadata extension's =gpkg_metadata= and
+=gpkg_metadata_reference=. Then the three required =gpkg_spatial_ref_sys=
+records (=4326=, =-1= undefined cartesian, =0= undefined geographic), one
+feature table, and =PRAGMA application_id = 0x47504B47=, =PRAGMA user_version=
+a five-digit version integer.
+
+*Pins:* that geosetta *reads* a strictly conformant file, and -- once a
+comparison exists -- that what it *writes* matches this DDL. The natural test
+is a set comparison of =sqlite_master= rows between this fixture and geosetta's
+own output, normalised for whitespace, which is a much stronger check than the
+substring assertions =the_registry_tables_are_written_as_the_specification_defines_them=
+uses today. /Those substring assertions are what let =gdc_tn= go missing./
+
+** =gpkg_metadata_autoincrement.gpkg=
+=gpkg_metadata= is specified as =id INTEGER PRIMARY KEY AUTOINCREMENT=, so a
+populated one *requires a =sqlite_sequence= row*. That is the second of the
+three remaining =sqlite.rs= gaps, and this fixture is what makes it concrete
+rather than reasoned.
+
+*Pins:* M3b carrying =gpkg_metadata= at all. Dropping =sqlite_sequence= lets a
+later insert reuse a retired id -- currently recorded as /reasoned, not
+measured/ in =plans/same-format-fidelity.org= § MILESTONES, M3b, gap 2. **This
+fixture is how it stops being reasoned.**
+
+*Build:* =sqlite3=, the Metadata extension's DDL, two rows, then delete one so
+the high-water mark exceeds =max(id)= -- which is the only state that makes
+the sequence row observable rather than derivable.
+
+** =gpkg_tiles.gpkg=
+A real tile pyramid: several tiles across two zoom levels, with complete
+=gpkg_tile_matrix_set= and =gpkg_tile_matrix= rows.
+
+*Pins:* D8 -- a tile pyramid is *carried*, as independent container content,
+and no file is rejected for holding one. =sqlite_contents.gpkg= carries a
+*minimal* one row deep, enough to pin bug 14's reporting; it is not enough to
+test *carrying*, which has to move real BLOB payloads across the rewrite.
+
+*Build:* =gdal_translate -of GPKG= over a small raster, or =sqlite3= directly
+from the tiles DDL. /Prefer GDAL here/ -- unlike the registry DDL above, the
+tile *data* is exactly the case where a real producer's output is what occurs.
+
+** =gpkg_range_constraints.gpkg=
+Two =gpkg_data_column_constraints= rows of =constraint_type = 'range'=, which
+both have =value= NULL by definition -- =value= is for =enum= and =glob=.
+
+*Pins:* an assumption a carrying implementation will otherwise make.
+=CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value)= **does
+not make range rows unique**, because SQLite treats NULLs as distinct under
+UNIQUE. /Measured 2026-08-23, by accident:/ an
+=INSERT INTO ... SELECT * FROM ... LIMIT 1= against a real file duplicated a
+=price_range= row and the UNIQUE index accepted it. Anything that dedupes on
+that key, or assumes the index makes a set, is wrong.
+
+** =sqlite_pagesize.gpkg= and =sqlite_reserved.gpkg=
+The last two =sqlite.rs= gaps, neither of which any fixture reaches: a page
+size other than 4096 (the writer hardcodes =WRITE_PAGE_SIZE=), and non-zero
+reserved per-page space (the reader computes =usable_size= from header byte 20;
+the writer always assumes zero).
+
+*Build:* =PRAGMA page_size = 8192= before creating any table, and a
+=PRAGMA reserved_bytes=-equivalent build for the second (SQLite exposes this
+only via a VFS or =sqlite3_file_control=; failing that, patch header byte 20 by
+hand and re-checksum nothing -- SQLite has no page checksums by default).
+
+*Pins:* that a same-format run is *content*-preserving rather than
+byte-preserving, which is currently a claim in the plan with nothing behind it.
+
+* WHAT IS ALREADY COVERED, SO NOBODY REBUILDS IT
+- =WITHOUT ROWID= -- =sqlite_altered.gpkg=, and its rows are now *counted*
+  rather than reported as uncountable.
+- =ALTER TABLE ADD COLUMN= short records with a =DEFAULT= -- same fixture.
+- =UNIQUE=, =TEXT PRIMARY KEY=, an explicit =CREATE INDEX=, and a
+  =UNIQUE COLLATE NOCASE= -- =sqlite_constraints.gpkg=.
+- A =data_type='attributes'= registration and a minimal tile registration --
+  =sqlite_contents.gpkg=.
+- Index cells past the on-page ceiling, so overflow chains -- *not a fixture*
+  but =sqlite::tests::an_index_btree_survives_a_write_at_every_depth= and the
+  =#[ignore]=d =sqlite_itself_validates_the_index_this_writer_builds=, both of
+  which build their records in-test. /Added 2026-08-23, after the first version
+  of both used uniformly short keys and never reached =write_overflow= at
+  all -- the "unadventurous values" blind spot, for the third time./

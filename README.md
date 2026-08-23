@@ -45,8 +45,12 @@ validated against DuckDB / GDAL.
 -   **GeoPackage** (read + write) on a from-scratch SQLite reader **and** writer. A
     `.gpkg` is multi-layer, so reading fans out over all feature tables and writing
     a layer creates the file or appends to it (upserting by name); the `--layer`
-    option and the directory-vs-single-file output rules drive the fan-out. Our
-    output passes SQLite's `integrity_check` and is read by GDAL. An opt-in
+    option and the directory-vs-single-file output rules drive the fan-out. The
+    registry tables are written with the constraints the specification defines —
+    primary keys, `UNIQUE`s and foreign keys, each with the index SQLite
+    requires behind it — so our output passes `integrity_check` and
+    `foreign_key_check`, enforces those constraints, and is read and rewritten
+    by GDAL. An opt-in
     `--rtree` flag also writes the GeoPackage RTree extension (SQLite's R\*Tree
     virtual table, built from scratch); the index passes `rtreecheck()` and
     answers GDAL/DuckDB bbox queries. A second opt-in flag, `--envelope`, caches
@@ -255,9 +259,12 @@ specification rather than pulled from a crate:
     and feature-locality sort, used to build FlatGeobuf's packed R-tree
 -   **`sqlite.rs`:** a minimal, from-scratch SQLite reader **and** whole-file writer
     (header, multi-page b-tree walk/pack with overflow chains — including a
-    `sqlite_master` that grows past page 1 — schema-only master rows for virtual
-    tables and triggers, record coding, CREATE TABLE parsing) — what our
-    GeoPackage output passes `integrity_check` on
+    `sqlite_master` that grows past page 1 — **table _and_ index b-trees**,
+    schema-only master rows for virtual tables and triggers, record coding,
+    CREATE TABLE parsing) — what our GeoPackage output passes `integrity_check`
+    on. Index support is what lets the writer emit the `UNIQUE` and
+    `PRIMARY KEY` constraints the GeoPackage specification defines, since SQLite
+    backs each one with an implicit index
 -   **`geopackage/`:** GeoPackage reader and writer on `sqlite.rs` — layer fan-out
     from `gpkg_contents`, GeoPackage Binary geometry wrapping WKB, and
     create-or-append (upsert) writes. `geopackage/rtree.rs` builds the opt-in RTree

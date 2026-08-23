@@ -36,7 +36,7 @@ from a different denominator.
 *M3 in progress:* the *FlatGeobuf*, *GeoParquet* and *GeoPackage* spokes are
 done. Still to do: CSV, WKT, KML, and Shapefile's remaining *natives*, then
 both containers (M3b/M3c), *defect 3's fix* -- its *warning* shipped
-2026-08-21, see § Five defects -- and the exhaustive-match fixture registry
+2026-08-21, see § THE DEFECTS -- and the exhaustive-match fixture registry
 (M5/D6). Four readers still pass =native: None=.
 
 *M4 is done (2026-08-20), and it closed three defects rather than two.*
@@ -277,15 +277,32 @@ verbatim (faithful, and much less cheap). *Recommend rejecting*, and saying so
 in the error -- a vector tool declining a raster container is a defensible
 sentence; silently returning a =.gpkg= with the imagery gone is not.
 
+*Decided 2026-08-23, and the recommendation above was not taken -- see D8.*
+Tiles are *carried*; nothing is rejected. Both halves of the framing above
+failed once the case was measured rather than argued: the refusal was drawn at
+the *reader*, where nothing is lost, and "much less cheap" turned out to be
+false under the three-class contract, which makes a tile pyramid the *easiest*
+class rather than the hardest. /The paragraph above is left standing because
+what it got wrong is instructive -- it is the same wrong-layer mistake as the
+R*Tree warning that named layers it was not writing./
+
+*The state it was decided out of was worse than "silently returning a =.gpkg=
+with the imagery gone", which is what this section assumed today's behaviour
+was.* Defect 3's warning did not even *name* the tile table: it was excluded
+from the survey as though it were a layer. That is =handoff.org= § BUGS FOUND
+entry 14, found while taking this decision and fixed the same day.
 ** WHAT VIOLATES THE RULE TODAY
 Two kinds. The first kind is small, confirmed, and needs no new machinery.
 
-*** Five defects that are bugs the moment the rule is adopted
+*** THE DEFECTS that are bugs the moment the rule is adopted
 Each was measured, and each was traced to the side that is actually wrong --
 which in both of the first two is *not* the side the symptom suggests.
 
 /Was four until 2026-08-20; defect 5 was found while reviewing defect 1 and is
-the largest of them./
+the largest of them. Defect 6 arrived 2026-08-23. **The count came out of this
+section's name at the same time**, on the precedent of "THE NINE DECISIONS" --
+a heading that states a total is a heading that expires, and this one had
+already been renamed once./
 
 1. ~~*FlatGeobuf drops a null property cell.*~~ *FIXED 2026-08-20 (M4)*, both
    halves: =decode_properties= now yields every header column in header order,
@@ -518,6 +535,92 @@ defect. It is a *missing cross-format warning* and now lives in
 [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]. See
 § The invariant binds an invocation, not a pipeline for why it was misfiled --
 the mistake is instructive, not clerical.
+
+6. ~~*Every GeoPackage this crate writes states a schema the specification
+   does not.*~~ /Found 2026-08-23 while taking D10, and **FIXED the same
+   day**, once the index-writing capability it was really about existed./
+
+   The writer emits registry tables with *no table constraints at all* -- no
+   =PRIMARY KEY=, no =UNIQUE=, no =FOREIGN KEY=, no =DEFAULT=. So a
+   =gpkg -> gpkg= run reads a conformant container and hands back one whose
+   registry DDL has lost every constraint it arrived with. **That is a
+   same-format loss like any other**, which is why it is a defect here rather
+   than a tidiness question: the source stated a fact about its own schema and
+   the output does not repeat it.
+
+   /Measured, geosetta's output against =ogr2ogr='s, table by table:/
+
+   | table | what is missing from this writer's DDL |
+   |-------+----------------------------------------|
+   | =gpkg_spatial_ref_sys= | *no missing constraint* -- but it carried a =NOT NULL= on =srs_id= that the standard does not specify, copied from =ogr2ogr= |
+   | =gpkg_contents= | =PRIMARY KEY (table_name)=, =identifier TEXT UNIQUE=, =description ... DEFAULT ''=, =last_change ... DEFAULT (strftime(...))=, =CONSTRAINT fk_gc_r_srs_id FOREIGN KEY= |
+   | =gpkg_geometry_columns= | =CONSTRAINT pk_geom_cols=, =CONSTRAINT uk_gc_table_name=, =CONSTRAINT fk_gc_tn=, =CONSTRAINT fk_gc_srs= |
+   | =gpkg_data_columns= | =CONSTRAINT pk_gdc= *and* =CONSTRAINT gdc_tn UNIQUE (table_name, name)= -- =ogr2ogr= omits the second, and the first fix omitted it too |
+   | =gpkg_extensions= | =CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name)= |
+   | =gpkg_data_column_constraints= | =CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value)= -- =ogr2ogr= omits this one as well |
+
+   ***The exception is the whole explanation.*** =gpkg_spatial_ref_sys= is the
+   only registry table this writer gets exactly right, and it is also the only
+   one whose specified constraints need *no index b-tree*: its =srs_id INTEGER
+   NOT NULL PRIMARY KEY= is a rowid alias. Every other row in that table needs
+   a =sqlite_autoindex_*=, which =sqlite.rs= cannot write. **The deviation is
+   not a style choice anyone made; it is the writer's missing capability
+   showing through as a schema.** /That is the same shape as defect 1's
+   all-null column re-inferring to =String=: not a decision, a gap wearing a
+   decision's clothes./
+
+   *Nothing is broken today, and that is exactly why it survived.* GDAL reads
+   the output, =PRAGMA integrity_check= reports =ok=, and every value and
+   declared column type round-trips -- the constraint text is the only
+   casualty, and no test in the tree looks at it. A conformance validator
+   would not be so relaxed, and a schema that omits a =UNIQUE= the spec
+   requires is a file making a weaker promise than its format allows.
+
+   *It was gated on the same work as D10*, and that is the useful part: fixing
+   it meant writing =sqlite_autoindex_*= b-trees for tables *this crate builds
+   itself*, which is **construction, not the re-packing D10 scoped to**. See
+   D10's note on where that boundary falls -- the construction case is far
+   smaller than the general one, because the keys and the collation are both
+   this writer's own.
+
+   /What shipped:/ **all six registry tables**, each with the specification's
+   constraints and the indexes those oblige. /The first pass covered four and
+   left =gpkg_data_column_constraints= open, on the grounds that =ogr2ogr= does
+   not emit its =gdcc_ntv= constraint and the spec text had not been read. The
+   standard was then read, in the same session./
+
+   ***Reading it found a second, worse instance of the same thing.***
+   =gpkg_data_columns= is specified with *two* constraints -- =pk_gdc= **and**
+   =CONSTRAINT gdc_tn UNIQUE (table_name, name)= -- and =ogr2ogr= writes only
+   the first, so the fix that had just shipped *reproduced GDAL's omission*.
+   It had been checked against GDAL's own output, and therefore inherited
+   exactly the gap it was checking against. A third deviation ran the other
+   way: the standard says =srs_id INTEGER PRIMARY KEY= where =ogr2ogr= writes
+   =INTEGER NOT NULL PRIMARY KEY=, a =NOT NULL= this crate had copied.
+
+   *So the rule this defect actually teaches is not "read the spec".* It is
+   that **a differential check against a reference implementation measures
+   agreement, not conformance.** =ogr2ogr= is the right oracle for what a real
+   producer *emits* -- geometry, values, tile payloads -- and the wrong one for
+   what the standard *requires*. Four measured deviations, three inherited.
+
+   *The relevant clause is a SHALL, which is worth quoting because it makes
+   this a conformance failure rather than an untidiness:* "All =gpkg_*= tables
+   and views ... SHALL have only the specified columns and table constraints."
+
+   /And the fixture set has the same shape as the bug:/ every fixture in the
+   tree came from GDAL, so nothing in it could have caught any of this. The
+   fixture that can is designed in =tests/fixtures/PLANNED.org= --
+   =spec_conformant.gpkg=, built from Annex C's DDL by =sqlite3=, with no GDAL
+   anywhere in its provenance.
+
+   /Verified:/ =PRAGMA integrity_check= =ok= and =foreign_key_check= clean on
+   plain and =--rtree= writes; a duplicate =INSERT= rejected by each restored
+   constraint, =gdc_tn= and =gdcc_ntv= included; =EXPLAIN QUERY PLAN= showing the planner using
+   =sqlite_autoindex_gpkg_contents_1=; =ogr2ogr= rewriting the output with the
+   non-ASCII identifier intact. /The UTF-8 ordering got a free test from the
+   fixture: =Bykerne -- København og Zürich= is the identifier the UNIQUE index
+   sorts and compares./
 
 *** The structural violation: everything the IR never modelled
 The rest is the ceiling. =same-format-output.org= enumerated it for GeoJSON
@@ -816,7 +919,7 @@ a pipe for the same D5 reason -- a type that rode as a native would be
 invisible to the middle tool that just changed a column's values. It arrived
 by a different route than the width, though, and the route is worth recording:
 not from the inventory, but from *defects 1 and 2 turning out to need the same
-thing* (§ Five defects). An all-null FlatGeobuf column re-infers as =String=
+thing* (§ THE DEFECTS). An all-null FlatGeobuf column re-infers as =String=
 without it, and a GeoPackage =BOOLEAN= has nowhere to be remembered. See M4.
 
 *** D2 -- the payload is an enum, not =Box<dyn Any>=
@@ -980,6 +1083,152 @@ shape and should, in this plan rather than filed separately: leaving a working
 example of the anti-pattern beside the new rule is how the rule gets read as
 optional.
 
+*** D8 -- a tile pyramid is carried, and no file is rejected for holding one
+/Decided 2026-08-23, overturning the recommendation in § The collision./
+
+That section left one of two things to be chosen: the Gpkg *reader* rejects a
+file whose tile tables are populated (recommended, "cheap"), or tiles become
+opaque natives carried verbatim ("faithful, and much less cheap"). *Neither
+half of that framing survived measurement.*
+
+**The refusal was drawn at the wrong layer.** The loss is on the *write* path:
+=run_geopackage_write= rewrites the container, and a =gpkg -> geojson= read
+destroys nothing at all. Rejecting at the reader punishes the one path that was
+never lossy -- a user extracting a vector layer out of a mixed container gets
+refused over imagery they were not touching. *This is defect 3's warning
+mistake in another place*: the R*Tree message named layers that were not being
+written (=handoff.org= § WHAT CHANGED, 2026-08-21 review, item 1), because the
+guard sat where it could *see* the content rather than where the damage was.
+A carve-out, if one is ever wanted, belongs on the write path.
+
+**And "much less cheap" does not survive the three-class contract.** Tiles are
+*independent* content by that classification -- they depend on no layer, and no
+middle-stage edit can invalidate them. A tile table is an ordinary rowid table
+with a BLOB column, so carrying one is the same operation as carrying
+=side_notes=, with no raster-specific code anywhere. Under the contract M3b has
+to build regardless, *the raster case is the easiest class, not the hardest.*
+
+*What it does cost, stated so nobody discovers it:* memory. =read_rows= decodes
+a table to =Vec<Vec<Value>>=, so a large pyramid is held decoded and re-encoded.
+That is true of any large carried table and is not specific to imagery; it is an
+argument for streaming a carried table someday, not for refusing this one.
+
+*Does this make geosetta a raster tool?* No, and the distinction is worth
+keeping sharp: it reads no tile, decodes no image, and answers no question about
+one. It *preserves bytes it did not understand*, which is exactly what D1's
+opaque channel does for every other format. The rule in § THE RULE asks for
+nothing less.
+
+*** D9 -- =run_geopackage_write= keeps rewriting; the question is closed
+/Decided 2026-08-23. The conclusion is the one § MILESTONES M3b already leaned
+to; the argument is not, and the argument is why this is now closed rather than
+"expect it to reopen"./
+
+The recorded reasoning was cost: in-place mutation asks =sqlite.rs= for
+free-list management and page reuse, which is harder file-format work than
+anything in it. True, and *not the load-bearing reason.*
+
+**In-place makes preservation the default and destruction the exception, which
+is backwards for editing.** It would faithfully preserve =gpkg_ogr_contents=,
+every R*Tree, and =gpkg_contents='s bbox across an edit that invalidated all
+three -- decision 23's failure mode written into the architecture rather than
+merely risked by it. A rewrite forces every object through an explicit
+classification, which is precisely M3b's job. Given the three-class contract,
+the design where *carrying is a decision* beats the design where *carrying is
+an omission*.
+
+So cost and correctness agree here, which is the comfortable case, and the
+question should stop being carried as open.
+
+*Note what this does not concede.* The risk people attach to rewriting -- a
+truncated file when the write fails partway -- is real and is answered
+separately by =edit-composability.org= D4's committed atomic write-and-rename,
+which needs no file-format work at all.
+
+*** D10 -- an index's fate follows the content class of the table it indexes
+/Decided 2026-08-23. It dissolves the "carry or rebuild an index" question in
+=handoff.org= § OPEN QUESTIONS by splitting it: that question named one thing
+and meant two./
+
+**The R*Tree.** The cost argument recorded for carrying -- that building needs
+SQLite's comparison semantics and its collations -- *does not apply to it at
+all*. R*Tree shadow tables are ordinary rowid *table* b-trees, already
+writable, and =rtree::build= already constructs a complete index from a
+=FeatureCollection= (a bbox per feature, Hilbert order, pack). There is no
+trade to weigh: rebuilding is implemented and cheap, and =handoff.org= § THE
+EDIT LOOP says a carried one is *wrong rather than stale* once geometry has
+been touched. **Never carried. Always rebuilt.**
+
+**Ordinary SQLite indexes**, including the implicit =sqlite_autoindex_*=. These
+are not geometry-derived, so the edit-loop argument does not reach them -- and
+here "an index on disk is already sorted, so an in-order read re-packs without
+comparing two keys" is both true and load-bearing.
+
+*The two resolve into one rule*, which is the part worth carrying forward:
+
+| what the index indexes | fate |
+|------------------------+------|
+| a feature layer (R*Tree) | *derived* -- rebuild, never carry |
+| an independent table carried *verbatim*, same rows and same rowids | *carry it verbatim* -- it is exactly as valid as the table |
+| anything rewritten, or layer-coupled | does not arise: this writer emits its own constraint-free DDL |
+
+**The scope that falls out is much tighter than the question implied:** read
+index b-trees and re-pack them; *never construct one from unsorted keys*. No
+comparison semantics, no collation logic -- the expensive half of the warning
+in § MILESTONES M3b gap 1 is out of scope entirely, because an index is only
+ever carried for a table whose rows and rowids were carried unchanged.
+
+*And the half nobody had noticed: this makes index b-trees mandatory.* SQLite
+creates a =sqlite_autoindex_*= b-tree for every =UNIQUE= and every non-INTEGER
+=PRIMARY KEY=. A table carried with its DDL verbatim and no index behind it is
+a *malformed database*. /Measured, on a file whose DDL was rewritten to declare
+=UNIQUE= with no autoindex present:/
+
+#+begin_src text
+  SELECT                  -> works
+  PRAGMA integrity_check  -> database disk image is malformed
+                             wrong # of entries in index sqlite_autoindex_notes_1
+  INSERT                  -> malformed (11)
+#+end_src
+
+*Reads work, which is why no round trip would have caught it.* Two things kept
+it hidden and both are the fixture lesson again: this writer *strips
+constraints from its own DDL* (it emits =gpkg_contents (table_name TEXT NOT
+NULL, ...)= where GDAL writes =table_name TEXT NOT NULL PRIMARY KEY, identifier
+TEXT UNIQUE, ... CONSTRAINT fk_gc_r_srs_id FOREIGN KEY ...=), so it has never
+needed an autoindex; and the only user table in the fixture set,
+=side_notes(id INTEGER PRIMARY KEY, note TEXT)=, is the one shape that needs
+none either. =PRAGMA integrity_check= on this crate's output is =ok= today.
+
+*What this turned up, and it is not M3b's -- it is bigger:* the registry DDL
+this crate emits deviates from the specification's own definitions, in five of
+the six tables it writes. That is **defect 6**, filed in § THE DEFECTS the same
+day with the table-by-table measurement. It was briefly filed as an open
+question and should not have been: conformance is not a matter of taste.
+
+*So the scope boundary this decision drew needs one more line, because defect 6
+crosses it.* "Re-pack only, never construct" is right for *carried* content,
+and it is not sufficient for content this writer *builds*:
+
+| the index is for | how it is produced | what it needs |
+|------------------+--------------------+---------------|
+| a feature layer's R*Tree | rebuilt by =rtree::build= | already implemented |
+| a *carried* table (a user's own) | *re-packed* from the source's own b-tree, in order | no comparison logic at all |
+| a table this writer *builds* (=gpkg_contents=, =gpkg_geometry_columns=, ...) | *constructed* from keys it just wrote | ordering rules -- but only its own |
+
+**The construction case is far smaller than the general one, and the reason is
+that this writer controls both sides.** The general fear -- SQLite's full
+comparison semantics, =BINARY=/=NOCASE=/=RTRIM= collations -- applies to
+arbitrary user DDL. The registry tables' specified DDL declares *no =COLLATE=
+clause anywhere*, so their keys sort under =BINARY=, which is =memcmp= over
+UTF-8 bytes; and the keys are table names and constraint names this writer
+produced itself. What is actually needed is the type-class ordering
+(NULL < INT/REAL < TEXT < BLOB) plus =memcmp=, over a few dozen short rows.
+
+*A user table declaring =COLLATE NOCASE= on a =UNIQUE= column never reaches
+this path*, because its index is carried rather than constructed -- which is
+the rule at the top of this decision doing its job.
+
 ** SEQUENCING -- this inverts part of =same-format-output.org=
 That plan currently scopes closing the fidelity gap *out*, and ships a warning
 describing it instead ("This one warns about the gap; it does not close it",
@@ -1013,7 +1262,7 @@ genuine cross-format capability gaps -- and its § OPEN QUESTIONS entry asking
 whether the same-format warning needs its own =--quiet= escape hatch dissolves,
 because on a same-format run there is nothing left to warn about.
 
-Defects 1--2 in § Five defects are independent of all of this and should not
+Defects 1--2 in § THE DEFECTS are independent of all of this and should not
 wait for any of it. Defect 3 is the container, so it travels with M3b; defect 4
 travels with D1's =name= modelling.
 
@@ -1031,7 +1280,7 @@ travels with D1's =name= modelling.
   =sqlite_master= objects and unpopulated =gpkg_*= registry rows carried as
   opaque natives, derived tables recomputed. The single largest piece of work
   in this plan, and the one that most needs its own milestone.
-- Defects 1--2 in § Five defects (independently shippable); defect 3's warning
+- Defects 1--2 in § THE DEFECTS (independently shippable); defect 3's warning
   now -- *done 2026-08-21*, =geopackage/container.rs= -- and its fix with the
   container work (M3b); defect 4 with D1's collection-name modelling.
 - *Atomic write-and-rename*, committed 2026-08-20 as the second half of
@@ -1256,7 +1505,16 @@ travels with D1's =name= modelling.
   =gpkg_metadata_reference=, =gpkg_ogr_contents=) with no new file-format work.
 
   Four gaps stand between that and a faithful container:
-  1. *Index b-trees are supported by neither side.* =walk_table= handles
+  1. ~~*Index b-trees are supported by neither side.*~~ **CLOSED 2026-08-23**,
+     both directions, scoped by D10 to re-packing plus the one bounded
+     construction case. =Database::read_index= walks them in index order and
+     the writer packs fresh ones; =MasterEntry='s =rootpage= became the
+     per-entry choice this entry predicted. A =WITHOUT ROWID= table is
+     decodable as a result, and defect 6 was fixed on top of it the same day.
+     /The original text follows, because what it got wrong about the cost is
+     recorded in D10./
+
+     *Index b-trees are supported by neither side.* =walk_table= handles
      =0x0d=/=0x05= and errors on anything else; the writer's =leaf_cell=
      writes a rowid varint, which is table-cell format. Index pages
      (=0x0a=/=0x02=) are payload-only. This is also why a =WITHOUT ROWID=
@@ -1271,12 +1529,30 @@ travels with D1's =name= modelling.
      comparing two keys. M3b needs only the carrying case. The catch: a
      carried index needs a real root page, so =write_database='s hardcoded
      =rootpage: 0= for every =MasterEntry= has to become a per-entry choice.
+
+     ***This gap is not optional, and until 2026-08-23 this entry implied it
+     was.*** It reads as work needed only if M3b chooses to carry indexes.
+     D10's second half shows it is forced by carrying *tables*: SQLite creates
+     a =sqlite_autoindex_*= b-tree for every =UNIQUE= and every non-INTEGER
+     =PRIMARY KEY=, so a table carried with its DDL verbatim and no index
+     behind it is a *malformed database* -- =SELECT= works, =PRAGMA
+     integrity_check= fails, and every =INSERT= fails. Measured; see D10 and
+     =handoff.org= § BUGS FOUND entry 15. Anything M3b carries beyond the
+     =INTEGER PRIMARY KEY= shape needs this gap closed first.
   2. *=sqlite_sequence= carries state, not just DDL.* =container.rs= skips
      =sqlite_*= names on the reasoning that "these follow the DDL rather than
-     carrying anything" -- true of =sqlite_autoindex_*=, *false* of
-     =sqlite_sequence=, whose rows are AUTOINCREMENT high-water marks that no
-     DDL regenerates. Dropping them lets a later insert reuse a retired id.
+     carrying anything" -- *false* of =sqlite_sequence=, whose rows are
+     AUTOINCREMENT high-water marks that no DDL regenerates. Dropping them
+     lets a later insert reuse a retired id.
      /Reasoned, not measured: it cannot bite until M3b carries tables./
+
+     *And false of =sqlite_autoindex_*= too, which this entry originally
+     offered as the case the reasoning /did/ hold for.* It holds only when
+     SQLite executes the DDL. Geosetta assembles bytes, so nothing re-creates
+     an autoindex on its behalf -- see gap 1 above and D10. The =sqlite_*=
+     skip therefore has to split three ways rather than being narrowed by one:
+     autoindexes on carried tables are *carried*, =sqlite_sequence= is
+     *carried*, and nothing else under that prefix arises.
   3. *Page size is not preserved.* The reader honours the header's value
      including the =1= → 65536 encoding; the writer hardcodes
      =WRITE_PAGE_SIZE = 4096=. Content-preserving, not byte-preserving --
@@ -1291,14 +1567,32 @@ travels with D1's =name= modelling.
   un-checkpointed changes reads as its last checkpointed state, silently. The
   refusal has to happen at the layer that *has* the path, not here.
 
-  *Two decisions to take before writing any of it:* the raster question
-  (§ The collision -- recommendation is to reject a populated tile container,
-  and note it is a *reader* change that makes previously-readable files fail),
-  and whether =run_geopackage_write= should rewrite at all. On the second, the
-  in-place alternative is not a refactor of GeoPackage code: it asks
-  =sqlite.rs= to gain incremental mutation -- free-list management, page reuse
-  -- which is substantially harder file-format work than anything currently in
-  it. Enumerating what to carry is the cheaper path by a wide margin.
+  *The three decisions that gated this milestone were taken on 2026-08-23* --
+  D8, D9 and D10 in § DECISIONS, and the capability the third of them needed
+  shipped the same day (gap 1 below, now closed). Two of them had a recommendation on file
+  here and both recommendations changed once the case was *measured* rather
+  than reasoned; the third turned out to be two questions wearing one name.
+  Summarised in place, argued in full at each decision:
+
+  1. *The raster question -- carry, and do not reject.* The recommendation
+     here was to reject a populated tile container at the *reader*. Wrong
+     layer: the loss is on the *write* path, and a =gpkg -> geojson= read
+     destroys nothing, so rejecting there refuses the one path that was never
+     lossy. And "much less cheap" does not survive the three-class contract
+     below -- a tile pyramid is *independent* content, so carrying it is the
+     same operation as carrying =side_notes=, with no raster-specific code.
+     Cost is memory, not complexity.
+  2. *=run_geopackage_write= keeps rewriting.* Unchanged, but on a better
+     argument than the cost one recorded above: in-place mutation makes
+     *preservation the default and destruction the exception*, which is
+     backwards for editing. It would faithfully preserve =gpkg_ogr_contents=,
+     the R*Tree and =gpkg_contents='s bbox across an edit that invalidated all
+     three -- decision 23's failure mode written into the architecture. The
+     question is *closed* rather than left for this milestone to reopen.
+  3. *An index's fate follows the content class of the table it indexes*, not
+     a cost comparison -- which dissolves the "carry or rebuild" question by
+     splitting it. See D10; the consequence for gap 1 above is that index
+     b-trees are *not* optional.
 
   *A third content class, forced by the edit loop -- added 2026-08-22.* D4
   splits derived content two ways; carrying a container needs a third, because
@@ -1368,7 +1662,7 @@ travels with D1's =name= modelling.
      unsigned column was already being misread. Fixed in =emit_ints=.
 
   *Re-scoped 2026-08-20, twice in one day.* First to *defects 1--2 as one
-  piece* (they share a fix, not merely a milestone -- § Five defects, defect
+  piece* (they share a fix, not merely a milestone -- § THE DEFECTS, defect
   2), then wider still when *defect 5* turned up: all three are the same
   missing affordance, and the third is the one that sets its shape.
 
@@ -1423,7 +1717,7 @@ travels with D1's =name= modelling.
 ** TESTING
 - *The invariant, table-driven, per format*: read a hostile fixture, write the
   same format, read back, assert equality of IR *plus* natives. This is the
-  test that would have caught every defect in § Five defects, and the fixture
+  test that would have caught every defect in § THE DEFECTS, and the fixture
   registry behind it is the D6 enforcement -- an exhaustive =match=, no
   catch-all, so a tenth spoke cannot compile the suite without one.
 - *The hostile fixture is the work.* One per format, each built to carry
@@ -1448,7 +1742,46 @@ travels with D1's =name= modelling.
   a test that asserts a native is *gone* after a format change is as important
   as the ones asserting it survived.
 
+** THE ORACLE RULE -- what =ogr2ogr= is and is not evidence of
+/Added 2026-08-23, out of defect 6. It is short because it is a rule, not an
+argument, and it should be applied before the next differential check is
+written./
+
+This crate leans on GDAL as a second opinion throughout, and that is right --
+=tests/gdal_types.rs=, the =ogrinfo= diffing that caught the =REAL= bug, the
+=ogr2ogr= rewrite check. **But agreement with a reference implementation is not
+conformance to a standard**, and defect 6 is what happens when the two are
+treated as one thing: four measured deviations in =ogr2ogr='s GeoPackage
+output, three of which this crate had inherited by checking against it.
+
+| question | the right oracle |
+|----------+------------------|
+| What does a real producer *emit*? | =ogr2ogr=, DuckDB, pyarrow -- a member a real tool writes is a member that really occurs |
+| Can a real consumer *read what we wrote*? | =ogr2ogr=, =ogrinfo=, DuckDB |
+| Is a b-tree *well formed*? | =sqlite3= -- =PRAGMA integrity_check= |
+| **What does the format /require/?** | **the standard's own text, and nothing else** |
+
+*The failure mode is specific and worth naming:* a differential test cannot see
+a deviation the two implementations *share*, and the cheapest way to end up
+sharing one is to build the reference file with the tool you are checking
+against. Every GeoPackage fixture in this tree came from =ogr2ogr=, so the
+whole fixture set was blind to exactly this class. See
+=tests/fixtures/PLANNED.org=, whose first entry exists to break that.
+
+/The normative SQL is small and worth fetching rather than recalling:/ Annex C
+of OGC 12-128r19, plus the extension annexes for the Schema and Metadata
+tables. Source text at
+[[https://www.geopackage.org/spec/][geopackage.org/spec]]; the =.adoc= files
+behind it are in =opengeospatial/geopackage= under =spec/core/annexes/=, which
+is the form to read if the rendered page truncates.
+
 ** OPEN QUESTIONS
+/An entry filed here on 2026-08-23 -- whether this writer's constraint-free
+registry DDL matters -- lasted about an hour. It is not an open question:
+conformance to the published specification is the property the whole format
+layer is for, and a file that states a weaker schema than the spec defines is
+a file a user is right not to trust. It is *defect 6* in § THE DEFECTS, and it
+is gated on the index-writing work in D10./
 - *Should a =.dbf= field be sized to the data, or fixed per type the way GDAL
   does?* /Raised 2026-08-21, measured both ways, deliberately not decided./
 

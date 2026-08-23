@@ -222,7 +222,7 @@ Plus the null cell (defect 1), which is a reader bug rather than an unmodelled
 member: the column survives in the header and the value is encoded by omission.
 
 *Except that its second half /was/ an unmodelled member* /(found 2026-08-20,
-reviewing defect 1 -- see =same-format-fidelity.org= § Five defects)./ Both
+reviewing defect 1 -- see =same-format-fidelity.org= § THE DEFECTS)./ Both
 halves are *fixed* as of M4. Restoring the cell was the reader bug; keeping the
 column's *declared type* was not, because =FieldDecl= had no type field and
 =infer_columns= defaults an all-null column to =String=. So =Column.type(1)=
@@ -661,7 +661,7 @@ answer.
 
 ** RELATED
 - [[file:same-format-fidelity.org][same-format-fidelity.org]] -- M1's owner;
-  D4 supplies the classes and § Five defects overlaps this list at four points.
+  D4 supplies the classes and § THE DEFECTS overlaps this list at four points.
 - [[file:same-format-output.org][same-format-output.org]] -- M2's
   =Format::unmodelled_members= was to be built from this; under the sequencing
   decision it is superseded by the natives channel, but the enumeration is the

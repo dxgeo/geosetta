@@ -23,12 +23,26 @@ still pass =native: None=.*
   format with no slot still *warns*.
 - *=edit-composability.org='s live bug 1* -- the GeoPackage edit loop that
   duplicated layers -- is fixed.
-- *Defect 3 is the only defect left*, and it travels with the GeoPackage
-  container (M3b). Its *warning* shipped 2026-08-21 -- a =gpkg= write now says
-  what the rewrite destroys instead of exiting 0 in silence -- but the *fix*
-  is still M3b's. /A second, smaller bug is open beside it as of 2026-08-22:
-  that warning misclassifies =gpkg_ogr_contents=, which is derived. Entry 13 in
-  § BUGS FOUND; it closes with M3b./
+- *Defect 3 is the only defect left again.* Its *warning* shipped 2026-08-21
+  -- a =gpkg= write now says what the rewrite destroys instead of exiting 0 in
+  silence -- but the *fix* is still M3b's. /Entry 13 is open beside it: that
+  warning misclassifies =gpkg_ogr_contents=, which is derived. It closes with
+  M3b./
+- ***Defect 6 was found and fixed on 2026-08-23**, twice over, and it is the
+  one to read first if you are new to this work.* /The first fix was checked
+  against =ogr2ogr= and inherited two of that tool's own deviations from the
+  standard; reading the specification found them. See § THE ORACLE RULE in the
+  fidelity plan./ Five of the six registry tables were
+  written with *no table constraints at all* -- no =PRIMARY KEY=, no =UNIQUE=,
+  no =FOREIGN KEY= -- so this crate's output did not state the schema the
+  GeoPackage specification defines. **It was never a decision**: =sqlite.rs=
+  could not write an index b-tree, so the DDL that would have needed one was
+  never written, and what was left read like a house style. Fixed by building
+  the index b-tree, which was the actual missing capability; the DDL then
+  followed in one line per table. /Verified with =PRAGMA integrity_check=,
+  =foreign_key_check=, a duplicate =INSERT= against every restored constraint,
+  =EXPLAIN QUERY PLAN= showing the planner using the index, and =ogr2ogr=
+  rewriting the output./
 - *Two things changed on 2026-08-22 that a returning reader should not
   discover by accident.* The format-check deletion's only gating argument
   *expired*, so its position at the end of the chain is an open call rather
@@ -38,11 +52,14 @@ still pass =native: None=.*
   M3b has to honour and rules out dirty-flag invalidation on structural
   grounds (§ THE EDIT LOOP).
 
-535 tests pass (=cargo test -p geosetta=: 487 lib, 47 integration, 1 doc),
+540 tests pass (=cargo test -p geosetta=: 492 lib, 47 integration, 1 doc),
 clippy clean, *and =cargo doc= is green* -- add that third command to your
 verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
-else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). Two further GDAL cross-checks are =#[ignore]=d by default:
-=cargo test --test gdal_types -- --ignored=. See
+else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). Six
+=#[ignore]=d cross-checks run with =cargo test -p geosetta -- --ignored=, and
+one of them is new: =sqlite_itself_validates_the_index_this_writer_builds=
+hands this crate's b-tree to the =sqlite3= binary and asks *it* whether the
+file is well formed. See
 [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
 § STATUS for the precise line between done and not.
 
@@ -77,7 +94,13 @@ In this order. The first two are the load-bearing ones:
 4. [[file:plans/edit-composability.org][plans/edit-composability.org]] -- the
    original ask, now the consumer of the above.
 5. [[file:tests/fixtures/HOSTILE.org][tests/fixtures/HOSTILE.org]] -- what each
-   fixture carries and why. Read before touching any of them.
+   fixture carries and why. Read before touching any of them, and
+   [[file:tests/fixtures/PLANNED.org][PLANNED.org]] beside it for the ones
+   designed on 2026-08-23 and not yet built -- =spec_conformant.gpkg= first.
+6. =same-format-fidelity.org= § THE ORACLE RULE -- one page, and it is the
+   thing this project got wrong most recently: *=ogr2ogr= is evidence of what a
+   producer emits and what a consumer accepts, never of what the standard
+   requires.* Read it before writing another differential test.
 
 =plans/lossy-conversion-warnings.org= and =plans/spatial-index.org= were also
 edited; see § WHAT CHANGED IN EXISTING DOCS.
@@ -151,6 +174,37 @@ capability a user can reach.
 data destruction is the priority, M3b still leads; if *composability* is, the
 deletion does, and M3b improves a path (=gpkg -> gpkg= in one invocation) that
 an edit loop does not even use.
+
+*** What 2026-08-23 did to the order, and it is not what the diagram says
+/The three decisions M3b was blocked on were taken this day (rows 24--26), and
+taking them turned up defect 6 -- the registry DDL this crate emits does not
+match the GeoPackage specification. That reorders the work, because conformance
+to the published spec is not one feature among others: it is the property that
+decides whether anyone can rely on the output at all. A file that reads fine in
+GDAL and fails a conformance check is a file a user is right to distrust./
+
+*The dependency runs the other way from how it was drawn.* The diagram has M3b
+carrying container content, with index b-trees filed as a gap M3b might or might
+not need. In fact:
+
+#+begin_src text
+  index b-tree write  --+--> defect 6: spec-exact registry DDL   (constructed keys)
+                        |
+                        +--> M3b: carrying any table that is not
+                             INTEGER PRIMARY KEY shaped            (re-packed keys)
+#+end_src
+
+**One capability unblocks both**, and the *conformance* half is the one with a
+user-visible payoff that does not wait for the rest of M3b. It is also the
+smaller half: constructing the registry tables' autoindexes needs the type-class
+ordering and =memcmp= over keys this writer produced, with no =COLLATE= clause
+anywhere in the specified DDL -- not the general comparison-and-collation
+machinery that the "carrying is cheaper than building" note was warning about.
+
+*So the order to work in is:* index b-trees first (both halves of D10), then
+defect 6, then the carrying that M3b's classification work sits on. The three
+things queued on 2026-08-23 -- entry 14's fix, the missing fixtures, and index
+b-trees -- are all upstream of that and unchanged.
 
 ** THE EDIT LOOP, AND WHAT IT REQUIRES OF EVERYTHING ELSE
 /Added 2026-08-22, from the question "a middle package should be able to modify
@@ -252,8 +306,8 @@ should move to =edit-composability.org= when that plan is next opened./
 | 7 | In-place: fix identity loss first, atomic writes second; gpkg append stays | =edit-composability.org= D4 |
 | 8/9 | =--print-crs= one-pass and multi-layer piping both *closed* | =edit-composability.org= § OPEN QUESTIONS |
 | 10 | =FieldDecl= gains a *declared type*, in each spoke's vocabulary rather than the hub's four | =same-format-fidelity.org= D1 / M4 |
-| 11 | Precedence: the declaration wins where the data is *silent*, the data wins where it *contradicts* | § Five defects, defect 2; =FieldDecl::type_for= |
-| 12 | A FlatGeobuf omitted cell reads back as *null* -- the unset-vs-null "fork" was measured away | § Five defects, defect 1 |
+| 11 | Precedence: the declaration wins where the data is *silent*, the data wins where it *contradicts* | § THE DEFECTS, defect 2; =FieldDecl::type_for= |
+| 12 | A FlatGeobuf omitted cell reads back as *null* -- the unset-vs-null "fork" was measured away | § THE DEFECTS, defect 1 |
 | 13 | =created_by= is *not* a native: it names the writer, and geosetta is the writer | § MILESTONES, M3 GeoParquet |
 | 14 | An opaque member can also be *derived*: =ARROW:schema= is replayed only while the columns match | § MILESTONES, M3 GeoParquet |
 | 15 | GeoParquet's =covering= is an *index*, not a native -- rebuilt if present, and handed over | =spatial-index.org= milestone E |
@@ -265,6 +319,9 @@ should move to =edit-composability.org= when that plan is next opened./
 | 21 | =JsonValue= and =DeclType= are *exported*, =#[non_exhaustive]= -- a modelled field a caller cannot name is a native with extra steps | D7 |
 | 22 | Numbers are =Int(i64)= / =Float(f64)=, not an =f64= plus a flag; a whole float keeps its =.0=, as =ogr2ogr= writes it | § The number model |
 | 23 | Native validity is *computed at write* by comparing against what is being written, never *tracked* by a dirty flag -- =Feature::properties= and =FeatureCollection::schema= are public fields, so a consumer's mutation cannot be intercepted | =handoff.org= § THE EDIT LOOP; migrate to =edit-composability.org= when that plan is next edited |
+| 24 | A tile pyramid is *carried*, and no file is rejected for holding one -- the refusal had been drawn at the reader, where nothing is lost | =same-format-fidelity.org= D8; § The collision |
+| 25 | =run_geopackage_write= keeps *rewriting*, and the question is closed -- in-place would make preservation the default, which is backwards for editing | =same-format-fidelity.org= D9 |
+| 26 | An index's fate follows the *content class of the table it indexes*, not a cost comparison -- so the R*Tree is always rebuilt, a verbatim-carried table's index is carried, and index b-trees turn out to be *mandatory* rather than optional | =same-format-fidelity.org= D10 |
 
 *Three later rulings extended D1*, all worth knowing before you design
 anything, and *all three now implemented*. The third is =FieldDecl='s
@@ -342,7 +399,7 @@ of it was planned work* -- each item was found by measuring the one above it:
   FlatGeobuf's and GeoPackage's indexes. Blocked on the writer's flat schema:
   it has never emitted a nested struct column.
 - *Defect 3* -- the only entry left in § LIVE BUGS. Note that section's
-  numbering is *not* the plan's "five defects"; see its own note.
+  numbering is *not* the plan's defect numbering; see its own note.
 - The exhaustive-match fixture registry (D6).
 - The format-check deletion. *Drawn last in the diagram, no longer forced
   there*: its only gating argument (the duplicated inventory pass) is spent as
@@ -363,39 +420,56 @@ of it was planned work* -- each item was found by measuring the one above it:
 2026-08-21, when two shipped: defect 3's container warning and
 =decl_recast_warning=.
 
-*Four =sqlite.rs= gaps are known and unclosed*, all found while scoping M3b on
-2026-08-22 and all recorded in =plans/same-format-fidelity.org= § MILESTONES,
+*Three =sqlite.rs= gaps remain of the four found while scoping M3b on
+2026-08-22*, all recorded in =plans/same-format-fidelity.org= § MILESTONES,
 M3b. None is a silent data loss today; each is work M3b needs:
-*index b-trees* (neither read nor written, which is also why =WITHOUT ROWID=
-tables cannot be decoded), *=sqlite_sequence='s* AUTOINCREMENT high-water marks
-(state that DDL cannot regenerate, currently skipped with the =sqlite_*=
-prefix), *page size* (read faithfully, written as a hardcoded 4096) and
-*reserved per-page space* (read as =usable_size=, written as zero). A fifth is
-out of scope by construction: *WAL* is invisible to a reader that takes bytes
-rather than a path, so an un-checkpointed GeoPackage reads as its last
-checkpoint, silently.
+*=sqlite_sequence='s* AUTOINCREMENT high-water marks (state that DDL cannot
+regenerate, currently skipped with the =sqlite_*= prefix), *page size* (read
+faithfully, written as a hardcoded 4096) and *reserved per-page space* (read as
+=usable_size=, written as zero). A fifth is out of scope by construction:
+*WAL* is invisible to a reader that takes bytes rather than a path, so an
+un-checkpointed GeoPackage reads as its last checkpoint, silently.
 
-** BUGS FOUND -- TWO STILL LIVE
-/Renamed 2026-08-20: this was "LIVE BUGS FOUND, NOT FIXED" when five of its
-six entries were live, then "ONE STILL LIVE" once five were fixed. **Entry 3
-(defect 3, the GeoPackage container) and entry 13 (=gpkg_ogr_contents=
-misclassified) are the two open ones**, and they close together -- 13 is a
-classification M3b has to make anyway. The fixed entries stay because each
-records how it was measured and what the fix turned on./
+***The first gap -- index b-trees -- closed on 2026-08-23.*** Both directions:
+=Database::read_index= walks =0x0a=/=0x02= in index order, and the writer packs
+records into fresh index pages, with =MasterEntry='s =rootpage= now a per-entry
+choice exactly as the plan predicted it would have to be. *Scoped by D10 to
+re-packing and one bounded construction case*, so it carries no collation
+logic. Three things came with it that were not the point of it: defect 6's fix,
+a =WITHOUT ROWID= table now reporting a real row count instead of
+=(rows not counted)=, and the reason the fourth =sqlite.rs= gap was never
+merely M3b's.
 
-/Four more were found on 2026-08-21 and all four are fixed. Three more on
-2026-08-22, two fixed and one open. Both groups are in their own subsections at
-the end, because in each case what *found* them is the useful part./
+** BUGS FOUND
+/This heading has been renamed four times and the count in it is the reason --
+"LIVE BUGS FOUND, NOT FIXED", then "ONE STILL LIVE", "TWO STILL LIVE", and now
+this. **Read the entries, not the heading.** The open ones are marked *LIVE* in
+their own text, which is the only place that cannot drift./
+
+**Open at the end of 2026-08-23:** entry 3 (defect 3, the GeoPackage
+container) and entry 13 (=gpkg_ogr_contents= misclassified). Entry 15 is not a
+bug in shipped behaviour but a constraint on M3b, and its missing capability
+shipped. Entry 16 (*defect 6*) was found and fixed the same day, once the
+index-writing work it was gated on existed. The fixed entries stay because each
+records how it was measured and what the fix turned on.
+
+/Four more were found on 2026-08-21 and all four are fixed. Three on
+2026-08-22, two fixed and one open. Three on 2026-08-23, one fixed and two
+open. Each group is in its own subsection at the end, because in each case what
+*found* them is the useful part./
 
 *Note the two countings, since they have collided before.* "Defect /n/" is
-=same-format-fidelity.org= § Five defects and is canonical; the numbered
-entries here are reading order. By the *defect* counting there is still exactly
-one left (defect 3) -- entry 13 is not one of the five.
+=same-format-fidelity.org= § THE DEFECTS and is canonical; the numbered
+entries here are reading order. By the *defect* counting there are *two* left
+(3 and 6) -- entries 13 and 15 are neither of them. /That section stopped
+naming a total on 2026-08-23, when a sixth defect arrived; a heading that
+states a count is a heading that expires, and this one had already been
+renamed once./
 
 Ordered by how likely they were to bite a real user.
 
 *The list positions below are reading order, not defect numbers.* The canonical
-numbering is =same-format-fidelity.org= § Five defects, and each entry names
+numbering is =same-format-fidelity.org= § THE DEFECTS, and each entry names
 its own identity in bold; entries with no such name are not one of the five at
 all. This is worth stating because an earlier draft numbered these entries
 1--5 and then referred to them as though they *were* the plan's numbers, which
@@ -438,7 +512,7 @@ things. /Reconciled 2026-08-20./
    about what =writer::build= emits and has to move when the writer does, and
    an R*Tree's =gpkg_extensions= rows are counted as part of the index rather
    than as a loss of their own. Both are written up in
-   =same-format-fidelity.org= § Five defects, defect 3.
+   =same-format-fidelity.org= § THE DEFECTS, defect 3.
 4. ~~*FlatGeobuf drops null cells*~~ -- *defect 1*, *FIXED 2026-08-20 (M4)*.
    It was *two* losses, not one, and the second was nearly missed: fixing the
    cell is necessary and not sufficient, because an all-null column then
@@ -452,7 +526,7 @@ things. /Reconciled 2026-08-20./
    GeoPackage and CSV already do exactly that in this crate today*, with
    Shapefile rectangular too. FlatGeobuf is the lone outlier, being the only
    format rectangular in its header and sparse in its rows. There is no fork
-   to settle. See =same-format-fidelity.org= § Five defects for the
+   to settle. See =same-format-fidelity.org= § THE DEFECTS for the
    spoke-by-spoke measurement.
 5. ~~*GeoPackage loses booleans*~~ -- *defect 2*, *FIXED 2026-08-20 (M4)*.
    The reader now parses the declared SQL type out of the table DDL, so a
@@ -583,6 +657,150 @@ can close. The new =sqlite_altered.gpkg= is the first fixture built by
 reading the *format* for what it allows instead of the *tool* for what it
 writes.
 
+*** 2026-08-23 -- by taking the three decisions M3b was blocked on, then by reading the standard
+/Five entries, 14--18. The first three came from taking the decisions M3b was
+blocked on -- **by measuring the case instead of re-reading the argument**;
+two of the three recommendations on file had been carried for days and neither
+survived first contact with a measurement. The last two came from reading the
+*specification itself*, after the work above was already believed finished, and
+both are failures of the checking method rather than of the code: 17 is a
+differential test inheriting the reference tool's own deviations, 18 is a test
+that never produced a value large enough to reach the branch it was written
+for./
+
+14. ~~*Defect 3's warning excluded any dataset that was not a feature layer,
+    and so destroyed it in silence.*~~ *FIXED 2026-08-23.* =container.rs='s =feature_layers= collects
+    *every* =gpkg_contents.table_name= regardless of =data_type=, where the
+    reader (=reader.rs=, =feature_layer_names=) filters on
+    =data_type = 'features'=. So a tile pyramid or a GDAL =attributes= table
+    was treated as "a layer, out of scope" by the survey -- and then not
+    written, because it is not a feature layer either. /Measured on
+    =gdal_hostile.gpkg= with one =gpkg_contents= row added and nothing else
+    changed:/
+
+    #+begin_src text
+      side_notes unregistered   -> "... side_notes (1 row), gpkg_metadata (1 row) ..."   destroyed, named
+      side_notes as attributes  -> "... gpkg_metadata (1 row) ..."                        destroyed, unnamed
+    #+end_src
+
+    *=ogr2ogr= writes =data_type='attributes'= for an aspatial table*, so this
+    was reachable from ordinary GDAL output -- just not from any fixture in the
+    tree. **The third scope bug in a warning, after the R*Tree message naming
+    unwritten layers and entry 11's =WITHOUT ROWID= silence.** A round-trip
+    assertion cannot see any of the three: they are all about what the warning
+    *covers*, and a test that checks a warning's text has already assumed its
+    scope.
+
+15. *A table carried with its DDL verbatim would produce a malformed database.*
+    **The capability it was missing shipped 2026-08-23**; the classification
+    work that consumes it is still M3b's, so this stays here as a constraint
+    rather than a bug. **Found by asking what carrying a user table actually
+    costs**, which is D10's question. SQLite creates a =sqlite_autoindex_*= b-tree for every
+    =UNIQUE= and every non-INTEGER =PRIMARY KEY=; =write_database= cannot write
+    an index b-tree and hardcodes =rootpage: 0= for every =MasterEntry=.
+    /Measured on a file whose DDL was rewritten to declare =UNIQUE= with no
+    autoindex present:/ =SELECT= works, =PRAGMA integrity_check= reports
+    *database disk image is malformed*, and every =INSERT= fails.
+
+    Not a bug in shipped behaviour -- nothing carries a table yet -- but a
+    *live constraint on M3b* that the plan had recorded as optional. Two things
+    hid it, and both are the fixture lesson: this writer strips constraints
+    from its own DDL, and =side_notes(id INTEGER PRIMARY KEY, note TEXT)= --
+    the only user table in the fixture set -- is the one shape that needs no
+    autoindex.
+
+16. ~~*Every GeoPackage this crate writes states a schema the specification
+    does not.*~~ *FIXED 2026-08-23, the same day it was found.* This is
+    *defect 6*, and it is the one entry in this section
+    that is a defect in the canonical numbering -- see
+    =same-format-fidelity.org= § THE DEFECTS for the table-by-table
+    measurement. Five of the six registry tables are emitted with no table
+    constraints at all: no =PRIMARY KEY=, no =UNIQUE=, no =FOREIGN KEY=, no
+    =DEFAULT=. A =gpkg -> gpkg= run reads a conformant container and returns
+    one whose registry DDL has lost every constraint it arrived with.
+
+    ***The exception explains the rule.*** =gpkg_spatial_ref_sys= is the only
+    one emitted exactly right, and the only one whose specified constraints
+    need no index b-tree -- =srs_id INTEGER NOT NULL PRIMARY KEY= is a rowid
+    alias. **The deviation was never a decision; it is entry 15's missing
+    capability showing through as a schema.**
+
+    *Nothing observable was broken*, which is why it survived: GDAL read the
+    output, =integrity_check= was =ok=, every value and declared type
+    round-tripped. The constraint text was the only casualty and no test in the
+    tree looked at it. That is precisely the class of thing a conformance
+    checker looks at first.
+
+    /What the fix produced, measured:/ =PRAGMA integrity_check= =ok= and
+    =foreign_key_check= clean on both a plain and an =--rtree= write; a
+    duplicate =INSERT= now *rejected* by each restored constraint
+    (=gpkg_contents.table_name=, =gpkg_contents.identifier=,
+    =gpkg_geometry_columns='s composite key, =gpkg_extensions.ge_tce=);
+    =EXPLAIN QUERY PLAN= showing =SEARCH gpkg_contents USING INDEX
+    sqlite_autoindex_gpkg_contents_1=; and =ogr2ogr= rewriting the output with
+    the non-ASCII identifier intact. **The DDL was the one-line part.** The
+    work was the index b-tree underneath it, which is why this entry sits
+    beside 15 rather than being filed as a formatting change.
+
+    *One table is deliberately left alone:* =gpkg_data_column_constraints=.
+    The Schema extension specifies =CONSTRAINT gdcc_ntv UNIQUE
+    (constraint_name, constraint_type, value)=, but *=ogr2ogr= does not emit
+    it* -- so the reference implementation and the specification disagree here,
+    where they agreed on all four tables that were changed. **It is not changed
+    on a recollection of the spec text**, and the code says so at the site. Read
+    the specification and finish it; it is one line plus one
+    =autoindex_records= call.
+
+17. *=gpkg_data_columns= was missing =gdc_tn=, and defect 6's first fix
+    reproduced GDAL's omission rather than the standard.* **Found 2026-08-23 by
+    reading the specification**, after defect 6 had already been "fixed" the
+    same day. The Schema extension specifies *two* constraints on that table --
+    =CONSTRAINT pk_gdc PRIMARY KEY (table_name, column_name)= **and**
+    =CONSTRAINT gdc_tn UNIQUE (table_name, name)=. =ogr2ogr= writes only the
+    first. The fix had been cross-checked against GDAL's own file, so it
+    inherited exactly the gap it was checking against.
+
+    *The same reading settled the table that had been left open on purpose*:
+    =gpkg_data_column_constraints= does specify
+    =CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value)=,
+    and =ogr2ogr= omits that too. Both now emitted.
+
+    *And one deviation ran the other way:* the standard says
+    =srs_id INTEGER PRIMARY KEY= on =gpkg_spatial_ref_sys=, while =ogr2ogr=
+    writes =INTEGER NOT NULL PRIMARY KEY= -- a =NOT NULL= the spec does not ask
+    for, which this crate had copied. Now matched to the standard.
+
+    ***The lesson is not "check the spec".*** It is that **a differential test
+    against a reference implementation measures agreement, not correctness**,
+    and this crate had been treating =ogr2ogr= as though those were the same
+    thing. Four measured deviations in the reference tool, three of which we
+    had inherited. /The fixture set has the same shape as the bug: everything
+    in it came from GDAL, so nothing in it could have caught this./
+    =tests/fixtures/PLANNED.org= designs the fixture that can.
+
+18. *The index writer's overflow path was shipped untested.* **Found
+    2026-08-23**, in code written the same day. =build_index_btree= handles a
+    record too large for an index cell by spilling to an overflow chain, and
+    both new tests built their records out of ~40-byte keys, so *neither ever
+    reached =write_overflow=*. Fixed by widening every fourth key past the
+    ~1002-byte ceiling in the round-trip test and every fifth in the =sqlite3=
+    cross-check, so =PRAGMA integrity_check= is now asked about the chains and
+    an overflowing key is looked up through the index.
+
+    **The third time the same blind spot has been recorded here** -- after the
+    =Int64= sweep whose representative value was small enough to survive a
+    double, and the type sweep that never looked at a value. /A test can be
+    exhaustive over structure and still never reach a branch, because the
+    branch is chosen by a *size* the test never produces./
+
+*What entries 15 and 16 add to the lesson list*, and it is the sharpest form of
+it yet: **a missing capability does not always announce itself as a failure --
+sometimes it announces itself as a design.** Nobody chose to write
+constraint-free DDL. The writer could not write an index, so the DDL that
+needed one never got written, and what was left read like a house style. The
+way it was found was not a test; it was asking what a *different* feature would
+cost.
+
 ** WHAT CHANGED IN EXISTING DOCS
 Listed explicitly because each entry was written before its work was committed.
 /=git log= is the better source wherever the two disagree -- see § THE ONE REAL
@@ -590,11 +808,68 @@ GAP, whose "no commits" claim was itself an error and is retracted there, and
 which explains why this section must never be read as a statement about what is
 committed./
 
-*As of 2026-08-22 every entry below has landed*, through =c789447=. That
-sentence is exactly the kind that expires, which is the point of the rule above:
-check =git log= rather than trusting it.
+*Everything below had landed as of 2026-08-22, through =c789447=; the
+2026-08-23 entry was uncommitted when written.* That sentence is exactly the
+kind that expires, which is the point of the rule above: check =git log=
+rather than trusting it.
 
 /Newest first./
+
+*The three M3b decisions, index b-trees, and defect 6, 2026-08-23 -- code.*
+The three decisions M3b was blocked on (D8, D9, D10) were taken by *measuring
+each case rather than re-reading the argument for it*, and two of the three
+recommendations on file did not survive that. Taking them turned up three bugs
+(§ BUGS FOUND, entries 14--16) and one missing capability that turned out to be
+underneath all of it.
+
+- =src/sqlite.rs= -- *index b-trees, both directions.* =Database::read_index=
+  and =walk_index=/=index_cell= (page types =0x0a=/=0x02=); =local_payload=
+  factored out of =leaf_cell= because index cells use a different on-page
+  ceiling; =Writer::build_index_btree=, =pack_index_interior=,
+  =index_leaf_cell=, =index_interior_cell=, =render_index_leaf=,
+  =write_index_interior=, =index_cell_size=; =autoindex_records= and
+  =compare_values=; =MasterEntry::records= and =TableSpec::autoindexes=, which
+  make =rootpage= the per-entry choice the plan said it would have to become.
+  Four new tests, one of them =#[ignore]=d.
+- =src/geopackage/writer.rs= -- *defect 6.* Four registry tables now emit the
+  specification's DDL, constraints included, each with the index its
+  constraints oblige. One new test.
+- =src/geopackage/container.rs= -- *entry 14's fix*: =feature_layers= filters
+  on =data_type = 'features'=, as the reader always has. And a
+  =WITHOUT ROWID= table now reports a real row count, because the index walk
+  can read one. One new test; one existing test updated to the better
+  behaviour.
+- =tests/fixtures/sqlite_contents.gpkg=, =tests/fixtures/sqlite_constraints.gpkg=
+  and =tests/fixtures/build_sqlite_fixtures.sh= -- *new*, with =HOSTILE.org=
+  entries. The script is checked in because these two exist to pin the gap
+  between what our fixtures contain and what the format permits, and a recipe
+  nobody can re-run reopens it.
+- =plans/same-format-fidelity.org= -- D8, D9, D10; defect 6 in § THE DEFECTS;
+  M3b's gap 1 and gap 2 corrected; § The collision's overturned
+  recommendation left standing with the reason.
+- =plans/spatial-index.org= -- D4's "rebuilt when the source had one" recorded
+  as an *unimplemented decision* rather than an open question, with M3b named
+  as its owner.
+
+*Three things worth carrying forward, and the third is the one to remember.*
+
+1. **A count in a heading is a heading that expires.** § THE DEFECTS stopped
+   being "Five defects" and § BUGS FOUND stopped naming a number, both on the
+   precedent of "THE NINE DECISIONS". Between them these two headings had been
+   renamed five times for no reason but arithmetic.
+2. **Two of three recorded recommendations were wrong, and both in the same
+   way** -- they were reasoned rather than measured, and each had been carried
+   forward long enough to read as settled. The raster refusal was drawn at the
+   reader, where nothing is lost; "carrying tiles is much less cheap" was false
+   under a classification written *after* it. /Re-derive a recommendation
+   before implementing it, especially one that has been sitting still./
+3. ***A missing capability does not always announce itself as a failure.
+   Sometimes it announces itself as a design.*** Nobody chose to write
+   constraint-free DDL. =sqlite.rs= could not write an index b-tree, so the DDL
+   that needed one was never written, and what was left looked like a house
+   style -- with the one table that needed no index standing as the apparent
+   exception that proved the rule. It was found by asking what a *different*
+   feature would cost, not by testing anything.
 
 *Two =sqlite.rs= bugs and the M3b survey, 2026-08-22 -- code.* Scoping M3b
 meant reading =src/sqlite.rs= for what it cannot do; the reading turned up two
@@ -992,7 +1267,7 @@ vector at all.
 to finish M3 before M4 turned up a *fifth defect*: =schema::ColumnType='s four
 values are narrower than every real format's, so =Int16=, =Float32= and
 =DateTime= columns all widen or degrade on a round trip -- with no null
-involved. Written up in =same-format-fidelity.org= (§ Five defects, which is
+involved. Written up in =same-format-fidelity.org= (§ THE DEFECTS, which is
 what that section is now called), and it re-scoped M4 to open with a
 *vocabulary investigation* instead of a field addition.
 

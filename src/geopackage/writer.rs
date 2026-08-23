@@ -10,7 +10,7 @@ use crate::geometry::{to_wkb, Bbox, Geometry};
 use crate::schema::{columns_for, Cell, Column, ColumnType, DeclType};
 use crate::format::Format;
 use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
-use crate::sqlite::{MasterEntry, TableSpec, Value, write_database};
+use crate::sqlite::{MasterEntry, TableSpec, Value, autoindex_records, write_database};
 
 use super::reader::read_layers;
 use super::rtree;
@@ -25,6 +25,48 @@ const UNDEFINED_SRS_ID: i64 = 0;
 /// First srs_id handed out to a CRS that carries no usable authority code.
 const SYNTHETIC_SRS_BASE: i64 = 100_000;
 const LAST_CHANGE: &str = "1970-01-01T00:00:00.000Z";
+
+// The registry tables' DDL, as the GeoPackage specification defines them —
+// **including the table constraints**, which is what makes each of these a
+// statement about the schema rather than a loose approximation of it.
+//
+// Every `UNIQUE` and every non-INTEGER `PRIMARY KEY` below obliges this writer
+// to emit a `sqlite_autoindex_*` b-tree alongside the table; declaring one
+// without the other produces a database SQLite reports as malformed. The
+// obligation is carried by `crate::sqlite::TableSpec::autoindexes`, and each
+// table's construction site names which constraint each index is for.
+//
+// **These were emitted constraint-free until 2026-08-23** — *defect 6* in
+// `plans/same-format-fidelity.org` § THE DEFECTS. That was never a decision:
+// `sqlite.rs` could not write an index b-tree, so the DDL that needed one was
+// never written, and `gpkg_spatial_ref_sys` looked like the exception when it
+// was really the only table whose key (`INTEGER PRIMARY KEY`, a rowid alias)
+// needs no index at all.
+
+/// `gpkg_spatial_ref_sys` — `srs_id INTEGER PRIMARY KEY` with **no
+/// `NOT NULL`**: that is what the specification states, and `ogr2ogr` adds a
+/// `NOT NULL` the spec does not ask for. Either way it is a rowid alias and
+/// owns no index b-tree, which is why this was the one table already correct
+/// when defect 6 was found.
+const SPATIAL_REF_SYS_DDL: &str = "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT)";
+
+/// `gpkg_contents` — the specification's definition, constraints included.
+const CONTENTS_DDL: &str = "CREATE TABLE gpkg_contents (table_name TEXT NOT NULL PRIMARY KEY, data_type TEXT NOT NULL, identifier TEXT UNIQUE, description TEXT DEFAULT '', last_change DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER, CONSTRAINT fk_gc_r_srs_id FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys(srs_id))";
+
+/// `gpkg_geometry_columns` — two keys and two foreign keys.
+const GEOMETRY_COLUMNS_DDL: &str = "CREATE TABLE gpkg_geometry_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, geometry_type_name TEXT NOT NULL, srs_id INTEGER NOT NULL, z TINYINT NOT NULL, m TINYINT NOT NULL, CONSTRAINT pk_geom_cols PRIMARY KEY (table_name, column_name), CONSTRAINT uk_gc_table_name UNIQUE (table_name), CONSTRAINT fk_gc_tn FOREIGN KEY (table_name) REFERENCES gpkg_contents(table_name), CONSTRAINT fk_gc_srs FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys (srs_id))";
+
+/// `gpkg_data_columns` — the Schema extension's column metadata. **Two**
+/// constraints: `ogr2ogr` writes only `pk_gdc`, and the specification also
+/// requires `gdc_tn`.
+const DATA_COLUMNS_DDL: &str = "CREATE TABLE gpkg_data_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, name TEXT, title TEXT, description TEXT, mime_type TEXT, constraint_name TEXT, CONSTRAINT pk_gdc PRIMARY KEY (table_name, column_name), CONSTRAINT gdc_tn UNIQUE (table_name, name))";
+
+/// `gpkg_data_column_constraints` — the Schema extension's constraint
+/// definitions. `ogr2ogr` writes this one with no constraint at all.
+const DATA_COLUMN_CONSTRAINTS_DDL: &str = "CREATE TABLE gpkg_data_column_constraints (constraint_name TEXT NOT NULL, constraint_type TEXT NOT NULL, value TEXT, min NUMERIC, min_is_inclusive BOOLEAN, max NUMERIC, max_is_inclusive BOOLEAN, description TEXT, CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value))";
+
+/// `gpkg_extensions` — one row per extension in use.
+const EXTENSIONS_DDL: &str = "CREATE TABLE gpkg_extensions (table_name TEXT, column_name TEXT, extension_name TEXT NOT NULL, definition TEXT NOT NULL, scope TEXT NOT NULL, CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name))";
 
 const WGS84_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563,AUTHORITY[\"EPSG\",\"7030\"]],AUTHORITY[\"EPSG\",\"6326\"]],PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AUTHORITY[\"EPSG\",\"4326\"]]";
 
@@ -158,12 +200,7 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
         return Vec::new();
     }
 
-    let mut specs = vec![TableSpec {
-        name: "gpkg_data_columns".into(),
-        // No PRIMARY KEY, for the reason `gpkg_contents` gives: a key here
-        // would need an auto-index this writer does not build.
-        sql: "CREATE TABLE gpkg_data_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, name TEXT, title TEXT, description TEXT, mime_type TEXT, constraint_name TEXT)".into(),
-        rows: columns
+    let data_column_rows: Vec<(i64, Vec<Value>)> = columns
             .into_iter()
             .enumerate()
             .map(|(i, (table, column))| {
@@ -180,12 +217,23 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
                     ],
                 )
             })
-            .collect(),
+            .collect();
+    let mut specs = vec![TableSpec {
+        name: "gpkg_data_columns".into(),
+        sql: DATA_COLUMNS_DDL.into(),
+        // `pk_gdc` over (table_name, column_name), then `gdc_tn` over
+        // (table_name, name) — `name` is nullable, and SQLite sorts NULLs
+        // first, which `compare_values` handles.
+        autoindexes: vec![
+            autoindex_records(&data_column_rows, &[0, 1]),
+            autoindex_records(&data_column_rows, &[0, 2]),
+        ],
+        rows: data_column_rows,
     }];
     if !constraints.is_empty() {
         specs.push(TableSpec {
             name: "gpkg_data_column_constraints".into(),
-            sql: "CREATE TABLE gpkg_data_column_constraints (constraint_name TEXT NOT NULL, constraint_type TEXT NOT NULL, value TEXT, min NUMERIC, min_is_inclusive BOOLEAN, max NUMERIC, max_is_inclusive BOOLEAN, description TEXT)".into(),
+            sql: DATA_COLUMN_CONSTRAINTS_DDL.into(),
             rows: constraints
                 .into_iter()
                 .enumerate()
@@ -205,7 +253,13 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
                     )
                 })
                 .collect(),
+            autoindexes: Vec::new(),
         });
+        // `gdcc_ntv UNIQUE (constraint_name, constraint_type, value)`. Built
+        // from the rows just pushed, since `constraints` was consumed above.
+        let rows = &specs[specs.len() - 1].rows;
+        let records = autoindex_records(rows, &[0, 1, 2]);
+        specs.last_mut().expect("just pushed").autoindexes = vec![records];
     }
     specs
 }
@@ -227,10 +281,7 @@ fn bool_or_null(value: Option<bool>) -> Value {
 }
 
 fn extensions_table(rows: Vec<ExtensionRow>) -> TableSpec {
-    TableSpec {
-        name: "gpkg_extensions".into(),
-        sql: "CREATE TABLE gpkg_extensions (table_name TEXT, column_name TEXT, extension_name TEXT NOT NULL, definition TEXT NOT NULL, scope TEXT NOT NULL)".into(),
-        rows: rows
+    let rows: Vec<(i64, Vec<Value>)> = rows
             .into_iter()
             .enumerate()
             .map(|(i, r)| {
@@ -245,7 +296,13 @@ fn extensions_table(rows: Vec<ExtensionRow>) -> TableSpec {
                     ],
                 )
             })
-            .collect(),
+            .collect();
+    TableSpec {
+        name: "gpkg_extensions".into(),
+        sql: EXTENSIONS_DDL.into(),
+        // `ge_tce UNIQUE (table_name, column_name, extension_name)`.
+        autoindexes: vec![autoindex_records(&rows, &[0, 1, 2])],
+        rows,
     }
 }
 
@@ -373,12 +430,15 @@ fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
     }
     // Rows must be rowid- (srs_id-) ordered for the b-tree writer.
     rows.sort_by_key(|(srs_id, _)| *srs_id);
-    let sql = "CREATE TABLE gpkg_spatial_ref_sys (srs_name TEXT NOT NULL, srs_id INTEGER NOT NULL PRIMARY KEY, organization TEXT NOT NULL, organization_coordsys_id INTEGER NOT NULL, definition TEXT NOT NULL, description TEXT)";
-    TableSpec { name: "gpkg_spatial_ref_sys".into(), sql: sql.into(), rows }
+    let sql = SPATIAL_REF_SYS_DDL;
+    // `srs_id INTEGER NOT NULL PRIMARY KEY` is a rowid alias, so this table
+    // owns no index b-tree — which is why it was the only registry table this
+    // writer already emitted exactly as specified (defect 6).
+    TableSpec { name: "gpkg_spatial_ref_sys".into(), sql: sql.into(), rows, autoindexes: Vec::new() }
 }
 
 fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) -> TableSpec {
-    let rows = layers
+    let rows: Vec<(i64, Vec<Value>)> = layers
         .iter()
         .zip(per_layer_srs)
         .enumerate()
@@ -414,15 +474,20 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) 
         .collect();
     TableSpec {
         name: "gpkg_contents".into(),
-        // No TEXT PRIMARY KEY / UNIQUE: those would require auto-indexes we do
-        // not build. The columns are otherwise the GPKG-standard ones.
-        sql: "CREATE TABLE gpkg_contents (table_name TEXT NOT NULL, data_type TEXT NOT NULL, identifier TEXT, description TEXT, last_change DATETIME NOT NULL, min_x DOUBLE, min_y DOUBLE, max_x DOUBLE, max_y DOUBLE, srs_id INTEGER)".into(),
+        sql: CONTENTS_DDL.into(),
+        // `table_name` is the primary key and `identifier` is UNIQUE, so this
+        // table owns two implicit indexes — `_1` for the key, `_2` for the
+        // UNIQUE, which is the order SQLite assigns them.
+        autoindexes: vec![
+            autoindex_records(&rows, &[0]),
+            autoindex_records(&rows, &[2]),
+        ],
         rows,
     }
 }
 
 fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) -> TableSpec {
-    let rows = layers
+    let rows: Vec<(i64, Vec<Value>)> = layers
         .iter()
         .zip(per_layer_srs)
         .enumerate()
@@ -442,7 +507,13 @@ fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64
         .collect();
     TableSpec {
         name: "gpkg_geometry_columns".into(),
-        sql: "CREATE TABLE gpkg_geometry_columns (table_name TEXT NOT NULL, column_name TEXT NOT NULL, geometry_type_name TEXT NOT NULL, srs_id INTEGER NOT NULL, z TINYINT NOT NULL, m TINYINT NOT NULL)".into(),
+        sql: GEOMETRY_COLUMNS_DDL.into(),
+        // `pk_geom_cols` over (table_name, column_name), then
+        // `uk_gc_table_name` over table_name alone.
+        autoindexes: vec![
+            autoindex_records(&rows, &[0, 1]),
+            autoindex_records(&rows, &[0]),
+        ],
         rows,
     }
 }
@@ -483,6 +554,10 @@ fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64, envelope: bool
         name: name.to_string(),
         sql,
         rows,
+        // The feature table is keyed by `"fid" INTEGER PRIMARY KEY`, a rowid
+        // alias, so it owns no index b-tree of its own. Its *spatial* index is
+        // a separate opt-in structure — see `super::rtree`.
+        autoindexes: Vec::new(),
     }
 }
 
@@ -661,6 +736,78 @@ mod tests {
     }
     fn fc(features: Vec<Feature>) -> FeatureCollection {
         FeatureCollection::new(features)
+    }
+
+    /// Every registry table is written as the specification defines it, with
+    /// the index each of its constraints requires.
+    ///
+    /// This is *defect 6*. Until 2026-08-23 all of these were emitted with no
+    /// table constraints at all, so a `gpkg -> gpkg` run read a conformant
+    /// container and returned one whose registry DDL had lost every key it
+    /// arrived with. **Nothing observable broke** — GDAL read the output and
+    /// `PRAGMA integrity_check` passed — which is why no existing test caught
+    /// it: they compare values and declared column types, and a table
+    /// constraint is neither.
+    ///
+    /// Two halves, and both are needed. The DDL half asserts the constraint is
+    /// *declared*; the index half asserts the b-tree it obliges is *there*,
+    /// because declaring one without the other is precisely the malformed
+    /// database of `handoff.org` § BUGS FOUND entry 15.
+    #[test]
+    fn the_registry_tables_are_written_as_the_specification_defines_them() {
+        // Declared: the constraints the specification states, by name where it
+        // names them.
+        assert!(CONTENTS_DDL.contains("table_name TEXT NOT NULL PRIMARY KEY"));
+        assert!(CONTENTS_DDL.contains("identifier TEXT UNIQUE"));
+        assert!(CONTENTS_DDL.contains("CONSTRAINT fk_gc_r_srs_id FOREIGN KEY"));
+        assert!(CONTENTS_DDL.contains("description TEXT DEFAULT ''"));
+        assert!(GEOMETRY_COLUMNS_DDL.contains("CONSTRAINT pk_geom_cols PRIMARY KEY"));
+        assert!(GEOMETRY_COLUMNS_DDL.contains("CONSTRAINT uk_gc_table_name UNIQUE"));
+        assert!(GEOMETRY_COLUMNS_DDL.contains("CONSTRAINT fk_gc_tn FOREIGN KEY"));
+        assert!(GEOMETRY_COLUMNS_DDL.contains("CONSTRAINT fk_gc_srs FOREIGN KEY"));
+        assert!(DATA_COLUMNS_DDL.contains("CONSTRAINT pk_gdc PRIMARY KEY"));
+        // `gdc_tn` is the constraint `ogr2ogr` omits and the specification
+        // requires — missed on this test's first pass for exactly that reason,
+        // since GDAL's own file was the reference being read.
+        assert!(DATA_COLUMNS_DDL.contains("CONSTRAINT gdc_tn UNIQUE (table_name, name)"));
+        assert!(DATA_COLUMN_CONSTRAINTS_DDL.contains("CONSTRAINT gdcc_ntv UNIQUE"));
+        assert!(EXTENSIONS_DDL.contains("CONSTRAINT ge_tce UNIQUE"));
+        // The specification states `srs_id INTEGER PRIMARY KEY`; `ogr2ogr`
+        // writes `INTEGER NOT NULL PRIMARY KEY`. Follow the specification.
+        assert!(SPATIAL_REF_SYS_DDL.contains("srs_id INTEGER PRIMARY KEY"));
+        assert!(!SPATIAL_REF_SYS_DDL.contains("NOT NULL PRIMARY KEY"));
+
+        // Present: with `--rtree`, so `gpkg_extensions` is written too.
+        let layer = fc(vec![Feature {
+            geometry: point(1.0, 2.0),
+            properties: vec![("name".into(), JsonValue::String("a".into()))],
+            native: None,
+        }]);
+        let bytes = write_layers(None, &[("places".into(), layer)], true, false).unwrap();
+        let objects = crate::sqlite::Database::open(&bytes).unwrap().master_objects().unwrap();
+
+        // Named and ordered as SQLite names them: `_1` for the primary key,
+        // `_2` for the UNIQUE beside it.
+        for (table, count) in [("gpkg_contents", 2), ("gpkg_geometry_columns", 2), ("gpkg_extensions", 1)] {
+            for n in 1..=count {
+                let want = format!("sqlite_autoindex_{table}_{n}");
+                let found = objects
+                    .iter()
+                    .find(|o| o.name == want)
+                    .unwrap_or_else(|| panic!("missing {want}"));
+                assert_eq!(found.kind, "index", "{want}");
+                assert_eq!(found.tbl_name, table, "{want}");
+                assert_ne!(found.root_page, 0, "{want} must own a real b-tree");
+            }
+        }
+
+        // And `gpkg_spatial_ref_sys` owns none: `INTEGER PRIMARY KEY` is a
+        // rowid alias, which is the whole reason that one table was already
+        // correct while the other five were not.
+        assert!(
+            !objects.iter().any(|o| o.name.starts_with("sqlite_autoindex_gpkg_spatial_ref_sys")),
+            "a rowid alias needs no index of its own"
+        );
     }
 
     #[test]

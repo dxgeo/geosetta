@@ -303,7 +303,7 @@ Two consequences:
   users who can wait for that: it ranks transits by how little they lose, when
   the right answer is to not change format at all. It stays because it is
   still the honest picture of what a user can do *today*, and because it is
-  what found three of the five defects.
+  what found three of the defects.
 
 ** SCOPE
 

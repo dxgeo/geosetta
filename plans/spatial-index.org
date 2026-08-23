@@ -173,3 +173,18 @@ and the =covering= member in the =geo= metadata. Values come free from the
   So the question left here is strictly the remaining one: *should a file that
   never had an index get one?* That is a defaulting decision about new
   capability, and it stays this plan's call.
+
+  /Confirmed and assigned an owner, 2026-08-23./
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] D10 settles the
+  R*Tree half of the carry-or-rebuild question -- *never carried, always
+  rebuilt* -- which leaves the "rebuilt when the source had one" obligation
+  above as an *unimplemented decision* rather than an open question. It is not
+  waiting on an argument; it is waiting on code, and the code belongs to
+  =same-format-fidelity.org= M3b, which is already rewriting the container
+  around it.
+
+  *The tell is in the warning's own wording.* =container.rs= tells a user whose
+  source carried an index to "pass =--rtree= to rebuild it" -- that is, it
+  detects the exact condition D4 says should rebuild automatically, and then
+  asks the user to ask. Whatever this plan decides about files that never had
+  an index, that sentence should stop appearing on a same-format run.

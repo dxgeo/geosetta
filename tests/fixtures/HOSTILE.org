@@ -22,6 +22,13 @@ has landed: as of 2026-08-20 the GeoJSON spoke carries its unmodelled members,
 and =gdal_hostile.shp='s declared field widths survive a FlatGeobuf transit.
 Everything else is still the target.
 
+*Fixtures designed and not yet built live in
+[[file:PLANNED.org][PLANNED.org]]*, added 2026-08-23. The first entry there is
+the one that matters: **every GeoPackage fixture in this file came from
+=ogr2ogr=, and =ogr2ogr= deviates from the GeoPackage standard in at least four
+measured places** -- so nothing here can test conformance to the standard
+itself. See =plans/same-format-fidelity.org= § THE ORACLE RULE.
+
 ** NAMING
 - =gdal_hostile.*= -- produced by *GDAL 3.13.2 =ogr2ogr=*. Preferred, because a
   member a real tool actually writes is a member that really occurs.
@@ -29,8 +36,8 @@ Everything else is still the target.
   members are the clearest example: any tool that round-trips them would have
   had to model them, and a tool that models them will not emit an unmodelled
   one on demand.
-- =sqlite_*.gpkg= -- /added 2026-08-22/. An =ogr2ogr= base with *SQLite's own*
-  DDL applied on top. A third prefix rather than a stretch of the other two,
+- =sqlite_*.gpkg= -- /added 2026-08-22; three of them as of 2026-08-23/. An
+  =ogr2ogr= base with *SQLite's own* DDL applied on top. A third prefix rather than a stretch of the other two,
   because the provenance is the point: =ogr2ogr= will not emit a
   =WITHOUT ROWID= table or an =ALTER TABLE ADD COLUMN=, and neither is
   hand-authored -- =sqlite3= writes both, and a GeoPackage is a SQLite database
@@ -179,6 +186,51 @@ both plain =Real=. That last pair *is* the bug, written down.
 
 *Do not "simplify" this by dropping =c_real= as a duplicate of =c_double=.*
 They are the same width and that is the entire point.
+
+*** =sqlite_contents.gpkg= -- /added 2026-08-23, and not hostile/
+Pins *bug 14*: a =gpkg_contents= row whose =data_type= is not =features= used
+to be treated by =container.rs= as a layer, which meant the survey skipped it
+as out of scope *and* the writer dropped it -- it vanished at exit 0, with the
+warning whose whole job is to say what a rewrite destroys saying nothing.
+
+| content | what it pins |
+|---------+--------------|
+| =notes_aspatial=, registered =data_type='attributes'= | what =ogr2ogr= registers an *aspatial* table as. Reachable from ordinary GDAL output; absent from every fixture in the tree until now |
+| =imagery= + its =gpkg_tile_matrix_set=/=gpkg_tile_matrix= rows, registered =data_type='tiles'= | a *tile pyramid*, the case =same-format-fidelity.org= § The collision is about. D8 decided these are *carried*, not rejected |
+
+*The one to keep in view is the tile row*, because it is what the raster
+decision was taken against: the state D8 was decided out of was not "silently
+returns a =.gpkg= with the imagery gone", which is what § The collision assumed.
+It was worse -- the imagery was gone *and unmentioned*.
+
+*** =sqlite_constraints.gpkg= -- /added 2026-08-23, and not hostile/
+The constraint shapes that need an *index b-tree*, none of which any earlier
+fixture contained. It exists because of *bug 15*: SQLite creates a
+=sqlite_autoindex_*= for every =UNIQUE= and every non-INTEGER =PRIMARY KEY=,
+and =sqlite.rs= can write neither -- so carrying any of these tables verbatim
+would emit a *malformed database* (=SELECT= works, =integrity_check= fails,
+=INSERT= fails).
+
+| content | what it pins |
+|---------+--------------|
+| =tags(tag TEXT UNIQUE)= | one =sqlite_autoindex_*= from a plain =UNIQUE= |
+| =registry(key TEXT PRIMARY KEY)= | a non-rowid primary key -- *the shape =gpkg_contents= itself has in the specification*, which is why this fixture also covers defect 6 |
+| =events= + =CREATE INDEX idx_events_kind= | a named =sqlite_master= =index= entry rather than an autoindex |
+| =people(email TEXT UNIQUE COLLATE NOCASE)= | the case D10 says must be *carried* rather than constructed: constructing it needs =NOCASE=, and this writer's own tables never do |
+
+*Why the whole fixture set had no member of this class*, which is the same
+lesson as =sqlite_altered.gpkg= one table further out: the only user table
+anywhere in the tree was =side_notes(id INTEGER PRIMARY KEY, note TEXT)= --
+*the one shape that needs no index at all*. The gap was invisible because the
+single example happened to be the exception.
+
+*/Both files are rebuilt by/* =tests/fixtures/build_sqlite_fixtures.sh=, which
+takes =gdal_hostile.gpkg= as its base and applies the =sqlite3= statements
+above. It is checked in beside them because the two fixtures exist to pin the
+gap between *what our fixtures contain* and *what the format permits*, and a
+recipe nobody can re-run reopens that gap the first time one needs changing.
+/Both were confirmed readable by geosetta and =PRAGMA integrity_check= = =ok=
+before being committed./
 
 *** =sqlite_altered.gpkg= -- /added 2026-08-22, and not hostile/
 Not a fixture that fails the invariant. It pins *two bugs found on 2026-08-22*,

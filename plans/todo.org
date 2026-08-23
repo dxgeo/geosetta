@@ -43,6 +43,13 @@ check it off and remove it once the item ships or is shelved.
   *byte-level value type* — a =gpkg= run had been destroying every blob it read
   — an exact *integer* model, and *D7*, which exported the types a caller needs
   to name for any of the editing story to be true.
+
+  /2026-08-23:/ the three decisions M3b was blocked on are *taken* (D8, D9,
+  D10), *index b-trees read and write*, and **defect 6 is fixed** -- five of
+  the six =gpkg= registry tables had been written with no table constraints at
+  all, so this crate's output did not state the schema the specification
+  defines. Defect 3 is once again the only defect left; what remains of M3b is
+  the classification work rather than file-format work.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

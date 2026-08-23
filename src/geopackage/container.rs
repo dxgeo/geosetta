@@ -183,7 +183,18 @@ fn survey(bytes: &[u8], written: &[String]) -> Result<Survey> {
             Some(table) => match db.read_rows(table).map(|r| r.len()) {
                 Ok(0) => survey.empty += 1,
                 Ok(n) => survey.populated.push((object.name.clone(), Some(n))),
-                Err(_) => survey.populated.push((object.name.clone(), None)),
+                // A table the *table* walk cannot decode is a `WITHOUT ROWID`
+                // table, which SQLite stores as an index b-tree — so ask the
+                // index walk instead before giving up on a count. Until
+                // 2026-08-23 this reported `(rows not counted)`, which was the
+                // honest answer while `sqlite.rs` could not read an index.
+                Err(_) => {
+                    let counted = db.read_index(object.root_page).map(|r| r.len()).ok();
+                    match counted {
+                        Some(0) => survey.empty += 1,
+                        other => survey.populated.push((object.name.clone(), other)),
+                    }
+                }
             },
             None => survey.schema += 1,
         }
@@ -263,11 +274,24 @@ fn foreign_extension_rows(db: &Database, table: &crate::sqlite::Table) -> Result
         .count())
 }
 
-/// Every table named by a `gpkg_contents` row, whatever its `data_type`. Tile
-/// pyramids are deliberately included: a raster GeoPackage's imagery is not
-/// something this vector tool carries, and until § The collision's rejection
-/// recommendation is settled, a populated tile table should at minimum say it
-/// is being dropped rather than vanish.
+/// The tables named by a `gpkg_contents` row whose `data_type` is `features` —
+/// the same test [`super::reader::read_layers`] applies, and it has to be the
+/// same one.
+///
+/// This list is what the survey treats as *out of scope because it is a layer*.
+/// So anything wrongly in it is not reported as a loss **and** is not written
+/// either, since the writer only emits feature layers: it vanishes at exit 0.
+/// A GDAL `attributes` table (what `ogr2ogr` registers an aspatial table as)
+/// and a tile pyramid are both `gpkg_contents` rows that are not layers, and
+/// both used to land here.
+///
+/// **The version before this took every row whatever its `data_type`, and said
+/// in its own doc comment that it did so deliberately so that a populated tile
+/// table "should at minimum say it is being dropped rather than vanish".** It
+/// achieved the exact reverse. Worth keeping in view when reading the rest of
+/// this module: the intent was recorded correctly and the code did the
+/// opposite, so the comment could not catch it and neither could a test that
+/// trusted the comment.
 fn feature_layers(db: &Database, objects: &[MasterObject], tables: &[crate::sqlite::Table]) -> Vec<String> {
     let Some(table) = tables.iter().find(|t| t.name == "gpkg_contents") else {
         return Vec::new();
@@ -280,10 +304,19 @@ fn feature_layers(db: &Database, objects: &[MasterObject], tables: &[crate::sqli
     let Some(idx) = table.columns.iter().position(|c| c == "table_name") else {
         return Vec::new();
     };
+    // No `data_type` column: a `gpkg_contents` this cannot classify by. Treat
+    // every row as a layer, which is this function's pre-2026-08-23 behaviour
+    // and errs toward under-reporting — the alternative on a malformed
+    // registry is to report every feature layer in the file as destroyed.
+    let kind = table.columns.iter().position(|c| c == "data_type");
     let Ok(rows) = db.read_rows(table) else {
         return Vec::new();
     };
     rows.iter()
+        .filter(|row| match kind {
+            Some(k) => matches!(row.get(k), Some(Value::Text(t)) if t == "features"),
+            None => true,
+        })
         .filter_map(|row| match row.get(idx) {
             Some(Value::Text(name)) => Some(name.clone()),
             _ => None,
@@ -354,6 +387,11 @@ mod tests {
     /// stores as an *index* b-tree. See `tests/fixtures/HOSTILE.org`.
     const ALTERED: &[u8] = include_bytes!("../../tests/fixtures/sqlite_altered.gpkg");
 
+    /// The same base plus two `gpkg_contents` rows that are *not* feature
+    /// layers: an `attributes` table and a tile pyramid. See
+    /// `tests/fixtures/HOSTILE.org`.
+    const CONTENTS: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+
     fn layer(name: &str) -> (String, FeatureCollection) {
         let fc = FeatureCollection::new(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
@@ -381,9 +419,12 @@ mod tests {
         let written = vec!["cities".to_string()];
         let warnings = container_drop_warnings(ALTERED, "in.gpkg", &written, false);
         let loss = &warnings[0];
-        // Named, without a count — the rows are real and this cannot count them,
-        // and inventing a number would be worse than admitting that.
-        assert!(loss.contains("kv (rows not counted)"), "{loss}");
+        // Counted, as of 2026-08-23. A `WITHOUT ROWID` table is stored as an
+        // index b-tree, and `sqlite.rs` can now read one — so the fallback this
+        // test was written against ("kv (rows not counted)", the honest answer
+        // while the rows were genuinely unreachable) is no longer reached here.
+        // The fallback itself is still live for a table neither walk can decode.
+        assert!(loss.contains("kv (2 rows)"), "{loss}");
         // The rest of the survey is unaffected: the tables it *can* read are
         // still counted, which is what the abort used to take down with it.
         assert!(loss.contains("gpkg_ogr_contents (1 row)"), "{loss}");
@@ -500,4 +541,32 @@ mod tests {
             Vec::<String>::new()
         );
     }
+
+    /// A `gpkg_contents` row that is not a feature layer is container content,
+    /// and must be surveyed like any other.
+    ///
+    /// `feature_layers` took *every* `gpkg_contents.table_name` until
+    /// 2026-08-23, whatever its `data_type`. That list is what the survey
+    /// skips as "out of scope because it is a layer" — so a GDAL `attributes`
+    /// table or a tile pyramid was skipped by the survey *and* dropped by the
+    /// writer, which emits feature layers only. It vanished at exit 0, and the
+    /// warning whose entire job is to say what a rewrite destroys did not
+    /// mention it.
+    ///
+    /// Asserted against `survey` rather than the message because the message
+    /// stops naming past `MAX_NAMED` — the bug was that these never reached
+    /// the survey at all, which is the level the assertion belongs at.
+    #[test]
+    fn a_gpkg_contents_row_that_is_not_a_feature_layer_is_still_surveyed() {
+        let written = vec!["cities".to_string()];
+        let s = survey(CONTENTS, &written).expect("fixture opens");
+        let found: Vec<&str> = s.populated.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(found.contains(&"notes_aspatial"), "attributes table missing: {found:?}");
+        assert!(found.contains(&"imagery"), "tile table missing: {found:?}");
+        // And the feature layer is still out of scope on this fixture too —
+        // the property `a_layer_is_never_reported_as_container_content` owns,
+        // re-checked here only because the filter above is what could break it.
+        assert!(!found.contains(&"cities"), "the layer is not a loss: {found:?}");
+    }
+
 }

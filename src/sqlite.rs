@@ -255,6 +255,109 @@ impl<'a> Database<'a> {
         Ok(())
     }
 
+    /// Every record of an index b-tree rooted at `page_no`, **in index order**.
+    ///
+    /// This is the read half of decision D10 in
+    /// `plans/same-format-fidelity.org`: an index on disk is *already sorted*,
+    /// so reading it in order yields records that can be re-packed into a fresh
+    /// file without ever comparing two keys. Nothing here knows SQLite's
+    /// collation or type-ordering rules, and nothing here needs to.
+    ///
+    /// An index record is a plain SQLite record whose last column is the rowid
+    /// of the table row it points at; this returns it undecoded, because a
+    /// carried index is carried, not understood.
+    pub fn read_index(&self, root_page: u32) -> Result<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        self.walk_index(root_page, &mut out)?;
+        Ok(out)
+    }
+
+    /// In-order walk of an index b-tree: `0x0a` leaf, `0x02` interior.
+    ///
+    /// Unlike a table b-tree — where an interior cell carries only a rowid and
+    /// every payload lives in a leaf — an index interior cell carries a *real
+    /// record*, which sorts between its left subtree and the next cell. So the
+    /// walk has to emit it, in position, or the sequence comes back missing one
+    /// record per interior cell.
+    fn walk_index(&self, page_no: u32, out: &mut Vec<Vec<u8>>) -> Result<()> {
+        let page = self.page(page_no)?;
+        // An index b-tree never roots on page 1: page 1 is `sqlite_master`,
+        // which is a table b-tree. So there is no 100-byte header to skip here.
+        let page_type = page[0];
+        let num_cells = u16::from_be_bytes([page[3], page[4]]) as usize;
+
+        match page_type {
+            0x0a => {
+                let ptr_array = 8;
+                for i in 0..num_cells {
+                    let off = u16::from_be_bytes([page[ptr_array + i * 2], page[ptr_array + i * 2 + 1]])
+                        as usize;
+                    out.push(self.index_cell(page, off, false)?.1);
+                }
+            }
+            0x02 => {
+                let ptr_array = 12;
+                for i in 0..num_cells {
+                    let off = u16::from_be_bytes([page[ptr_array + i * 2], page[ptr_array + i * 2 + 1]])
+                        as usize;
+                    let (child, payload) = self.index_cell(page, off, true)?;
+                    self.walk_index(child, out)?;
+                    out.push(payload);
+                }
+                let right = u32::from_be_bytes([page[8], page[9], page[10], page[11]]);
+                self.walk_index(right, out)?;
+            }
+            other => return err(&format!("unexpected index b-tree page type {other:#x}")),
+        }
+        Ok(())
+    }
+
+    /// Decode an index cell at `off`, assembling any overflow payload.
+    /// Returns `(left_child, payload)`; `left_child` is 0 on a leaf.
+    ///
+    /// An interior cell is a 4-byte child pointer followed by exactly what a
+    /// leaf cell is, which is why one function serves both.
+    fn index_cell(&self, page: &[u8], off: usize, interior: bool) -> Result<(u32, Vec<u8>)> {
+        let (child, off) = if interior {
+            let c = u32::from_be_bytes([page[off], page[off + 1], page[off + 2], page[off + 3]]);
+            (c, off + 4)
+        } else {
+            (0, off)
+        };
+        let (payload_len, n) = varint(page, off)?;
+        let payload_len = payload_len as usize;
+        let content = off + n;
+
+        // Index cells keep a larger share on-page than table leaves do:
+        // `((usable - 12) * 64 / 255) - 23` against `usable - 35`.
+        let u = self.usable_size;
+        let local = local_payload(payload_len, u, ((u - 12) * 64 / 255) - 23);
+
+        let mut payload = page
+            .get(content..content + local)
+            .ok_or_else(|| Error::Convert("sqlite: index cell payload out of range".into()))?
+            .to_vec();
+
+        if payload_len > local {
+            let mut next = u32::from_be_bytes([
+                page[content + local],
+                page[content + local + 1],
+                page[content + local + 2],
+                page[content + local + 3],
+            ]);
+            while next != 0 && payload.len() < payload_len {
+                let ov = self.page(next)?;
+                next = u32::from_be_bytes([ov[0], ov[1], ov[2], ov[3]]);
+                let take = (payload_len - payload.len()).min(u - 4);
+                payload.extend_from_slice(&ov[4..4 + take]);
+            }
+        }
+        if payload.len() < payload_len {
+            return err("truncated overflow payload");
+        }
+        Ok((child, payload))
+    }
+
     /// Decode a leaf table cell at `off`, assembling any overflow payload.
     fn leaf_cell(&self, page: &[u8], off: usize) -> Result<(i64, Vec<u8>)> {
         let (payload_len, n1) = varint(page, off)?;
@@ -262,16 +365,11 @@ impl<'a> Database<'a> {
         let payload_len = payload_len as usize;
         let content = off + n1 + n2;
 
-        // How much of the payload lives on this page.
+        // How much of the payload lives on this page. A table leaf keeps up to
+        // `usable - 35`; an index cell uses a different ceiling, which is why
+        // this is a parameter rather than a constant (see `local_payload`).
         let u = self.usable_size;
-        let max_local = u - 35;
-        let local = if payload_len <= max_local {
-            payload_len
-        } else {
-            let min_local = ((u - 12) * 32 / 255) - 23;
-            let k = min_local + (payload_len - min_local) % (u - 4);
-            if k <= max_local { k } else { min_local }
-        };
+        let local = local_payload(payload_len, u, u - 35);
 
         let mut payload = page
             .get(content..content + local)
@@ -675,20 +773,50 @@ pub struct TableSpec {
     pub name: String,
     pub sql: String,
     pub rows: Vec<(i64, Vec<Value>)>,
+    /// The **implicit** indexes this table's DDL requires, in
+    /// `sqlite_autoindex_<name>_1`, `_2`, … order — each as its records, in
+    /// index order (see [`autoindex_records`]).
+    ///
+    /// SQLite creates one of these for every `UNIQUE` and every non-INTEGER
+    /// `PRIMARY KEY`. **Declaring such a constraint without supplying its
+    /// index produces a malformed database** — `SELECT` works, but
+    /// `PRAGMA integrity_check` fails and every `INSERT` fails. That is
+    /// `handoff.org` § BUGS FOUND entry 15, and it is why this field sits on
+    /// `TableSpec` rather than being something a caller may forget: the DDL
+    /// and the indexes it implies are one decision.
+    ///
+    /// Empty for a table whose only key is `INTEGER PRIMARY KEY`, which is a
+    /// rowid alias and owns no separate b-tree.
+    pub autoindexes: Vec<Vec<Vec<u8>>>,
 }
 
-/// A schema-only `sqlite_master` entry with no b-tree of its own (`rootpage`
-/// 0): a virtual table (`CREATE VIRTUAL TABLE …`) or a trigger. Used by the
-/// GeoPackage R*Tree extension, whose virtual table is backed by ordinary
-/// shadow [`TableSpec`]s and whose triggers are pure schema.
+/// A `sqlite_master` entry that is not a [`TableSpec`]: a virtual table
+/// (`CREATE VIRTUAL TABLE …`), a trigger, or an **index**.
+///
+/// The first two own no b-tree and take `records: None`, which writes
+/// `rootpage` 0 — a virtual table lives in its shadow tables and a trigger is
+/// pure schema. An index owns one, and supplies its records in index order.
 pub struct MasterEntry {
-    /// `sqlite_master.type` — `"table"` for a virtual table, `"trigger"`.
+    /// `sqlite_master.type` — `"table"` for a virtual table, `"trigger"`,
+    /// `"index"`.
     pub kind: String,
     pub name: String,
     /// The table this entry is attached to (its own name for a virtual table,
-    /// the triggering table for a trigger).
+    /// the triggering table for a trigger, the indexed table for an index).
     pub tbl_name: String,
     pub sql: String,
+    /// An index's records, **already in index order** — as
+    /// [`Database::read_index`] returns them.
+    ///
+    /// `Some` makes this entry own a b-tree and get a real `rootpage`; `None`
+    /// leaves it schema-only. Per decision D10 in
+    /// `plans/same-format-fidelity.org` this writer only ever *re-packs* an
+    /// order some other index already established. **It does not sort**, and
+    /// giving it unordered records produces a file SQLite will read as
+    /// corrupt rather than an error here — there is nothing at this layer that
+    /// could tell the difference, since ordering depends on a collation this
+    /// module deliberately knows nothing about.
+    pub records: Option<Vec<Vec<u8>>>,
 }
 
 /// Write a complete SQLite database from `tables` plus any schema-only
@@ -705,9 +833,12 @@ pub fn write_database(
         next_page: 2, // page 1 is reserved for sqlite_master
     };
 
-    // Build each user table; collect a sqlite_master row per table.
+    // Build each table, then the indexes its own DDL implies. A
+    // `sqlite_master` row per object, and the autoindexes follow their table
+    // immediately — the layout SQLite itself produces.
     let mut master_rows: Vec<(i64, Vec<Value>)> = Vec::new();
-    for (i, t) in tables.iter().enumerate() {
+    let mut next_rowid = 1i64;
+    for t in tables {
         let cells: Vec<(i64, Vec<u8>)> = t
             .rows
             .iter()
@@ -715,7 +846,7 @@ pub fn write_database(
             .collect();
         let root = w.build_btree(&cells)?;
         master_rows.push((
-            (i + 1) as i64,
+            next_rowid,
             vec![
                 Value::Text("table".into()),
                 Value::Text(t.name.clone()),
@@ -724,22 +855,46 @@ pub fn write_database(
                 Value::Text(t.sql.clone()),
             ],
         ));
+        next_rowid += 1;
+
+        for (k, records) in t.autoindexes.iter().enumerate() {
+            let root = w.build_index_btree(records)?;
+            master_rows.push((
+                next_rowid,
+                vec![
+                    Value::Text("index".into()),
+                    Value::Text(format!("sqlite_autoindex_{}_{}", t.name, k + 1)),
+                    Value::Text(t.name.clone()),
+                    Value::Int(root as i64),
+                    // An implicit index has no `CREATE INDEX` text of its own;
+                    // SQLite stores NULL here and re-derives it from the DDL.
+                    Value::Null,
+                ],
+            ));
+            next_rowid += 1;
+        }
     }
 
-    // Schema-only entries follow the tables, keeping rowid order. Their
-    // `rootpage` is 0 — they own no b-tree (a virtual table lives in its shadow
-    // tables; a trigger is pure schema).
-    for (j, e) in extra_master.iter().enumerate() {
+    // Then the entries that are not tables, keeping rowid order. `rootpage` is
+    // per-entry: 0 for the schema-only ones (a virtual table lives in its
+    // shadow tables; a trigger is pure schema), and a real page for an index,
+    // whose b-tree is built here from the records it carries.
+    for e in extra_master {
+        let root = match &e.records {
+            Some(records) => w.build_index_btree(records)?,
+            None => 0,
+        };
         master_rows.push((
-            (tables.len() + j + 1) as i64,
+            next_rowid,
             vec![
                 Value::Text(e.kind.clone()),
                 Value::Text(e.name.clone()),
                 Value::Text(e.tbl_name.clone()),
-                Value::Int(0),
+                Value::Int(root as i64),
                 Value::Text(e.sql.clone()),
             ],
         ));
+        next_rowid += 1;
     }
 
     // sqlite_master is a table b-tree rooted at page 1, whose page header sits
@@ -859,6 +1014,138 @@ impl Writer {
         }
     }
 
+    /// Build an **index** b-tree from records already in index order; returns
+    /// the root page. The read-side counterpart is
+    /// [`Database::read_index`], and D10 in `plans/same-format-fidelity.org`
+    /// is why only this direction exists: an index being carried is already
+    /// sorted, so nothing here compares two keys.
+    ///
+    /// The shape differs from [`Writer::build_btree`] in one way that matters:
+    /// an index interior cell carries a *real record*, not just a key. So
+    /// building a level **promotes** one record out of the leaf sequence to
+    /// serve as each divider, and that record then lives only in the interior
+    /// node. Leaving it in the leaf as well would duplicate an entry.
+    fn build_index_btree(&mut self, records: &[Vec<u8>]) -> Result<u32> {
+        // An empty index still needs one (empty) leaf page as its root.
+        if records.is_empty() {
+            let page_no = self.alloc();
+            let page = render_index_leaf(&[])?;
+            self.pages.insert(page_no, page);
+            return Ok(page_no);
+        }
+
+        let cap = WRITE_PAGE_SIZE - 8;
+        let mut children: Vec<u32> = Vec::new();
+        let mut dividers: Vec<Vec<u8>> = Vec::new();
+        let mut i = 0;
+        while i < records.len() {
+            // Choose the group by *size* before building any cell: materialising
+            // one allocates its overflow pages, and a cell built and then
+            // rejected would leave those pages unreferenced — which SQLite's
+            // own integrity check reports as "Page N: never used".
+            let mut used = 0;
+            let start = i;
+            while i < records.len() {
+                let sz = 2 + index_cell_size(records[i].len());
+                if i > start && used + sz > cap {
+                    break;
+                }
+                used += sz;
+                i += 1;
+            }
+            let cells: Vec<Vec<u8>> = (start..i)
+                .map(|k| self.index_leaf_cell(&records[k]))
+                .collect();
+            let page_no = self.alloc();
+            let page = render_index_leaf(&cells)?;
+            self.pages.insert(page_no, page);
+            children.push(page_no);
+
+            // Promote the next record as the divider between this leaf and the
+            // one after it, and do not place it in either.
+            if i < records.len() {
+                dividers.push(records[i].clone());
+                i += 1;
+            }
+        }
+
+        while children.len() > 1 {
+            let (c, d) = self.pack_index_interior(&children, &dividers)?;
+            children = c;
+            dividers = d;
+        }
+        Ok(children[0])
+    }
+
+    /// One interior level over `children`, separated by `dividers`
+    /// (`dividers.len() == children.len() - 1`). Returns the level above it,
+    /// with the dividers that were promoted out of this one.
+    fn pack_index_interior(
+        &mut self,
+        children: &[u32],
+        dividers: &[Vec<u8>],
+    ) -> Result<(Vec<u32>, Vec<Vec<u8>>)> {
+        let cap = WRITE_PAGE_SIZE - 12;
+        let mut out_children = Vec::new();
+        let mut out_dividers = Vec::new();
+        let mut start = 0;
+        while start < children.len() {
+            // Grow the node while its dividers fit; `end` indexes the child
+            // that becomes the right-most pointer, so the node spans
+            // `children[start..=end]` and `dividers[start..end]`.
+            let mut end = start;
+            let mut used = 0;
+            while end < children.len() - 1 {
+                let cost = 2 + 4 + index_cell_size(dividers[end].len());
+                if end > start && used + cost > cap {
+                    break;
+                }
+                used += cost;
+                end += 1;
+            }
+            let mut cells = Vec::with_capacity(end - start);
+            for k in start..end {
+                cells.push(self.index_interior_cell(children[k], &dividers[k]));
+            }
+            let page_no = self.alloc();
+            let mut page = vec![0u8; WRITE_PAGE_SIZE];
+            write_index_interior(&mut page, &cells, children[end])?;
+            self.pages.insert(page_no, page);
+            out_children.push(page_no);
+
+            // The divider just past this node separates it from the next, so it
+            // is promoted rather than stored here.
+            if end < dividers.len() {
+                out_dividers.push(dividers[end].clone());
+            }
+            start = end + 1;
+        }
+        Ok((out_children, out_dividers))
+    }
+
+    /// An index leaf cell: `varint(payload_len)` + as much payload as fits,
+    /// plus an overflow page pointer when it does not all fit.
+    fn index_leaf_cell(&mut self, record: &[u8]) -> Vec<u8> {
+        let local = local_payload(record.len(), WRITE_PAGE_SIZE, index_max_local());
+        let mut cell = Vec::new();
+        write_varint(&mut cell, record.len() as u64);
+        cell.extend_from_slice(&record[..local]);
+        if local < record.len() {
+            let first = self.write_overflow(&record[local..]);
+            cell.extend_from_slice(&first.to_be_bytes());
+        }
+        cell
+    }
+
+    /// An index interior cell: a 4-byte left-child pointer, then exactly what a
+    /// leaf cell is.
+    fn index_interior_cell(&mut self, child: u32, record: &[u8]) -> Vec<u8> {
+        let mut cell = child.to_be_bytes().to_vec();
+        cell.extend_from_slice(&self.index_leaf_cell(record));
+        cell
+    }
+
+    /// Pack cells into leaf pages of capacity `cap`; returns `(page, max_rowid)`
     /// Pack cells into leaf pages of capacity `cap`; returns `(page, max_rowid)`
     /// per page.
     fn pack_leaves(&mut self, cells: &[(i64, Vec<u8>)], cap: usize) -> Result<Vec<(u32, i64)>> {
@@ -994,6 +1281,169 @@ fn write_interior(page: &mut [u8], header_offset: usize, group: &[(u32, i64)]) -
     Ok(())
 }
 
+/// The records of an implicit index over `key_cols` of `rows`, in index order,
+/// ready for [`TableSpec::autoindexes`].
+///
+/// An index record is the key columns followed by the rowid of the row it
+/// points at, and the order is by key columns then rowid — so this both builds
+/// the records and sorts them.
+///
+/// **This is the one place in this module that orders anything**, and D10 in
+/// `plans/same-format-fidelity.org` draws the boundary deliberately: an index
+/// being *carried* is re-packed in the order the source file already
+/// established, and only an index this writer *builds for its own tables* is
+/// constructed here. The distinction is what keeps [`compare_values`] small —
+/// see its note on collations.
+pub fn autoindex_records(rows: &[(i64, Vec<Value>)], key_cols: &[usize]) -> Vec<Vec<u8>> {
+    let mut keyed: Vec<(Vec<Value>, i64)> = rows
+        .iter()
+        .map(|(rowid, values)| {
+            let key: Vec<Value> = key_cols
+                .iter()
+                .map(|&c| values.get(c).cloned().unwrap_or(Value::Null))
+                .collect();
+            (key, *rowid)
+        })
+        .collect();
+
+    keyed.sort_by(|(ka, ra), (kb, rb)| {
+        for (a, b) in ka.iter().zip(kb) {
+            match compare_values(a, b) {
+                std::cmp::Ordering::Equal => {}
+                other => return other,
+            }
+        }
+        ra.cmp(rb)
+    });
+
+    keyed
+        .into_iter()
+        .map(|(mut key, rowid)| {
+            key.push(Value::Int(rowid));
+            encode_record(&key)
+        })
+        .collect()
+}
+
+/// SQLite's ordering over two values, under the **default `BINARY`**
+/// collation: `NULL` first, then numbers, then text, then blobs, with text and
+/// blobs compared byte by byte.
+///
+/// *No other collation is implemented, and that is a scoped decision rather
+/// than a gap.* `NOCASE` and `RTRIM` can only appear in DDL this crate did not
+/// write, and an index on such a table is **carried** rather than constructed
+/// (D10) — so it is re-packed in the order that file already had, and nothing
+/// here has to know how it was reached. The registry tables this writer builds
+/// declare no `COLLATE` clause anywhere in their specified DDL.
+fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+
+    // SQLite's storage-class order, which outranks any comparison within a
+    // class: NULL < INTEGER = REAL < TEXT < BLOB.
+    fn class(v: &Value) -> u8 {
+        match v {
+            Value::Null => 0,
+            Value::Int(_) | Value::Real(_) => 1,
+            Value::Text(_) => 2,
+            Value::Blob(_) => 3,
+        }
+    }
+    match class(a).cmp(&class(b)) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    match (a, b) {
+        (Value::Null, Value::Null) => Ordering::Equal,
+        // Integers and reals compare numerically across the two types. An i64
+        // beyond f64's exact range would compare wrongly as a float, so the
+        // integer pair is kept exact.
+        (Value::Int(x), Value::Int(y)) => x.cmp(y),
+        (Value::Real(x), Value::Real(y)) => x.total_cmp(y),
+        (Value::Int(x), Value::Real(y)) => (*x as f64).total_cmp(y),
+        (Value::Real(x), Value::Int(y)) => x.total_cmp(&(*y as f64)),
+        (Value::Text(x), Value::Text(y)) => x.as_bytes().cmp(y.as_bytes()),
+        (Value::Blob(x), Value::Blob(y)) => x.as_slice().cmp(y.as_slice()),
+        // Unreachable: the class comparison above has already returned.
+        _ => Ordering::Equal,
+    }
+}
+
+/// The on-page payload ceiling for an index cell, at this writer's page size.
+fn index_max_local() -> usize {
+    ((WRITE_PAGE_SIZE - 12) * 64 / 255) - 23
+}
+
+/// The byte cost of an index cell holding a record of `record_len` bytes,
+/// excluding its 2-byte pointer-array slot. Computed without building the cell,
+/// so a group can be chosen before any overflow page is allocated.
+fn index_cell_size(record_len: usize) -> usize {
+    let local = local_payload(record_len, WRITE_PAGE_SIZE, index_max_local());
+    varint_len(record_len as u64) + local + if local < record_len { 4 } else { 0 }
+}
+
+/// Render an index leaf page (`0x0a`) from pre-built cells.
+fn render_index_leaf(cells: &[Vec<u8>]) -> Result<Vec<u8>> {
+    let mut page = vec![0u8; WRITE_PAGE_SIZE];
+    let mut content = WRITE_PAGE_SIZE;
+    let mut ptrs = Vec::with_capacity(cells.len());
+    for cell in cells {
+        content -= cell.len();
+        page[content..content + cell.len()].copy_from_slice(cell);
+        ptrs.push(content as u16);
+    }
+    if 8 + 2 * cells.len() > content {
+        return err("index leaf page overflow");
+    }
+    page[0] = 0x0a;
+    page[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    page[5..7].copy_from_slice(&(content as u16).to_be_bytes());
+    for (k, p) in ptrs.iter().enumerate() {
+        page[8 + k * 2..10 + k * 2].copy_from_slice(&p.to_be_bytes());
+    }
+    Ok(page)
+}
+
+/// Render an index interior page (`0x02`) from pre-built cells plus the
+/// right-most child pointer.
+fn write_index_interior(page: &mut [u8], cells: &[Vec<u8>], right: u32) -> Result<()> {
+    let mut content = WRITE_PAGE_SIZE;
+    let mut ptrs = Vec::with_capacity(cells.len());
+    for cell in cells {
+        content -= cell.len();
+        page[content..content + cell.len()].copy_from_slice(cell);
+        ptrs.push(content as u16);
+    }
+    if 12 + 2 * cells.len() > content {
+        return err("index interior page overflow");
+    }
+    page[0] = 0x02;
+    page[3..5].copy_from_slice(&(cells.len() as u16).to_be_bytes());
+    page[5..7].copy_from_slice(&(content as u16).to_be_bytes());
+    page[8..12].copy_from_slice(&right.to_be_bytes());
+    for (k, p) in ptrs.iter().enumerate() {
+        page[12 + k * 2..14 + k * 2].copy_from_slice(&p.to_be_bytes());
+    }
+    Ok(())
+}
+
+/// How many bytes of a `total`-byte payload live on the page itself, the rest
+/// How many bytes of a `total`-byte payload live on the page itself, the rest
+/// going to an overflow chain. `max_local` is the page-type's ceiling: a table
+/// leaf keeps `usable - 35`, an index cell `((usable - 12) * 64 / 255) - 23`.
+///
+/// The `min_local`/`k` dance is SQLite's own, and its purpose is worth knowing
+/// before anyone "simplifies" it: it makes the *spilled* remainder land in a
+/// useful size band rather than leaving a few bytes on the page and a nearly
+/// empty overflow page after it.
+fn local_payload(total: usize, usable: usize, max_local: usize) -> usize {
+    if total <= max_local {
+        return total;
+    }
+    let min_local = ((usable - 12) * 32 / 255) - 23;
+    let k = min_local + (total - min_local) % (usable - 4);
+    if k <= max_local { k } else { min_local }
+}
+
 /// Encode a row into the SQLite record format: `varint(header_len)` + serial
 /// types + value bodies.
 fn encode_record(values: &[Value]) -> Vec<u8> {
@@ -1085,6 +1535,218 @@ fn write_db_header(out: &mut [u8], total_pages: u32, application_id: u32, user_v
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `ogr2ogr` base carrying the constraint shapes that need an index
+    /// b-tree: `UNIQUE`, a `TEXT PRIMARY KEY`, an explicit `CREATE INDEX`, and
+    /// a `UNIQUE COLLATE NOCASE`. See `tests/fixtures/HOSTILE.org`.
+    const CONSTRAINTS: &[u8] = include_bytes!("../tests/fixtures/sqlite_constraints.gpkg");
+
+    /// Root page of `name` in `sqlite_master`.
+    fn root_of(db: &Database, name: &str) -> u32 {
+        db.master_objects()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.name == name)
+            .unwrap_or_else(|| panic!("no sqlite_master entry named {name}"))
+            .root_page
+    }
+
+    /// The last column of an index record is the rowid it points at.
+    fn trailing_rowid(record: &[u8]) -> i64 {
+        let values = decode_record(record).unwrap();
+        match values.last() {
+            Some(Value::Int(n)) => *n,
+            other => panic!("index record does not end in a rowid: {other:?}"),
+        }
+    }
+
+    /// An index b-tree can be read, and it comes back *in index order* rather
+    /// than in table order — which is the whole reason a carried index needs no
+    /// comparison logic (D10).
+    #[test]
+    fn an_index_btree_reads_back_in_index_order() {
+        let db = Database::open(CONSTRAINTS).unwrap();
+
+        // `tags` holds ('alpha',1), ('beta',2), ('gamma',3) — inserted in an
+        // order that already matches, so it cannot distinguish the two orders.
+        // `idx_events_kind` can: 'open' was inserted at rowid 1 and 'close' at
+        // rowid 2, so index order ('close' < 'open') reverses them.
+        let records = db.read_index(root_of(&db, "idx_events_kind")).unwrap();
+        let rowids: Vec<i64> = records.iter().map(|r| trailing_rowid(r)).collect();
+        assert_eq!(rowids, vec![2, 1], "index order, not table order");
+
+        // And an autoindex reads the same way.
+        let auto = db.read_index(root_of(&db, "sqlite_autoindex_tags_1")).unwrap();
+        assert_eq!(auto.len(), 3);
+        assert_eq!(
+            auto.iter().map(|r| trailing_rowid(r)).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    /// An index b-tree survives a write and reads back with every record in
+    /// the same order — including at a size that forces interior nodes, which
+    /// is where the divider promotion happens.
+    ///
+    /// A single-leaf index would pass this without ever exercising
+    /// `pack_index_interior`, and the promotion is the one place this writer
+    /// differs structurally from the table-b-tree case: a record promoted to a
+    /// divider lives *only* in the interior node. Losing that record, or
+    /// leaving a copy behind in the leaf, are the two natural bugs and both
+    /// show up as a count mismatch here.
+    #[test]
+    fn an_index_btree_survives_a_write_at_every_depth() {
+        // Enough records to need several leaves and at least one interior
+        // level: each cell is ~40 bytes and a leaf holds under 4 KiB.
+        for count in [0usize, 1, 3, 500] {
+            let records: Vec<Vec<u8>> = (0..count)
+                .map(|i| {
+                    // Every fourth key is far past an index cell's on-page
+                    // ceiling (~1002 bytes at this page size), so the overflow
+                    // chain is exercised in the same pass as the packing. It
+                    // was not, until 2026-08-23: the first version of this test
+                    // used uniformly short keys and never reached
+                    // `write_overflow` at all, which is the "unadventurous
+                    // values" blind spot `handoff.org` records twice already.
+                    let pad = if i % 4 == 0 { 2000 } else { 20 };
+                    encode_record(&[
+                        Value::Text(format!("key-{i:06}-{}", "x".repeat(pad))),
+                        Value::Int(i as i64 + 1),
+                    ])
+                })
+                .collect();
+
+            let table = TableSpec {
+                name: "t".into(),
+                sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT)".into(),
+                rows: Vec::new(),
+                autoindexes: Vec::new(),
+            };
+            let entry = MasterEntry {
+                kind: "index".into(),
+                name: "idx_t_k".into(),
+                tbl_name: "t".into(),
+                sql: "CREATE INDEX idx_t_k ON t(k)".into(),
+                records: Some(records.clone()),
+            };
+            let bytes = write_database(&[table], &[entry], 0, 0).unwrap();
+
+            let db = Database::open(&bytes).unwrap();
+            let root = root_of(&db, "idx_t_k");
+            assert_ne!(root, 0, "an index must get a real root page (count={count})");
+            let back = db.read_index(root).unwrap();
+            assert_eq!(back.len(), records.len(), "record count (count={count})");
+            assert_eq!(back, records, "records and their order (count={count})");
+        }
+    }
+
+    /// The index this writer builds is checked by **SQLite itself**, not by
+    /// this crate's reader.
+    ///
+    /// `an_index_btree_survives_a_write_at_every_depth` proves the writer and
+    /// the reader agree, which is exactly the closure a shared misreading of
+    /// the format would survive — the lesson `handoff.org` records from the
+    /// `REAL` bug ("a writer never emits the spelling it cannot read"). So this
+    /// one hands the bytes to the reference implementation and asks two
+    /// questions our own code cannot: is the b-tree *well formed*, and does an
+    /// index *scan* return the right rows?
+    ///
+    /// `#[ignore]`d and run with `cargo test -p geosetta -- --ignored`, on the
+    /// same footing as the GDAL cross-checks in `tests/gdal_types.rs`: it needs
+    /// a `sqlite3` binary on PATH.
+    #[test]
+    #[ignore = "needs the sqlite3 binary; run with --ignored"]
+    fn sqlite_itself_validates_the_index_this_writer_builds() {
+        use std::process::Command;
+
+        // A real table with rows, plus an index over one of its columns — so
+        // the index's trailing rowids have to line up with actual rows for a
+        // scan to return anything.
+        let n = 500i64;
+        // Every fifth key overflows an index cell, so `integrity_check` is
+        // asked about the overflow chains too — a chain whose pages are
+        // mis-linked or left unreferenced is exactly what it reports.
+        let key = |v: i64| -> String {
+            if v % 5 == 0 { format!("k{v:04}{}", "y".repeat(2000)) } else { format!("k{v:04}") }
+        };
+        let rows: Vec<(i64, Vec<Value>)> = (1..=n)
+            .map(|i| (i, vec![Value::Null, Value::Text(key(n - i))]))
+            .collect();
+        let table = TableSpec {
+            name: "t".into(),
+            sql: "CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT)".into(),
+            rows,
+            autoindexes: Vec::new(),
+        };
+        // Index order is by `k`, which reverses the rowids.
+        let records: Vec<Vec<u8>> = (1..=n)
+            .map(|i| encode_record(&[Value::Text(key(i - 1)), Value::Int(n - i + 1)]))
+            .collect();
+        let entry = MasterEntry {
+            kind: "index".into(),
+            name: "idx_t_k".into(),
+            tbl_name: "t".into(),
+            sql: "CREATE INDEX idx_t_k ON t(k)".into(),
+            records: Some(records),
+        };
+        let bytes = write_database(&[table], &[entry], 0, 0).unwrap();
+
+        let path = std::env::temp_dir().join("geosetta_index_crosscheck.db");
+        std::fs::write(&path, &bytes).unwrap();
+
+        let ask = |sql: &str| -> String {
+            let out = Command::new("sqlite3")
+                .arg(&path)
+                .arg(sql)
+                .output()
+                .expect("sqlite3 on PATH");
+            assert!(
+                out.status.success(),
+                "sqlite3 {sql}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+
+        // 1. The b-tree is well formed, and every page is reachable. This is
+        //    the check that catches an orphaned overflow page, which is why
+        //    `build_index_btree` sizes a cell before it builds one.
+        assert_eq!(ask("PRAGMA integrity_check;"), "ok");
+
+        // 2. The index is *usable*: a covering-index scan, which SQLite will
+        //    only plan if it trusts the index, returns index order.
+        assert_eq!(ask("SELECT count(*) FROM t ORDER BY k;"), n.to_string());
+        // Strictly greater than the smallest key — which is an *overflowing*
+        // one, so this also asks SQLite to compare a key it had to reassemble
+        // from an overflow chain.
+        assert_eq!(
+            ask(&format!("SELECT count(*) FROM t WHERE k > '{}';", key(0))),
+            (n - 1).to_string()
+        );
+
+        // 3. And it agrees with the table it points at — a lookup through the
+        //    index resolves to the row that actually holds that key.
+        // An overflowing key resolved through the index back to its own row.
+        assert_eq!(ask(&format!("SELECT id FROM t WHERE k = '{}';", key(0))), n.to_string());
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A `WITHOUT ROWID` table is *stored as* an index b-tree, which is why
+    /// `walk_table` could never decode one — the read side of entry 11 in
+    /// `handoff.org` § BUGS FOUND.
+    #[test]
+    fn a_without_rowid_table_is_an_index_btree() {
+        const ALTERED: &[u8] = include_bytes!("../tests/fixtures/sqlite_altered.gpkg");
+        let db = Database::open(ALTERED).unwrap();
+        let root = root_of(&db, "kv");
+        // The table walk still refuses it, which is the behaviour
+        // `container.rs` classifies against.
+        let mut cells = Vec::new();
+        assert!(db.walk_table(root, &mut cells).is_err());
+        // The index walk reads it.
+        assert!(!db.read_index(root).unwrap().is_empty());
+    }
 
     #[test]
     fn varint_values() {
@@ -1191,6 +1853,7 @@ mod tests {
             name: "t".into(),
             sql: r#"CREATE TABLE "t" ("id" INTEGER PRIMARY KEY, "name" TEXT, "n" INTEGER, "r" REAL, "data" BLOB)"#.into(),
             rows,
+            autoindexes: Vec::new(),
         };
         let bytes = write_database(&[spec], &[], 0, 0).unwrap();
 

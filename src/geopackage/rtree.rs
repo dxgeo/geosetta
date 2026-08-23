@@ -202,16 +202,21 @@ fn serialize(table: &str, levels: &[Vec<Node>]) -> Rtree {
             name: format!("{rtree_name}_node"),
             sql: format!("CREATE TABLE \"{rtree_name}_node\"(nodeno INTEGER PRIMARY KEY,data)"),
             rows: node_rows,
+            // Shadow tables are keyed by `INTEGER PRIMARY KEY`, a rowid alias,
+            // so none of them owns a separate index b-tree.
+            autoindexes: Vec::new(),
         },
         TableSpec {
             name: format!("{rtree_name}_rowid"),
             sql: format!("CREATE TABLE \"{rtree_name}_rowid\"(rowid INTEGER PRIMARY KEY,nodeno)"),
             rows: rowid_rows,
+            autoindexes: Vec::new(),
         },
         TableSpec {
             name: format!("{rtree_name}_parent"),
             sql: format!("CREATE TABLE \"{rtree_name}_parent\"(nodeno INTEGER PRIMARY KEY,parentnode)"),
             rows: parent_rows,
+            autoindexes: Vec::new(),
         },
     ];
 
@@ -220,6 +225,9 @@ fn serialize(table: &str, levels: &[Vec<Node>]) -> Rtree {
         name: rtree_name.clone(),
         tbl_name: rtree_name.clone(),
         sql: format!("CREATE VIRTUAL TABLE \"{rtree_name}\" USING rtree(id, minx, maxx, miny, maxy)"),
+        // The virtual table owns no b-tree: its data lives in the shadow
+        // `TableSpec`s above.
+        records: None,
     }];
     for (suffix, sql) in triggers(table, &rtree_name) {
         master.push(MasterEntry {
@@ -227,6 +235,8 @@ fn serialize(table: &str, levels: &[Vec<Node>]) -> Rtree {
             name: format!("{rtree_name}_{suffix}"),
             tbl_name: table.into(),
             sql,
+            // A trigger is pure schema.
+            records: None,
         });
     }
 

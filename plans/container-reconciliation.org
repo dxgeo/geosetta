@@ -1,0 +1,237 @@
+#+TITLE: Container Reconciliation -- Writing Into A GeoPackage That Already Has One
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: 2026-08-23
+
+* Container Reconciliation
+
+** STATUS -- scoping only (2026-08-23). Nothing implemented.
+/Split out of [[file:same-format-fidelity.org][same-format-fidelity.org]] M3b
+on 2026-08-23, when scoping the carrying channel turned up a question M3b had
+never asked: what happens to container content when the destination already
+has some./
+
+*Blocks M3b's completion.* M3b can carry a source container into a *fresh*
+destination without any of this; it cannot claim to carry a container in
+general until this is settled, because the append path is a documented feature
+and not an edge case.
+
+** WHERE THIS ARISES, WHICH IS EXACTLY ONE CONFIGURATION
+=main.rs= reads the output file when it exists and hands it to
+=write_layers=, which keeps its layers and merges the incoming ones over by
+name. So the question needs *two* containers, and there are only two:
+
+#+begin_src text
+  geosetta a.gpkg out.gpkg     out.gpkg exists   -> TWO containers, this plan
+  geosetta a.gpkg new.gpkg     out does not      -> existing = None, no question
+  geosetta a.gpkg -            stdout            -> never "existing", no question
+  geosetta a.gpkg a.gpkg       same file         -> refused (same-format-output D4)
+#+end_src
+
+*It cannot be dodged by removing the append.* A =.gpkg= is multi-layer, and
+accumulating layers into one file by repeated invocation is how you build one;
+=README.md= documents it and =run_geopackage_write= implements it deliberately.
+
+*And it is not on the edit loop's path*, which is why it can be scoped
+separately from the carrying work rather than inside it. A loop writes to a
+fresh path or replaces one -- and since the same-file guard landed, never to its
+own input.
+
+** THE ASYMMETRY THAT IS ALREADY THERE
+Worth stating first, because it is the thing being made consistent rather than
+a new problem:
+
+| destination's… | today |
+|----------------+-------|
+| *layers* | *survive*, except where an incoming layer replaces one by name |
+| *everything else* | *destroyed* -- defect 3, applied to the destination |
+
+=run_geopackage_write= already warns about the second, at its *second*
+=container_drop_warnings= call. So "source wins vs destination wins" is not a
+question about whether the destination's content survives today. It does not.
+
+** THE QUESTION IS NARROWER AND HARDER THAN "WHICH WINS"
+Where names do not collide, every candidate rule keeps both sides. The rule
+only decides *collisions* -- and collisions are the **common case, not the rare
+one**. Any two =ogr2ogr=-produced GeoPackages both hold =gpkg_metadata=,
+=gpkg_metadata_reference= and =gpkg_extensions=.
+
+*** The four rules, and why none of them is right
+| rule | for | against |
+|------+-----+---------|
+| *source wins* | consistent with layers; =gpkg -> gpkg= into a fresh file carries exactly the source | on append, silently discards the destination's rows -- backwards for the file being accumulated |
+| *destination wins* | right for append: the accumulating file keeps its history | wrong for the edit loop; inconsistent with layers |
+| *source only* (destination's dropped, as today) | no regression, smallest change, edit loop fully served | leaves defect 3 half-fixed, two behaviours to explain |
+| *refuse on collision* | never silently wrong | fires on the ordinary path, which is the noise bar =same-format-fidelity.org= § THE RULE forbids |
+
+***For several of these tables neither side should win.*** =gpkg_metadata= is a
+*set of records*; two files' worth is two files' worth. The honest operation is
+a **merge**, and the rest of this plan is what a merge actually costs.
+
+** WHAT FULL CORRECTNESS REQUIRES
+The target: *the output is what SQLite would have produced had it opened the
+destination and inserted the source's content.* Six things stand between M3b
+and that, and they are not equal -- one is needed with or without append, three
+are the reconciliation layer, one is a decision reversal, one is a contract.
+
+*** 1. =srs_id= reconciliation -- **needed now, not only for append**
+=writer.rs='s =resolve_srs= recomputes every =srs_id= from the merged layer
+set: an authority code becomes the id directly, and a CRS *without* a usable
+code is handed a synthetic id from =SYNTHETIC_SRS_BASE= (100000), *in layer
+order*.
+
+So synthetic ids are **position-dependent**. Any carried object that
+*references* an =srs_id= -- a tile pyramid's =gpkg_contents= row, its
+=gpkg_tile_matrix_set= row -- points into the *source's* numbering, which the
+writer has just renumbered. Left alone that is a dangling reference, and
+=gpkg_contents= declares =fk_gc_r_srs_id=, so =foreign_key_check= catches it.
+
+***This is a requirement of M3b's carrying channel itself.*** D8's tile
+carrying trips it on the first fixture. It is filed here because it is the same
+*kind* of problem -- a carried reference into a renumbered space -- and solving
+it here first is cheaper than solving it twice.
+
+*** 2. Identity reconciliation for =AUTOINCREMENT= tables
+=gpkg_metadata.id= is =INTEGER PRIMARY KEY AUTOINCREMENT=, so both files number
+from 1 and their ids collide. A merge means:
+- renumbering one side's =id=s,
+- rewriting every =md_file_id= and =md_parent_id= in
+  =gpkg_metadata_reference= (its =crmr_mfi_fk= / =crmr_mpi_fk= references), and
+- **recomputing =sqlite_sequence= rather than carrying it.**
+
+That last one *inverts* what shipped on 2026-08-23: carrying the high-water
+mark verbatim is correct for a carried table and wrong the moment its ids move.
+Both behaviours are needed, and which applies is decided here.
+
+*** 3. Set-union semantics, per table, on the right key
+Each table needs its own notion of row identity -- its =UNIQUE= key where it
+has one, and nothing to appeal to where it does not.
+
+| table | key |
+|-------+-----|
+| =gpkg_extensions= | =ge_tce= -- =(table_name, column_name, extension_name)= |
+| =gpkg_data_column_constraints= | =gdcc_ntv= -- and see the trap below |
+| =gpkg_data_columns= | =pk_gdc= / =gdc_tn= |
+| a user table | *none in general* -- see § 5 |
+
+***The trap, and it is measured:*** =gdcc_ntv= **does not make a set**. A
+=range= constraint has =value= NULL by definition, and SQLite treats NULLs as
+distinct under =UNIQUE=, so two identical range rows both survive. /Found by
+accident 2026-08-23 -- an =INSERT INTO ... SELECT * FROM ... LIMIT 1= against a
+real file duplicated a =price_range= row and the index accepted it./ Anything
+deduping on that key is wrong. =gpkg_range_constraints.gpkg= in
+=tests/fixtures/PLANNED.org= exists to pin it.
+
+*** 4. Index rebuild -- ***this reopens D10***
+[[file:same-format-fidelity.org][same-format-fidelity.org]] D10 says a carried
+table's index is *carried verbatim*, and the whole reason that is cheap is that
+**an index on disk is already sorted**: an in-order read yields records that
+re-pack into fresh pages without ever comparing two keys.
+
+*A merged table's rows are in neither source's order.* Its indexes cannot be
+re-packed; they have to be **built** -- which needs SQLite's comparison
+semantics: the NULL < INT/REAL < TEXT < BLOB type ordering *plus* the
+=BINARY=/=NOCASE=/=RTRIM= collations. That is precisely the machinery D10
+scoped out, and =sqlite_constraints.gpkg= already carries a
+=UNIQUE COLLATE NOCASE= to pin the case.
+
+**So this is not an increment on M3b's carrying work. It reopens the decision
+that work is built on**, and it should be reopened deliberately rather than as
+a side effect of picking a collision rule.
+
+*** 5. Refusal where a merge is undecidable
+Some collisions have no correct answer and must be *reported*, not resolved:
+- a same-named user table with **different DDL** -- no union exists;
+- the same =constraint_name= naming different constraints;
+- the same =(table_name, column_name, extension_name)= with a different
+  =definition= or =scope=.
+
+Per =same-format-fidelity.org= § A refusal honours the rule, a refusal is not a
+silent loss and is therefore an acceptable answer. It is only unacceptable when
+it fires on the *ordinary* path, which is why § 3's dedup has to work: without
+it, every ordinary append would land here.
+
+*** 6. A written contract for "the same row"
+Two =gpkg_metadata= rows with identical content and different ids are one
+record; the same id with different content is two. That judgement has to be
+stated per table, because §§ 2 and 3 both depend on it and neither can be
+implemented until it exists.
+
+** THE SEQUENCING THAT FALLS OUT
+#+begin_src text
+  1. srs_id reconciliation        -> needed by M3b's carrying regardless
+  2. the "same row" contract      -> paper; blocks 3 and 4
+  3. set-union + refusal          -> the reconciliation layer
+  4. AUTOINCREMENT renumbering    -> needs 2; inverts the 2026-08-23 carry rule
+  5. index construction           -> REOPENS D10; needs collation semantics
+#+end_src
+
+Steps 1--4 are ordinary work. **Step 5 is a decision before it is a task**, and
+it is the one to be honest about: a merged table cannot keep a carried index,
+so either this crate gains collation-aware comparison, or a merge is refused
+for any table that owns an index it cannot rebuild.
+
+/That second option deserves a fair hearing rather than being treated as a
+fallback./ It is bounded, it is honest, and it fires only on a merge of an
+*indexed* table -- which the registry tables mostly are not.
+
+** DECISIONS
+*** D1 -- this is a blocker for M3b, not a follow-on
+/Decided 2026-08-23 by the project owner, overruling the recommendation on
+file./ The recommendation was to ship M3b's carrying with "source only"
+(the third rule above), leaving the destination's content dropped as it is
+today, and to decide the collision rule when someone needed append.
+
+*The argument for deferring was reach:* the edit loop never hits the append
+case, so deferring costs the stated goal nothing and keeps D10's reversal
+unspent.
+
+*The argument that wins is that M3b's claim would be false.* M3b is "the
+GeoPackage container carried faithfully". A version of it that silently
+destroys container content down one of its two paths has not carried a
+container; it has carried one in the case that was easy. The warning would
+still be there, so it would not be a *silent* loss -- but "we warn about it"
+is the state defect 3 has been in since 2026-08-21, and M3b exists to end that,
+not to relocate it.
+
+*** D2 -- OPEN: merge, or refuse the merge for indexed tables?
+The § 4 fork. **Do not decide this from the armchair**: it turns on how often a
+real GeoPackage carries an index on a table that would need merging, which is
+measurable and has not been measured. Per =plans/README.org= § Sourcing a
+fixture from a real tool, ask =ogr2ogr= and a real dataset before choosing.
+
+*** D3 -- OPEN: is =srs_id= reconciliation this plan's or M3b's?
+It is needed by M3b regardless (§ 1), so it may simply belong there. Filed here
+because it is the same kind of problem and the two solutions would share code.
+/Decide when M3b's carrying channel is built, not before./
+
+** SCOPE
+*** In
+- The six requirements above, and the collision rule that falls out of them.
+- =srs_id= rewriting for carried content, if D3 lands it here.
+- A fixture pair: two GeoPackages that collide on =gpkg_metadata=,
+  =gpkg_extensions= and a user table, built by =ogr2ogr= so the collision is
+  the one that really occurs.
+
+*** Out
+- *The carrying channel itself.* [[file:same-format-fidelity.org][same-format-fidelity.org]]
+  M3b owns it; this plan is what M3b needs before it can close.
+- *Cross-format append.* Writing a =.shp= into an existing =.gpkg= is the same
+  append path but carries no source container, so none of this applies.
+- *Merging layers.* Already implemented and not in question: =write_layers=
+  upserts by name, and that behaviour is what the container rules are being
+  made consistent *with*.
+
+** DEPENDS ON / RELATED
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] :: M3b, which this
+  blocks; D8 (tiles are carried), D10 (an index's fate follows its table's
+  content class -- reopened by § 4), and the three content classes the merge
+  rules have to respect.
+- [[file:same-format-output.org][same-format-output.org]] :: D4's same-file
+  refusal, which removed the one configuration where "which container wins"
+  would have been ambiguous rather than merely undecided.
+- [[file:geopackage.org][geopackage.org]] :: the container's shape, and the
+  create-or-append write path this plan is about.
+- [[file:edit-composability.org][edit-composability.org]] :: the edit loop,
+  which is why M3b is being built and which does *not* reach this case.
+- =tests/fixtures/PLANNED.org= :: =gpkg_range_constraints.gpkg=, which pins § 3's
+  NULL trap, and =gpkg_tiles.gpkg=, which trips § 1.

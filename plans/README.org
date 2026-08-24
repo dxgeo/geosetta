@@ -361,6 +361,28 @@ why, not to implement the spec's table from symmetry.
   in-place guard the format check had been providing by accident (=ogr2ogr=
   refuses same-file too; geosetta's =gpkg= path currently allows it).
   *Scoping only.*
+- [[file:container-reconciliation.org][container-reconciliation.org]] :: What
+  happens to a GeoPackage's *container* content when the destination already
+  has some -- the one configuration =geosetta a.gpkg out.gpkg= reaches when
+  =out.gpkg= exists, which the append path makes an ordinary case rather than
+  an edge one. Split out of =same-format-fidelity.org= M3b, and a *blocker* for
+  it: M3b can carry a source container into a fresh file without any of this,
+  and cannot claim to carry a container in general until it is settled. The
+  finding that makes it a plan rather than a rule is that the collision is the
+  *common* case -- any two =ogr2ogr= GeoPackages both hold =gpkg_metadata= --
+  so "source wins" and "destination wins" are each wrong down one of the two
+  paths, and for a table whose rows are a *set* the honest operation is a
+  merge. Merging is what costs: =gpkg_metadata='s AUTOINCREMENT ids collide, so
+  one side must be renumbered and every =gpkg_metadata_reference= foreign key
+  rewritten, and =sqlite_sequence= recomputed rather than carried -- inverting
+  the rule that shipped the same day. And a merged table's rows are in neither
+  source's index order, so its indexes cannot be *re-packed* and must be
+  *built*, which needs the collation-aware comparison
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] D10 deliberately
+  scoped out. **That last one is a decision reversal, not a task.** One
+  requirement is due regardless: carried content referencing an =srs_id= points
+  into the source's numbering, which =resolve_srs= has just renumbered.
+  *Scoping only.*
 - [[file:edit-composability.org][edit-composability.org]] :: Read a file, let
   *some other program* modify the feature collection, write it back -- the
   third seam in the family

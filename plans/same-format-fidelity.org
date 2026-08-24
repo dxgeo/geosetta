@@ -1656,6 +1656,33 @@ travels with D1's =name= modelling.
     finding above, and the two have to be decided together rather than
     separately. See =handoff.org= § THE EDIT LOOP for the full argument.
 
+  ***And it cannot close until container-reconciliation.org is settled.***
+  /Added 2026-08-23, while scoping the carrying channel./ Everything above
+  assumes *one* container. There are two whenever the destination
+  =.gpkg= already exists -- the append path, which is a documented feature
+  rather than an edge case -- and this milestone never asked what happens to
+  the destination's own container content then. Today it is destroyed, warned
+  about by =run_geopackage_write='s second =container_drop_warnings= call,
+  while the destination's *layers* survive: an asymmetry M3b would otherwise
+  inherit and enshrine.
+
+  The question is not "which wins": collisions are the *common* case (any two
+  =ogr2ogr= GeoPackages both hold =gpkg_metadata=), and for a table whose rows
+  are a set the honest operation is a *merge* -- which renumbers AUTOINCREMENT
+  ids, rewrites the foreign keys pointing at them, recomputes =sqlite_sequence=
+  instead of carrying it, and **rebuilds indexes rather than re-packing them,
+  reopening D10**. Split out to
+  [[file:container-reconciliation.org][container-reconciliation.org]] rather
+  than decided here, because one of its six requirements is a decision reversal
+  and the rest is a layer that does not exist.
+
+  *One of them is M3b's regardless:* carried content that references an
+  =srs_id= -- a tile pyramid's =gpkg_contents= and =gpkg_tile_matrix_set= rows
+  -- points into the *source's* numbering, and =resolve_srs= renumbers, handing
+  out synthetic ids from 100000 *in layer order*. D8's tile carrying trips it
+  on the first fixture, and =gpkg_contents= declares =fk_gc_r_srs_id=, so
+  =foreign_key_check= catches it.
+
   *Finally, =container.rs= should invert.* =REPRODUCED= is a hand-maintained
   constant that must move whenever =writer::build= does, which its module doc
   flags twice because the coupling goes unnoticed until it is wrong. After M3b

@@ -51,6 +51,19 @@ check it off and remove it once the item ships or is shelved.
   =tests/fixtures/spec_conformant.gpkg=, the first fixture in this tree with no
   GDAL in its provenance, and a test comparing whole registry DDL against it --
   all six tables match the standard exactly.
+- [ ] [[file:container-reconciliation.org][container-reconciliation.org]] —
+  what happens to container content when the *destination* GeoPackage already
+  has some. **Blocks =same-format-fidelity.org= M3b from closing**: M3b can
+  carry a source container into a fresh file without it, and cannot claim to
+  carry a container in general until it is settled. The collision is the
+  *common* case, not the rare one — any two =ogr2ogr= GeoPackages both hold
+  =gpkg_metadata= — so no "which wins" rule is right down both paths, and a
+  real merge means renumbering AUTOINCREMENT ids, rewriting the foreign keys
+  that point at them, recomputing =sqlite_sequence= rather than carrying it,
+  and *building* indexes rather than re-packing them — which reopens D10.
+  One requirement is due regardless of the merge question: carried content
+  referencing an =srs_id= points into the source's numbering, which
+  =resolve_srs= renumbers. Scoping only.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

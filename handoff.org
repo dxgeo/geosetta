@@ -96,9 +96,12 @@ In this order. The first two are the load-bearing ones:
    of the nine readers actually discards, measured. This is the reference the
    other three plans are written against.
 3. [[file:plans/same-format-output.org][plans/same-format-output.org]] --
-   deleting the =args.from == out.format= check. *Was gated* by (1); the one
-   argument that gated it expired on 2026-08-22 and its position is now an open
-   call -- see § THE SEQUENCING and § THE EDIT LOOP.
+   deleting the =args.from == out.format= check. ***SHIPPED 2026-08-23***, out
+   of the order the diagram draws, on the composability reading of the call in
+   § THE SEQUENCING. Read it for what measuring the result overturned: the
+   prediction that the warning would cover four spokes (it covers seven), and
+   the plan's own example of a format with nothing to lose (WKT, which loses
+   the lexeme).
 4. [[file:plans/edit-composability.org][plans/edit-composability.org]] -- the
    original ask, now the consumer of the above.
 5. [[file:tests/fixtures/HOSTILE.org][tests/fixtures/HOSTILE.org]] -- what each
@@ -107,7 +110,13 @@ In this order. The first two are the load-bearing ones:
    designed on 2026-08-23 and not yet built. /Its first entry,
    =spec_conformant.gpkg=, was built the same day and has moved to
    =HOSTILE.org= under a new =spec_= prefix./
-6. =same-format-fidelity.org= § THE ORACLE RULE -- one page, and it is the
+6. [[file:plans/container-reconciliation.org][plans/container-reconciliation.org]]
+   -- /new 2026-08-23/. What happens to container content when the destination
+   =.gpkg= already has some. **Read it before finishing M3b**, which it gates:
+   M3b can carry a source container into a fresh file without any of it, and
+   cannot claim to carry a container in general until it is settled. Its § 1 is
+   due regardless of the rest.
+7. =same-format-fidelity.org= § THE ORACLE RULE -- one page, and it is the
    thing this project got wrong most recently: *=ogr2ogr= is evidence of what a
    producer emits and what a consumer accepts, never of what the standard
    requires.* Read it before writing another differential test.
@@ -148,6 +157,8 @@ time. *Not started.*
       GeoParquet                                  [DONE]
       GeoPackage                                  [DONE]
       csv / wkt / kml / shp                       [not started]
+            |
+  container-reconciliation.org  [NEW 2026-08-23 -- gates M3b's close]
             |
   M3b GeoPackage container   M3c KMZ container
             |

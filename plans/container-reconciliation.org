@@ -16,6 +16,12 @@ thing this plan had recorded as settled: =ge_tce= does not make a set either,
 so § 3's trap is a property of the registry keys generally and not a
 =gdcc_ntv= peculiarity.
 
+*§ 6's "same row" contract is written*, which was step 2 of § THE SEQUENCING
+and the thing blocking steps 3 and 4. It settles every registry table and the
+tile table, and raised two questions it could not settle -- **D4** (a tile
+collision with different bytes) and **D5** (a same-named user table whose DDL
+matches). Both are filed with a recommendation and neither blocks § 1.
+
 *Blocks M3b's completion.* M3b can carry a source container into a *fresh*
 destination without any of this; it cannot claim to carry a container in
 general until this is settled, because the append path is a documented feature
@@ -300,10 +306,92 @@ record; the same id with different content is two. That judgement has to be
 stated per table, because §§ 2 and 3 both depend on it and neither can be
 implemented until it exists.
 
+***Written 2026-08-23, and it is load-bearing for three tables rather than
+one.*** § THE MEASUREMENT killed the shortcut this requirement was competing
+with: the =UNIQUE= key cannot be leaned on to dedupe for any table but
+=gpkg_data_columns=, so identity has to be *stated* rather than delegated to
+the database. What follows is that statement.
+
+**** The three rules that decide every table
+1. ***A surrogate id is allocation, not identity.*** =gpkg_metadata.id= and a
+   tile table's =id= exist to be pointed at, not to say what a row *is*. Two
+   rows differing only in a surrogate id are one record; this is what makes
+   § 2's renumbering safe rather than destructive.
+2. ***NULL equals NULL.*** Not SQLite's rule under =UNIQUE=, which is the
+   entire content of § 3's trap, so it has to be said here or the trap is
+   re-entered at every call site. Identity comparison treats two NULLs in the
+   same column as equal and a NULL as unequal to every non-NULL.
+3. ***A write-time stamp is provenance, not identity.***
+   =gpkg_metadata_reference.timestamp= defaults to =strftime('now')=, so two
+   files describing the same reference *always* disagree on it. Including it
+   in identity would mean nothing ever dedupes. /Measured 2026-08-23, and the
+   reference implementation goes further than this rule does: =ogr2ogr
+   -update -append= rewrote **both** timestamps to the append time, including
+   the destination row's, which was already there./
+
+   *This crate should keep the destination's stamp on a dedup rather than
+   follow GDAL here.* The record existed; the append did not create it. GDAL
+   is the oracle for what occurs, not for what is right -- § THE ORACLE RULE.
+
+**** The contract, table by table
+| table | two rows are the same record when | on a conflict |
+|-------+-----------------------------------+---------------|
+| =gpkg_extensions= | =(table_name, column_name, extension_name)= match, NULLs equal | differing =definition= or =scope= -> *refuse* (§ 5) |
+| =gpkg_metadata= | =(md_scope, md_standard_uri, mime_type, metadata)= match -- *=id= excluded* | none possible: different content is a different record |
+| =gpkg_metadata_reference= | =(reference_scope, table_name, column_name, row_id_value)= match *and* the **mapped** =md_file_id= / =md_parent_id= match -- =timestamp= excluded | none possible: a different mapped parent is a different reference |
+| =gpkg_data_columns= | =(table_name, column_name)= match -- =pk_gdc=, the one key that is sound | any other column differs -> *refuse* (§ 5) |
+| =gpkg_data_column_constraints= | *depends on =constraint_type=* -- see below | differing =min=/=max=/inclusive flags/=description= -> *refuse* (§ 5) |
+| =gpkg_contents= | =table_name= matches | differing =data_type= -> *refuse*; the rest follows the layer merge |
+| =gpkg_geometry_columns= | =(table_name, column_name)= match | follows its layer; it is not merged independently |
+| a tile table | =(zoom_level, tile_column, tile_row)= match -- *=id= excluded* | differing =tile_data= -> **D4, open** |
+| a user table | *no general answer* | **D5, open** |
+
+***=gpkg_data_column_constraints= is the one whose identity is type-dependent***,
+and saying so is the honest resolution of § 3's NULL trap rather than a
+workaround for it:
+
+| =constraint_type= | identity |
+|-------------------+----------|
+| =enum=, =glob= | =(constraint_name, constraint_type, value)= |
+| =range= | =(constraint_name, constraint_type)= -- =value= is NULL *by definition*, and the standard admits one range row per constraint name, so it carries no information to key on |
+
+*The trap and the contract are the same fact seen twice.* =gdcc_ntv= includes
+=value= because it must cover =enum=, where the value is the row's whole point;
+a =range= row has none, so the index cannot separate two of them and identity
+must not try to.
+
+**** What is not merged at all, because it is derived
+Stated here so that "merge every table" is not read into the contract:
+
+- =gpkg_ogr_contents= -- a row-count cache. *Recomputed* from what is actually
+  written. /Its misclassification in defect 3's warning is M3b's to fix./
+- =gpkg_spatial_ref_sys= -- recomputed by =resolve_srs= from the merged layer
+  set, which is exactly why § 1 exists.
+- the R*Tree shadow tables -- derived, rebuilt (=same-format-fidelity.org= D10).
+- =sqlite_sequence= -- recomputed from the merged table's ids per § 2, *not*
+  carried, which is the inversion that requirement records.
+
+**** The order the contract forces, which §§ 2 and 3 cannot choose freely
+=gpkg_metadata= identity excludes =id=, and =gpkg_metadata_reference= identity
+*includes* the mapped =md_file_id=. So the two cannot be deduped in either
+order:
+
+#+begin_src text
+  1. dedupe gpkg_metadata by content     -> yields an id map per side
+  2. apply the map to gpkg_metadata_reference's md_file_id / md_parent_id
+  3. dedupe gpkg_metadata_reference on the mapped values
+  4. recompute sqlite_sequence from the merged ids
+#+end_src
+
+*Step 2 sits between the two dedups*, which is the thing an implementation
+will get wrong if it treats § 3 as one pass over all tables. /This is also why
+§ 2 and § 3 were filed as separate requirements and are not separable in
+practice./
+
 ** THE SEQUENCING THAT FALLS OUT
 #+begin_src text
   1. srs_id reconciliation        -> needed by M3b's carrying regardless
-  2. the "same row" contract      -> paper; blocks 3 and 4
+  2. the "same row" contract      -> WRITTEN 2026-08-23 (§ 6); unblocks 3 and 4
   3. set-union + refusal          -> the reconciliation layer
   4. AUTOINCREMENT renumbering    -> needs 2; inverts the 2026-08-23 carry rule
   5. index construction           -> REOPENS D10; needs collation semantics
@@ -385,6 +473,51 @@ reported, not guessed at. =sqlite_constraints.gpkg= is that refusal's fixture.
 It is needed by M3b regardless (§ 1), so it may simply belong there. Filed here
 because it is the same kind of problem and the two solutions would share code.
 /Decide when M3b's carrying channel is built, not before./
+
+*** D4 -- OPEN: a tile collision on =(z, x, y)= with different =tile_data=
+/Raised 2026-08-23 by § 6's contract, which settles every other table and
+cannot settle this one./ Two containers each holding a tile table of the same
+name, with a tile at the same =(zoom_level, tile_column, tile_row)= and
+different bytes. Identical bytes dedupe under § 6 rule 1 and raise nothing.
+
+*There is no union.* A tile coordinate holds one image; two images at one
+coordinate is not a set with two members, it is a disagreement. So the
+candidates are refuse, source wins, or destination wins -- and the last two
+both destroy an image without saying which.
+
+**Recommendation: refuse**, per § 5. The argument that it stays off the
+ordinary path is the specific one: appending a *different* raster layer creates
+a *differently named* tile table, which collides with nothing. Reaching this
+case means two pyramids that were built separately and given the same name,
+which is a genuine ambiguity rather than an ordinary append.
+
+/Not decided here: whether the refusal names the first colliding tile or counts
+them. Naming one is more useful and cheaper./
+
+*** D5 -- OPEN: a same-named user table whose DDL *matches*
+/Raised 2026-08-23 by § 6, same reason./ § 5 already refuses a same-named user
+table with **different** DDL, on the grounds that no union exists. Identical
+DDL is a different case: a union is *expressible*. Whether it is *correct* is
+the question, and § 6 rule 1 cannot answer it -- the rule says a surrogate id
+is allocation rather than identity, and for a user table this crate has no way
+to know whether the primary key is a surrogate or carries meaning.
+
+**Recommendation: refuse initially, and revisit if a real case turns up.** Two
+supports, and the second is the one that makes it cheap:
+
+- *A user table has no declared identity*, so every merge rule is a guess about
+  someone else's schema. Refusing says so; merging on rowid quietly asserts
+  that rowids from two files are comparable, which is false in general.
+- **It does not reach the ordinary path, because a feature layer never gets
+  here.** =write_layers= already upserts layers by name, so the user tables
+  this decision governs are the *non-layer* ones -- =side_notes= and its kind.
+  Two containers colliding on one of those is rare in a way that two containers
+  colliding on =gpkg_metadata= is not.
+
+/The reason to file it rather than fold it into § 5: the refusal is being
+recommended from the absence of evidence, not from a measurement. If a real
+dataset turns up where a same-DDL user table is appended repeatedly, that is
+the case that should reopen it./
 
 ** SCOPE
 *** In

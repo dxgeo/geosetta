@@ -76,7 +76,13 @@ check it off and remove it once the item ships or is shelved.
   four registry keys have a nullable column, so merging two *plain* =ogr2ogr=
   files deduped nothing at all while =integrity_check= reported =ok=. What is
   left is ordinary work plus one piece of paper: the "same row" contract, now
-  load-bearing for three tables rather than one.
+  load-bearing for three tables rather than one. *That contract is written* --
+  § 6 states identity per table, the three rules that decide it (a surrogate id
+  is allocation; NULL equals NULL; a write-time stamp is provenance), what is
+  recomputed rather than merged, and the step ordering §§ 2 and 3 cannot choose
+  freely. It raised **D4** and **D5**, both open with a recommendation:
+  a tile collision with differing bytes, and a same-named user table whose DDL
+  matches. Next is § 1, =srs_id= reconciliation, which needs neither.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

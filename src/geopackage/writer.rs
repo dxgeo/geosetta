@@ -1120,6 +1120,76 @@ mod tests {
         assert_eq!(ids, vec![Some(1.0), Some(3.0)], "the deletion did not stick");
     }
 
+    /// **Two writes of the same input produce byte-identical files**, and the
+    /// mechanism that makes them so is [`LAST_CHANGE`] being a fixed sentinel
+    /// rather than a clock reading.
+    ///
+    /// *This test exists to be broken deliberately rather than by accident.*
+    /// `plans/same-format-fidelity.org` § OPEN QUESTIONS decided that
+    /// `gpkg_contents.last_change` should be **carried** from the source, and
+    /// stamped fresh only where there is nothing to carry — a cross-format
+    /// source. Implementing that removes this property from essentially every
+    /// write, because same-format runs only became possible on 2026-08-23 and
+    /// nearly everything this tool does is cross-format.
+    ///
+    /// That is a fine trade to make and a bad one to make *silently*. Without
+    /// this test the whole suite stays green while the property disappears, and
+    /// it gets rediscovered later as noise in a `cmp` of two outputs. **Whoever
+    /// implements the carry-and-stamp rule has to come here and change this
+    /// test on purpose**, which is the only point of it.
+    ///
+    /// /Measured before it was written:/ two release-binary runs two seconds
+    /// apart hashed identically, so the property was real rather than assumed.
+    ///
+    /// *The two assertions are not redundant.* Byte-equality guards the broad
+    /// property, but it cannot be trusted alone as a guard against a clock:
+    /// two calls in one process can land in the same millisecond and agree by
+    /// luck. The sentinel assertion is the deterministic half — a wall-clock
+    /// stamp fails it however fast the machine is — and it pins the *literal*
+    /// epoch rather than [`LAST_CHANGE`], so that changing the constant is
+    /// also a change someone has to make here on purpose.
+    ///
+    /// **Both halves confirmed by mutation**, which is how the first draft's
+    /// bug was found: writing `t == LAST_CHANGE` compared the output against
+    /// the constant that produced it and passed happily when the constant was
+    /// changed — defect 6's fixture mistake, reproduced in a test written to
+    /// guard against that class.
+    #[test]
+    fn two_writes_of_the_same_input_are_byte_identical() {
+        let layer = || {
+            fc(vec![Feature {
+                geometry: point(1.0, 2.0),
+                properties: vec![("name".into(), JsonValue::String("a".into()))],
+                native: None,
+            }])
+        };
+        let first = write_layers(None, &[("places".into(), layer())], false, false).unwrap();
+        let second = write_layers(None, &[("places".into(), layer())], false, false).unwrap();
+        assert_eq!(first, second, "two writes of the same input differ");
+
+        // The mechanism, asserted separately so a failure says which half went.
+        let db = crate::sqlite::Database::open(&first).unwrap();
+        let contents = db
+            .tables()
+            .unwrap()
+            .into_iter()
+            .find(|t| t.name == "gpkg_contents")
+            .expect("gpkg_contents");
+        let rows = db.read_rows(&contents).unwrap();
+        let stamps: Vec<&crate::sqlite::Value> = rows.iter().map(|r| &r[4]).collect();
+        // The literal, deliberately — *not* `LAST_CHANGE`. Comparing the written
+        // value against the constant that produced it proves only that the
+        // constant equals itself, which is defect 6's fixture mistake in
+        // miniature. Confirmed by mutation: with `LAST_CHANGE` on the right the
+        // sentinel could be changed to any other value and this still passed.
+        assert!(
+            stamps
+                .iter()
+                .all(|v| matches!(v, crate::sqlite::Value::Text(t) if t == "1970-01-01T00:00:00.000Z")),
+            "last_change is no longer the fixed epoch sentinel: {stamps:?}"
+        );
+    }
+
     #[test]
     fn write_then_read_round_trips_z_and_m() {
         // GeoPackage needed zero new format-specific code for this (see

@@ -1087,6 +1087,14 @@ example of the anti-pattern beside the new rule is how the rule gets read as
 optional.
 
 *** D8 -- a tile pyramid is carried, and no file is rejected for holding one
+/One consequence, found 2026-08-23 while scoping the carrying channel: a tile
+pyramid carries =srs_id= *references* -- in its =gpkg_contents= row and its
+=gpkg_tile_matrix_set= row -- and =resolve_srs= renumbers, handing out
+synthetic ids from 100000 in layer order. So carrying a pyramid is not purely a
+byte move: those references have to be rewritten into the new numbering, or
+=fk_gc_r_srs_id= makes =foreign_key_check= say so. See
+[[file:container-reconciliation.org][container-reconciliation.org]] § 1./
+
 /Decided 2026-08-23, overturning the recommendation in § The collision./
 
 That section left one of two things to be chosen: the Gpkg *reader* rejects a
@@ -1152,6 +1160,17 @@ which needs no file-format work at all.
 /Decided 2026-08-23. It dissolves the "carry or rebuild an index" question in
 =handoff.org= § OPEN QUESTIONS by splitting it: that question named one thing
 and meant two./
+
+***This decision is under a standing challenge -- read
+[[file:container-reconciliation.org][container-reconciliation.org]] § 4 before
+relying on it.*** /Added 2026-08-23, the same day it was taken./ Everything
+below rests on one fact: *an index on disk is already sorted*, so it can be
+re-packed without ever comparing two keys. **That fact does not survive a
+merge.** Combine two containers' rows for one table and the result is in
+neither source's order, so the index has to be *built* rather than re-packed --
+needing exactly the comparison-and-collation machinery this decision was taken
+to avoid. Whether that machinery gets built, or a merge is instead refused for
+any table owning an index, is D2 of that plan and is *open*.
 
 **The R*Tree.** The cost argument recorded for carrying -- that building needs
 SQLite's comparison semantics and its collations -- *does not apply to it at

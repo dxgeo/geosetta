@@ -868,6 +868,17 @@ const SEQUENCE_DDL: &str = "CREATE TABLE sqlite_sequence(name,seq)";
 /// [`Database::sequence_numbers`] beside it: the capability landed ahead of
 /// M3b's carrying deliberately, because this is the gap the *first* carried
 /// table trips and the one the verification ritual cannot see.
+///
+/// # Carrying a mark verbatim is correct only while the ids stand still
+///
+/// A carried table keeps its rowids, so its mark carries with them. **Merge
+/// two containers and it does not.** `gpkg_metadata.id` is
+/// `INTEGER PRIMARY KEY AUTOINCREMENT`, so two files both number from 1 and
+/// one side has to be renumbered — at which point the mark must be
+/// *recomputed* rather than carried, and every `gpkg_metadata_reference`
+/// foreign key pointing at those ids rewritten. Both behaviours are needed and
+/// which applies is decided in `plans/container-reconciliation.org` § 2, not
+/// here. Do not reach for this variant on a merge path without reading it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[allow(dead_code)]
 pub enum Autoincrement {

@@ -323,15 +323,30 @@ the database. What follows is that statement.
    same column as equal and a NULL as unequal to every non-NULL.
 3. ***A write-time stamp is provenance, not identity.***
    =gpkg_metadata_reference.timestamp= defaults to =strftime('now')=, so two
-   files describing the same reference *always* disagree on it. Including it
-   in identity would mean nothing ever dedupes. /Measured 2026-08-23, and the
-   reference implementation goes further than this rule does: =ogr2ogr
-   -update -append= rewrote **both** timestamps to the append time, including
-   the destination row's, which was already there./
+   files describing the same reference *always* disagree on it -- /measured:
+   two independently built =ogr2ogr= files stamped the same logical reference
+   two minutes apart./ Including it in identity would mean nothing ever
+   dedupes. **That argument stands on its own and needs no oracle.**
 
-   *This crate should keep the destination's stamp on a dedup rather than
-   follow GDAL here.* The record existed; the append did not create it. GDAL
-   is the oracle for what occurs, not for what is right -- § THE ORACLE RULE.
+   /GDAL corroborates it, and the corroboration is narrower than it first
+   looked, so it is worth stating exactly./ =ogr2ogr -update -append= of a
+   *new layer* rewrote the destination's **pre-existing**
+   =gpkg_metadata_reference= row to the append time, though nothing about that
+   row had changed. It is *not* a refresh on every write: appending features
+   into an *existing* layer left the stamp untouched, and so did a read-only
+   =ogrinfo=. What triggers it is a new metadata record, at which point GDAL
+   rewrites the whole table.
+
+   /An earlier draft of this rule said "rewrote **both** timestamps", which
+   was true of the file and useless as evidence: the second row was newly
+   created, so its stamp being the append time says nothing. One row carried
+   the finding. Corrected on re-measurement, 2026-08-23./
+
+   *The conditional happens to land in scope* -- a container merge is the
+   layer-set-grows case -- but this crate should still stop short of GDAL.
+   **Keep the destination's stamp on a dedup:** the record existed and the
+   append did not create it. GDAL is the oracle for what occurs, not for what
+   is right -- § THE ORACLE RULE.
 
 **** The contract, table by table
 | table | two rows are the same record when | on a conflict |

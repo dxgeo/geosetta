@@ -1499,6 +1499,23 @@ four commands, and the last one is the oracle:
 /The =pragma_index_xinfo= line is the one to keep: it is the only way to read an
 autoindex's collation, since an autoindex has no =sql= text to grep./
 
+*A trap in the append leg, which cost one wrong sentence in a commit message.*
+The interesting row is the destination's *pre-existing*
+=gpkg_metadata_reference= row, not the count of rows afterwards -- the new
+layer's row is newly created, so its =timestamp= being the append time is
+evidence of nothing. Read the destination before and after, and discriminate
+the mechanism before generalising:
+
+#+begin_src sh
+  ogr2ogr -f GPKG -update -append d.gpkg b.geojson -nln rivers  # NEW layer: rewrites the old row's ts
+  ogr2ogr -f GPKG -update -append d.gpkg a.geojson -nln roads   # EXISTING layer: leaves it alone
+  ogrinfo d.gpkg roads -so                                      # read-only: leaves it alone
+#+end_src
+
+/It is a new metadata *record* that makes GDAL rewrite the whole table, not a
+write to the file. Two of those three commands are what stop "GDAL refreshes
+metadata on every write" from being written down as measured./
+
 Two traps that already cost time once each:
 - *Do not write fixtures through a shell heredoc.* It silently mangled
   =København= to =Ke\xe2\x88\x9a\xe2\x88\x8f...=. Write with explicit encoding

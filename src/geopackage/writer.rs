@@ -24,6 +24,35 @@ const WGS84_SRS_ID: i64 = 4326;
 const UNDEFINED_SRS_ID: i64 = 0;
 /// First srs_id handed out to a CRS that carries no usable authority code.
 const SYNTHETIC_SRS_BASE: i64 = 100_000;
+/// The value written into `gpkg_contents.last_change`, for every layer, on
+/// every run.
+///
+/// **A fixed epoch, so this writer's output is byte-identical across runs.**
+/// The alternative is `strftime('%Y-%m-%dT%H:%M:%fZ','now')`, which is what the
+/// column's DEFAULT expression holds and what `ogr2ogr` writes, and which would
+/// make two runs over the same input produce two different files.
+///
+/// *This is conformant, and worth recording why rather than leaving it to be
+/// rediscovered.* The standard's only requirement touching the value is that it
+/// be **in DATETIME format** — "Values of the `gpkg_contents` table
+/// `last_change` column SHALL be in a DATETIME format as per Requirement 5",
+/// and Requirement 5 is about data types. The epoch is a well-formed ISO-8601
+/// UTC string, so it passes, and the abstract test suite checks format alone.
+///
+/// *But note what it costs, because the standard does define this column's
+/// meaning:* `gpkg_contents.last_change` is described as "timestamp of last
+/// change to content". A fixed value does not carry that meaning, and it is the
+/// only registry column this writer fills with something chosen for the
+/// writer's convenience rather than read from the data. The neighbouring
+/// `gpkg_metadata_reference.timestamp` is the contrasting case — the standard
+/// gives it no semantics at all, only a format — which is argued in
+/// `plans/container-reconciliation.org` § 6 rule 3.
+///
+/// **Open, and filed there rather than here:** a `gpkg -> gpkg` run overwrites
+/// the source's `last_change` with this constant, which under
+/// `plans/same-format-fidelity.org` is a content question rather than a
+/// formatting one. Whether that is a loss (carry it), a derived value (recompute
+/// it honestly), or correctly ignored has not been decided.
 const LAST_CHANGE: &str = "1970-01-01T00:00:00.000Z";
 
 // The registry tables' DDL, as the GeoPackage specification defines them —

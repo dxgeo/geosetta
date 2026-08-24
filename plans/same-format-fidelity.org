@@ -1916,6 +1916,48 @@ conformance to the published specification is the property the whole format
 layer is for, and a file that states a weaker schema than the spec defines is
 a file a user is right not to trust. It is *defect 6* in § THE DEFECTS, and it
 is gated on the index-writing work in D10./
+- *What should =gpkg_contents.last_change= hold on a =gpkg -> gpkg= run?*
+  /Raised 2026-08-23, while reading the normative text for
+  =container-reconciliation.org= § 6 rule 3./
+
+  =src/geopackage/writer.rs= has =const LAST_CHANGE: &str =
+  "1970-01-01T00:00:00.000Z"=, written for every layer on every run. It had no
+  doc comment, no plan entry and no mention in =handoff.org=; it now has the
+  first, and this is the second. **The effect is that this writer's output is
+  byte-identical across runs**, which is worth having and is presumably why it
+  is there -- /the reason was never recorded, so that is inference/.
+
+  *It is conformant.* The standard's only requirement touching the value is
+  that it be in DATETIME format, and Requirement 5 is about data types; the
+  epoch is a well-formed ISO-8601 UTC string and the abstract test suite checks
+  format alone.
+
+  ***The question is what the rule says, not what the standard says.*** Unlike
+  =gpkg_metadata_reference.timestamp=, which the standard leaves undefined,
+  =gpkg_contents.last_change= is described as *"timestamp of last change to
+  content"*. So it has a meaning, this writer does not carry it, and a
+  =gpkg -> gpkg= run overwrites the source's value with a constant. Three
+  readings, and they are not obviously distinguishable:
+
+  1. *A loss* -- it is content the source held and the output does not.
+     Then the natives channel should carry it, and the rule is violated today.
+  2. *Derived* -- it describes the write rather than the data, like
+     =gpkg_ogr_contents='s row count. Then it should be *recomputed honestly*,
+     and a constant epoch is not that either.
+  3. *Correctly ignored* -- a write-time stamp is provenance, which is exactly
+     the argument =container-reconciliation.org= § 6 rule 3 makes for the
+     *other* column. Then the only defect is that nothing said so.
+
+  /Reading 3 is the tempting one and it is the one to be careful with:/ rule 3
+  earned its conclusion from the standard declining to define
+  =gpkg_metadata_reference.timestamp=. That argument is unavailable here,
+  because the standard *did* define this one. **Do not carry rule 3 across by
+  analogy** -- the two columns differ in exactly the respect the argument
+  turned on.
+
+  *Cheap to resolve and not yet resolved:* nothing measures what this crate
+  does to a source =last_change= today, and no fixture asserts either
+  behaviour.
 - *Should a =.dbf= field be sized to the data, or fixed per type the way GDAL
   does?* /Raised 2026-08-21, measured both ways, deliberately not decided./
 

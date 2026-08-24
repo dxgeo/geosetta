@@ -189,6 +189,36 @@ or tracking an older revision of the annex is unchecked, and the obligation is
 the same either way./ *Not added to defect 6's tally of four deviations:*
 =gpkg_metadata= is not one of the six tables this crate emits.
 
+** WHAT THE STANDARD CAN AND CANNOT SETTLE HERE
+/Written 2026-08-23, after reading the normative text for § 6 rule 3 and the
+tile contract. It belongs at the top of this plan rather than inside a
+requirement, because the next person will reasonably ask "what does the spec
+say about this collision" and deserves the structural answer before spending an
+hour finding it out./
+
+***The GeoPackage standard constrains file state, not operations.*** It defines
+what a conformant =.gpkg= contains; it has **no notion of append, merge, or
+two files at all**. So it can settle what a row *is* and it cannot settle what
+to do when two of them disagree.
+
+| question | can the standard answer it? |
+|----------+-----------------------------|
+| what makes two rows the same record (§ 6) | *often yes* -- a declared =UNIQUE= or primary key is normative |
+| may this crate rely on the index enforcing that | *sometimes no* -- see the tiles WARNING below |
+| what to do when identity matches and content differs (D4, D5) | **no, and structurally so** |
+| whether a value must be preserved across a rewrite (rule 3) | **no** -- and where it is silent, the silence is sometimes deliberate |
+
+*So D4 and D5 rest on this plan's own arguments and always will.* Reading more
+specification will not move them, and § THE ORACLE RULE's fourth row -- "what
+does the format *require*?" -- simply has no entry for "what should a merge
+do". /Two decisions were checked against the text before this was written, and
+both came back silent./
+
+**Where it does bite, it bites hard**, and § 6 has both instances: the tile
+identity key is normative (Requirement 54), and the =gpkg_metadata_reference=
+timestamp's *lack* of defined semantics is itself informative, because the
+neighbouring =gpkg_contents.last_change= has them.
+
 ** WHAT FULL CORRECTNESS REQUIRES
 The target: *the output is what SQLite would have produced had it opened the
 destination and inserted the source's content.* Six things stand between M3b
@@ -343,10 +373,38 @@ the database. What follows is that statement.
    the finding. Corrected on re-measurement, 2026-08-23./
 
    *The conditional happens to land in scope* -- a container merge is the
-   layer-set-grows case -- but this crate should still stop short of GDAL.
-   **Keep the destination's stamp on a dedup:** the record existed and the
-   append did not create it. GDAL is the oracle for what occurs, not for what
-   is right -- § THE ORACLE RULE.
+   layer-set-grows case -- but GDAL is the oracle for what occurs, not for
+   what is right, so the standard was read rather than inferred from it.
+
+   ***The specification constrains the format and is silent on the
+   semantics.*** /Read 2026-08-23 at pinned commit =fe83fdd=,
+   =spec/core/annexes/extension_metadata.adoc=./ The column description is
+   "Timestamp value in ISO 8601 format as defined by the strftime function
+   =%Y-%m-%dT%H:%M:%fZ= format string applied to the current time", and
+   **Requirement 100** is the only SHALL that reaches it: /"Every
+   =gpkg_metadata_reference= table row timestamp column value SHALL be in a
+   DATETIME format as per r5."/ Requirement 5 is about *data types*. The
+   abstract test suite agrees -- test case
+   =/extensions/metadata/metadata_reference/timestamp= reads /"Fail if format
+   of returned value does not match"/.
+
+   So there is no requirement that the value denote a particular event, none
+   to update it when anything changes, and none to preserve it. **Both
+   behaviours produce conformant files**, and the column being =NOT NULL= with
+   a DEFAULT means an =INSERT= supplying a value is entirely regular.
+
+   *The contrast inside the same standard is the useful part.*
+   =gpkg_contents.last_change= is described as **"timestamp of last change to
+   content"** -- explicit semantics -- and carries an identically shaped,
+   format-only SHALL. The standard gave one of its two DATETIME columns a
+   meaning and did not give the other one. /That is an argument from silence
+   and should be weighted as one/, but it cuts toward preservation: GDAL's
+   rewrite treats =timestamp= as though it were a =last_change=, which is
+   precisely the definition the standard declined to write.
+
+   **Keep the destination's stamp on a dedup.** The record existed and the
+   append did not create it -- and the standard leaves the choice open rather
+   than making it for us.
 
 **** The contract, table by table
 | table | two rows are the same record when | on a conflict |
@@ -358,7 +416,7 @@ the database. What follows is that statement.
 | =gpkg_data_column_constraints= | *depends on =constraint_type=* -- see below | differing =min=/=max=/inclusive flags/=description= -> *refuse* (§ 5) |
 | =gpkg_contents= | =table_name= matches | differing =data_type= -> *refuse*; the rest follows the layer merge |
 | =gpkg_geometry_columns= | =(table_name, column_name)= match | follows its layer; it is not merged independently |
-| a tile table | =(zoom_level, tile_column, tile_row)= match -- *=id= excluded* | differing =tile_data= -> **D4, open** |
+| a tile table | =(zoom_level, tile_column, tile_row)= match -- *=id= excluded*; see the note below | differing =tile_data= -> **D4, open** |
 | a user table | *no general answer* | **D5, open** |
 
 ***=gpkg_data_column_constraints= is the one whose identity is type-dependent***,
@@ -374,6 +432,28 @@ workaround for it:
 =value= because it must cover =enum=, where the value is the row's whole point;
 a =range= row has none, so the index cannot separate two of them and identity
 must not try to.
+
+***A tile table's identity is normative; its index is not.*** /Read 2026-08-23,
+=spec/core/2b_tiles.adoc= at =fe83fdd=./ **Requirement 54** says every tile
+pyramid user data table /"SHALL be structured consistently with"/ the table
+definition and the example SQL, and that definition marks =zoom_level=,
+=tile_column= and =tile_row= as **UK** -- so =(z, x, y)= is the declared unique
+key, and the contract row above rests on the standard rather than on GDAL's
+practice. The =id= is required to be an INTEGER primary key acting as a rowid
+alias, which is exactly why § 6 rule 1 excludes it from identity.
+
+*But the enforcement is explicitly not required*, and this is a WARNING in the
+standard's own words: /"Though this standard does not technically mandate the
+use of an indexing mechanism in a tiles table, the lack of such an index, e.g.,
+a =UNIQUE= clause as in the example, is likely to significantly degrade the
+performance of queries."/ The example SQL carrying the =UNIQUE= is labelled
+**Informative**.
+
+Two consequences, both concrete. A conformant tile table **may have no index at
+all**, so nothing here may *require* one -- which also means D2's
+index-building obligation is conditional on the source having declared one.
+And the dedup may not lean on the index even when it is there, which is the
+same conclusion § 3 reached for the registry tables by a different route.
 
 **** What is not merged at all, because it is derived
 Stated here so that "merge every table" is not read into the contract:
@@ -505,6 +585,18 @@ ordinary path is the specific one: appending a *different* raster layer creates
 a *differently named* tile table, which collides with nothing. Reaching this
 case means two pyramids that were built separately and given the same name,
 which is a genuine ambiguity rather than an ordinary append.
+
+*The standard strengthens this without deciding it.* Requirement 54 makes
+=(zoom_level, tile_column, tile_row)= the table's declared unique key (§ 6),
+so keeping both rows would emit a table inconsistent with its own definition --
+which removes "hold both" from the candidates and leaves refuse, source wins
+and destination wins. Choosing among *those three* is still ours: per § WHAT
+THE STANDARD CAN AND CANNOT SETTLE HERE, the text has nothing to say about what
+a merge should do.
+
+/A second-order note for whoever implements the refusal: a conformant tile
+table may carry no =UNIQUE= index at all, so the collision has to be detected
+by comparing rows rather than by an insert failing./
 
 /Not decided here: whether the refusal names the first colliding tile or counts
 them. Naming one is more useful and cheaper./

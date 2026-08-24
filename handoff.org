@@ -1248,6 +1248,15 @@ whole job is that this does not happen. /Found while reading the normative text
 for an unrelated question -- the =gpkg_metadata_reference= timestamp, which the
 standard leaves undefined, and the contrast is what made this one visible./
 
+*The new payload is contained, measured against the parent commit:* over
+=gdal_hostile.gpkg=, =geojson=, =fgb=, =csv= and =wkt= output is byte-identical
+and so is stderr; only =gpkg= differs, which is the intended change. A
+=Gpkg=-tagged payload is invisible to other spokes because =payload_for= is
+format-tagged, and no warning path reads =fc.native=. **The risk that remains
+is the proxy one:** =is_empty()= is now always false for a foreign GeoPackage,
+so =native.is_some()= no longer means "this file has unusual content" -- one
+existing test used it that way and broke on this change.
+
 *Only the carry half shipped.* The rule is that the stamp follows whoever last
 changed the content and that is never geosetta, so a passthrough carries and a
 cross-format source -- having nothing to carry -- still gets the writer's epoch

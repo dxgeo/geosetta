@@ -345,6 +345,35 @@ from the source, so carrying them would be recording the absence of content:
   meaningful, and the alternative to carrying it is destroying it. /D3's "the
   common case costs nothing" is unharmed for *our own* output, which is what it
   was about./
+
+  ***The payload change is contained, and that was measured rather than
+  argued.*** Two release binaries -- this commit and its parent -- over
+  =gdal_hostile.gpkg=, writing to identical paths in separate directories so
+  that nothing differs by filename:
+
+  #+begin_src text
+    geojson  payload:SAME  stderr:SAME
+    gpkg     payload:DIFF  stderr:SAME   <- the intended change
+    fgb      payload:SAME  stderr:SAME
+    csv      payload:SAME  stderr:SAME
+    wkt      payload:SAME  stderr:SAME
+  #+end_src
+
+  So a native existing where none did before changes *nothing* outside the
+  GeoPackage write path -- no warning fires that did not fire, and no other
+  spoke's bytes move. The reason is structural rather than lucky:
+  =payload_for(Format::X)= is format-tagged, so a =Gpkg=-tagged payload is
+  invisible to every other spoke, and **no warning path reads =fc.native= at
+  all**. /Cost of the payload itself: one =Option<String>= per *layer*, holding
+  a 24-character timestamp. Not per feature./
+
+  ***The residual risk is worth naming because it has already bitten once.***
+  =is_empty()= is now effectively always false for a foreign GeoPackage, so any
+  code using =native.is_some()= as a proxy for /"this file has unusual
+  content"/ is now wrong for every =ogr2ogr= file.
+  =an_identifier_that_only_repeats_the_layer_name_is_not_carried= used exactly
+  that proxy and broke on this change -- loudly, which is the good case. The
+  next such proxy may not have a test behind it.
 - =description= is dropped when empty. =ogr2ogr= writes ='' = (not NULL), and
   so does this writer.
 

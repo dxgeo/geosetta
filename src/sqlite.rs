@@ -943,12 +943,18 @@ pub struct MasterEntry {
     ///
     /// `Some` makes this entry own a b-tree and get a real `rootpage`; `None`
     /// leaves it schema-only. Per decision D10 in
-    /// `plans/same-format-fidelity.org` this writer only ever *re-packs* an
-    /// order some other index already established. **It does not sort**, and
-    /// giving it unordered records produces a file SQLite will read as
-    /// corrupt rather than an error here — there is nothing at this layer that
-    /// could tell the difference, since ordering depends on a collation this
-    /// module deliberately knows nothing about.
+    /// `plans/same-format-fidelity.org` an entry reaching *this* field is
+    /// always a carried index, so what happens here is a *re-pack* of an order
+    /// some other index already established. **It does not sort**, and giving
+    /// it unordered records produces a file SQLite will read as corrupt rather
+    /// than an error here — there is nothing at this layer that could tell the
+    /// difference, since ordering depends on a collation this module
+    /// deliberately knows nothing about.
+    ///
+    /// *Do not read that as "this writer never sorts".* It does, in
+    /// [`autoindex_records`], for an index it builds itself and — under D2 in
+    /// `plans/container-reconciliation.org` — for one over a merged table.
+    /// Those arrive through [`TableSpec::autoindexes`], not through here.
     pub records: Option<Vec<Vec<u8>>>,
 }
 
@@ -1194,10 +1200,14 @@ impl Writer {
     }
 
     /// Build an **index** b-tree from records already in index order; returns
-    /// the root page. The read-side counterpart is
-    /// [`Database::read_index`], and D10 in `plans/same-format-fidelity.org`
-    /// is why only this direction exists: an index being carried is already
-    /// sorted, so nothing here compares two keys.
+    /// the root page. The read-side counterpart is [`Database::read_index`].
+    ///
+    /// **Nothing here compares two keys**, and that holds however the records
+    /// were ordered: a carried index arrives already sorted (D10 in
+    /// `plans/same-format-fidelity.org`), and a constructed one was sorted by
+    /// [`autoindex_records`] before it got here — including, under D2 in
+    /// `plans/container-reconciliation.org`, an index over a merged table.
+    /// The ordering question lives entirely on the other side of that call.
     ///
     /// The shape differs from [`Writer::build_btree`] in one way that matters:
     /// an index interior cell carries a *real record*, not just a key. So
@@ -1467,12 +1477,21 @@ fn write_interior(page: &mut [u8], header_offset: usize, group: &[(u32, i64)]) -
 /// points at, and the order is by key columns then rowid — so this both builds
 /// the records and sorts them.
 ///
-/// **This is the one place in this module that orders anything**, and D10 in
-/// `plans/same-format-fidelity.org` draws the boundary deliberately: an index
-/// being *carried* is re-packed in the order the source file already
-/// established, and only an index this writer *builds for its own tables* is
-/// constructed here. The distinction is what keeps [`compare_values`] small —
-/// see its note on collations.
+/// **This is the one place in this module that orders anything**, and the
+/// boundary around it is drawn deliberately by two decisions. D10 in
+/// `plans/same-format-fidelity.org`: an index being *carried* is re-packed in
+/// the order the source file already established, and never reaches this
+/// function. D2 in `plans/container-reconciliation.org`: an index over a
+/// *merged* table cannot be re-packed, because the merged rows are in neither
+/// source's order — so it is constructed here, alongside the indexes this
+/// writer builds for its own tables.
+///
+/// *D2 widened this function's scope and left its cost alone*, which is the
+/// part worth knowing before reaching for it: merging obliges construction,
+/// but not a richer comparison. A merge of a table whose index declares a
+/// collation [`compare_values`] does not implement is refused rather than
+/// built — see its note, and D2 for why that refusal stays off the ordinary
+/// path.
 pub fn autoindex_records(rows: &[(i64, Vec<Value>)], key_cols: &[usize]) -> Vec<Vec<u8>> {
     let mut keyed: Vec<(Vec<Value>, i64)> = rows
         .iter()
@@ -1510,10 +1529,24 @@ pub fn autoindex_records(rows: &[(i64, Vec<Value>)], key_cols: &[usize]) -> Vec<
 ///
 /// *No other collation is implemented, and that is a scoped decision rather
 /// than a gap.* `NOCASE` and `RTRIM` can only appear in DDL this crate did not
-/// write, and an index on such a table is **carried** rather than constructed
-/// (D10) — so it is re-packed in the order that file already had, and nothing
-/// here has to know how it was reached. The registry tables this writer builds
-/// declare no `COLLATE` clause anywhere in their specified DDL.
+/// write, and the registry tables this writer builds declare no `COLLATE`
+/// clause anywhere in their specified DDL.
+///
+/// **The scope holds under two rules now, not one.** D10 in
+/// `plans/same-format-fidelity.org` covers a *carried* index: it is re-packed
+/// in the order that file already had, so nothing here has to know how it was
+/// reached. D2 in `plans/container-reconciliation.org` covers a *merged*
+/// one — whose rows are in neither source's order, so its index must be
+/// constructed rather than re-packed — and rules that a merge of a table
+/// whose index declares a collation this function does not implement is
+/// **refused**, not guessed at. So a value this function cannot order
+/// correctly never reaches it either way.
+///
+/// *Measured before D2 was taken:* across six GDAL-produced GeoPackages and
+/// `tests/fixtures/spec_conformant.gpkg`, every index is an autoindex on
+/// `BINARY` ascending key columns. The only `NOCASE` in the tree is in
+/// `sqlite_constraints.gpkg`, which is hand-built to be hostile, and it is
+/// that refusal's fixture rather than a case on the ordinary path.
 fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
 

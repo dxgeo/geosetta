@@ -64,6 +64,19 @@ check it off and remove it once the item ships or is shelved.
   One requirement is due regardless of the merge question: carried content
   referencing an =srs_id= points into the source's numbering, which
   =resolve_srs= renumbers. Scoping only.
+
+  /2026-08-23:/ **D2 is decided -- merge, and build the index** -- on § THE
+  MEASUREMENT rather than on the argument that was on file, and *both* options
+  moved when =ogr2ogr= was actually asked. Refusing a merge for indexed tables
+  is out: **every** table that would need merging carries an index, so it would
+  fire on every ordinary append. Building is in, and costs less than feared: no
+  producer emits a non-=BINARY= index, so the collation machinery stays out of
+  scope and § 5's refusal covers what does not fit. The same run overturned the
+  plan's own § 3 -- ***=ge_tce= does not make a set either***, and three of the
+  four registry keys have a nullable column, so merging two *plain* =ogr2ogr=
+  files deduped nothing at all while =integrity_check= reported =ok=. What is
+  left is ordinary work plus one piece of paper: the "same row" contract, now
+  load-bearing for three tables rather than one.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

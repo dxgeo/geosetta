@@ -1161,16 +1161,30 @@ which needs no file-format work at all.
 =handoff.org= § OPEN QUESTIONS by splitting it: that question named one thing
 and meant two./
 
-***This decision is under a standing challenge -- read
-[[file:container-reconciliation.org][container-reconciliation.org]] § 4 before
-relying on it.*** /Added 2026-08-23, the same day it was taken./ Everything
-below rests on one fact: *an index on disk is already sorted*, so it can be
-re-packed without ever comparing two keys. **That fact does not survive a
-merge.** Combine two containers' rows for one table and the result is in
-neither source's order, so the index has to be *built* rather than re-packed --
-needing exactly the comparison-and-collation machinery this decision was taken
-to avoid. Whether that machinery gets built, or a merge is instead refused for
-any table owning an index, is D2 of that plan and is *open*.
+***This decision holds for carrying and is superseded for merging -- read
+[[file:container-reconciliation.org][container-reconciliation.org]] § 4 and D2
+before relying on it.*** /Added 2026-08-23, the same day it was taken;
+resolved the same day./ Everything below rests on one fact: *an index on disk
+is already sorted*, so it can be re-packed without ever comparing two keys.
+**That fact does not survive a merge.** Combine two containers' rows for one
+table and the result is in neither source's order, so the index has to be
+*built* rather than re-packed.
+
+*The challenge was answered by measurement, and it cut both ways.* That plan's
+D2 is now **decided: build**. Two things it found, neither visible from here:
+**every** table that would need merging carries an index, so refusing on one is
+not the bounded escape it read as -- and *no real producer emits an index this
+crate would struggle to build*, because across six GDAL files and
+=spec_conformant.gpkg= every index is an autoindex on =BINARY= ascending key
+columns.
+
+**So the sentence below that says "no comparison semantics, no collation logic"
+splits.** No *collation* logic: that stays out of scope, and a merge of a table
+whose index declares one this crate does not implement is refused. Comparison
+semantics: the type ordering plus =BINARY= is *in* scope for merging -- which
+is the same capability defect 6 already obliged for the registry tables this
+crate builds itself, so it extends shipped work rather than opening an axis.
+**Carrying is unchanged: re-pack, and construct nothing.**
 
 **The R*Tree.** The cost argument recorded for carrying -- that building needs
 SQLite's comparison semantics and its collations -- *does not apply to it at
@@ -1694,6 +1708,17 @@ travels with D1's =name= modelling.
   [[file:container-reconciliation.org][container-reconciliation.org]] rather
   than decided here, because one of its six requirements is a decision reversal
   and the rest is a layer that does not exist.
+
+  /Measured the same day, and its D2 is now decided: **merge, and build the
+  index**./ Two findings from that plan reach back into this milestone. The
+  reversal is real -- every table that would need merging carries an index, so
+  construction cannot be dodged -- but it is *bounded*: no producer emits a
+  non-=BINARY= index, so the collation machinery stays out and § 5's refusal
+  covers what does not fit. **And the trap is wider than that plan first
+  recorded:** three of the four registry =UNIQUE= keys have a nullable column,
+  =ge_tce= included, so *nothing* M3b carries can be deduped by leaning on the
+  key. What that costs M3b directly is a written "same row" contract, which is
+  paper this milestone does not otherwise need.
 
   *One of them is M3b's regardless:* carried content that references an
   =srs_id= -- a tile pyramid's =gpkg_contents= and =gpkg_tile_matrix_set= rows

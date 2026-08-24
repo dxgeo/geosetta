@@ -10,6 +10,12 @@ on 2026-08-23, when scoping the carrying channel turned up a question M3b had
 never asked: what happens to container content when the destination already
 has some./
 
+*D2 is closed, the same day, by measurement rather than argument -- see
+§ THE MEASUREMENT.* The answer is **merge**, and the measurement overturned one
+thing this plan had recorded as settled: =ge_tce= does not make a set either,
+so § 3's trap is a property of the registry keys generally and not a
+=gdcc_ntv= peculiarity.
+
 *Blocks M3b's completion.* M3b can carry a source container into a *fresh*
 destination without any of this; it cannot claim to carry a container in
 general until this is settled, because the append path is a documented feature
@@ -67,6 +73,116 @@ one**. Any two =ogr2ogr=-produced GeoPackages both hold =gpkg_metadata=,
 *set of records*; two files' worth is two files' worth. The honest operation is
 a **merge**, and the rest of this plan is what a merge actually costs.
 
+** THE MEASUREMENT -- =ogr2ogr=, 2026-08-23, and it settles D2
+/Run because D2 said not to decide it from the armchair. Six GeoPackages built
+by GDAL 3.13.2 -- plain, metadata-bearing, tiled, field-domain-bearing, and one
+produced by =ogr2ogr -update -append= -- read back with =sqlite3= 3.51.0, with
+=spec_conformant.gpkg= standing in for the standard's side./
+
+*** Every table that would need merging carries an index
+| table | indexes | kind |
+|-------+---------+------|
+| =gpkg_extensions= | 1 | autoindex =ge_tce= |
+| =gpkg_data_columns= | 2 | autoindex =pk_gdc=, =gdc_tn= |
+| =gpkg_data_column_constraints= | 1 | autoindex =gdcc_ntv= |
+| =gpkg_contents= | 2 | autoindex |
+| =gpkg_geometry_columns= | 2 | autoindex |
+| a tile table | 1 | autoindex, =UNIQUE (zoom_level, tile_column, tile_row)= |
+| =gpkg_metadata= | *0* | =id INTEGER PRIMARY KEY= -- a rowid alias |
+| =gpkg_metadata_reference= | *0* | foreign keys only, no =UNIQUE= |
+| a user feature table | *0* | =fid INTEGER PRIMARY KEY AUTOINCREMENT= |
+
+***So "refuse the merge for any indexed table" is dead.*** § THE SEQUENCING
+offered it as the bounded, honest option on the reasoning that it "fires only
+on a merge of an /indexed/ table -- which the registry tables mostly are not."
+**They mostly are.** The fallback would refuse every ordinary append, which is
+exactly the noise bar =same-format-fidelity.org= § THE RULE forbids.
+
+*The two tables needing AUTOINCREMENT renumbering carry no index at all*, so
+§§ 2 and 4 are disjoint work rather than compounding.
+
+*** But the rebuild is far smaller than § 4 feared
+Across all six GDAL files and the spec fixture: **zero explicit indexes, zero
+non-=BINARY= collations, zero =DESC= key columns.** Every index is an
+autoindex; every key column is =BINARY= ascending, read from
+=pragma_index_xinfo=.
+
+The only =CREATE INDEX= and the only =NOCASE= in this entire tree are in
+=sqlite_constraints.gpkg=, which is *hand-built* to be hostile -- so the case
+§ 4 cites as pinned is pinned by a fixture no producer would emit. The
+=NOCASE=/=RTRIM= machinery D10 scoped out **is not needed for anything a real
+producer writes**; building these indexes needs the type ordering (NULL <
+INT/REAL < TEXT < BLOB) and =memcmp=.
+
+*Sizing, since it is the other half of the cost:* every mergeable registry
+table measured in single digits -- =gpkg_extensions= 2--4 rows,
+=gpkg_data_column_constraints= 4. The one that grows is the tile table (64 rows
+for a 2048² source, scaling with area), and its key is *three integers*, so it
+needs no text comparison at all.
+
+*** =ogr2ogr='s own append is the merge this plan describes
+=ogr2ogr -update -append= into an existing =.gpkg= is the reference
+implementation answering § WHAT FULL CORRECTNESS REQUIRES in its own output:
+
+#+begin_src text
+  gpkg_extensions           3 -> 4   the two NULL-column_name rows appear ONCE
+  gpkg_metadata             1 -> 2   renumbered, not collided
+  gpkg_metadata_reference   md_file_id rewritten: roads -> 1, rivers -> 2
+  integrity_check ok, foreign_key_check clean
+#+end_src
+
+It merges, it renumbers, and it rewrites the foreign keys pointing at the
+renumbered ids. *That is evidence for merging over refusing*, and it is the
+right kind of evidence: § THE ORACLE RULE's first row -- what a real producer
+emits.
+
+*** ***=ge_tce= does not make a set either, and it fails on the ordinary path***
+§ 3 filed the NULL trap as a =gdcc_ntv= peculiarity and listed =ge_tce= among
+the keys that work. Measured, *three of the four =UNIQUE= keys on mergeable
+registry tables have a nullable key column*, and SQLite treats NULLs as
+distinct under =UNIQUE=:
+
+| key | nullable member | makes a set? |
+|-----+-----------------+--------------|
+| =ge_tce= | =table_name= *and* =column_name= | *no* |
+| =gdcc_ntv= | =value= | *no* |
+| =gdc_tn= | =name= | *no* |
+| =pk_gdc= | -- | yes |
+
+**And every table-scoped extension registration has =column_name= NULL.**
+=INSERT OR IGNORE=-ing one plain =ogr2ogr= file's =gpkg_extensions= into
+another's deduped *nothing*: 3 + 3 -> 6, the =gpkg_metadata= and
+=gpkg_metadata_reference= registration rows doubled, =integrity_check=
+reporting =ok=.
+
+That is this plan's own archetype -- "any two =ogr2ogr= GeoPackages both hold
+=gpkg_metadata=" -- breaking on the most ordinary input there is. *GDAL gets it
+right because it checks before inserting. It cannot be leaning on the index,
+because the index does not hold.*
+
+/=gdcc_ntv= reproduced on real GDAL output too, and with a refinement:/ a
+self-merge of a field-domain file went 4 rows -> 5, duplicating the
+=price_range= row. The neighbouring =_zoning_dom_domain_description= row
+deduped correctly -- its =value= is the empty *string*, not NULL. So the trap
+is =constraint_type = 'range'= specifically, not "constraints with no value".
+
+***The consequence lands on § 6, not § 3.*** The written "same row" contract is
+load-bearing for *three* tables rather than one, and getting the key right
+substitutes for none of it: the database will not dedupe on any of them.
+
+*** One difference in =gpkg_metadata='s DDL, which bears on § 2
+GDAL writes =id INTEGER CONSTRAINT m_pk PRIMARY KEY ASC NOT NULL=; the pinned
+normative text =build_spec_fixtures.sh= transcribes says =id INTEGER PRIMARY
+KEY AUTOINCREMENT=. Both are rowid aliases, so neither carries an index, and
+the ids collide from 1 either way -- § 2's renumbering is needed against both.
+
+What differs is the bookkeeping: **a GDAL-written =gpkg_metadata= has no
+=sqlite_sequence= row to recompute**, having never declared AUTOINCREMENT. A
+spec-conformant file, or one this crate wrote, does. /Whether GDAL is deviating
+or tracking an older revision of the annex is unchecked, and the obligation is
+the same either way./ *Not added to defect 6's tally of four deviations:*
+=gpkg_metadata= is not one of the six tables this crate emits.
+
 ** WHAT FULL CORRECTNESS REQUIRES
 The target: *the output is what SQLite would have produced had it opened the
 destination and inserted the source's content.* Six things stand between M3b
@@ -91,8 +207,11 @@ carrying trips it on the first fixture. It is filed here because it is the same
 it here first is cheaper than solving it twice.
 
 *** 2. Identity reconciliation for =AUTOINCREMENT= tables
-=gpkg_metadata.id= is =INTEGER PRIMARY KEY AUTOINCREMENT=, so both files number
-from 1 and their ids collide. A merge means:
+=gpkg_metadata.id= is =INTEGER PRIMARY KEY AUTOINCREMENT= in the standard's
+DDL, so both files number from 1 and their ids collide. /Measured: GDAL's own
+=gpkg_metadata= omits the AUTOINCREMENT, so it has no =sqlite_sequence= row to
+recompute -- the ids still collide and the renumbering is still needed. See
+§ THE MEASUREMENT./ A merge means:
 - renumbering one side's =id=s,
 - rewriting every =md_file_id= and =md_parent_id= in
   =gpkg_metadata_reference= (its =crmr_mfi_fk= / =crmr_mpi_fk= references), and
@@ -106,20 +225,35 @@ Both behaviours are needed, and which applies is decided here.
 Each table needs its own notion of row identity -- its =UNIQUE= key where it
 has one, and nothing to appeal to where it does not.
 
-| table | key |
-|-------+-----|
-| =gpkg_extensions= | =ge_tce= -- =(table_name, column_name, extension_name)= |
-| =gpkg_data_column_constraints= | =gdcc_ntv= -- and see the trap below |
-| =gpkg_data_columns= | =pk_gdc= / =gdc_tn= |
-| a user table | *none in general* -- see § 5 |
+| table | key | makes a set? |
+|-------+-----+--------------|
+| =gpkg_extensions= | =ge_tce= -- =(table_name, column_name, extension_name)= | *no* -- both name columns nullable |
+| =gpkg_data_column_constraints= | =gdcc_ntv= | *no* -- =value= nullable |
+| =gpkg_data_columns= | =pk_gdc= -- =(table_name, column_name)= | *yes*, and it is the only one |
+| =gpkg_data_columns= | =gdc_tn= -- =(table_name, name)= | *no* -- =name= nullable |
+| a user table | *none in general* | -- see § 5 |
 
-***The trap, and it is measured:*** =gdcc_ntv= **does not make a set**. A
-=range= constraint has =value= NULL by definition, and SQLite treats NULLs as
-distinct under =UNIQUE=, so two identical range rows both survive. /Found by
-accident 2026-08-23 -- an =INSERT INTO ... SELECT * FROM ... LIMIT 1= against a
-real file duplicated a =price_range= row and the index accepted it./ Anything
-deduping on that key is wrong. =gpkg_range_constraints.gpkg= in
-=tests/fixtures/PLANNED.org= exists to pin it.
+***The trap, and it is not one table's peculiarity:*** SQLite treats NULLs as
+distinct under =UNIQUE=, so *any* registry key with a nullable member fails to
+dedupe -- and **three of the four do**. The measurement is in § THE
+MEASUREMENT; the short form is that =INSERT OR IGNORE= merging two plain
+=ogr2ogr= files' =gpkg_extensions= deduped nothing at all, and
+=integrity_check= called the result =ok=.
+
+/This entry originally read "=gdcc_ntv= does not make a set", found by accident
+on 2026-08-23 when an =INSERT INTO ... SELECT * FROM ... LIMIT 1= against a
+real file duplicated a =price_range= row. That was true and too narrow: the
+accident happened to land on the table whose NULL is easiest to explain, and
+the entry generalised it to the wrong scope -- a =range= constraint's missing
+=value= -- rather than to the right one, which is the key's nullability./
+
+**So the dedup cannot be delegated to the =UNIQUE= key on any table but
+=gpkg_data_columns=.** It has to compare the columns the § 6 contract names,
+treating NULL as a value that equals itself -- which is what =ogr2ogr= does,
+and the reason its append gets the right answer.
+=gpkg_range_constraints.gpkg= in =tests/fixtures/PLANNED.org= pins the
+=gdcc_ntv= half; the =ge_tce= half needs no new fixture, because *any two
+=ogr2ogr= outputs* exhibit it.
 
 *** 4. Index rebuild -- ***this reopens D10***
 [[file:same-format-fidelity.org][same-format-fidelity.org]] D10 says a carried
@@ -137,6 +271,16 @@ scoped out, and =sqlite_constraints.gpkg= already carries a
 **So this is not an increment on M3b's carrying work. It reopens the decision
 that work is built on**, and it should be reopened deliberately rather than as
 a side effect of picking a collision rule.
+
+***Measured 2026-08-23, and the cost is a fraction of the paragraph above.***
+D10 is genuinely reopened -- every mergeable table carries an index, so there
+is no version of this that avoids construction. But *no real producer emits an
+index this crate would struggle to build*: across six GDAL files and the spec
+fixture, every index is an autoindex on =BINARY= ascending key columns. The
+collations are the expensive half of the sentence above and **nothing needs
+them**. =sqlite_constraints.gpkg='s =COLLATE NOCASE= is hand-built, and it
+remains the right fixture for § 5's refusal rather than for the general path.
+See § THE MEASUREMENT.
 
 *** 5. Refusal where a merge is undecidable
 Some collisions have no correct answer and must be *reported*, not resolved:
@@ -165,14 +309,24 @@ implemented until it exists.
   5. index construction           -> REOPENS D10; needs collation semantics
 #+end_src
 
-Steps 1--4 are ordinary work. **Step 5 is a decision before it is a task**, and
-it is the one to be honest about: a merged table cannot keep a carried index,
-so either this crate gains collation-aware comparison, or a merge is refused
-for any table that owns an index it cannot rebuild.
+Steps 1--4 are ordinary work. **Step 5 was a decision before it was a task**,
+and D2 has now taken it: *build*. /The paragraphs below are the argument as it
+stood before the measurement, kept because what it got wrong is the useful
+part./
+
+Step 5 is the one to be honest about: a merged table cannot keep a carried
+index, so either this crate gains collation-aware comparison, or a merge is
+refused for any table that owns an index it cannot rebuild.
 
 /That second option deserves a fair hearing rather than being treated as a
 fallback./ It is bounded, it is honest, and it fires only on a merge of an
 *indexed* table -- which the registry tables mostly are not.
+
+***The registry tables mostly are.*** That last clause was the load-bearing one
+and it was never checked; § THE MEASUREMENT checked it. Refusing would fire on
+every ordinary append. And the fear on the other side was overstated in the
+same measurement -- no producer emits a non-=BINARY= index, so "collation-aware
+comparison" is not what step 5 costs.
 
 ** DECISIONS
 *** D1 -- this is a blocker for M3b, not a follow-on
@@ -193,11 +347,39 @@ still be there, so it would not be a *silent* loss -- but "we warn about it"
 is the state defect 3 has been in since 2026-08-21, and M3b exists to end that,
 not to relocate it.
 
-*** D2 -- OPEN: merge, or refuse the merge for indexed tables?
-The § 4 fork. **Do not decide this from the armchair**: it turns on how often a
-real GeoPackage carries an index on a table that would need merging, which is
-measurable and has not been measured. Per =plans/README.org= § Sourcing a
-fixture from a real tool, ask =ogr2ogr= and a real dataset before choosing.
+*** D2 -- **MERGE.** Build the index; do not refuse.
+/Decided 2026-08-23 by the project owner, on the measurement in § THE
+MEASUREMENT rather than on the argument that was on file. The entry as it stood
+is kept below, because the instruction it carried is the reason the decision is
+sound./
+
+/The entry, unchanged:/ The § 4 fork. **Do not decide this from the armchair**:
+it turns on how often a real GeoPackage carries an index on a table that would
+need merging, which is measurable and has not been measured. Per
+=plans/README.org= § Sourcing a fixture from a real tool, ask =ogr2ogr= and a
+real dataset before choosing.
+
+*It was asked, and both sides of the fork moved.* Refusing turned out to fire
+on the ordinary path -- **every** table that would need merging carries an
+index, so the refusal is not the bounded thing it read as. Building turned out
+to cost far less than § 4 states, because no real producer emits an index this
+crate cannot build: every index in every measured file is an autoindex on
+=BINARY= ascending key columns, and the collation machinery is unneeded.
+
+*So the option that read as safe was the noisy one, and the option that read as
+expensive was cheap.* That is the whole content of the decision, and neither
+half was visible without running the command.
+
+**What D2 obliges, precisely:** index *construction* over the type ordering
+(NULL < INT/REAL < TEXT < BLOB) and =BINARY= comparison -- which is the same
+capability defect 6 already needed for the registry tables this crate builds
+itself, so it is an extension of shipped work rather than a new axis.
+=NOCASE=/=RTRIM= are **out of scope** and belong to § 5's refusal: a merge of a
+table whose index declares a collation this crate does not implement is
+reported, not guessed at. =sqlite_constraints.gpkg= is that refusal's fixture.
+
+/What is *not* settled by this: whether =DESC= key columns or a partial index
+(=CREATE INDEX ... WHERE=) can occur. Neither appeared in any measured file./
 
 *** D3 -- OPEN: is =srs_id= reconciliation this plan's or M3b's?
 It is needed by M3b regardless (§ 1), so it may simply belong there. Filed here
@@ -210,7 +392,11 @@ because it is the same kind of problem and the two solutions would share code.
 - =srs_id= rewriting for carried content, if D3 lands it here.
 - A fixture pair: two GeoPackages that collide on =gpkg_metadata=,
   =gpkg_extensions= and a user table, built by =ogr2ogr= so the collision is
-  the one that really occurs.
+  the one that really occurs. /Built and thrown away during § THE MEASUREMENT
+  -- two plain =ogr2ogr= files over different layer names collide on all three
+  registry tables with no coaxing, and a third produced by =ogr2ogr -update
+  -append= is the oracle for what the merged result should be. That third file
+  is the one worth keeping: it is the expected output, not just an input./
 
 *** Out
 - *The carrying channel itself.* [[file:same-format-fidelity.org][same-format-fidelity.org]]
@@ -224,7 +410,8 @@ because it is the same kind of problem and the two solutions would share code.
 ** DEPENDS ON / RELATED
 - [[file:same-format-fidelity.org][same-format-fidelity.org]] :: M3b, which this
   blocks; D8 (tiles are carried), D10 (an index's fate follows its table's
-  content class -- reopened by § 4), and the three content classes the merge
+  content class -- reopened by § 4 and resolved by D2: carried indexes are
+  re-packed, merged ones are built), and the three content classes the merge
   rules have to respect.
 - [[file:same-format-output.org][same-format-output.org]] :: D4's same-file
   refusal, which removed the one configuration where "which container wins"

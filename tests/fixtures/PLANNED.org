@@ -66,6 +66,23 @@ test *carrying*, which has to move real BLOB payloads across the rewrite.
 from the tiles DDL. /Prefer GDAL here/ -- unlike the registry DDL above, the
 tile *data* is exactly the case where a real producer's output is what occurs.
 
+/Measured 2026-08-23 while running =container-reconciliation.org= D2, so the
+shape is known before anyone builds it:/ =gdal_translate -of GPKG -co
+TILING_SCHEME=GoogleMapsCompatible= over a 2048² 3-band source yields **64
+tiles**, and the table is
+
+#+begin_src text
+  CREATE TABLE "imagery" (id INTEGER PRIMARY KEY AUTOINCREMENT, zoom_level INTEGER NOT NULL,
+    tile_column INTEGER NOT NULL, tile_row INTEGER NOT NULL, tile_data BLOB NOT NULL,
+    UNIQUE (zoom_level, tile_column, tile_row))
+#+end_src
+
+So a tile table is the *only* mergeable table that both declares AUTOINCREMENT
+and owns an index -- and its index key is three integers, needing no collation.
+*Use a burned raster, not =gdal_create= alone:* an all-nodata source produced a
+=gpkg= with the full DDL and **zero** tile rows, because GDAL skips blank
+tiles, and a fixture built that way would exercise nothing.
+
 ** =gpkg_range_constraints.gpkg=
 Two =gpkg_data_column_constraints= rows of =constraint_type = 'range'=, which
 both have =value= NULL by definition -- =value= is for =enum= and =glob=.
@@ -77,6 +94,23 @@ UNIQUE. /Measured 2026-08-23, by accident:/ an
 =INSERT INTO ... SELECT * FROM ... LIMIT 1= against a real file duplicated a
 =price_range= row and the UNIQUE index accepted it. Anything that dedupes on
 that key, or assumes the index makes a set, is wrong.
+
+***And the same day, deliberately: this is not one table's peculiarity.***
+Three of the four =UNIQUE= keys on the mergeable registry tables have a
+nullable member -- =ge_tce= (=table_name= *and* =column_name=), =gdcc_ntv=
+(=value=), =gdc_tn= (=name=) -- and only =pk_gdc= makes a set. **=ge_tce= is
+the one that matters**, because every *table-scoped* extension registration has
+=column_name= NULL, so it fails on files nobody had to construct: merging two
+plain =ogr2ogr= outputs deduped nothing, 3 + 3 -> 6, =integrity_check= =ok=.
+/That half needs no fixture -- any two =ogr2ogr= files exhibit it -- which is
+why this one is still worth building: the =range= half is the case a real tool
+will not hand you./
+
+*A refinement worth keeping, or the fixture will be built wrong:* the trap is
+=constraint_type = 'range'= specifically. A neighbouring
+=_<domain>_domain_description= row that GDAL writes has =value= = the empty
+*string*, not NULL, and dedupes correctly. Build the fixture with a real NULL,
+not =''=.
 
 ** =sqlite_pagesize.gpkg= and =sqlite_reserved.gpkg=
 The last two =sqlite.rs= gaps, neither of which any fixture reaches: a page

@@ -115,7 +115,13 @@ In this order. The first two are the load-bearing ones:
    =.gpkg= already has some. **Read it before finishing M3b**, which it gates:
    M3b can carry a source container into a fresh file without any of it, and
    cannot claim to carry a container in general until it is settled. Its § 1 is
-   due regardless of the rest.
+   due regardless of the rest. *Its D2 was decided the same day it was filed,
+   on § THE MEASUREMENT* -- **merge, and build the index** -- and that section
+   is the one to read first, because both options moved when the command was
+   run: refusing turned out to fire on every ordinary append, and building
+   turned out not to need the collation machinery it was feared for. It also
+   overturned an entry in the plan's own § 3: =ge_tce= does not make a set
+   either, so three of the four registry keys cannot be leaned on to dedupe.
 7. =same-format-fidelity.org= § THE ORACLE RULE -- one page, and it is the
    thing this project got wrong most recently: *=ogr2ogr= is evidence of what a
    producer emits and what a consumer accepts, never of what the standard
@@ -158,7 +164,8 @@ time. *Not started.*
       GeoPackage                                  [DONE]
       csv / wkt / kml / shp                       [not started]
             |
-  container-reconciliation.org  [NEW 2026-08-23 -- gates M3b's close]
+  container-reconciliation.org  [NEW 2026-08-23 -- gates M3b's close;
+                                 D2 decided the same day: merge + build]
             |
   M3b GeoPackage container   M3c KMZ container
             |
@@ -1473,6 +1480,25 @@ geosetta tests/fixtures/gdal_hostile.gpkg - --to geojson --layer cities
 geosetta tests/fixtures/hand_hostile.csv - --to fgb | geosetta - - --from fgb --to csv
 #+end_src
 
+*The D2 measurement (2026-08-23) needs files that are not in the tree*, because
+it is about what a *producer* emits rather than about a fixture. It rebuilds in
+four commands, and the last one is the oracle:
+
+#+begin_src sh
+  ogr2ogr -f GPKG a.gpkg roads.geojson   -nln roads
+  ogr2ogr -f GPKG b.gpkg rivers.geojson  -nln rivers
+  # every index in either file, with the collation of its first key column
+  sqlite3 a.gpkg "SELECT tbl_name, name, sql IS NULL AS autoindex FROM sqlite_master WHERE type='index';"
+  sqlite3 a.gpkg "SELECT name, coll, desc FROM pragma_index_xinfo('sqlite_autoindex_gpkg_extensions_1') WHERE key=1;"
+  # the naive set-union, which dedupes nothing: 3 + 3 -> 6
+  cp a.gpkg m.gpkg && sqlite3 m.gpkg "ATTACH 'b.gpkg' AS s; INSERT OR IGNORE INTO gpkg_extensions SELECT * FROM s.gpkg_extensions; SELECT count(*) FROM gpkg_extensions;"
+  # what the answer should have been: 4, renumbered, foreign keys rewritten
+  cp a.gpkg o.gpkg && ogr2ogr -f GPKG -update -append o.gpkg rivers.geojson -nln rivers
+#+end_src
+
+/The =pragma_index_xinfo= line is the one to keep: it is the only way to read an
+autoindex's collation, since an autoindex has no =sql= text to grep./
+
 Two traps that already cost time once each:
 - *Do not write fixtures through a shell heredoc.* It silently mangled
   =København= to =Ke\xe2\x88\x9a\xe2\x88\x8f...=. Write with explicit encoding
@@ -1529,12 +1555,28 @@ Not blockers, but they will come up:
   call turns on whether defect 3's destruction or *composability* is the
   priority, because per § THE EDIT LOOP no format has a lossless edit loop
   until the deletion lands.
-- *Does M3b carry an index, or rebuild it?* /Added 2026-08-22./ Carrying is far
-  cheaper than it looks -- an index b-tree on disk is *already sorted*, so an
-  in-order read re-packs without any comparison or collation logic, which is
-  the expensive part of building one. But § THE EDIT LOOP says a carried index
-  is *wrong* rather than stale once a middle stage has touched the geometry.
-  The two pull opposite ways and the plan's M3b entry records both.
+- ~~*Does M3b carry an index, or rebuild it?*~~ **CLOSED 2026-08-23**, in two
+  steps, and the question named more than two things. /Added 2026-08-22:/
+  Carrying is far cheaper than it looks -- an index b-tree on disk is *already
+  sorted*, so an in-order read re-packs without any comparison or collation
+  logic, which is the expensive part of building one. But § THE EDIT LOOP says
+  a carried index is *wrong* rather than stale once a middle stage has touched
+  the geometry. The two pull opposite ways and the plan's M3b entry records
+  both.
+
+  *=same-format-fidelity.org= D10 dissolved the fork* by splitting it: an
+  index's fate follows the *content class of the table it indexes*. An R*Tree
+  over a feature layer is derived -- always rebuilt, and =rtree::build= already
+  does it. An ordinary index over a table carried verbatim is carried verbatim.
+
+  *=container-reconciliation.org= D2 answered the third case D10 exposed* -- a
+  *merged* table, whose rows are in neither source's order and whose index
+  therefore cannot be re-packed at all. **Build it.** Both sides of that fork
+  moved once measured: refusing the merge fires on every ordinary append
+  (every table that would need merging carries an index), and building needs no
+  collation logic (no real producer emits a non-=BINARY= index). So the answer
+  is *all three*, by content class: rebuild derived, carry carried, build
+  merged.
 - *Is canonicalisation a loss?* =MULTIPOINT ((1 2))= → =MULTIPOINT (1 2)=,
   =linestring= → =LINESTRING=. Decides whether the CSV/WKT lexeme problem is
   two bugs or a whole class. (=native-inventory.org= § QUESTIONS, item 1.)

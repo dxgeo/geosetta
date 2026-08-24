@@ -1720,12 +1720,30 @@ travels with D1's =name= modelling.
   key. What that costs M3b directly is a written "same row" contract, which is
   paper this milestone does not otherwise need.
 
-  *One of them is M3b's regardless:* carried content that references an
-  =srs_id= -- a tile pyramid's =gpkg_contents= and =gpkg_tile_matrix_set= rows
-  -- points into the *source's* numbering, and =resolve_srs= renumbers, handing
-  out synthetic ids from 100000 *in layer order*. D8's tile carrying trips it
-  on the first fixture, and =gpkg_contents= declares =fk_gc_r_srs_id=, so
-  =foreign_key_check= catches it.
+  ***One of them is M3b's, and as of 2026-08-23 it is M3b's formally --
+  =srs_id= reconciliation, moved here by that plan's D3.*** Carried content
+  that references an =srs_id= -- a tile pyramid's =gpkg_contents= and
+  =gpkg_tile_matrix_set= rows -- points into the *source's* numbering, and
+  =resolve_srs= renumbers, handing out synthetic ids from
+  =SYNTHETIC_SRS_BASE= (100000) *in layer order*, so the ids are
+  **position-dependent**. Left alone that is a dangling reference; D8's tile
+  carrying trips it on the first fixture, and =gpkg_contents= declares
+  =fk_gc_r_srs_id=, so =foreign_key_check= catches it.
+
+  *What moved it was a contradiction rather than a preference.*
+  =container-reconciliation.org= gates M3b's *completion* on the grounds that
+  M3b can carry into a **fresh** destination without any of it. That is only
+  true if this requirement is not part of it -- =resolve_srs= renumbers on
+  every write, with no "existing destination" condition, so a pyramid carried
+  into a brand-new file dangles just as badly. The failure occurs where there
+  is *one* container and nothing to reconcile, which puts it here.
+
+  **So this is work M3b does first and that plan consumes.** The general case
+  is rewriting a carried =srs_id= reference into the space =resolve_srs= has
+  just built; a merge reuses that and adds nothing to it.
+  =gpkg_tiles.gpkg= in =tests/fixtures/PLANNED.org= is the fixture that trips
+  it, and =foreign_key_check= is the oracle that catches it -- neither needs
+  the merge layer to exist.
 
   *Finally, =container.rs= should invert.* =REPRODUCED= is a hand-maintained
   constant that must move whenever =writer::build= does, which its module doc
@@ -1916,9 +1934,57 @@ conformance to the published specification is the property the whole format
 layer is for, and a file that states a weaker schema than the spec defines is
 a file a user is right not to trust. It is *defect 6* in § THE DEFECTS, and it
 is gated on the index-writing work in D10./
-- *What should =gpkg_contents.last_change= hold on a =gpkg -> gpkg= run?*
-  /Raised 2026-08-23, while reading the normative text for
-  =container-reconciliation.org= § 6 rule 3./
+- ~~*What should =gpkg_contents.last_change= hold on a =gpkg -> gpkg= run?*~~
+  ***DECIDED 2026-08-23: carry it. Stamp only when there is nothing to
+  carry.*** /Raised and decided the same day it was raised./
+
+  **The rule, in one line: the stamp follows whoever last changed the content,
+  and that is never geosetta.**
+
+  #+begin_src text
+    geosetta in.gpkg out.gpkg               passthrough  -> carry the source's value
+    geosetta in.shp  out.gpkg               cross-format -> stamp: nothing to carry
+    geosetta in.gpkg - --to gpkg | tool | … middleman    -> carry what the tool left
+  #+end_src
+
+  ***What collapses the rule to three cases is an invariant this crate already
+  holds: geosetta never changes content.*** It does not reproject
+  (=src/main.rs= module doc, =src/crs.rs=, and
+  [[file:reproject-composability.org][reproject-composability.org]] -- a
+  reprojection tool composes with it through a pipe or the mutation seam, and
+  the transform happens *there*). So there is no "geosetta edited this" case to
+  stamp for, and the only reason it ever writes a fresh value is that a
+  cross-format source had none to give.
+
+  /An earlier draft of this decision carried a fourth row --
+  =geosetta in.gpkg out.gpkg --reproject= -- and it was wrong: that flag does
+  not exist and by design will not. =--crs= is the nearest thing and it is
+  *assign, not enrich*: it relabels a declared CRS without moving a
+  coordinate, so it is not a content change under this rule./
+
+  *So the classification is =independent=, not layer-coupled.* Carried
+  unconditionally on a same-format run -- which under a complete M3b *is* a
+  passthrough by construction, since that is what the rule in § THE RULE
+  promises. It wants a =GpkgNative= field beside =identifier= and
+  =description=, and nothing more.
+
+  **And the middleman case works because of D5**, which is the non-obvious
+  part: a native crosses the pipe when the transit format is the same format,
+  which per the transit corollary is the only shape in which a GeoPackage edit
+  loop is lossless anyway. So the tool's own stamp survives if it set one, and
+  its staleness stays visible if it did not. *Geosetta manufacturing a
+  timestamp there would launder the tool's omission rather than fix it* --
+  which is why no middleman-detection is attempted, and it could not be:
+  the second process has no baseline to diff against.
+
+  *The cost, which is real and unasserted:* stamping on the cross-format path
+  makes output non-reproducible across runs, which the fixed epoch buys today.
+  No test in the tree depends on it. /If both are wanted later, the standard
+  answer is a =SOURCE_DATE_EPOCH=-style pin, and that is a separate feature./
+
+  /The original text follows./
+
+  **** the entry as filed -- what should =gpkg_contents.last_change= hold?
 
   =src/geopackage/writer.rs= has =const LAST_CHANGE: &str =
   "1970-01-01T00:00:00.000Z"=, written for every layer on every run. It had no

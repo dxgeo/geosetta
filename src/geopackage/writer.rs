@@ -48,11 +48,25 @@ const SYNTHETIC_SRS_BASE: i64 = 100_000;
 /// gives it no semantics at all, only a format — which is argued in
 /// `plans/container-reconciliation.org` § 6 rule 3.
 ///
-/// **Open, and filed there rather than here:** a `gpkg -> gpkg` run overwrites
-/// the source's `last_change` with this constant, which under
-/// `plans/same-format-fidelity.org` is a content question rather than a
-/// formatting one. Whether that is a loss (carry it), a derived value (recompute
-/// it honestly), or correctly ignored has not been decided.
+/// **Decided, and this constant is the interim behaviour rather than the
+/// intended one.** A `gpkg -> gpkg` run overwrites the source's `last_change`
+/// with this constant, which is a *loss*: the rule is to **carry** the source's
+/// value, and to write a fresh stamp only when there is none to carry — a
+/// cross-format source. See `plans/same-format-fidelity.org` § OPEN QUESTIONS.
+///
+/// *The rule is short because of an invariant this crate already holds:* the
+/// stamp follows whoever last changed the content, and **that is never
+/// geosetta**. It does not reproject (see this crate's `main` module doc and
+/// [`crate::crs`]); a reprojection tool composes through a pipe or the mutation
+/// seam, and the change happens there. `--crs` is *assign, not enrich* — it
+/// relabels a declared CRS without moving a coordinate — so it is not a content
+/// change either.
+///
+/// So this wants a field on [`crate::native::GpkgNative`] beside `identifier`
+/// and `description`, carried unconditionally, and it is classed *independent*
+/// rather than layer-coupled for exactly that reason. **Not yet built:** it
+/// travels with M3b's carrying channel, and until then this constant stands and
+/// the loss is real.
 const LAST_CHANGE: &str = "1970-01-01T00:00:00.000Z";
 
 // The registry tables' DDL, as the GeoPackage specification defines them —

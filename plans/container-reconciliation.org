@@ -225,7 +225,27 @@ destination and inserted the source's content.* Six things stand between M3b
 and that, and they are not equal -- one is needed with or without append, three
 are the reconciliation layer, one is a decision reversal, one is a contract.
 
-*** 1. =srs_id= reconciliation -- **needed now, not only for append**
+*** 1. =srs_id= reconciliation -- ***MOVED TO M3b, 2026-08-23 (D3)***
+/It lives in [[file:same-format-fidelity.org][same-format-fidelity.org]] § MILESTONES
+M3b now. The text is kept here because D3 turned on it and because this plan's
+other requirements still refer to the renumbering it describes -- but M3b owns
+the work, and this plan **depends on** it rather than containing it./
+
+**What decided D3 was a contradiction between this requirement and this plan's
+own gate.** Line 25 says M3b can carry a source container into a *fresh*
+destination without any of this. The heading below says the opposite, and the
+heading is right: =resolve_srs= recomputes every =srs_id= from the merged layer
+set on **every** write, with no "existing destination" condition anywhere in
+it. So carrying a tile pyramid into a brand-new file dangles its references
+just as badly. A requirement needed on the path this plan declares *out of
+scope* -- one container, no reconciliation -- is not this plan's.
+
+/With it moved, line 25 is true as written, and D1's gate is the one it was
+decided as: blocks M3b's **completion**, not its start./
+
+/The original text follows./
+
+**** =srs_id= reconciliation -- **needed now, not only for append**
 =writer.rs='s =resolve_srs= recomputes every =srs_id= from the merged layer
 set: an authority code becomes the id directly, and a CRS *without* a usable
 code is handed a synthetic id from =SYNTHETIC_SRS_BASE= (100000), *in layer
@@ -417,7 +437,7 @@ the database. What follows is that statement.
 | =gpkg_contents= | =table_name= matches | differing =data_type= -> *refuse*; the rest follows the layer merge |
 | =gpkg_geometry_columns= | =(table_name, column_name)= match | follows its layer; it is not merged independently |
 | a tile table | =(zoom_level, tile_column, tile_row)= match -- *=id= excluded*; see the note below | differing =tile_data= -> **D4, open** |
-| a user table | *no general answer* | **D5, open** |
+| a user table | *no general answer* -- and per **D5** none is invented: a same-named user table is **refused** | see D5, and § 5 for the differing-DDL case |
 
 ***=gpkg_data_column_constraints= is the one whose identity is type-dependent***,
 and saying so is the honest resolution of § 3's NULL trap rather than a
@@ -485,7 +505,7 @@ practice./
 
 ** THE SEQUENCING THAT FALLS OUT
 #+begin_src text
-  1. srs_id reconciliation        -> needed by M3b's carrying regardless
+  1. srs_id reconciliation        -> MOVED to M3b (D3); this plan depends on it
   2. the "same row" contract      -> WRITTEN 2026-08-23 (§ 6); unblocks 3 and 4
   3. set-union + refusal          -> the reconciliation layer
   4. AUTOINCREMENT renumbering    -> needs 2; inverts the 2026-08-23 carry rule
@@ -564,12 +584,58 @@ reported, not guessed at. =sqlite_constraints.gpkg= is that refusal's fixture.
 /What is *not* settled by this: whether =DESC= key columns or a partial index
 (=CREATE INDEX ... WHERE=) can occur. Neither appeared in any measured file./
 
-*** D3 -- OPEN: is =srs_id= reconciliation this plan's or M3b's?
-It is needed by M3b regardless (§ 1), so it may simply belong there. Filed here
-because it is the same kind of problem and the two solutions would share code.
-/Decide when M3b's carrying channel is built, not before./
+*** D3 -- **M3b's.** Moved 2026-08-23.
+/Decided by the project owner, ahead of the schedule this entry set for itself./
 
-*** D4 -- OPEN: a tile collision on =(z, x, y)= with different =tile_data=
+/The entry, unchanged:/ It is needed by M3b regardless (§ 1), so it may simply
+belong there. Filed here because it is the same kind of problem and the two
+solutions would share code. /Decide when M3b's carrying channel is built, not
+before./
+
+*It was decided earlier than that because it stopped being a placement
+preference and became a contradiction.* This plan's gate says M3b can carry
+into a *fresh* destination without any of this; § 1 says it is a requirement of
+M3b's carrying channel itself. Both cannot hold, and § 1 is the one that
+survives contact with =resolve_srs=, which renumbers on every write regardless
+of whether a destination existed.
+
+**So the deciding question was never "where is it cheaper to solve".** It was
+which plan's *scope* contains the failure, and the failure occurs with one
+container present -- where there is nothing to reconcile. /The shared-code
+argument that filed it here was real and is simply not decisive: M3b's rewriting
+of carried =srs_id= references is the general case, and this plan's merge reuses
+it rather than the other way round./
+
+*** D4 -- **REFUSE.** Decided 2026-08-23.
+/Decided by the project owner, on the recommendation below and after the two
+alternatives were given a fair hearing. The entry as filed follows, unchanged./
+
+**The scope is narrower than "a tile collision", and that is why refusing is
+affordable.** A set-union on =(z, x, y)= merges two pyramids covering
+*adjacent* extents with no collision at all -- different coordinates, nothing
+to decide. D4 fires only on a **true overlap with different bytes**: one
+coordinate, two images.
+
+*What it costs, stated plainly rather than minimised:* re-tiling the same
+extent with newer imagery, by appending a second pyramid under the same table
+name, is refused. That is a real workflow and the answer to it is to write a
+fresh file, not to have the tool choose an image.
+
+*Why refusing beats "source wins, per tile", which was the live alternative:*
+the per-tile rule serves that workflow, and it pays for it by silently
+discarding the destination's image at **every** overlap -- which is precisely
+the place a user would want to be told. Per
+=same-format-fidelity.org= § A refusal honours the rule, a refusal is not a
+silent loss; a discarded tile is.
+
+*And why not the layer rule:* treating a same-named tile table as a whole-table
+replacement would be consistent with =write_layers='s upsert-by-name and is the
+cleanest story, but it reopens **D8**, which classified a tile pyramid as
+*independent container content* rather than as a layer. Reversing that to
+resolve a collision that fires only on genuine overlap is a large change bought
+for a small case.
+
+**** the entry as filed -- OPEN: a tile collision on =(z, x, y)= with different =tile_data=
 /Raised 2026-08-23 by § 6's contract, which settles every other table and
 cannot settle this one./ Two containers each holding a tile table of the same
 name, with a tile at the same =(zoom_level, tile_column, tile_row)= and
@@ -601,7 +667,61 @@ by comparing rows rather than by an insert failing./
 /Not decided here: whether the refusal names the first colliding tile or counts
 them. Naming one is more useful and cheaper./
 
-*** D5 -- OPEN: a same-named user table whose DDL *matches*
+*** D5 -- **REFUSE.** Decided 2026-08-23, after being decided the other way and reopened.
+/Decided by the project owner. It was first answered "merge on a declared key",
+then reopened by the owner when it emerged that the options had been put
+without the filed recommendation attached -- and re-argued, at which point a
+hazard turned up that neither option had accounted for. **The reversal was the
+right call and the reason is the hazard, not the process.** The entry as filed
+follows, unchanged./
+
+**** The hazard that decided it -- an unchecked reference the tools cannot see
+=gpkg_metadata_reference.row_id_value= is normatively /"the ROWID of a row in
+the SQLite table or view identified by the =table_name= column value"/
+(=spec/core/annexes/extension_metadata.adoc= at =fe83fdd=). **The DDL declares
+no foreign key on it** -- =crmr_mfi_fk= and =crmr_mpi_fk= are the only two, and
+both point at =gpkg_metadata(id)=.
+
+So merging a user table renumbers its rowids, and every row-scoped metadata
+reference into that table becomes silently wrong. =foreign_key_check= cannot
+see it, because there is no key to check. =PRAGMA integrity_check= cannot see
+it, because the database is not malformed -- it is merely *lying*.
+
+***That is the same class as =handoff.org= § BUGS FOUND entry 15 and the
+=sqlite_sequence= gap*** -- a file every verification ritual in this tree
+reports green on. This project has been caught by that class twice in a week,
+and the second time only because someone measured a case they had reasoned
+about. **Refusing makes it structurally impossible** rather than guarded
+against.
+
+**** Why refusing is affordable here, where D2 rejected the same move
+D2 threw out "refuse for indexed tables" because it fired on **every ordinary
+append**. That objection does not reach D5, and the reason is specific:
+=write_layers= already upserts *feature layers* by name, so the tables D5
+governs are the **non-layer** ones -- =side_notes= and its kind. No collision
+on one of those has been demonstrated at all, and any two =ogr2ogr= GeoPackages
+colliding on =gpkg_metadata= is a *measured* fact. The two cases are not
+comparable in frequency, so the same rule is noisy in one and silent in the
+other.
+
+**** What is being given up, stated rather than minimised
+A table declaring =UNIQUE (sku)= has said exactly what a duplicate is, and this
+rule refuses it anyway. That is real information discarded, and the coherence
+argument for using it is good: § 6 rule 1 already says a surrogate id is
+allocation rather than identity, an =INTEGER PRIMARY KEY= rowid alias *is* a
+surrogate, so "declared no identity" falls out of an existing rule instead of
+being a special case for user tables. **That argument is not refuted -- it is
+outweighed**, and only because of the hazard above.
+
+***Reopen this when a real case appears, and reopen it into a specific shape:***
+merge on the declared key, **plus** an explicit guard that refuses when any
+=gpkg_metadata_reference= row with =reference_scope= of ='row'= or ='row/col'=
+targets the table. That is one query, it closes the hazard, and it is the
+version to build the day someone produces a colliding non-layer user table with
+a declared key. /Filed as the shape rather than left to be rediscovered,
+because the guard is the part that is silent if it is forgotten./
+
+**** the entry as filed -- OPEN: a same-named user table whose DDL *matches*
 /Raised 2026-08-23 by § 6, same reason./ § 5 already refuses a same-named user
 table with **different** DDL, on the grounds that no union exists. Identical
 DDL is a different case: a union is *expressible*. Whether it is *correct* is
@@ -629,7 +749,9 @@ the case that should reopen it./
 ** SCOPE
 *** In
 - The six requirements above, and the collision rule that falls out of them.
-- =srs_id= rewriting for carried content, if D3 lands it here.
+- ~~=srs_id= rewriting for carried content, if D3 lands it here.~~ **Out** --
+  D3 landed it in M3b (2026-08-23). This plan *consumes* the rewriting M3b
+  builds; it does not build it.
 - A fixture pair: two GeoPackages that collide on =gpkg_metadata=,
   =gpkg_extensions= and a user table, built by =ogr2ogr= so the collision is
   the one that really occurs. /Built and thrown away during § THE MEASUREMENT

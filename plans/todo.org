@@ -80,9 +80,26 @@ check it off and remove it once the item ships or is shelved.
   § 6 states identity per table, the three rules that decide it (a surrogate id
   is allocation; NULL equals NULL; a write-time stamp is provenance), what is
   recomputed rather than merged, and the step ordering §§ 2 and 3 cannot choose
-  freely. It raised **D4** and **D5**, both open with a recommendation:
-  a tile collision with differing bytes, and a same-named user table whose DDL
-  matches. Next is § 1, =srs_id= reconciliation, which needs neither.
+  freely. It raised **D4** and **D5**, and *both are now decided*, along with
+  **D3** -- so this plan has no open decisions left.
+
+  - *D3 -- =srs_id= reconciliation is **M3b's**.* Not a placement preference in
+    the end: this plan's gate says M3b can carry into a *fresh* destination
+    without any of it, and =resolve_srs= renumbers on every write regardless,
+    so the failure happens where there is one container and nothing to
+    reconcile.
+  - *D4 -- a tile collision with differing bytes is **refused**.* It fires only
+    on a true overlap: adjacent pyramids union cleanly on =(z, x, y)=, which
+    Requirement 54 makes the declared key.
+  - *D5 -- a same-named user table is **refused**.* Decided, reopened, and
+    re-decided on a hazard neither option had accounted for:
+    =gpkg_metadata_reference.row_id_value= is normatively a rowid into the
+    table but carries **no foreign key**, so merging renumbers rowids and
+    every row-scoped reference rots *silently* -- past =integrity_check= and
+    past =foreign_key_check=. The reopen-shape is filed for when a real case
+    turns up.
+
+  Next is =same-format-fidelity.org= M3b, which now owns § 1.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

@@ -1227,14 +1227,35 @@ can read a declaration but not construct one. That partly undercuts D5's
 argument for modelling the schema rather than carrying it as a native. Left
 alone deliberately: it is an API decision, not a bug fix.
 
-*The GeoPackage spoke, 2026-08-21 -- code.* =GpkgNative= carries a layer's
-=gpkg_contents.identifier=/=description= and its =gpkg_data_columns= rows plus
+*The GeoPackage spoke, 2026-08-21 -- code, extended 2026-08-24.* =GpkgNative=
+carries a layer's =gpkg_contents.identifier=/=description=/=last_change= and its
+=gpkg_data_columns= rows plus
 the =gpkg_data_column_constraints= they name; verified on real =ogr2ogr= output
 and *read back by GDAL* (=ogrinfo= reports the same alternative names, comments
 and domain off our output; =ogr2ogr= rewrites it). 513 tests (from 509). The
 identifier was defect 4's shape in another format -- =gpkg_contents(identifier)=
 was hardcoded to the table name, =description= to ='' =, exactly as FlatGeobuf's
 =NAME= slot had been hardcoded to =geosetta=.
+
+***=last_change= was added on 2026-08-24, and it had been missed rather than
+deferred.*** The =gpkg_contents= row was surveyed for what it says *about* a
+layer, and a timestamp reads as bookkeeping -- so it was never listed as a
+member in =native-inventory.org= at all. It is not bookkeeping: the standard
+defines it as /"timestamp of last change to content"/, the one column in that
+row with a stated meaning about the data. So a =gpkg -> gpkg= run had been
+overwriting a real value with a constant for three days, inside the spoke whose
+whole job is that this does not happen. /Found while reading the normative text
+for an unrelated question -- the =gpkg_metadata_reference= timestamp, which the
+standard leaves undefined, and the contrast is what made this one visible./
+
+*Only the carry half shipped.* The rule is that the stamp follows whoever last
+changed the content and that is never geosetta, so a passthrough carries and a
+cross-format source -- having nothing to carry -- still gets the writer's epoch
+sentinel. Writing a fresh timestamp there is the other half and is deliberately
+unbuilt: it would cost byte-reproducible output on nearly every run this tool
+does, and fixes nothing the carry does not. That property is now pinned by
+=two_writes_of_the_same_input_are_byte_identical=, which exists so the trade
+cannot be made by accident.
 
 Three things came out of it, all in the plan's M3 entry:
 1. *A member equal to what the writer would emit anyway is derived, not

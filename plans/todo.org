@@ -100,6 +100,15 @@ check it off and remove it once the item ships or is shelved.
     turns up.
 
   Next is =same-format-fidelity.org= M3b, which now owns § 1.
+
+  /2026-08-24:/ **=gpkg_contents.last_change= is now carried** -- a member the
+  inventory had missed entirely, because the row was surveyed for what it says
+  *about* a layer and this reads as bookkeeping. It is not: the standard defines
+  it as "timestamp of last change to content", and a =gpkg -> gpkg= run had been
+  overwriting it with a constant since the GeoPackage spoke shipped. Carried
+  only; the *stamp* half of the rule -- a fresh timestamp where there is nothing
+  to carry -- is deliberately unbuilt, because it would spend byte-reproducible
+  output on nearly every run and fixes nothing the carry does not.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

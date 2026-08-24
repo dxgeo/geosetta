@@ -2221,13 +2221,122 @@ mod tests {
         assert_eq!(*gpkg_native(&back[0].1), native, "the layer's members did not survive");
     }
 
+    /// **A `gpkg -> gpkg` run keeps the source's `gpkg_contents.last_change`**
+    /// instead of overwriting it with the writer's sentinel.
+    ///
+    /// Until 2026-08-24 it did overwrite it, and that was a real loss under
+    /// § THE RULE: a value the source held that the output did not. The standard
+    /// defines this column — "timestamp of last change to content" — unlike
+    /// `gpkg_metadata_reference.timestamp`, which it leaves undefined, so there
+    /// is something definite being destroyed.
+    ///
+    /// *The stamp is never regenerated, only carried*, because the rule is that
+    /// it follows whoever last changed the content and that is never geosetta.
+    /// A cross-format source has none to carry and gets the sentinel — asserted
+    /// below too, since that is the half a future change would break first.
+    #[test]
+    fn a_geopackage_last_change_survives_its_own_format() {
+        let source = hostile_layer("second");
+        let carried = gpkg_native(&source).last_change.clone().expect("ogr2ogr wrote one");
+        assert_ne!(carried, crate::geopackage::LAST_CHANGE, "fixture is not exercising this");
+
+        let bytes = crate::geopackage::write_layers(
+            None,
+            &[("second".to_string(), source)],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(last_change_of(&bytes, "second"), carried, "the source's stamp was overwritten");
+
+        // A layer with no native — every cross-format source — still gets the
+        // sentinel, never a clock reading.
+        let bare = crate::FeatureCollection::new(Vec::new());
+        let bytes = crate::geopackage::write_layers(
+            None,
+            &[("fresh".to_string(), bare)],
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            last_change_of(&bytes, "fresh"),
+            crate::geopackage::LAST_CHANGE,
+            "a layer with nothing to carry did not get the sentinel"
+        );
+    }
+
+    /// **A GeoPackage this crate wrote carries no `last_change` payload**, so
+    /// D3's "None when nothing was unmodelled" still holds for our own output.
+    ///
+    /// The reader drops the stamp when it is the writer's own sentinel, on the
+    /// `identifier` precedent — a value the writer regenerates is not content.
+    /// Without that filter every geosetta-written file would round-trip into one
+    /// carrying a native, which is the payload-on-every-file outcome
+    /// [`crate::GpkgNative`]'s `description` reasoning exists to avoid.
+    ///
+    /// /Written because a mutation went uncaught: deleting the reader's filter
+    /// broke nothing in the suite. The writer half was already covered by
+    /// `a_geopackage_last_change_survives_its_own_format`; this is its mirror./
+    #[test]
+    fn our_own_last_change_sentinel_is_not_carried_back() {
+        let layer = crate::FeatureCollection::new(Vec::new());
+        let bytes =
+            crate::geopackage::write_layers(None, &[("fresh".to_string(), layer)], false, false)
+                .unwrap();
+        let back = crate::geopackage::read_layers(&bytes).unwrap();
+        assert!(
+            back[0].1.native.is_none(),
+            "our own output round-tripped into a payload: {:?}",
+            back[0].1.native
+        );
+    }
+
+    /// `gpkg_contents.last_change` for one table, read back out of written bytes.
+    fn last_change_of(bytes: &[u8], table: &str) -> String {
+        let db = crate::sqlite::Database::open(bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let contents = tables.iter().find(|t| t.name == "gpkg_contents").unwrap();
+        let name_col = contents.columns.iter().position(|c| c == "table_name").unwrap();
+        let stamp_col = contents.columns.iter().position(|c| c == "last_change").unwrap();
+        db.read_rows(contents)
+            .unwrap()
+            .iter()
+            .find(|row| matches!(&row[name_col], crate::sqlite::Value::Text(t) if t == table))
+            .map(|row| match &row[stamp_col] {
+                crate::sqlite::Value::Text(t) => t.clone(),
+                other => panic!("last_change is not text: {other:?}"),
+            })
+            .expect("no gpkg_contents row")
+    }
+
     /// D3: a spoke that recovered nothing constructs no payload. `ogr2ogr`
     /// writes `identifier = table_name` for every layer it creates, so treating
     /// that as content would put a native on essentially every GeoPackage.
+    ///
+    /// ***Narrowed 2026-08-24, when `last_change` started being carried.*** This
+    /// asserted `native.is_none()`, which was a fair proxy for "the identifier
+    /// was dropped" only while `identifier`, `description` and the schema rows
+    /// were the whole payload. A GDAL-written `gpkg_contents` row also holds a
+    /// real `last_change`, and carrying that is the point — so an `ogr2ogr`
+    /// layer now *does* construct a payload, and the proxy no longer means what
+    /// the test name says.
+    ///
+    /// /D3 is untouched by that: "None when nothing was unmodelled" still holds
+    /// for the files this crate writes, whose `last_change` is the sentinel the
+    /// reader drops. What changed is that an ogr2ogr file is no longer a file
+    /// with nothing to carry./ The assertion is now on the member this test is
+    /// actually about, plus the two that shared its reasoning.
     #[test]
     fn an_identifier_that_only_repeats_the_layer_name_is_not_carried() {
         // `second` is the fixture's untouched layer: ogr2ogr's defaults.
-        assert!(hostile_layer("second").native.is_none());
+        let layer = hostile_layer("second");
+        let native = gpkg_native(&layer);
+        assert_eq!(native.identifier, None, "identifier repeating the name was carried");
+        assert_eq!(native.description, None, "an empty description was carried");
+        assert!(native.data_columns.is_empty() && native.constraints.is_empty());
+        // And the only reason this layer has a payload at all:
+        assert!(native.last_change.is_some(), "ogr2ogr's last_change was not carried");
     }
 
     /// D4, decision 14's shape: an opaque member can also be derived. A

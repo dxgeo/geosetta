@@ -62,12 +62,23 @@ const SYNTHETIC_SRS_BASE: i64 = 100_000;
 /// relabels a declared CRS without moving a coordinate — so it is not a content
 /// change either.
 ///
-/// So this wants a field on [`crate::native::GpkgNative`] beside `identifier`
-/// and `description`, carried unconditionally, and it is classed *independent*
-/// rather than layer-coupled for exactly that reason. **Not yet built:** it
-/// travels with M3b's carrying channel, and until then this constant stands and
-/// the loss is real.
-const LAST_CHANGE: &str = "1970-01-01T00:00:00.000Z";
+/// So it is a field on [`crate::native::GpkgNative`] beside `identifier` and
+/// `description`, classed *independent* for exactly that reason.
+///
+/// ***The carry half shipped 2026-08-24 and this constant is now the fallback
+/// rather than the answer.*** A layer that carried a `last_change` writes it
+/// back; one that did not — a cross-format source, or a file this crate wrote —
+/// gets this. /It needed nothing from M3b: `gpkg_contents`'s descriptive
+/// columns were already in the layer natives channel. An earlier draft of this
+/// comment said it travelled with M3b's container work, which was wrong./
+///
+/// **The stamp half is deliberately not built.** Writing a fresh timestamp
+/// where there is nothing to carry would be more honest than this sentinel and
+/// would cost byte-reproducibility on nearly every run, since almost everything
+/// this tool does is cross-format. The test
+/// `two_writes_of_the_same_input_are_byte_identical` in this module exists so
+/// that trade cannot be made by accident.
+pub(crate) const LAST_CHANGE: &str = "1970-01-01T00:00:00.000Z";
 
 // The registry tables' DDL, as the GeoPackage specification defines them —
 // **including the table constraints**, which is what makes each of these a
@@ -501,6 +512,11 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) 
                 .unwrap_or_else(|| name.clone());
             let description =
                 native.and_then(|n| n.description.clone()).unwrap_or_default();
+            // Carried when the source had one; the sentinel otherwise. Never a
+            // clock reading — see `LAST_CHANGE`.
+            let last_change = native
+                .and_then(|n| n.last_change.clone())
+                .unwrap_or_else(|| LAST_CHANGE.to_string());
             (
                 (i + 1) as i64,
                 vec![
@@ -508,7 +524,7 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) 
                     Value::Text("features".into()),
                     Value::Text(identifier),
                     Value::Text(description),
-                    Value::Text(LAST_CHANGE.into()),
+                    Value::Text(last_change),
                     minx,
                     miny,
                     maxx,
@@ -976,6 +992,7 @@ mod tests {
             crate::NativePayload::Gpkg(crate::GpkgNative {
                 identifier: None,
                 description: None,
+                last_change: None,
                 data_columns: vec![crate::GpkgDataColumn {
                     column_name: "name".into(),
                     name: Some("Name".into()),

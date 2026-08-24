@@ -213,6 +213,7 @@ struct ContentsMeta {
     table: String,
     identifier: Option<String>,
     description: Option<String>,
+    last_change: Option<String>,
 }
 
 /// Assemble one layer's [`GpkgNative`], or `None` when it carries nothing
@@ -251,13 +252,19 @@ fn layer_native(
         description: meta
             .and_then(|m| m.description.clone())
             .filter(|description| !description.is_empty()),
+        // Dropped when it is the sentinel this crate writes, on the
+        // `identifier` precedent: a value the writer regenerates anyway is not
+        // worth a payload, so our own output still carries no native here.
+        last_change: meta
+            .and_then(|m| m.last_change.clone())
+            .filter(|stamp| stamp != crate::geopackage::LAST_CHANGE),
         data_columns: columns,
         constraints: named,
     };
     (!native.is_empty()).then(|| Native::new(Format::Gpkg, NativePayload::Gpkg(native)))
 }
 
-/// Every `gpkg_contents` row's `identifier`/`description`.
+/// Every `gpkg_contents` row's `identifier`, `description` and `last_change`.
 fn contents_metadata(db: &Database, tables: &[Table]) -> Result<Vec<ContentsMeta>> {
     let Some(contents) = tables.iter().find(|t| t.name == "gpkg_contents") else {
         return Ok(Vec::new());
@@ -267,6 +274,7 @@ fn contents_metadata(db: &Database, tables: &[Table]) -> Result<Vec<ContentsMeta
     // malformed — it just has nothing here to carry.
     let identifier_col = contents.columns.iter().position(|c| c == "identifier");
     let description_col = contents.columns.iter().position(|c| c == "description");
+    let last_change_col = contents.columns.iter().position(|c| c == "last_change");
     Ok(db
         .read_rows(contents)?
         .iter()
@@ -275,6 +283,7 @@ fn contents_metadata(db: &Database, tables: &[Table]) -> Result<Vec<ContentsMeta
                 table: table.clone(),
                 identifier: identifier_col.and_then(|i| text_at(row, i)),
                 description: description_col.and_then(|i| text_at(row, i)),
+                last_change: last_change_col.and_then(|i| text_at(row, i)),
             }),
             _ => None,
         })

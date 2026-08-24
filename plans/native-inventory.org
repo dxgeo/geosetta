@@ -244,12 +244,14 @@ GeoParquet keeps them structured.
 *** GeoPackage -- /measured/ + /code/
 Two levels, and decision 2a put both in scope.
 
-*Layer level:* /all three carried as of 2026-08-21 -- see § GeoPackage spoke./
+*Layer level:* /all three carried as of 2026-08-21, and a fourth on 2026-08-24
+-- see § GeoPackage spoke./
 | member                                   | class    | note |
 |------------------------------------------+----------+------|
 | declared column type (=BOOLEAN=)          | *modelled* | ~~defect 2~~ *FIXED 2026-08-20 (M4)*: reclassified opaque -> modelled, then implemented -- the reader parses the DDL's declared type and the writer emits one, so a =BOOLEAN= survives its own format |
 | =gpkg_contents.identifier= / =description=| identity | *DONE 2026-08-21*: carried on =GpkgNative=, but only when they say something the layer name and the writer's own defaults do not |
 | =gpkg_data_columns= / constraints         | opaque   | *DONE 2026-08-21*: carried per layer, rows re-emitted for columns that still exist |
+| =gpkg_contents.last_change=               | opaque   | ***DONE 2026-08-24***: carried verbatim; the writer's epoch sentinel is dropped on read so our own output stays payload-free. **This one had been missed by the inventory entirely** -- see § GeoPackage spoke |
 
 *Container level* /(measured)/ -- a =.gpkg= with two layers, a user table,
 dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
@@ -301,10 +303,20 @@ entries above, and both are now closed:
   =hand_mixed_number.geojson=; the open call is whether it warrants a warning,
   recorded in =lossy-conversion-warnings.org=.
 
-*** GeoPackage spoke -- DONE 2026-08-21
-=GpkgNative= (=src/native.rs=) carries =gpkg_contents.identifier= and
-=description= plus the layer's =gpkg_data_columns= rows and the
-=gpkg_data_column_constraints= they name. /Measured/ on =gdal_hostile.gpkg=,
+*** GeoPackage spoke -- DONE 2026-08-21, extended 2026-08-24
+=GpkgNative= (=src/native.rs=) carries =gpkg_contents.identifier=,
+=description= and =last_change=, plus the layer's =gpkg_data_columns= rows and
+the =gpkg_data_column_constraints= they name.
+
+***=last_change= was missed by this inventory, and the way it was missed is the
+lesson.*** The =gpkg_contents= row was surveyed for what it says *about* a
+layer -- title, description -- and =last_change= reads as bookkeeping, so it was
+never listed as a member at all. It is not bookkeeping: the standard defines it
+as /"timestamp of last change to content"/, which is the one =gpkg_contents=
+column with a stated meaning about the *data*. A =gpkg -> gpkg= run had been
+overwriting it with a constant since the spoke shipped. /Found 2026-08-23 while
+reading the normative text for a different question -- the timestamp in
+=gpkg_metadata_reference=, which the standard pointedly leaves undefined./ /Measured/ on =gdal_hostile.gpkg=,
 extended for this spoke (see =tests/fixtures/HOSTILE.org=): a =gpkg -> gpkg=
 run now preserves the title =Bykerne — København og Zürich=, the description,
 both column rows and the =price_range= domain -- and *=ogrinfo= reads all of it
@@ -320,6 +332,19 @@ from the source, so carrying them would be recording the absence of content:
   part that is a bug rather than noise -- *replay a stale title into a layer
   that had since been renamed*. An identifier equal to the layer name is
   *derived* under D4 and regenerated.
+- =last_change= is dropped when it is the writer's own epoch sentinel
+  (=1970-01-01T00:00:00.000Z=), on exactly the =identifier= reasoning: a value
+  the writer regenerates anyway is not content. /Added 2026-08-24./
+
+  **But the consequence differs from =identifier='s, and that is worth stating
+  because the two rules look identical.** Every file *another* tool wrote has a
+  real =last_change=, so an =ogr2ogr= GeoPackage now *does* construct a payload
+  -- the outcome the =identifier= rule exists to prevent. The difference is what
+  is being recorded: dropping an empty =description= avoids a payload that
+  records the *absence* of information, while =last_change= is present and
+  meaningful, and the alternative to carrying it is destroying it. /D3's "the
+  common case costs nothing" is unharmed for *our own* output, which is what it
+  was about./
 - =description= is dropped when empty. =ogr2ogr= writes ='' = (not NULL), and
   so does this writer.
 

@@ -152,6 +152,31 @@ pub struct GpkgNative {
     /// written, so NULL and `''` are the same output either way, and the
     /// distinction has nowhere to live.
     pub description: Option<String>,
+    /// `gpkg_contents.last_change` — the standard's "timestamp of last change
+    /// to content", carried verbatim so a same-format run does not destroy it.
+    ///
+    /// *Dropped when it is the epoch sentinel this crate itself writes*, on
+    /// exactly the [`Self::identifier`] precedent: a value the writer would
+    /// regenerate anyway is not worth a payload. So a GeoPackage this crate
+    /// produced carries nothing here, and D3's "the common case costs nothing"
+    /// survives for our own output.
+    ///
+    /// **This deliberately does not follow [`Self::description`]'s argument**,
+    /// and the difference is worth stating because the two look alike. Dropping
+    /// an empty `description` avoids putting a payload on every GeoPackage in
+    /// the world *to record the absence of information*. `last_change` is
+    /// present and meaningful in every file another tool wrote, so carrying it
+    /// records something real — and the alternative is destroying it, which is
+    /// what this crate did until 2026-08-24.
+    ///
+    /// *Never stamped fresh here.* The rule decided in
+    /// `plans/same-format-fidelity.org` § OPEN QUESTIONS is that the stamp
+    /// follows whoever last changed the content, and that is never geosetta —
+    /// it does not reproject, and `--crs` relabels without moving a coordinate.
+    /// A cross-format source simply has none to carry, and the writer's own
+    /// constant stands in. /Writing a fresh stamp there is the other half of
+    /// that rule and is deliberately not implemented; see the plan./
+    pub last_change: Option<String>,
     /// `gpkg_data_columns` rows for this layer, in column order. GDAL surfaces
     /// these as a field's alternative name, comment and domain, so they are
     /// visible content rather than inert bookkeeping.
@@ -174,6 +199,7 @@ impl GpkgNative {
     pub fn is_empty(&self) -> bool {
         self.identifier.is_none()
             && self.description.is_none()
+            && self.last_change.is_none()
             && self.data_columns.is_empty()
             && self.constraints.is_empty()
     }

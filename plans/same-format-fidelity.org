@@ -1937,6 +1937,8 @@ is gated on the index-writing work in D10./
 - ~~*What should =gpkg_contents.last_change= hold on a =gpkg -> gpkg= run?*~~
   ***DECIDED 2026-08-23: carry it. Stamp only when there is nothing to
   carry.*** /Raised and decided the same day it was raised./
+  ***The carry half SHIPPED 2026-08-24; the stamp half is deliberately not
+  built.*** /See § THE TWO HALVES at the end of this entry./
 
   **The rule, in one line: the stamp follows whoever last changed the content,
   and that is never geosetta.**
@@ -1977,10 +1979,43 @@ is gated on the index-writing work in D10./
   which is why no middleman-detection is attempted, and it could not be:
   the second process has no baseline to diff against.
 
-  *The cost, which is real and unasserted:* stamping on the cross-format path
-  makes output non-reproducible across runs, which the fixed epoch buys today.
-  No test in the tree depends on it. /If both are wanted later, the standard
-  answer is a =SOURCE_DATE_EPOCH=-style pin, and that is a separate feature./
+  *The cost, which is real and was unasserted:* stamping on the cross-format
+  path makes output non-reproducible across runs, which the fixed epoch buys.
+  /Measured 2026-08-23 -- two release-binary runs two seconds apart hashed
+  identically -- and then pinned by
+  =two_writes_of_the_same_input_are_byte_identical=, so the property can no
+  longer be spent by accident. If both are wanted later, the standard answer is
+  a =SOURCE_DATE_EPOCH=-style pin, and that is a separate feature./
+
+  **** THE TWO HALVES -- carry shipped, stamp did not
+  /2026-08-24./ The two halves were separable and only one of them was worth
+  shipping now, which was not obvious when the decision was taken.
+
+  ***The carry half needed nothing from M3b.*** =gpkg_contents='s descriptive
+  columns were *already* in the layer natives channel -- =ContentsMeta= in
+  =src/geopackage/reader.rs= reads that row for =identifier= and =description=
+  -- so this was a third field beside them, not container work. /An earlier
+  note in this plan and in =writer.rs='s doc comment said it travelled with
+  M3b's carrying channel. That was wrong./
+
+  | | passthrough | cross-format | reproducible? |
+  |-+-------------+--------------+---------------|
+  | before | epoch -- *the source's value destroyed* | epoch | yes |
+  | **now** | *carried* | epoch | **yes** |
+  | stamp half, unbuilt | carried | write time | *no* |
+
+  **So the carry half is a strict improvement and the stamp half is the only
+  part that spends anything** -- and it spends reproducibility on nearly every
+  run, since almost everything this tool does is cross-format. Doing the stamp
+  *alone* would have been the one clearly wrong order: the property gone and
+  the loss still there.
+
+  /Four tests, each mutation-checked:/ the carry survives its own format; a
+  layer with nothing to carry still gets the sentinel; our own output does not
+  round-trip into a payload; and two writes stay byte-identical. **The third
+  exists because a mutation went uncaught** -- deleting the reader's
+  sentinel-drop broke nothing in the suite, which meant D3's "the common case
+  costs nothing" had no test behind it for this member.
 
   /The original text follows./
 

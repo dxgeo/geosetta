@@ -23,11 +23,14 @@ still pass =native: None=.*
   format with no slot still *warns*.
 - *=edit-composability.org='s live bug 1* -- the GeoPackage edit loop that
   duplicated layers -- is fixed.
-- *Defect 3 is the only defect left again.* Its *warning* shipped 2026-08-21
-  -- a =gpkg= write now says what the rewrite destroys instead of exiting 0 in
-  silence -- but the *fix* is still M3b's. /Entry 13 is open beside it: that
-  warning misclassifies =gpkg_ogr_contents=, which is derived. It closes with
-  M3b./
+- *Defect 3 is the only defect left, and as of 2026-08-24 it is **partly
+  fixed**.* Its *warning* shipped 2026-08-21 -- a =gpkg= write says what the
+  rewrite destroys instead of exiting 0 in silence -- and the first piece of
+  the *fix* shipped on 2026-08-24: a **tile pyramid now survives** a
+  =gpkg -> gpkg= write, carried by =geopackage/carry.rs=. Everything else the
+  container holds is still destroyed, so the defect stays open. /Entry 13
+  closed with it: the warning had misclassified =gpkg_ogr_contents=, and ten
+  triggers besides./
 - ***Defect 6 was found and fixed on 2026-08-23**, twice over, and it is the
   one to read first if you are new to this work.* /The first fix was checked
   against =ogr2ogr= and inherited two of that tool's own deviations from the
@@ -54,7 +57,7 @@ still pass =native: None=.*
   M3b has to honour and rules out dirty-flag invalidation on structural
   grounds (§ THE EDIT LOOP).
 
-554 tests pass (=cargo test -p geosetta=: 497 lib, 56 integration, 1 doc),
+562 tests pass (=cargo test -p geosetta=: 505 lib, 56 integration, 1 doc),
 clippy clean, *and =cargo doc= is green* -- add that third command to your
 verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
 else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). The
@@ -109,7 +112,10 @@ In this order. The first two are the load-bearing ones:
    [[file:tests/fixtures/PLANNED.org][PLANNED.org]] beside it for the ones
    designed on 2026-08-23 and not yet built. /Its first entry,
    =spec_conformant.gpkg=, was built the same day and has moved to
-   =HOSTILE.org= under a new =spec_= prefix./
+   =HOSTILE.org= under a new =spec_= prefix; =gdal_tiles.gpkg= followed on
+   2026-08-24 -- designed there as =gpkg_tiles.gpkg=, renamed to the =gdal_=
+   prefix because provenance is what these names carry -- and it is the fixture
+   M3b § 1 needs./
 6. [[file:plans/container-reconciliation.org][plans/container-reconciliation.org]]
    -- /new 2026-08-23/. What happens to container content when the destination
    =.gpkg= already has some. **Read it before finishing M3b**, which it gates:
@@ -388,6 +394,29 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
 =crate::FieldDecl= and =FeatureCollection::schema=.
 
 ** WHAT IS BUILT
+- ***The container carrying channel*** (M3b's first half, /2026-08-24/) --
+  =geopackage/carry.rs=. Independent container content is read out of a source
+  =.gpkg= and re-emitted, which is the first part of *defect 3's fix* rather
+  than another warning about it. Today it reaches the **tile pyramid**: the
+  tile table verbatim with its rows, its autoindex, its =sqlite_sequence= mark
+  and its six triggers, plus =gpkg_tile_matrix= whole and
+  =gpkg_tile_matrix_set=. /Measured on =gdal_tiles.gpkg=: 80 tiles
+  blob-for-blob, =gdalinfo -checksum= identical through the output, a second
+  pass byte-identical to the first, and =integrity_check= + =foreign_key_check=
+  clean./ **Nothing in it decodes a tile** -- D8's argument that carrying a
+  pyramid needs no raster-specific code, held.
+  - *With it, M3b requirement 1* -- =srs_id= reconciliation.
+    =writer::reconcile_carried_srs= maps a carried reference into the numbering
+    =resolve_srs= has just rebuilt: /reuse/, /renumber/ on a collision with a
+    different CRS, or /register/. It could not ship separately, which is the
+    thing worth knowing: until something carried an =srs_id= there was nothing
+    to dangle.
+  - *And the two tile registry tables' DDL*, transcribed from Annex C at the
+    pinned commit and checked by =the_registry_ddl_is_what_the_standard_says=,
+    which now compares **eight** tables rather than six. =spec_conformant.gpkg=
+    grew the two tables so it could. /GDAL emits both identically -- the one
+    place so far where reading the standard confirmed the producer instead of
+    correcting it./
 - *The inventory*, all nine spokes, every entry marked /measured/ or /code/.
 - *The natives mechanism and four spokes* -- GeoJSON (=id=, foreign members
   at three levels), FlatGeobuf (header/=Crs=/per-column descriptive members
@@ -420,7 +449,11 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
 of it was planned work* -- each item was found by measuring the one above it:
 - *Defect 3's warning* -- =geopackage/container.rs= surveys the container a
   =gpkg= write is about to rewrite and reports what will not survive. The
-  destruction is still M3b's to fix; the silence is not.
+  destruction is still M3b's to fix; the silence is not. /Since 2026-08-24 the
+  survey subtracts what =carry.rs= reproduces, so the warning names the tile
+  pyramid no longer -- and its trigger count fell from 18 schema objects to 12
+  on =gdal_tiles.gpkg=, because the six a carried table owns are carried with
+  it./
 - *The recast matrix* -- =DeclType::admits= (the widening relation),
   =Format::recast= (what each format does to each type),
   =decl_recast_warning=, =DeclType::ALL=, two sweeps, four *inbound* tables
@@ -437,7 +470,12 @@ of it was planned work* -- each item was found by measuring the one above it:
 
 ** WHAT IS NOT BUILT
 - The remaining spokes' *natives* (M3 -- CSV, WKT, KML, Shapefile) and both
-  containers (M3b =gpkg=, M3c =kmz=). *Column declarations are done everywhere they can be*: all four
+  containers (M3c =kmz=, and *the rest of* M3b). /M3b is no longer wholly
+  unbuilt: its carrying channel and requirement 1 shipped 2026-08-24. What is
+  left is the other independent content -- a user's own table, =gpkg_metadata=
+  and its references, =gpkg_extensions= rows -- plus the layer-coupled class,
+  and =container-reconciliation.org= for a destination that already has a
+  container./ *Column declarations are done everywhere they can be*: all four
   declaring spokes carry one as of M4, so =Format::carries_column_schema= has
   stopped shrinking and the four remaining =false= answers (GeoJSON, CSV, WKT,
   KML) are permanent -- those formats have no slot.
@@ -447,8 +485,10 @@ of it was planned work* -- each item was found by measuring the one above it:
   already owns the same D4 "rebuild it when the source had one" pattern for
   FlatGeobuf's and GeoPackage's indexes. Blocked on the writer's flat schema:
   it has never emitted a nested struct column.
-- *Defect 3* -- the only entry left in § LIVE BUGS. Note that section's
-  numbering is *not* the plan's defect numbering; see its own note.
+- *Defect 3* -- the only entry left in § LIVE BUGS, and now **partly fixed**
+  rather than wholly open: a tile pyramid survives a =gpkg -> gpkg= write as of
+  2026-08-24, and everything else the container holds still does not. Note that
+  section's numbering is *not* the plan's defect numbering; see its own note.
 - The exhaustive-match fixture registry (D6).
 - The format-check deletion. *Drawn last in the diagram, no longer forced
   there*: its only gating argument (the duplicated inventory pass) is spent as
@@ -500,7 +540,12 @@ this. **Read the entries, not the heading.** The open ones are marked *LIVE* in
 their own text, which is the only place that cannot drift./
 
 **Open at the end of 2026-08-23:** entry 3 (defect 3, the GeoPackage
-container) and entry 13 (=gpkg_ogr_contents= misclassified). Entry 15 is not a
+container) and entry 13 (=gpkg_ogr_contents= misclassified). /Entry 3 became
+*partly fixed* on 2026-08-24: a tile pyramid is carried, everything else the
+container holds is still destroyed. It stays LIVE, because "partly" is not
+fixed and the entry is about the container, not about tiles. **Entry 13 is
+fixed** the same day -- and it turned out to be the smaller half of its own
+class; see the doc-change entry on the ten triggers./ Entry 15 is not a
 bug in shipped behaviour but a constraint on M3b, and its missing capability
 shipped. Entry 16 (*defect 6*) was found and fixed the same day, once the
 index-writing work it was gated on existed. The fixed entries stay because each
@@ -677,12 +722,26 @@ emit. The third (13) came from the edit-loop question and is *still open*.
     An expression default can never apply to a short record.
 
 13. *=gpkg_ogr_contents= is reported as destroyed content, and it is derived.*
-    **LIVE, found 2026-08-22, not fixed.** Defect 3's warning names it in the
-    loss list -- =gpkg_ogr_contents (2 rows)= -- but the table is
+    ***FIXED 2026-08-24*** (found 2026-08-22). Defect 3's warning named it in
+    the loss list -- =gpkg_ogr_contents (2 rows)= -- but the table is
     =(table_name TEXT PRIMARY KEY, feature_count INTEGER)=, GDAL's *row-count
     cache*, recomputable from the feature table by definition. Under D4 it
     belongs in the second message beside the R*Tree ("derived, not rebuilt"),
     not in the first.
+
+    ***Reported silently instead, and the reason matters more than the entry
+    did.*** The second message exists because =--rtree= is a **remedy**; a
+    cache with no remedy and no information lost would be furniture on every
+    =ogr2ogr= file. The =gpkg_extensions= precedent this entry cites went the
+    same way -- wholly derived rows are not reported at all -- so "beside the
+    R*Tree" meant *in the same class*, not *in the same sentence*.
+
+    ***And it was the smaller half of its own class.*** The pass that fixed it
+    found that **every** trigger attached to a table the write rebuilds is
+    derived too, including the *ten* =ogr2ogr= puts on =gpkg_tile_matrix= --
+    which the standard does not mandate. On a file holding a pyramid those ten
+    were the dominant term in the warning, and =gpkg_ogr_contents= was two
+    rows beside them.
 
     *This is the =gpkg_extensions= mistake in another table*, which the entry
     below in § WHAT CHANGED already records as caught once: counting derived
@@ -862,11 +921,137 @@ which explains why this section must never be read as a statement about what is
 committed./
 
 *Everything below had landed as of 2026-08-22, through =c789447=; the
-2026-08-23 entry was uncommitted when written.* That sentence is exactly the
-kind that expires, which is the point of the rule above: check =git log=
-rather than trusting it.
+2026-08-23 and 2026-08-24 entries were uncommitted when written.* That sentence
+is exactly the kind that expires -- it has now been extended twice, which is
+the point of the rule above: check =git log= rather than trusting it.
 
 /Newest first./
+
+*Ten triggers nobody had classified, 2026-08-24 -- the warning stops
+overstating what it destroys.* Carrying the tile pyramid made this visible
+rather than causing it: with =imagery= surviving, **ten of the twelve** "other
+schema objects" the drop warning still reported on =gdal_tiles.gpkg= were
+=ogr2ogr='s validation triggers on =gpkg_tile_matrix= -- a registry table this
+writer *constructs*.
+
+***The standard settles it, and settles it against GDAL's practice.***
+Requirements 46--52 constrain the **values** in =gpkg_tile_matrix= -- zoom
+level not negative, widths and pixel sizes greater than zero -- and the tiles
+clause (§ 2.2, pinned =fe83fdd=) does not mention a trigger anywhere. GDAL's
+ten are *one implementation* of enforcing a value requirement, so output
+without them is conformant as long as the values are, and this writer carries
+those values verbatim. /Another instance of § THE ORACLE RULE, and the second
+one this week where the standard and =ogr2ogr= had to be told apart./
+
+So they are **derived** under the three-class contract, along with every other
+trigger attached to something the write rebuilds -- and =gpkg_ogr_contents=,
+which is *entry 13*, filed 2026-08-22 as "found, live, fix it here" and fixed
+now: a =(table_name, feature_count)= row-count cache reported as destroyed
+content. Both silently, not in the index message: the R*Tree earns a message
+because =--rtree= is a remedy, and a cache with no remedy and nothing lost
+would be furniture on every =ogr2ogr= file. /On =gdal_hostile.gpkg= the
+message's schema clause disappears entirely, from "14 other schema objects" to
+none./
+
+***And the test written for the new rule was wrong, found by mutating it.***
+=is_derived_trigger= has a negative half -- a trigger on a table that really is
+destroyed must still be reported -- and **no fixture in the tree had one**:
+every trigger anywhere was attached to a layer or a registry table. So
+=sqlite_constraints.gpkg= gained =events_stamp=. The first test asserted the
+message contained /"other schema objects"/, which passed under a mutation
+classifying **every** trigger as derived -- because =idx_events_kind=, an
+explicit =CREATE INDEX= in the same fixture, satisfies that phrase by itself.
+/Assert the count, not the phrase./ Same lesson as the =LAST_CHANGE= fixture
+mistake two days earlier, in a different disguise.
+
+*Defect 3 stops being wholly a warning, 2026-08-24 -- code, a fixture and four
+plans.* =geopackage/carry.rs= is new: the container **carrying** channel, which
+reads independent content out of a source =.gpkg= so the write puts it back.
+Today it reaches the tile pyramid, which is D8's case, and with it *M3b
+requirement 1* -- =srs_id= reconciliation, in =writer::reconcile_carried_srs=.
+
+***The two shipped together because neither was shippable alone***, and that is
+the finding rather than a scheduling note. Requirement 1 was filed in
+=container-reconciliation.org=, moved to M3b by D3 on the argument that it is
+needed on the *one-container* path too -- and it is, but it is not *observable*
+until something carries an =srs_id=. Before the carrying, =foreign_key_check=
+on =gdal_tiles.gpkg='s output was clean because the row was gone. **A
+requirement whose oracle says nothing until its consumer exists cannot be
+verified on its own**, whatever the sequencing diagram says.
+
+*What it cost was less than the milestone predicted, and the reason is dated.*
+No new file-format work: =TableSpec='s =autoindexes= and =autoincrement=, both
+closed 2026-08-23 ahead of the carrying that needed them, are exactly the two
+capabilities a tile table obliges -- it is the only mergeable table that both
+declares AUTOINCREMENT and owns an index. /The prediction that they would be
+needed "the first thing M3b carries" was right to the table./
+
+*Measured, not argued:* 80 tiles blob-for-blob out of =gdal_tiles.gpkg=;
+=gdalinfo -checksum= reporting the same four band checksums through the output
+as through the source, so GDAL reads the same *pixels* and not merely the same
+row count; =integrity_check= and =foreign_key_check= clean **with the pyramid
+present**; a second pass byte-identical to the first; and a GeoPackage with no
+pyramid byte-identical to what the previous binary wrote, so the channel is
+contained the way =0e33a40='s payload was.
+
+*The conformance oracle grew with it.* The two tile registry tables' DDL is
+transcribed from Annex C at pinned =fe83fdd=, =spec_conformant.gpkg= gained both
+so it could be checked, and =the_registry_ddl_is_what_the_standard_says= now
+compares **eight** tables rather than six. /GDAL emits both identically: the
+first table so far where reading the standard confirmed the producer rather
+than correcting it, which is worth recording precisely because the four core
+tables went the other way./
+
+*Two refusals rather than two guesses*, both on D5's reasoning: a carried table
+whose name a layer already has, and a carried =gpkg_contents.identifier= a
+layer already has. Both would build an index with two equal keys -- a malformed
+database -- so they are made impossible instead of guarded against.
+
+/All four new tests were mutation-tested./ Dropping the srs registration, never
+renumbering on a collision, dropping the carried triggers and dropping the
+=sqlite_sequence= mark each fail exactly one test and no others.
+
+*A raster fixture, and the naming rule that turned out to be unwritten,
+2026-08-24 -- fixture and docs.* =tests/fixtures/gdal_tiles.gpkg= is the first
+*tile pyramid* in this tree: 80 tiles over two zoom levels with real JPEG
+payloads, built by =build_tile_fixture.sh= from a generated raster. It is the
+fixture =same-format-fidelity.org= M3b § 1 needs, and =PLANNED.org= had
+designed it as =gpkg_tiles.gpkg=.
+
+**Three things it forced.** /First:/ a *tiles-only* GeoPackage is **rejected by
+this reader** -- =GeoPackage has no feature layers= -- against =HOSTILE.org='s
+standing rule that every fixture reads without error, so =cities= from
+=gdal_hostile.gpkg= sits beside the pyramid. That accident is what makes the
+fixture bite: the layer is EPSG:4326 and the pyramid EPSG:3857, so the file
+holds an =srs_id= **no feature layer accounts for**, which is exactly what
+=resolve_srs= will not write and =fk_gc_r_srs_id= will catch.
+
+/Second:/ *the naming rule was a pattern, not a rule.* Four prefixes that all
+happened to encode provenance is not the same as a written rule, and the
+fixture nearly landed under a content-named =gpkg_= prefix with a paragraph
+arguing why the rule should bend. =HOSTILE.org= § NAMING now *states* it --
+**prefix is provenance, stem is purpose** -- and the two remaining =gpkg_*=
+names in =PLANNED.org= were changed to match: =sqlite_sequence.gpkg= and
+=sqlite_nullkey.gpkg=. /The second changed stem as well as prefix: it was named
+after its vehicle (=range= constraints) rather than its finding (a =UNIQUE= key
+with a nullable member does not make a set), which is the half that
+generalises./
+
+/Third:/ **the baseline is on record before any carrying exists.** geosetta
+writes that fixture today as =cities= alone, warning correctly that =imagery=
+(80 rows), =gpkg_tile_matrix= (14 rows) and 18 other schema objects are not
+carried -- defect 3. =foreign_key_check= on the output is *clean only because
+the row is gone*, so the oracle says nothing until § 1 is built. /Two facts the
+design did not have: the tile table carries **six triggers**, and
+=gpkg_tile_matrix= has 14 rows for 2 populated levels, so anything recomputing
+it from the tiles present writes a different file./
+
+*And rebuilding it is not byte-reproducible*, at exactly four sites: both
+=gpkg_contents.last_change= values and both
+=gpkg_metadata_reference.timestamp= values -- the two DATETIME columns of the
+same day's reading. /Which also means its =last_change= is a real producer
+stamp rather than the epoch sentinel, so the fixture exercises the carry that
+shipped in =0e33a40=./
 
 *A conformance oracle with no GDAL in it, 2026-08-23 -- code and a fixture.*
 Defect 6's fix was verified against the standard by *reading* it, and the thing
@@ -1546,7 +1731,7 @@ the mechanism before generalising:
 write to the file. Two of those three commands are what stop "GDAL refreshes
 metadata on every write" from being written down as measured./
 
-Two traps that already cost time once each:
+Three traps that already cost time once each:
 - *Do not write fixtures through a shell heredoc.* It silently mangled
   =København= to =Ke\xe2\x88\x9a\xe2\x88\x8f...=. Write with explicit encoding
   and check the raw bytes.
@@ -1559,6 +1744,50 @@ Two traps that already cost time once each:
   =String (0.0)=. To exercise them, write a fresh FGB from
   =gdal_hostile.shp=. The =0.0= is itself a useful case -- it is what proved
   that GDAL writes =width: 0= for "undeclared".
+
+*The carrying measurement (2026-08-24)* runs entirely on fixtures in the tree,
+and the third command is the one that matters -- a row count survives a carry
+that mangles every payload, so the check has to be on the *pixels*:
+
+#+begin_src sh
+  geosetta tests/fixtures/gdal_tiles.gpkg /tmp/out.gpkg --to gpkg
+  sqlite3 /tmp/out.gpkg 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
+  # the reference implementation reading our output, band by band
+  gdalinfo -checksum tests/fixtures/gdal_tiles.gpkg | grep -i checksum
+  gdalinfo -checksum /tmp/out.gpkg                  | grep -i checksum
+  # a fixed point: writing our own output again changes nothing
+  geosetta /tmp/out.gpkg /tmp/out2.gpkg --to gpkg && cmp /tmp/out.gpkg /tmp/out2.gpkg
+#+end_src
+
+/And the containment check, on the =0e33a40= precedent:/ a GeoPackage with **no
+pyramid** must come out byte-identical to what the previous binary wrote, which
+is what says the new channel costs nothing where it does not apply. Build the
+parent commit's binary into a *separate* target directory before comparing --
+see the second false start below.
+
+*Two false starts on the payload-containment comparison (2026-08-24), both of
+which read as findings.* Neither was a bug in the code. Both were bugs in the
+measurement, and each was believed for a while before it was caught.
+- *The first compared files that were never written.* =zsh= does not
+  word-split unquoted expansions, so a list of format names held in a variable
+  stayed a single word, every output collapsed onto one path, and the
+  per-format files did not exist -- yet the comparison still reported a
+  difference in every spoke. **The mechanism is worth knowing exactly:**
+  =cmp= exits *2* for a missing file and *1* for a real difference, but the
+  usual test is =if ! cmp -s a b=, which sees only /non-zero/ -- and =-s=
+  suppresses the =No such file or directory= that would have given it away.
+  /Loop over an array, not over an unquoted string; the =bash= idiom is
+  silently wrong here./
+- *The second used a stale release binary*, built before the change, and so
+  showed the carry silently not working -- a clean, plausible negative result
+  about code that was never run. See the note at the head of this section:
+  =geosetta/target/= is a leftover, and even the workspace binary is only as
+  new as the last =cargo build --release=.
+
+/Both produce the shape of a finding rather than the shape of an error, which
+is why they cost time: nothing in either run looks like a failed measurement./
+***Check that the thing you measured exists and was built from the code you
+think it was.***
 
 ** THE ONE REAL GAP -- *RETRACTED 2026-08-20, it was a measurement error*
 This section claimed *"this repository has no commits at all"* and recommended

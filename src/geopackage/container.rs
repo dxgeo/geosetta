@@ -28,8 +28,39 @@ use crate::sqlite::{Database, MasterObject, Value};
 /// container content that survives a write today. `gpkg_extensions` is *not*
 /// here: it is written only when an index is, which [`container_drop_warnings`]
 /// handles alongside the index itself.
+///
+/// **Unconditional is the operative word.** Content that survives only when it
+/// was carried does not belong here — it arrives per call, as `carried`, from
+/// [`super::carry::Carried::reproduced_names`].
 const REPRODUCED: [&str; 3] =
     ["gpkg_spatial_ref_sys", "gpkg_contents", "gpkg_geometry_columns"];
+
+/// The registry tables [`super::writer::build`] constructs *conditionally* —
+/// it emits each only when something needs it. Together with [`REPRODUCED`]
+/// these are the tables the writer builds rather than carries, which is what
+/// makes a **trigger attached to one of them derived**: see
+/// [`is_derived_trigger`].
+const CONSTRUCTED: [&str; 3] =
+    ["gpkg_extensions", "gpkg_tile_matrix", "gpkg_tile_matrix_set"];
+
+/// Content that is *derived* under M3b's three-class contract: recomputable
+/// from what survives, so its absence is not a loss of information.
+///
+/// `gpkg_ogr_contents` is `(table_name TEXT PRIMARY KEY, feature_count
+/// INTEGER)` — a **row-count cache**, and GDAL's own extension rather than the
+/// standard's. Counting it as destroyed content was *bug 13*, filed 2026-08-22
+/// and fixed 2026-08-24: it is the same mistake as counting an R*Tree
+/// registration in `gpkg_extensions`, which `foreign_extension_rows` already
+/// avoids. Reported silently rather than in the index message, on that
+/// precedent: the R*Tree earns a message because `--rtree` is a remedy, and a
+/// cache with no remedy and no lost information would be furniture on every
+/// `ogr2ogr` file.
+///
+/// *Under editing this is the sharpest case in the container* — carry the
+/// cache after a middle stage deletes a feature and the output states a count
+/// that is a lie — which is why it is classed derived rather than merely
+/// ignored.
+const DERIVED: [&str; 1] = ["gpkg_ogr_contents"];
 
 /// The Schema extension's tables, which are *layer* content living in
 /// container-scoped tables: their rows are keyed by `(table_name,
@@ -82,9 +113,10 @@ pub fn container_drop_warnings(
     bytes: &[u8],
     label: &str,
     written: &[String],
+    carried: &[String],
     rtree: bool,
 ) -> Vec<String> {
-    match survey(bytes, written) {
+    match survey(bytes, written, carried) {
         Ok(s) => s.into_warnings(label, rtree),
         // Not the error path. Every caller has already read this container (or
         // is about to), so a file this cannot open is reported — with a better
@@ -118,7 +150,7 @@ struct Survey {
     indexed: Vec<String>,
 }
 
-fn survey(bytes: &[u8], written: &[String]) -> Result<Survey> {
+fn survey(bytes: &[u8], written: &[String], carried: &[String]) -> Result<Survey> {
     let db = Database::open(bytes)?;
     let objects = db.master_objects()?;
     let tables = db.tables()?;
@@ -144,8 +176,16 @@ fn survey(bytes: &[u8], written: &[String]) -> Result<Survey> {
         }
         if REPRODUCED.contains(&object.name.as_str())
             || LAYER_SCOPED.contains(&object.name.as_str())
+            || DERIVED.contains(&object.name.as_str())
             || layers.contains(&object.name)
             || written.contains(&object.name)
+            // Carried by `super::carry`, so it survives the write and is not a
+            // loss to report. A trigger on a carried table arrives here too,
+            // which is why this test is by *name* rather than by kind: the six
+            // triggers a tile table owns would otherwise still be counted
+            // among the schema objects said to be destroyed.
+            || carried.contains(&object.name)
+            || is_derived_trigger(object, &layers, carried)
         {
             continue;
         }
@@ -257,6 +297,45 @@ impl Survey {
             parts.join("; ")
         ))
     }
+}
+
+/// Whether `object` is a trigger whose loss is *derived* rather than content.
+///
+/// A trigger is attached to a table. When that table is one the write
+/// **rebuilds** — a layer, or a registry table [`super::writer::build`]
+/// constructs — the trigger is not container content that vanishes; it is
+/// enforcement or maintenance of a table that comes back, and what it enforced
+/// either still holds or is recomputed.
+///
+/// ***The case that made this necessary, and it is a large one.*** `ogr2ogr`
+/// writes **ten** validation triggers on `gpkg_tile_matrix` alone, enforcing
+/// the value constraints of Requirements 46--52 — `zoom_level` not negative,
+/// the widths and pixel sizes greater than zero — on insert and on update. So
+/// on any GeoPackage holding a pyramid, ten of the twelve "other schema
+/// objects" this warning reported as destroyed were those. /Measured on
+/// `gdal_tiles.gpkg`, 2026-08-24, the day the pyramid started surviving./
+///
+/// **The standard does not mandate them**, which is what settles the
+/// classification rather than a judgement about how useful they are:
+/// Requirements 46--52 constrain the *values in the table*, and the tiles
+/// clause (OGC 12-128r19 § 2.2, read at pinned `fe83fdd`) does not mention a
+/// trigger anywhere. GDAL's ten are one implementation of enforcing a value
+/// requirement, so a file without them is conformant as long as its values are
+/// — and this writer carries those values verbatim. Producer practice, not the
+/// standard: `plans/same-format-fidelity.org` § THE ORACLE RULE.
+///
+/// /What is genuinely given up is future enforcement: an `INSERT` of a bad row
+/// into this crate's output is caught by neither. That is a loss of a guard
+/// rather than of information, and it is not what a warning about **what a
+/// rewrite destroys** is counting./
+fn is_derived_trigger(object: &MasterObject, layers: &[String], carried: &[String]) -> bool {
+    object.kind == "trigger"
+        && (layers.contains(&object.tbl_name)
+            || carried.contains(&object.tbl_name)
+            || REPRODUCED.contains(&object.tbl_name.as_str())
+            || CONSTRUCTED.contains(&object.tbl_name.as_str())
+            || LAYER_SCOPED.contains(&object.tbl_name.as_str())
+            || DERIVED.contains(&object.tbl_name.as_str()))
 }
 
 /// How many `gpkg_extensions` rows register something other than the R*Tree
@@ -417,7 +496,7 @@ mod tests {
     #[test]
     fn a_table_this_cannot_decode_is_reported_rather_than_silencing_the_survey() {
         let written = vec!["cities".to_string()];
-        let warnings = container_drop_warnings(ALTERED, "in.gpkg", &written, false);
+        let warnings = container_drop_warnings(ALTERED, "in.gpkg", &written, &[], false);
         let loss = &warnings[0];
         // Counted, as of 2026-08-23. A `WITHOUT ROWID` table is stored as an
         // index b-tree, and `sqlite.rs` can now read one — so the fallback this
@@ -427,7 +506,10 @@ mod tests {
         assert!(loss.contains("kv (2 rows)"), "{loss}");
         // The rest of the survey is unaffected: the tables it *can* read are
         // still counted, which is what the abort used to take down with it.
-        assert!(loss.contains("gpkg_ogr_contents (1 row)"), "{loss}");
+        // /This asserted `gpkg_ogr_contents (1 row)` until 2026-08-24, when that
+        // table was reclassified as derived — bug 13. `gpkg_metadata` is the
+        // same assertion about the same property, on a table that really is
+        // content./
         assert!(loss.contains("gpkg_metadata (1 row)"), "{loss}");
         // And the second warning still fires. This is the one that proves the
         // bug was scope rather than formatting: an undecodable table has no
@@ -436,23 +518,60 @@ mod tests {
         assert!(warnings[1].contains("R*Tree spatial index on cities"), "{warnings:?}");
     }
 
+    /// A trigger on a table that is **genuinely destroyed** is still reported,
+    /// which is the half of [`is_derived_trigger`] that nothing else exercises.
+    ///
+    /// Every trigger in every other fixture is attached to something the write
+    /// rebuilds — a layer, or a registry table — so all of them are derived and
+    /// the rule could be widened to "all triggers" without a single test
+    /// noticing. `sqlite_constraints.gpkg` grew `events_stamp` on 2026-08-24
+    /// for exactly that reason: `events` is a user table this writer does not
+    /// reproduce, so its trigger goes down with it and the message has to say
+    /// so.
+    #[test]
+    fn a_trigger_on_a_destroyed_table_is_still_reported() {
+        const CONSTRAINTS: &[u8] = include_bytes!("../../tests/fixtures/sqlite_constraints.gpkg");
+        let written = vec!["cities".to_string(), "second".to_string()];
+        let warnings = container_drop_warnings(CONSTRAINTS, "in.gpkg", &written, &[], false);
+        let loss = &warnings[0];
+        assert!(loss.contains("events (2 rows)"), "the table itself: {loss}");
+        // **The count, not the phrase.** This asserted only that the message
+        // said "other schema objects", and passed under a mutation that
+        // classified *every* trigger as derived — because `idx_events_kind`,
+        // an explicit `CREATE INDEX` in the same fixture, satisfies the phrase
+        // on its own. Two objects: that index, and `events_stamp`. Found by
+        // mutation-testing this test on the day it was written.
+        assert!(loss.contains("2 other schema objects"), "its trigger: {loss}");
+    }
+
     #[test]
     fn the_container_around_the_layers_is_reported_object_by_object() {
         let written = vec!["cities".to_string(), "second".to_string()];
-        let warnings = container_drop_warnings(HOSTILE, "in.gpkg", &written, false);
+        let warnings = container_drop_warnings(HOSTILE, "in.gpkg", &written, &[], false);
         let loss = &warnings[0];
         // The user's own table is the one a reader of this message cares most
         // about, and it is named with its row count rather than counted.
         assert!(loss.contains("side_notes (1 row)"), "{loss}");
         assert!(loss.contains("gpkg_metadata (1 row)"), "{loss}");
         assert!(loss.contains("gpkg_metadata_reference (1 row)"), "{loss}");
-        assert!(loss.contains("gpkg_ogr_contents (2 rows)"), "{loss}");
         // gpkg_tile_matrix and gpkg_tile_matrix_set, created and never filled.
         assert!(loss.contains("2 empty tables"), "{loss}");
-        // 30 triggers in the file, 14 of them the R*Tree's own (derived, and
-        // reported as the index instead).
-        assert!(loss.contains("14 other schema objects"), "{loss}");
         assert!(loss.contains("in.gpkg"), "{loss}");
+
+        // ***Two things this message used to say and no longer does, both
+        // corrected 2026-08-24.***
+        //
+        // `gpkg_ogr_contents` is a row-count cache — *bug 13*, and the same
+        // mistake as counting an R*Tree registration in `gpkg_extensions`.
+        assert!(!loss.contains("gpkg_ogr_contents"), "{loss}");
+        // And **no** schema objects are left to report here, where the message
+        // used to claim 14. This file's 28 triggers are 14 R*Tree ones
+        // (already derived), 10 that `ogr2ogr` puts on `gpkg_tile_matrix` to
+        // enforce Requirements 46–52 — a table the writer rebuilds, and value
+        // constraints the standard states without mandating a trigger — and 4
+        // maintaining `gpkg_ogr_contents`. Every one of them is attached to
+        // something the write reconstructs.
+        assert!(!loss.contains("other schema object"), "{loss}");
     }
 
     #[test]
@@ -461,7 +580,7 @@ mod tests {
         // the output, but that is a selection the user asked for, not a loss
         // the container warning has any business reporting.
         for written in [vec!["cities".to_string(), "second".to_string()], vec!["cities".to_string()]] {
-            let warnings = container_drop_warnings(HOSTILE, "in.gpkg", &written, false);
+            let warnings = container_drop_warnings(HOSTILE, "in.gpkg", &written, &[], false);
             let joined = warnings.join(" | ");
             assert!(!joined.contains("cities ("), "{joined}");
             assert!(!joined.contains("second ("), "{joined}");
@@ -474,9 +593,9 @@ mod tests {
         // GeoPackage with nothing in it but layers and required tables, and a
         // warning that fires on that one teaches users to ignore it.
         let layers = vec![layer("a"), layer("b")];
-        let bytes = super::super::write_layers(None, &layers, false, false).unwrap();
+        let bytes = super::super::write_layers(None, &layers, &crate::geopackage::Carried::default(), false, false).unwrap();
         assert_eq!(
-            container_drop_warnings(&bytes, "own.gpkg", &names(&layers), false),
+            container_drop_warnings(&bytes, "own.gpkg", &names(&layers), &[], false),
             Vec::<String>::new()
         );
     }
@@ -484,18 +603,18 @@ mod tests {
     #[test]
     fn an_rtree_registration_is_not_a_loss_beside_the_index_it_declares() {
         let layers = vec![layer("a")];
-        let bytes = super::super::write_layers(None, &layers, true, false).unwrap();
+        let bytes = super::super::write_layers(None, &layers, &crate::geopackage::Carried::default(), true, false).unwrap();
 
         // Written again with an index: the index is rebuilt, so nothing at all.
         assert_eq!(
-            container_drop_warnings(&bytes, "own.gpkg", &names(&layers), true),
+            container_drop_warnings(&bytes, "own.gpkg", &names(&layers), &[], true),
             Vec::<String>::new()
         );
 
         // Written again without one: exactly one warning, and it is the index
         // — `gpkg_extensions` holds nothing but that index's own registration,
         // so reporting it as destroyed content would report one loss twice.
-        let warnings = container_drop_warnings(&bytes, "own.gpkg", &names(&layers), false);
+        let warnings = container_drop_warnings(&bytes, "own.gpkg", &names(&layers), &[], false);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("R*Tree spatial index on a"), "{warnings:?}");
         assert!(warnings[0].contains("--rtree"), "{warnings:?}");
@@ -508,10 +627,10 @@ mod tests {
         // leave out. Naming it would also offer `--rtree` as a remedy that
         // cannot apply: the writer only ever indexes the layers it writes.
         let layers = vec![layer("a"), layer("b")];
-        let bytes = super::super::write_layers(None, &layers, true, false).unwrap();
+        let bytes = super::super::write_layers(None, &layers, &crate::geopackage::Carried::default(), true, false).unwrap();
 
         let selected = vec!["a".to_string()];
-        let warnings = container_drop_warnings(&bytes, "in.gpkg", &selected, false);
+        let warnings = container_drop_warnings(&bytes, "in.gpkg", &selected, &[], false);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("R*Tree spatial index on a"), "{warnings:?}");
         assert!(!warnings[0].contains(" b"), "the unselected layer's index: {warnings:?}");
@@ -523,7 +642,7 @@ mod tests {
         // geometry column called `b_geom` — indistinguishable by name, which
         // is why attribution reads the triggers' `tbl_name` instead.
         let layers = vec![layer("a"), layer("a_b")];
-        let bytes = super::super::write_layers(None, &layers, true, false).unwrap();
+        let bytes = super::super::write_layers(None, &layers, &crate::geopackage::Carried::default(), true, false).unwrap();
         let db = Database::open(&bytes).unwrap();
         let objects = db.master_objects().unwrap();
         // Both layers are being written here, so the `written` filter admits
@@ -537,7 +656,7 @@ mod tests {
     #[test]
     fn unreadable_bytes_warn_about_nothing_and_leave_the_error_to_the_read() {
         assert_eq!(
-            container_drop_warnings(b"not a sqlite file", "junk.gpkg", &[], false),
+            container_drop_warnings(b"not a sqlite file", "junk.gpkg", &[], &[], false),
             Vec::<String>::new()
         );
     }
@@ -559,7 +678,7 @@ mod tests {
     #[test]
     fn a_gpkg_contents_row_that_is_not_a_feature_layer_is_still_surveyed() {
         let written = vec!["cities".to_string()];
-        let s = survey(CONTENTS, &written).expect("fixture opens");
+        let s = survey(CONTENTS, &written, &[]).expect("fixture opens");
         let found: Vec<&str> = s.populated.iter().map(|(n, _)| n.as_str()).collect();
         assert!(found.contains(&"notes_aspatial"), "attributes table missing: {found:?}");
         assert!(found.contains(&"imagery"), "tile table missing: {found:?}");

@@ -31,8 +31,28 @@ standard itself. =spec_conformant.gpkg= is that second opinion. See
 =plans/same-format-fidelity.org= § THE ORACLE RULE.
 
 ** NAMING
-- =gdal_hostile.*= -- produced by *GDAL 3.13.2 =ogr2ogr=*. Preferred, because a
-  member a real tool actually writes is a member that really occurs.
+***The prefix is the fixture's provenance; the stem is what it is for.***
+/Stated as a rule 2026-08-24, when a fixture was nearly landed under a
+content-named prefix and the rule turned out to be nowhere written down -- four
+prefixes that all happened to be provenance is a pattern, not a rule, and the
+next fixture is the one that discovers the difference./
+
+*Why provenance and not content.* Content is what the entry below the heading
+is for, and it changes: a fixture grows a table, and a name that described the
+old contents is now a lie in a filename nobody wants to churn. Provenance never
+changes -- =gdal_hostile.gpkg= was produced by GDAL and always will have been
+-- and it is the thing you cannot recover by opening the file. Two fixtures
+with the same content and different provenance are *different fixtures*, which
+is the whole reason =spec_= exists beside =sqlite_=.
+
+/The names in =PLANNED.org= follow the same rule, and two of them were changed
+on 2026-08-24 to do so./
+- =gdal_*= -- produced by *GDAL 3.13.2*. Preferred, because a member a real
+  tool actually writes is a member that really occurs. /Read =ogr2ogr= until
+  2026-08-24, when =gdal_tiles.gpkg= arrived from =gdal_translate=: the prefix
+  is the producer, not the one command./ The stem says what the fixture is for
+  -- =hostile= for the common source's awkward members, =tiles= for a raster
+  pyramid.
 - =hand_hostile.*= -- *authored*, for cases no tool will emit. GeoJSON foreign
   members are the clearest example: any tool that round-trips them would have
   had to model them, and a tool that models them will not emit an unmodelled
@@ -269,6 +289,7 @@ would emit a *malformed database* (=SELECT= works, =integrity_check= fails,
 | =registry(key TEXT PRIMARY KEY)= | a non-rowid primary key -- *the shape =gpkg_contents= itself has in the specification*, which is why this fixture also covers defect 6 |
 | =events= + =CREATE INDEX idx_events_kind= | a named =sqlite_master= =index= entry rather than an autoindex |
 | =people(email TEXT UNIQUE COLLATE NOCASE)= | the case D10 says must be *carried* rather than constructed: constructing it needs =NOCASE=, and this writer's own tables never do |
+| =events_stamp=, a trigger on =events= -- /added 2026-08-24/ | **the only trigger in this tree attached to a table the write does not rebuild.** Every other trigger anywhere -- =ogr2ogr='s R*Tree ones, its =gpkg_ogr_contents= maintenance, its ten on =gpkg_tile_matrix= -- hangs off a layer or a registry table, and is therefore *derived*. Without this one, =container.rs='s =is_derived_trigger= could be widened to "every trigger" and no test would notice; it was mutation-tested to prove that |
 
 *Why the whole fixture set had no member of this class*, which is the same
 lesson as =sqlite_altered.gpkg= one table further out: the only user table
@@ -307,6 +328,90 @@ set had no member of at all.
 then the three =sqlite3= statements above. Note =VACUUM= fails on this file
 ("attempt to write a readonly database"); the 128 KB size is in line with the
 other =.gpkg= fixtures and was left alone.
+
+*** =gdal_tiles.gpkg= -- /added 2026-08-24, and not hostile/
+A **real tile pyramid**, which no other fixture here has: 80 tiles across two
+zoom levels with real JPEG payloads, beside a feature layer from
+§ THE COMMON SOURCE. Built by
+[[file:build_tile_fixture.sh][=build_tile_fixture.sh=]] from a generated
+raster, because no raster small enough to keep as a source would produce a
+pyramid worth carrying.
+
+*Pins D8* -- a tile pyramid is *carried*, as independent container content, and
+no file is rejected for holding one. =sqlite_contents.gpkg= carries a minimal
+one row deep, enough for bug 14's reporting; it is not enough to test
+*carrying*, which has to move real BLOBs across the rewrite.
+
+| content | what it pins |
+|---------+--------------|
+| =imagery=, 64 tiles at z13 (8x8) + 16 at z12 (4x4) | carrying BLOB payloads, at a size where a per-tile mistake shows up as a count |
+| =id INTEGER PRIMARY KEY AUTOINCREMENT= *and* =UNIQUE (zoom_level, tile_column, tile_row)= | the **only** mergeable table that both declares AUTOINCREMENT and owns an index -- so it needs =sqlite_sequence= *and* an autoindex b-tree, the two =sqlite.rs= gaps closed on 2026-08-23, at once. Its key is three integers, needing no collation |
+| =gpkg_tile_matrix=, **14 rows for 2 populated levels** | that the matrix defines the whole scheme z0--z13 and not just what is stored: anything recomputing it from the tiles present writes a different file |
+| =gpkg_tile_matrix_set= over the full Web Mercator extent | a row referencing an =srs_id= that no feature layer accounts for |
+| *six triggers on the tile table* | schema objects on a carried table that are neither index nor DDL -- =zoom_level=, =tile_column= and =tile_row=, insert and update each |
+| =imagery= at =srs_id= 3857, =cities= at 4326 | ***the M3b § 1 case***, below |
+
+***Why it has a feature layer at all, which is not decoration.*** A tiles-only
+GeoPackage is *rejected by this reader* -- =GeoPackage has no feature layers=,
+measured 2026-08-24 -- and § NAMING's standing rule is that every fixture here
+is confirmed readable without error. So the pyramid needs a layer beside it,
+and the layer is taken from =gdal_hostile.gpkg= rather than invented, which
+keeps the fixture on the common source.
+
+*That constraint turned out to be the useful part.* The layer is EPSG:4326 and
+the pyramid EPSG:3857, so the file holds an =srs_id= that **no feature layer
+accounts for** -- and =writer.rs='s =resolve_srs= builds
+=gpkg_spatial_ref_sys= from the layer set alone. A carried pyramid row
+therefore points at a CRS the output never writes, which =gpkg_contents='s
+=fk_gc_r_srs_id= makes visible: this is
+=plans/same-format-fidelity.org= § MILESTONES M3b requirement 1, and
+=PRAGMA foreign_key_check= is its oracle.
+
+***The baseline it was built to measure lasted one day, which is the point of
+recording it.*** When this fixture landed on 2026-08-24, geosetta wrote it as
+=cities= alone -- =imagery= (80 rows), =gpkg_tile_matrix= (14 rows),
+=gpkg_tile_matrix_set= and *18 other schema objects* dropped, defect 3
+correctly reported, and =foreign_key_check= clean **only because the row was
+gone**. /Later the same day the carrying half shipped against this file./
+
+*What it now pins, which is the useful form:* the pyramid round-trips whole --
+80 tiles blob-for-blob, 14 matrix rows, the =sqlite_sequence= mark, all six
+triggers -- =foreign_key_check= is clean *with the row present*, and
+=gdalinfo -checksum= reports the same four band checksums through the output as
+through this file. The drop warning still fires, for what is genuinely still
+dropped: =gpkg_ogr_contents=, =gpkg_extensions=, =gpkg_metadata= and
+=gpkg_metadata_reference=.
+
+*What it does not cover, stated so nobody assumes it does.* Its
+=sqlite_sequence= mark is 80 and =max(id)= is 80. Like every other fixture in
+this tree it leaves a high-water mark *above* =max(id)= unexercised, which is
+=sqlite_sequence.gpkg='s job in =PLANNED.org= and still unbuilt.
+
+*Two build choices that are measurements rather than taste*, both recorded in
+the script: an **all-nodata source yields the full tile DDL and zero tile
+rows**, because GDAL skips blank tiles, so the raster is burned; and the pixels
+are smooth structure rather than noise, because noise defeats the tile codec
+and would make this fixture megabytes instead of 368 KB. /=TILE_FORMAT= is left
+at GDAL's default, which is JPEG for opaque RGB -- what a real producer emits
+is the point./
+
+/Verified: =PRAGMA integrity_check= ok, =foreign_key_check= clean, and geosetta
+reads it without error./
+
+***Rebuilding it does not reproduce it byte-for-byte, and the four bytes that
+move are the interesting ones.*** Two runs of the script five minutes apart
+produced files of identical size whose dumps are identical once timestamps are
+normalised, differing at exactly **four** sites: =gpkg_contents.last_change=
+for both tables, and =gpkg_metadata_reference.timestamp= for both. /Those are
+the two DATETIME columns of the 2026-08-24 reading -- the one the standard
+gives a meaning and the one it gives only a format./ So this fixture also
+exercises the carry that shipped that day: its =last_change= values are **real
+producer timestamps, not the epoch sentinel**, which is the condition under
+which =geopackage/reader.rs= keeps them.
+
+/Consequence for anyone rebuilding: do not expect =cmp= to be quiet, and do not
+"fix" it by freezing the clock -- a real producer's timestamp is what this
+fixture is for./
 
 *** =gdal_hostile.gpkg=
 =ogr2ogr= plus =sqlite3= for the container content. Carries:

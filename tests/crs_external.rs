@@ -212,7 +212,7 @@ fn prints_one_line_per_distinct_layer_crs() {
         ("b".to_string(), point_fc(Some(epsg_3857))),
         ("c".to_string(), point_fc(Some(code_only_crs()))),
     ];
-    std::fs::write(&path, geosetta::geopackage::write_layers(None, &layers, false, false).unwrap())
+    std::fs::write(&path, geosetta::geopackage::write_layers(None, &layers, &geosetta::geopackage::Carried::default(), false, false).unwrap())
         .unwrap();
 
     let r = run(&[path.to_str().unwrap(), "--print-crs-code"], None);
@@ -364,7 +364,7 @@ fn a_geopackage_synthetic_id_is_not_reported_as_a_code() {
     let layers = vec![("a".to_string(), point_fc(Some(wkt_only_crs(ID_LESS_WKT_A))))];
     std::fs::write(
         &path,
-        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+        geosetta::geopackage::write_layers(None, &layers, &geosetta::geopackage::Carried::default(), false, false).unwrap(),
     )
     .unwrap();
     let src = path.to_str().unwrap();
@@ -390,7 +390,7 @@ fn a_geopackage_with_a_real_code_still_reports_it() {
     let layers = vec![("a".to_string(), point_fc(Some(code_only_crs())))];
     std::fs::write(
         &path,
-        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+        geosetta::geopackage::write_layers(None, &layers, &geosetta::geopackage::Carried::default(), false, false).unwrap(),
     )
     .unwrap();
 
@@ -464,7 +464,7 @@ fn more_than_one_distinct_definition_is_an_error_naming_the_layers() {
     ];
     std::fs::write(
         &path,
-        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+        geosetta::geopackage::write_layers(None, &layers, &geosetta::geopackage::Carried::default(), false, false).unwrap(),
     )
     .unwrap();
     let src = path.to_str().unwrap();
@@ -498,7 +498,7 @@ fn layers_sharing_one_definition_print_it_once() {
     ];
     std::fs::write(
         &path,
-        geosetta::geopackage::write_layers(None, &layers, false, false).unwrap(),
+        geosetta::geopackage::write_layers(None, &layers, &geosetta::geopackage::Carried::default(), false, false).unwrap(),
     )
     .unwrap();
 
@@ -764,7 +764,7 @@ fn crs_override_applies_to_every_geopackage_layer_and_says_so() {
         ("a".to_string(), point_fc(Some(code_only_crs()))),
         ("b".to_string(), point_fc(Some(epsg_3857))),
     ];
-    std::fs::write(&src, geosetta::geopackage::write_layers(None, &layers, false, false).unwrap())
+    std::fs::write(&src, geosetta::geopackage::write_layers(None, &layers, &geosetta::geopackage::Carried::default(), false, false).unwrap())
         .unwrap();
     let wkt_path = dir.join("gda2020.wkt");
     std::fs::write(&wkt_path, GDA2020_WKT1).unwrap();
@@ -793,7 +793,7 @@ fn crs_override_applies_to_every_geopackage_layer_and_says_so() {
     // relabel and got exactly it.
     let single = dir.join("single_src.gpkg");
     let one = vec![("a".to_string(), point_fc(Some(code_only_crs())))];
-    std::fs::write(&single, geosetta::geopackage::write_layers(None, &one, false, false).unwrap())
+    std::fs::write(&single, geosetta::geopackage::write_layers(None, &one, &geosetta::geopackage::Carried::default(), false, false).unwrap())
         .unwrap();
     let r = run(
         &[

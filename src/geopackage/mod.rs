@@ -6,12 +6,17 @@
 //! GeoPackage Binary — a small header wrapping standard WKB, which we already
 //! decode. See `plans/geopackage.org`.
 
+pub mod carry;
 mod container;
 mod reader;
 mod rtree;
 mod writer;
 
 pub use container::container_drop_warnings;
+/// The container carrying channel — independent content read out of a source
+/// GeoPackage so a `gpkg -> gpkg` write can put it back. Crate-visible: this is
+/// the write path's own plumbing, not part of the format-agnostic surface.
+pub use carry::{Carried, read as read_container};
 pub use reader::read_layers;
 pub use writer::write_layers;
 /// The sentinel `gpkg_contents.last_change` written where a layer carried none.

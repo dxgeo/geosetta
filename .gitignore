@@ -7,3 +7,5 @@
 !tests/fixtures/*.parquet
 # Local sample datasets (multi-GB gpkg/shapefiles) — not for version control.
 /examples/
+# Session summaries — working notes about a session, not repository content.
+/summary.org

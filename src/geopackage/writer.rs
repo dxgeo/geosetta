@@ -4,7 +4,7 @@
 //! layers, upsert, and rewrite the complete file (see `plans/geopackage.org`).
 
 use crate::crs::Crs;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::feature::FeatureCollection;
 use crate::geometry::{to_wkb, Bbox, Geometry};
 use crate::schema::{columns_for, Cell, Column, ColumnType, DeclType};
@@ -12,6 +12,7 @@ use crate::format::Format;
 use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
 use crate::sqlite::{MasterEntry, TableSpec, Value, autoindex_records, write_database};
 
+use super::carry::{Carried, Pyramid};
 use super::reader::read_layers;
 use super::rtree;
 
@@ -119,6 +120,23 @@ const DATA_COLUMNS_DDL: &str = "CREATE TABLE gpkg_data_columns (table_name TEXT 
 /// definitions. `ogr2ogr` writes this one with no constraint at all.
 const DATA_COLUMN_CONSTRAINTS_DDL: &str = "CREATE TABLE gpkg_data_column_constraints (constraint_name TEXT NOT NULL, constraint_type TEXT NOT NULL, value TEXT, min NUMERIC, min_is_inclusive BOOLEAN, max NUMERIC, max_is_inclusive BOOLEAN, description TEXT, CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value))";
 
+/// `gpkg_tile_matrix_set` — one row per tile pyramid, giving its extent in its
+/// own CRS.
+///
+/// Transcribed from OGC 12-128r19 Annex C at the pinned commit `fe83fdd`, the
+/// same source and the same commit as the four core tables above. **GDAL emits
+/// this one identically**, which is worth recording rather than assuming: the
+/// four core tables are where `ogr2ogr` deviates, and this is a case where
+/// checking the standard confirmed the producer instead of correcting it. The
+/// annex's inconsistent spacing — `gpkg_contents(table_name)` against
+/// `gpkg_spatial_ref_sys (srs_id)` — is preserved, because it is what the
+/// standard says.
+const TILE_MATRIX_SET_DDL: &str = "CREATE TABLE gpkg_tile_matrix_set (table_name TEXT NOT NULL PRIMARY KEY, srs_id INTEGER NOT NULL, min_x DOUBLE NOT NULL, min_y DOUBLE NOT NULL, max_x DOUBLE NOT NULL, max_y DOUBLE NOT NULL, CONSTRAINT fk_gtms_table_name FOREIGN KEY (table_name) REFERENCES gpkg_contents(table_name), CONSTRAINT fk_gtms_srs FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys (srs_id))";
+
+/// `gpkg_tile_matrix` — one row per zoom level of a pyramid, defining the
+/// tiling scheme. Same source and commit as [`TILE_MATRIX_SET_DDL`].
+const TILE_MATRIX_DDL: &str = "CREATE TABLE gpkg_tile_matrix (table_name TEXT NOT NULL, zoom_level INTEGER NOT NULL, matrix_width INTEGER NOT NULL, matrix_height INTEGER NOT NULL, tile_width INTEGER NOT NULL, tile_height INTEGER NOT NULL, pixel_x_size DOUBLE NOT NULL, pixel_y_size DOUBLE NOT NULL, CONSTRAINT pk_ttm PRIMARY KEY (table_name, zoom_level), CONSTRAINT fk_tmm_table_name FOREIGN KEY (table_name) REFERENCES gpkg_contents(table_name))";
+
 /// `gpkg_extensions` — one row per extension in use.
 const EXTENSIONS_DDL: &str = "CREATE TABLE gpkg_extensions (table_name TEXT, column_name TEXT, extension_name TEXT NOT NULL, definition TEXT NOT NULL, scope TEXT NOT NULL, CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name))";
 
@@ -133,6 +151,7 @@ const WGS84_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\
 pub fn write_layers(
     existing: Option<&[u8]>,
     new_layers: &[(String, FeatureCollection)],
+    carried: &Carried,
     rtree: bool,
     envelope: bool,
 ) -> Result<Vec<u8>> {
@@ -144,19 +163,47 @@ pub fn write_layers(
         layers.retain(|(n, _)| n != name);
         layers.push((name.clone(), fc.clone()));
     }
-    build(&layers, rtree, envelope)
+    build(&layers, carried, rtree, envelope)
 }
 
-fn build(layers: &[(String, FeatureCollection)], rtree: bool, envelope: bool) -> Result<Vec<u8>> {
+fn build(
+    layers: &[(String, FeatureCollection)],
+    carried: &Carried,
+    rtree: bool,
+    envelope: bool,
+) -> Result<Vec<u8>> {
+    // A carried table cannot share a name with a layer: one of the two would
+    // have to win, and `gpkg_contents.table_name` is a primary key, so writing
+    // both produces a database SQLite reports as malformed. Refused rather than
+    // resolved, on D5's grounds in `plans/container-reconciliation.org` — a
+    // silent wrong answer here passes `integrity_check` in some shapes and
+    // fails it in others, and neither is something to guess at.
+    for pyramid in &carried.pyramids {
+        if layers.iter().any(|(name, _)| *name == pyramid.name) {
+            return Err(Error::Convert(format!(
+                "gpkg: the source carries a tile pyramid named \"{}\" and a feature layer of \
+                 the same name; refusing to write a container where one would overwrite the \
+                 other",
+                pyramid.name
+            )));
+        }
+    }
+
     // Resolve every layer's srs_id up front (registering any non-default SRS),
-    // so gpkg_contents, gpkg_geometry_columns, and each geometry blob all agree.
-    let srs = resolve_srs(layers);
+    // so gpkg_contents, gpkg_geometry_columns, and each geometry blob all agree
+    // — and, since 2026-08-24, so does every *carried* object that references
+    // one. See `resolve_srs`.
+    let srs = resolve_srs(layers, carried);
 
     let mut specs = vec![
         spatial_ref_sys(&srs.registrations),
-        gpkg_contents(layers, &srs.per_layer),
+        gpkg_contents(layers, &srs.per_layer, carried, &srs.per_pyramid)?,
         geometry_columns(layers, &srs.per_layer),
     ];
+    if !carried.is_empty() {
+        specs.push(tile_matrix_set(carried, &srs.per_pyramid));
+        specs.push(tile_matrix(carried));
+    }
     // A GeoPackage has one `gpkg_extensions` table regardless of how many
     // extensions are in use, so every extension contributes rows to the same
     // combined table rather than each pushing its own `TableSpec`.
@@ -187,6 +234,23 @@ fn build(layers: &[(String, FeatureCollection)], rtree: bool, envelope: bool) ->
             specs.extend(index.tables);
             master.extend(index.master);
         }
+    }
+
+    // Carried tables last, so their b-trees are built after everything this
+    // writer constructs — the order has no meaning to SQLite, and keeping the
+    // constructed tables in the positions they have always had keeps this
+    // crate's own output byte-identical for a file that carries nothing.
+    for pyramid in &carried.pyramids {
+        specs.push(tile_table(pyramid));
+        master.extend(pyramid.triggers.iter().map(|(name, sql)| MasterEntry {
+            kind: "trigger".into(),
+            name: name.clone(),
+            tbl_name: pyramid.name.clone(),
+            sql: sql.clone(),
+            // A trigger owns no b-tree; it is pure schema, and there is nothing
+            // to reconstruct one from but the text SQLite stored.
+            records: None,
+        }));
     }
 
     write_database(&specs, &master, APPLICATION_ID, USER_VERSION)
@@ -372,10 +436,14 @@ struct SrsReg {
     definition: String,
 }
 
-/// The srs_id chosen for each layer (aligned with `layers`), plus the extra
+/// The srs_id chosen for each layer (aligned with `layers`) and for each
+/// carried pyramid (aligned with `carried.pyramids`), plus the extra
 /// `gpkg_spatial_ref_sys` rows those choices require.
 struct ResolvedSrs {
     per_layer: Vec<i64>,
+    /// **The output's** srs_id for each carried object, which is not the
+    /// source's — see [`reconcile_carried_srs`].
+    per_pyramid: Vec<i64>,
     registrations: Vec<SrsReg>,
 }
 
@@ -392,7 +460,7 @@ struct ResolvedSrs {
 /// doesn't (non-numeric, e.g. `"LAMB93"`) falls into the same synthetic-id path
 /// as "no code at all" — the WKT definition, if any, still carries through, so
 /// nothing is silently mislabeled, it just can't be the native id.
-fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
+fn resolve_srs(layers: &[(String, FeatureCollection)], carried: &Carried) -> ResolvedSrs {
     let mut per_layer = Vec::with_capacity(layers.len());
     let mut registrations: Vec<SrsReg> = Vec::new();
     let mut next_synthetic = SYNTHETIC_SRS_BASE;
@@ -453,7 +521,99 @@ fn resolve_srs(layers: &[(String, FeatureCollection)]) -> ResolvedSrs {
         }
         per_layer.push(srs_id);
     }
-    ResolvedSrs { per_layer, registrations }
+    // Carried content is resolved *after* every layer, so a layer's numbering
+    // is exactly what it was before this channel existed and a file carrying
+    // nothing is byte-identical.
+    let per_pyramid = carried
+        .pyramids
+        .iter()
+        .map(|pyramid| reconcile_carried_srs(pyramid, &mut registrations, &mut next_synthetic))
+        .collect();
+
+    ResolvedSrs { per_layer, per_pyramid, registrations }
+}
+
+/// Map a carried object's `srs_id` from the **source's** numbering into the
+/// output's, registering its CRS when the output does not already have one.
+///
+/// This is § MILESTONES M3b requirement 1, and the reason it is needed at all
+/// is that [`resolve_srs`] recomputes every id from the layer set on *every*
+/// write, with no "existing destination" condition: an authority code becomes
+/// the id directly and a codeless CRS is handed a synthetic id **in layer
+/// order**. So a carried `gpkg_contents` or `gpkg_tile_matrix_set` row points
+/// into a numbering the writer has just rebuilt, and left alone it dangles —
+/// past `integrity_check`, which has no opinion, and caught by
+/// `PRAGMA foreign_key_check` through `fk_gc_r_srs_id`.
+///
+/// Three cases, in the order they are tested:
+///
+/// 1. **The output already has this id, for this same CRS.** Reuse it. This is
+///    the ordinary case — a pyramid in EPSG:3857 beside a layer in EPSG:3857,
+///    or two pyramids sharing one.
+/// 2. **The output already has this id, for a *different* CRS.** The id
+///    collides, so the carried object is renumbered onto a fresh synthetic id
+///    and its definition registered there. Position-dependent synthetic ids are
+///    exactly how this arises: two files both numbering from
+///    [`SYNTHETIC_SRS_BASE`] mean the same integer names two different systems.
+/// 3. **The output does not have this id.** Register the source's own row under
+///    its own id, so the reference stays the number it already was.
+///
+/// A carried object whose source held *no* definition for its id is mapped to
+/// [`UNDEFINED_SRS_ID`] rather than carried through: the reference was already
+/// dangling in the source, and reproducing it would put this crate's name on a
+/// file that fails `foreign_key_check`. The CRS is not knowable from anything
+/// else in the file — a tile is an opaque blob here — so "undefined" is the
+/// true statement.
+fn reconcile_carried_srs(
+    pyramid: &Pyramid,
+    registrations: &mut Vec<SrsReg>,
+    next_synthetic: &mut i64,
+) -> i64 {
+    // The three rows `spatial_ref_sys` always writes. A carried reference to
+    // one of them needs no registration and no renumbering.
+    if pyramid.srs_id == UNDEFINED_SRS_ID || pyramid.srs_id == -1 {
+        return pyramid.srs_id;
+    }
+    let Some(def) = &pyramid.srs else {
+        return UNDEFINED_SRS_ID;
+    };
+    if pyramid.srs_id == WGS84_SRS_ID {
+        return WGS84_SRS_ID;
+    }
+
+    if let Some(existing) = registrations.iter().find(|r| r.srs_id == pyramid.srs_id) {
+        let same = existing.organization == def.organization
+            && existing.organization_coordsys_id == def.organization_coordsys_id
+            && existing.definition == def.definition;
+        if same {
+            return pyramid.srs_id;
+        }
+        // Case 2: renumber onto an id nothing has taken. Stepping past taken
+        // ids matters because a *carried* id may itself sit in the synthetic
+        // range, which is the collision this whole function exists for.
+        while registrations.iter().any(|r| r.srs_id == *next_synthetic) {
+            *next_synthetic += 1;
+        }
+        let srs_id = *next_synthetic;
+        *next_synthetic += 1;
+        registrations.push(SrsReg {
+            srs_id,
+            name: def.srs_name.clone(),
+            organization: def.organization.clone(),
+            organization_coordsys_id: def.organization_coordsys_id,
+            definition: def.definition.clone(),
+        });
+        return srs_id;
+    }
+
+    registrations.push(SrsReg {
+        srs_id: pyramid.srs_id,
+        name: def.srs_name.clone(),
+        organization: def.organization.clone(),
+        organization_coordsys_id: def.organization_coordsys_id,
+        definition: def.definition.clone(),
+    });
+    pyramid.srs_id
 }
 
 fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
@@ -494,7 +654,12 @@ fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
     TableSpec { name: "gpkg_spatial_ref_sys".into(), sql: sql.into(), rows, autoindexes: Vec::new(), autoincrement: None }
 }
 
-fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) -> TableSpec {
+fn gpkg_contents(
+    layers: &[(String, FeatureCollection)],
+    per_layer_srs: &[i64],
+    carried: &Carried,
+    per_pyramid_srs: &[i64],
+) -> Result<TableSpec> {
     let rows: Vec<(i64, Vec<Value>)> = layers
         .iter()
         .zip(per_layer_srs)
@@ -534,7 +699,41 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) 
             )
         })
         .collect();
-    TableSpec {
+    let mut rows = rows;
+    for (i, (pyramid, &srs_id)) in carried.pyramids.iter().zip(per_pyramid_srs).enumerate() {
+        // `identifier` is UNIQUE across the whole table, so a carried pyramid
+        // whose identifier a layer already took would build an index with two
+        // equal keys — a database SQLite reports as malformed. Refused for the
+        // same reason as the table-name collision in `build`.
+        if rows.iter().any(|(_, values)| values.get(2) == Some(&Value::Text(pyramid.identifier.clone())))
+        {
+            return Err(Error::Convert(format!(
+                "gpkg: the source carries a tile pyramid whose gpkg_contents identifier \"{}\" \
+                 is already used by another entry in the output; refusing to write a container \
+                 with a duplicate identifier",
+                pyramid.identifier
+            )));
+        }
+        rows.push((
+            (layers.len() + i + 1) as i64,
+            vec![
+                Value::Text(pyramid.name.clone()),
+                Value::Text("tiles".into()),
+                Value::Text(pyramid.identifier.clone()),
+                Value::Text(pyramid.description.clone()),
+                // Carried, on the same rule as a layer's: the stamp follows
+                // whoever last changed the content, and that is never geosetta.
+                Value::Text(pyramid.last_change.clone()),
+                pyramid.bbox[0].clone(),
+                pyramid.bbox[1].clone(),
+                pyramid.bbox[2].clone(),
+                pyramid.bbox[3].clone(),
+                Value::Int(srs_id),
+            ],
+        ));
+    }
+    let rows = rows;
+    Ok(TableSpec {
         name: "gpkg_contents".into(),
         sql: CONTENTS_DDL.into(),
         // `table_name` is the primary key and `identifier` is UNIQUE, so this
@@ -546,6 +745,94 @@ fn gpkg_contents(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) 
         ],
         rows,
         autoincrement: None,
+    })
+}
+
+/// `gpkg_tile_matrix_set` — one row per carried pyramid, in the **output's**
+/// srs numbering.
+fn tile_matrix_set(carried: &Carried, per_pyramid_srs: &[i64]) -> TableSpec {
+    let rows: Vec<(i64, Vec<Value>)> = carried
+        .pyramids
+        .iter()
+        .zip(per_pyramid_srs)
+        .enumerate()
+        .map(|(i, (pyramid, &srs_id))| {
+            (
+                (i + 1) as i64,
+                vec![
+                    Value::Text(pyramid.name.clone()),
+                    Value::Int(srs_id),
+                    pyramid.matrix_set[0].clone(),
+                    pyramid.matrix_set[1].clone(),
+                    pyramid.matrix_set[2].clone(),
+                    pyramid.matrix_set[3].clone(),
+                ],
+            )
+        })
+        .collect();
+    TableSpec {
+        name: "gpkg_tile_matrix_set".into(),
+        sql: TILE_MATRIX_SET_DDL.into(),
+        // `table_name TEXT NOT NULL PRIMARY KEY` is not a rowid alias, so it
+        // owns an autoindex.
+        autoindexes: vec![autoindex_records(&rows, &[0])],
+        autoincrement: None,
+        rows,
+    }
+}
+
+/// `gpkg_tile_matrix` — every carried pyramid's zoom levels, carried whole.
+fn tile_matrix(carried: &Carried) -> TableSpec {
+    let mut rows: Vec<(i64, Vec<Value>)> = Vec::new();
+    for pyramid in &carried.pyramids {
+        for level in &pyramid.matrix {
+            rows.push((
+                rows.len() as i64 + 1,
+                vec![
+                    Value::Text(pyramid.name.clone()),
+                    level.zoom_level.clone(),
+                    level.matrix_width.clone(),
+                    level.matrix_height.clone(),
+                    level.tile_width.clone(),
+                    level.tile_height.clone(),
+                    level.pixel_x_size.clone(),
+                    level.pixel_y_size.clone(),
+                ],
+            ));
+        }
+    }
+    TableSpec {
+        name: "gpkg_tile_matrix".into(),
+        sql: TILE_MATRIX_DDL.into(),
+        // `CONSTRAINT pk_ttm PRIMARY KEY (table_name, zoom_level)`.
+        autoindexes: vec![autoindex_records(&rows, &[0, 1])],
+        autoincrement: None,
+        rows,
+    }
+}
+
+/// The tile table itself: the source's DDL and rows, unchanged.
+///
+/// **Nothing here decodes a tile.** `tile_data` is a blob this crate moves and
+/// never inspects, which is D8's point — carrying a pyramid is the same
+/// operation as carrying any other independent table, with no raster-specific
+/// code anywhere in it.
+fn tile_table(pyramid: &Pyramid) -> TableSpec {
+    TableSpec {
+        name: pyramid.name.clone(),
+        sql: pyramid.sql.clone(),
+        // Requirement 54's `UNIQUE (zoom_level, tile_column, tile_row)`, built
+        // rather than re-packed: its key is three integers, so the ordering
+        // needs no collation this crate does not implement — which is what
+        // `plans/container-reconciliation.org` § THE MEASUREMENT established
+        // when it found no producer emitting a non-`BINARY` index at all.
+        autoindexes: if pyramid.key_columns.is_empty() {
+            Vec::new()
+        } else {
+            vec![autoindex_records(&pyramid.rows, &pyramid.key_columns)]
+        },
+        autoincrement: pyramid.autoincrement,
+        rows: pyramid.rows.clone(),
     }
 }
 
@@ -856,7 +1143,9 @@ mod tests {
             properties: vec![("name".into(), JsonValue::String("a".into()))],
             native: None,
         }]);
-        let bytes = write_layers(None, &[("places".into(), layer)], true, false).unwrap();
+        let bytes =
+            write_layers(None, &[("places".into(), layer)], &Carried::default(), true, false)
+                .unwrap();
         let objects = crate::sqlite::Database::open(&bytes).unwrap().master_objects().unwrap();
 
         // Named and ordered as SQLite names them: `_1` for the primary key,
@@ -948,6 +1237,243 @@ mod tests {
         assert_eq!(normalize_ddl(wrapped), inline);
     }
 
+    use super::super::carry::SrsDef;
+    use crate::NamedCrs;
+
+    /// **A tile pyramid survives a `gpkg -> gpkg` write**, which is D8's
+    /// carrying half and the largest single piece of defect 3's fix.
+    ///
+    /// Everything asserted here is a thing that was destroyed before
+    /// 2026-08-24: the tile rows and their blobs, the tiling scheme, the
+    /// `sqlite_sequence` mark, the six triggers, and the pyramid's own
+    /// `gpkg_contents` registration.
+    ///
+    /// *The blob comparison is the load-bearing one.* Row counts survive a
+    /// carry that mangles every payload; comparing the bytes is what makes this
+    /// a statement about the tiles rather than about the table.
+    #[test]
+    fn a_tile_pyramid_survives_a_geopackage_write() {
+        const TILES: &[u8] = include_bytes!("../../tests/fixtures/gdal_tiles.gpkg");
+        let carried = crate::geopackage::read_container(TILES).unwrap();
+        assert_eq!(carried.pyramids.len(), 1, "the fixture holds one pyramid");
+
+        let layers = read_layers(TILES).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+
+        let source = crate::sqlite::Database::open(TILES).unwrap();
+        let ours = crate::sqlite::Database::open(&bytes).unwrap();
+        let rows = |db: &crate::sqlite::Database, name: &str| {
+            let tables = db.tables().unwrap();
+            let t = tables.iter().find(|t| t.name == name).unwrap_or_else(|| {
+                panic!("{name} is missing from the output");
+            });
+            db.read_rows(t).unwrap()
+        };
+
+        // The tiles themselves, blob for blob and key for key.
+        assert_eq!(rows(&ours, "imagery"), rows(&source, "imagery"));
+
+        // The scheme, carried whole: 14 levels for the 2 that hold tiles.
+        assert_eq!(rows(&ours, "gpkg_tile_matrix").len(), 14);
+        assert_eq!(rows(&ours, "gpkg_tile_matrix_set"), rows(&source, "gpkg_tile_matrix_set"));
+
+        // The AUTOINCREMENT mark, which no DDL regenerates and whose absence is
+        // a database that passes `integrity_check` and fails every `INSERT`.
+        assert_eq!(
+            ours.sequence_numbers().unwrap().into_iter().find(|(t, _)| t == "imagery"),
+            Some(("imagery".to_string(), 80)),
+        );
+
+        // The six triggers, which are schema objects on a carried table that
+        // are neither index nor DDL.
+        let objects = ours.master_objects().unwrap();
+        let triggers = objects.iter().filter(|o| o.kind == "trigger" && o.tbl_name == "imagery");
+        assert_eq!(triggers.count(), 6);
+
+        // And the registration that makes it a pyramid rather than a table of
+        // blobs, beside the feature layer rather than instead of it.
+        let contents = rows(&ours, "gpkg_contents");
+        let kinds: Vec<_> = contents
+            .iter()
+            .map(|r| (text(&r[0]), text(&r[1])))
+            .collect();
+        assert!(kinds.contains(&("imagery".into(), "tiles".into())), "{kinds:?}");
+        assert!(kinds.contains(&("cities".into(), "features".into())), "{kinds:?}");
+    }
+
+    /// ***A carried pyramid's CRS is registered although no feature layer uses
+    /// it*** — M3b requirement 1, and the reason it is a requirement at all.
+    ///
+    /// `resolve_srs` builds `gpkg_spatial_ref_sys` from the *layer set*, so a
+    /// pyramid in EPSG:3857 beside a layer in EPSG:4326 would otherwise point
+    /// at a row the output never writes. That dangles past `integrity_check`,
+    /// which has no opinion about it, and is caught by `foreign_key_check`
+    /// through `fk_gc_r_srs_id`.
+    ///
+    /// /Deleting `reconcile_carried_srs`'s registration makes this fail, which
+    /// is the mutation it exists to catch./
+    #[test]
+    fn a_carried_pyramids_crs_is_registered_though_no_layer_uses_it() {
+        const TILES: &[u8] = include_bytes!("../../tests/fixtures/gdal_tiles.gpkg");
+        let carried = crate::geopackage::read_container(TILES).unwrap();
+        let layers = read_layers(TILES).unwrap();
+        // The premise: the only feature layer is 4326, so nothing but the
+        // pyramid accounts for 3857.
+        assert!(layers.iter().all(|(_, fc)| fc.crs != Some(Crs::Named(NamedCrs {
+            authority: Some("EPSG".into()),
+            code: Some("3857".into()),
+            wkt: None,
+            projjson: None,
+        }))));
+
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let srs = tables.iter().find(|t| t.name == "gpkg_spatial_ref_sys").unwrap();
+        let ids: Vec<i64> = db
+            .read_rows(srs)
+            .unwrap()
+            .iter()
+            // srs_id is column 1 and an INTEGER PRIMARY KEY, so `read_rows`
+            // has backfilled the rowid into it.
+            .filter_map(|r| match r.get(1) {
+                Some(Value::Int(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        assert!(ids.contains(&3857), "the pyramid's CRS was not registered: {ids:?}");
+
+        // And the pyramid's row points at it.
+        let contents = tables.iter().find(|t| t.name == "gpkg_contents").unwrap();
+        let row = db
+            .read_rows(contents)
+            .unwrap()
+            .into_iter()
+            .find(|r| text(&r[0]) == "imagery")
+            .expect("the pyramid is registered");
+        assert_eq!(row[9], Value::Int(3857));
+    }
+
+    /// A carried `srs_id` that **collides with a different CRS** is renumbered
+    /// rather than reused, and both systems survive.
+    ///
+    /// This is the position-dependent case the requirement was written for:
+    /// synthetic ids are handed out in layer order from `SYNTHETIC_SRS_BASE`,
+    /// so two files both numbering from it mean one integer names two
+    /// different coordinate systems. Reusing it would relabel the pyramid with
+    /// somebody else's CRS — a wrong answer that no oracle in this tree
+    /// catches, because the file is perfectly well formed.
+    #[test]
+    fn a_carried_srs_id_that_collides_with_a_layers_is_renumbered() {
+        // A layer with an unusable code takes the first synthetic id.
+        let mut layer = fc(vec![Feature {
+            geometry: point(1.0, 2.0),
+            properties: Vec::new(),
+            native: None,
+        }]);
+        layer.crs = Some(Crs::Named(NamedCrs {
+            authority: Some("IGNF".into()),
+            code: Some("LAMB93".into()),
+            wkt: Some("PROJCS[\"RGF93 Lambert 93\"]".into()),
+            projjson: None,
+        }));
+
+        // And a pyramid whose source numbered *its* CRS the same way.
+        let carried = Carried {
+            pyramids: vec![pyramid_at_srs(
+                SYNTHETIC_SRS_BASE,
+                SrsDef {
+                    srs_name: "some other system".into(),
+                    organization: "NONE".into(),
+                    organization_coordsys_id: SYNTHETIC_SRS_BASE,
+                    definition: "PROJCS[\"Not Lambert at all\"]".into(),
+                },
+            )],
+        };
+
+        let bytes = write_layers(None, &[("l".into(), layer)], &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let srs = tables.iter().find(|t| t.name == "gpkg_spatial_ref_sys").unwrap();
+        let definitions: Vec<String> =
+            db.read_rows(srs).unwrap().iter().map(|r| text(&r[4])).collect();
+        assert!(definitions.iter().any(|d| d.contains("RGF93")), "{definitions:?}");
+        assert!(definitions.iter().any(|d| d.contains("Not Lambert")), "{definitions:?}");
+
+        let contents = tables.iter().find(|t| t.name == "gpkg_contents").unwrap();
+        let row = db
+            .read_rows(contents)
+            .unwrap()
+            .into_iter()
+            .find(|r| text(&r[0]) == "tiles_table")
+            .expect("the pyramid is registered");
+        assert_ne!(
+            row[9],
+            Value::Int(SYNTHETIC_SRS_BASE),
+            "the pyramid kept an id the layer had already taken",
+        );
+    }
+
+    /// A carried table whose name a layer already has is **refused**, not
+    /// resolved.
+    ///
+    /// `gpkg_contents.table_name` is a primary key, so writing both would build
+    /// an index with two equal keys — a malformed database. D5 in
+    /// `plans/container-reconciliation.org` takes the same position for the
+    /// same reason: refusing makes the wrong file impossible rather than
+    /// guarded against.
+    #[test]
+    fn a_carried_table_named_like_a_layer_is_refused() {
+        let carried = Carried {
+            pyramids: vec![pyramid_at_srs(4326, SrsDef {
+                srs_name: "WGS 84".into(),
+                organization: "EPSG".into(),
+                organization_coordsys_id: 4326,
+                definition: WGS84_WKT.into(),
+            })],
+        };
+        let layer = fc(vec![Feature {
+            geometry: point(1.0, 2.0),
+            properties: Vec::new(),
+            native: None,
+        }]);
+        let err = write_layers(None, &[("tiles_table".into(), layer)], &carried, false, false)
+            .expect_err("a name collision must not be written");
+        assert!(format!("{err}").contains("tiles_table"), "{err}");
+    }
+
+    /// A minimal pyramid registered at `srs_id`, for the reconciliation tests.
+    /// Deliberately hand-built rather than read from a fixture: these tests are
+    /// about the *numbering*, and a fixture would pin one real CRS.
+    fn pyramid_at_srs(srs_id: i64, srs: SrsDef) -> super::Pyramid {
+        super::Pyramid {
+            name: "tiles_table".into(),
+            identifier: "tiles_table".into(),
+            description: String::new(),
+            last_change: LAST_CHANGE.into(),
+            bbox: [Value::Real(0.0), Value::Real(0.0), Value::Real(1.0), Value::Real(1.0)],
+            srs_id,
+            srs: Some(srs),
+            matrix_set: [Value::Real(0.0), Value::Real(0.0), Value::Real(1.0), Value::Real(1.0)],
+            matrix: Vec::new(),
+            sql: "CREATE TABLE tiles_table (id INTEGER PRIMARY KEY AUTOINCREMENT, zoom_level \
+                  INTEGER NOT NULL, tile_column INTEGER NOT NULL, tile_row INTEGER NOT NULL, \
+                  tile_data BLOB NOT NULL, UNIQUE (zoom_level, tile_column, tile_row))"
+                .into(),
+            rows: Vec::new(),
+            key_columns: vec![1, 2, 3],
+            autoincrement: Some(crate::sqlite::Autoincrement::Declared),
+            triggers: Vec::new(),
+        }
+    }
+
+    fn text(v: &Value) -> String {
+        match v {
+            Value::Text(s) => s.clone(),
+            other => format!("{other:?}"),
+        }
+    }
+
     /// Every registry table this crate writes declares *exactly* what the
     /// GeoPackage standard says it declares — no constraint missing, and none
     /// added.
@@ -970,6 +1496,7 @@ mod tests {
     #[test]
     fn the_registry_ddl_is_what_the_standard_says() {
         const SPEC: &[u8] = include_bytes!("../../tests/fixtures/spec_conformant.gpkg");
+        const TILES: &[u8] = include_bytes!("../../tests/fixtures/gdal_tiles.gpkg");
         let spec_db = crate::sqlite::Database::open(SPEC).unwrap();
         let spec_ddl: Vec<_> = spec_db
             .master_objects()
@@ -1016,7 +1543,14 @@ mod tests {
                 }],
             }),
         ));
-        let bytes = write_layers(None, &[("places".into(), layer)], true, false).unwrap();
+        // Carrying a pyramid is what makes the writer emit the two tile
+        // registry tables at all, so the oracle reaches eight tables rather
+        // than six. `gdal_tiles.gpkg` supplies a real one, because a
+        // hand-built pyramid would be this crate asserting against its own
+        // idea of the shape.
+        let carried = crate::geopackage::read_container(TILES).unwrap();
+        let bytes =
+            write_layers(None, &[("places".into(), layer)], &carried, true, false).unwrap();
         let ours = crate::sqlite::Database::open(&bytes).unwrap();
         let ours_ddl: std::collections::HashMap<String, String> = ours
             .master_objects()
@@ -1040,9 +1574,10 @@ mod tests {
         }
 
         // Without this the test passes vacuously the day a rename means
-        // nothing intersects. Six tables: the four core ones plus the Schema
-        // extension's two.
-        assert_eq!(compared, 6, "compared {compared} tables, expected 6");
+        // nothing intersects. Eight tables: the four core ones, the Schema
+        // extension's two, and — since 2026-08-24 — the two tile registry
+        // tables the carrying half emits.
+        assert_eq!(compared, 8, "compared {compared} tables, expected 8");
 
         // And the writer's constants are the same text, which is what makes
         // the six assertions above statements about this crate's output rather
@@ -1054,6 +1589,8 @@ mod tests {
             EXTENSIONS_DDL,
             DATA_COLUMNS_DDL,
             DATA_COLUMN_CONSTRAINTS_DDL,
+            TILE_MATRIX_SET_DDL,
+            TILE_MATRIX_DDL,
         ] {
             let name = ddl.trim_start_matches("CREATE TABLE ").split_whitespace().next().unwrap();
             let want = spec_ddl.iter().find(|(n, _)| n == name).map(|(_, s)| s);
@@ -1081,7 +1618,7 @@ mod tests {
                 native: None,
             },
         ]);
-        let bytes = write_layers(None, &[("places".into(), layer)], false, false).unwrap();
+        let bytes = write_layers(None, &[("places".into(), layer)], &Carried::default(), false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
 
         assert_eq!(back.len(), 1);
@@ -1100,7 +1637,7 @@ mod tests {
     #[test]
     fn a_layer_read_back_knows_its_own_name() {
         let bytes =
-            write_layers(None, &[("roads".into(), fc(vec![]))], false, false).unwrap();
+            write_layers(None, &[("roads".into(), fc(vec![]))], &Carried::default(), false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(back[0].1.name.as_deref(), Some("roads"));
     }
@@ -1120,14 +1657,14 @@ mod tests {
             native: None,
         };
         let original = fc(vec![feature(1.0), feature(2.0), feature(3.0)]);
-        let bytes = write_layers(None, &[("roads".into(), original)], false, false).unwrap();
+        let bytes = write_layers(None, &[("roads".into(), original)], &Carried::default(), false, false).unwrap();
 
         // Read it back the way a pipeline would, drop the middle feature, and
         // write it into the same GeoPackage using only the name the IR carries.
         let mut edited = read_layers(&bytes).unwrap().remove(0).1;
         edited.features.retain(|f| f.properties[0].1.as_f64() != Some(2.0));
         let name = edited.name.clone().expect("the reader names the layer");
-        let after = write_layers(Some(&bytes), &[(name, edited)], false, false).unwrap();
+        let after = write_layers(Some(&bytes), &[(name, edited)], &Carried::default(), false, false).unwrap();
 
         let layers = read_layers(&after).unwrap();
         assert_eq!(layers.len(), 1, "the edit loop appended a duplicate layer");
@@ -1180,8 +1717,8 @@ mod tests {
                 native: None,
             }])
         };
-        let first = write_layers(None, &[("places".into(), layer())], false, false).unwrap();
-        let second = write_layers(None, &[("places".into(), layer())], false, false).unwrap();
+        let first = write_layers(None, &[("places".into(), layer())], &Carried::default(), false, false).unwrap();
+        let second = write_layers(None, &[("places".into(), layer())], &Carried::default(), false, false).unwrap();
         assert_eq!(first, second, "two writes of the same input differ");
 
         // The mechanism, asserted separately so a failure says which half went.
@@ -1219,7 +1756,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let bytes = write_layers(None, &[("places".into(), layer)], false, false).unwrap();
+        let bytes = write_layers(None, &[("places".into(), layer)], &Carried::default(), false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(
             back[0].1.features[0].geometry,
@@ -1283,7 +1820,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let plain = write_layers(None, &[("l".into(), layer)], false, false).unwrap();
+        let plain = write_layers(None, &[("l".into(), layer)], &Carried::default(), false, false).unwrap();
         let (flags, indicator, env) = gpb_parts(&plain);
         assert_eq!(flags, 0x01);
         assert_eq!(indicator, 0);
@@ -1301,7 +1838,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+        let bytes = write_layers(None, &[("l".into(), layer)], &Carried::default(), false, true).unwrap();
         let (flags, indicator, env) = gpb_parts(&bytes);
         assert_eq!(flags, 0x03, "bit 0 little-endian + indicator 1 in bits 1-3");
         assert_eq!(indicator, 1);
@@ -1320,7 +1857,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+        let bytes = write_layers(None, &[("l".into(), layer)], &Carried::default(), false, true).unwrap();
         let (flags, indicator, env) = gpb_parts(&bytes);
         assert_eq!(flags, 0x05);
         assert_eq!(indicator, 2);
@@ -1343,7 +1880,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let bytes = write_layers(None, &[("l".into(), m_only)], false, true).unwrap();
+        let bytes = write_layers(None, &[("l".into(), m_only)], &Carried::default(), false, true).unwrap();
         let (_, indicator, env) = gpb_parts(&bytes);
         assert_eq!(
             indicator, 1,
@@ -1359,7 +1896,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let bytes = write_layers(None, &[("l".into(), zm)], false, true).unwrap();
+        let bytes = write_layers(None, &[("l".into(), zm)], &Carried::default(), false, true).unwrap();
         let (_, indicator, env) = gpb_parts(&bytes);
         assert_eq!(indicator, 2, "ZM tracks Z only, exactly as GDAL does");
         assert_eq!(
@@ -1378,7 +1915,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+        let bytes = write_layers(None, &[("l".into(), layer)], &Carried::default(), false, true).unwrap();
         let (flags, indicator, env) = gpb_parts(&bytes);
         assert_eq!(flags, 0x01);
         assert_eq!(indicator, 0);
@@ -1402,7 +1939,7 @@ mod tests {
                 properties: vec![],
                 native: None,
             }]);
-            let bytes = write_layers(None, &[("l".into(), layer)], false, true).unwrap();
+            let bytes = write_layers(None, &[("l".into(), layer)], &Carried::default(), false, true).unwrap();
             let back = read_layers(&bytes).unwrap();
             assert_eq!(back[0].1.features[0].geometry, geom);
         }
@@ -1432,7 +1969,7 @@ mod tests {
             );
 
             let layers = read_layers(fixture).unwrap();
-            let ours = write_layers(None, &layers, false, true).unwrap();
+            let ours = write_layers(None, &layers, &Carried::default(), false, true).unwrap();
             let (_, our_indicator, our_env) = gpb_parts(&ours);
 
             assert_eq!(our_indicator, gdal_indicator, "{name}: indicator");
@@ -1447,7 +1984,7 @@ mod tests {
         let feats: Vec<Feature> = (0..120)
             .map(|i| Feature { geometry: point(i as f64, (i % 7) as f64), properties: vec![], native: None })
             .collect();
-        let bytes = write_layers(None, &[("grid".into(), fc(feats))], true, false).unwrap();
+        let bytes = write_layers(None, &[("grid".into(), fc(feats))], &Carried::default(), true, false).unwrap();
 
         // The virtual table, its shadow tables, and gpkg_extensions are present.
         use crate::sqlite::Database;
@@ -1470,7 +2007,7 @@ mod tests {
     fn wgs84_layer_round_trips_as_wgs84() {
         let mut layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![], native: None }]);
         layer.crs = Some(Crs::Wgs84);
-        let bytes = write_layers(None, &[("p".into(), layer)], false, false).unwrap();
+        let bytes = write_layers(None, &[("p".into(), layer)], &Carried::default(), false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(back[0].1.crs, Some(Crs::Wgs84));
     }
@@ -1480,7 +2017,7 @@ mod tests {
         // CSV/WKT-style input with no CRS lands on the "undefined" SRS and reads
         // back as no CRS, not a mislabeled 4326.
         let layer = fc(vec![Feature { geometry: point(1.0, 2.0), properties: vec![], native: None }]);
-        let bytes = write_layers(None, &[("p".into(), layer)], false, false).unwrap();
+        let bytes = write_layers(None, &[("p".into(), layer)], &Carried::default(), false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(back[0].1.crs, None);
     }
@@ -1495,7 +2032,7 @@ mod tests {
             wkt: Some("PROJCS[\"WGS 84 / Pseudo-Mercator\"]".into()),
             projjson: None,
         }));
-        let bytes = write_layers(None, &[("web".into(), layer)], false, false).unwrap();
+        let bytes = write_layers(None, &[("web".into(), layer)], &Carried::default(), false, false).unwrap();
 
         // A valid, integrity-checkable GeoPackage that DuckDB/GDAL can open.
         use crate::sqlite::Database;
@@ -1526,7 +2063,7 @@ mod tests {
             wkt: Some("PROJCS[\"RGF93 Lambert 93\"]".into()),
             projjson: None,
         }));
-        let bytes = write_layers(None, &[("fr".into(), layer)], false, false).unwrap();
+        let bytes = write_layers(None, &[("fr".into(), layer)], &Carried::default(), false, false).unwrap();
 
         use crate::sqlite::Database;
         assert!(Database::open(&bytes).is_ok());
@@ -1561,7 +2098,7 @@ mod tests {
             wkt: None,
             projjson: Some(pj.into()),
         }));
-        let bytes = write_layers(None, &[("custom".into(), layer)], false, false).unwrap();
+        let bytes = write_layers(None, &[("custom".into(), layer)], &Carried::default(), false, false).unwrap();
 
         use crate::sqlite::Database;
         assert!(Database::open(&bytes).is_ok());
@@ -1595,8 +2132,8 @@ mod tests {
             Feature { geometry: point(2.0, 2.0), properties: vec![], native: None },
         ]);
 
-        let g1 = write_layers(None, &[("a".into(), a)], false, false).unwrap();
-        let g2 = write_layers(Some(&g1), &[("b".into(), b)], false, false).unwrap();
+        let g1 = write_layers(None, &[("a".into(), a)], &Carried::default(), false, false).unwrap();
+        let g2 = write_layers(Some(&g1), &[("b".into(), b)], &Carried::default(), false, false).unwrap();
         let layers = read_layers(&g2).unwrap();
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().any(|(n, _)| n == "a"));
@@ -1604,7 +2141,7 @@ mod tests {
 
         // Upsert "a" with three features -> still two layers, "a" replaced.
         let a2 = fc(vec![Feature { geometry: point(9.0, 9.0), properties: vec![], native: None }; 3]);
-        let g3 = write_layers(Some(&g2), &[("a".into(), a2)], false, false).unwrap();
+        let g3 = write_layers(Some(&g2), &[("a".into(), a2)], &Carried::default(), false, false).unwrap();
         let layers = read_layers(&g3).unwrap();
         assert_eq!(layers.len(), 2);
         assert_eq!(layers.iter().find(|(n, _)| n == "a").unwrap().1.features.len(), 3);

@@ -29,7 +29,13 @@ written at all. **All six registry tables this crate emits match the
 standard exactly**, so the 2026-08-23 spec pass holds up under a check that
 does not depend on anyone remembering what to assert.
 
-** =gpkg_metadata_autoincrement.gpkg= -- /narrowed 2026-08-23; still worth building/
+** =sqlite_sequence.gpkg= -- /narrowed 2026-08-23; renamed 2026-08-24; still worth building/
+/Designed as =gpkg_metadata_autoincrement.gpkg=. Renamed when =gdal_tiles.gpkg=
+made the rule explicit: **these names carry provenance, not content.** What it
+pins is a =sqlite_sequence= state, which is SQLite's behaviour rather than the
+standard's, and the cheap build is =gdal_hostile.gpkg= plus =sqlite3=
+statements -- so it is a =sqlite_*= fixture and belongs in
+=build_sqlite_fixtures.sh= beside the other three./
 =gpkg_metadata= is specified as =id INTEGER PRIMARY KEY AUTOINCREMENT=, so a
 populated one *requires a =sqlite_sequence= row*.
 
@@ -53,7 +59,31 @@ second. That leaves =seq= at 2 with =max(id)= of 1.
 the high-water mark exceeds =max(id)= -- which is the only state that makes
 the sequence row observable rather than derivable.
 
-** =gpkg_tiles.gpkg=
+*** BUILT 2026-08-24: =gdal_tiles.gpkg=
+/Documented in =HOSTILE.org=, and built by
+=build_tile_fixture.sh= -- a script rather than a recorded command line,
+because the input is a raster and the pixels have to be generated./
+
+**It came out one thing larger than designed, and the addition was forced.**
+The entry below asked for a tile pyramid; a *tiles-only* GeoPackage is
+**rejected by this reader** -- =GeoPackage has no feature layers= -- against
+=HOSTILE.org='s standing rule that every fixture is readable without error. So
+=cities= from =gdal_hostile.gpkg= sits beside the pyramid, and that turned out
+to be the useful half: the layer is EPSG:4326 and the pyramid EPSG:3857, so the
+file carries an =srs_id= no feature layer accounts for, which is exactly what
+=same-format-fidelity.org= M3b requirement 1 has to reconcile.
+
+*Both of the entry's measured warnings held.* The 2048² source at
+=GoogleMapsCompatible= yields 64 tiles, and a burned raster was necessary --
+the all-nodata trap is real. Two facts the entry did not have: the tile table
+carries **six triggers**, which are schema objects on a carried table that are
+neither index nor DDL; and =gpkg_tile_matrix= has **14 rows for 2 populated
+zoom levels**, so anything recomputing it from the tiles present writes a
+different file.
+
+/The entry as designed follows./
+
+**** =gpkg_tiles.gpkg= -- as designed 2026-08-23, under the name it was designed with
 A real tile pyramid: several tiles across two zoom levels, with complete
 =gpkg_tile_matrix_set= and =gpkg_tile_matrix= rows.
 
@@ -83,7 +113,22 @@ and owns an index -- and its index key is three integers, needing no collation.
 =gpkg= with the full DDL and **zero** tile rows, because GDAL skips blank
 tiles, and a fixture built that way would exercise nothing.
 
-** =gpkg_range_constraints.gpkg=
+** =sqlite_nullkey.gpkg= -- /renamed 2026-08-24/
+/Designed as =gpkg_range_constraints.gpkg=, and renamed for the same reason as
+the entry above -- with the stem changed as well as the prefix. The =range=
+rows are the *vehicle*; what the fixture pins is that **a =UNIQUE= key with a
+nullable member does not make a set**, which is why the entry immediately
+generalises it to =ge_tce= and =gdc_tn=. Naming it after the vehicle would have
+buried the finding./
+
+*Build it on =gdal_hostile.gpkg=*, with the Schema annex's
+=gpkg_data_column_constraints= DDL applied on top -- =ogr2ogr= omits the
+=gdcc_ntv= constraint, so a plain GDAL base has nothing to pin. That is the
+=sqlite_*= recipe exactly, and it keeps the question the fixture asks ("what
+does the *format* permit?") matched to the prefix. /Building it from
+=spec_conformant.gpkg= instead would be a =spec_= fixture asking a different
+question -- what the *standard requires* -- which is not this one./
+
 Two =gpkg_data_column_constraints= rows of =constraint_type = 'range'=, which
 both have =value= NULL by definition -- =value= is for =enum= and =glob=.
 

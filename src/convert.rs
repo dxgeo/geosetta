@@ -873,7 +873,7 @@ mod tests {
             wkt: Some("PROJCS[\"Web Mercator\"]".into()),
             projjson: None,
         }));
-        let gpkg = crate::geopackage::write_layers(None, &[("l".into(), src)], false, false).unwrap();
+        let gpkg = crate::geopackage::write_layers(None, &[("l".into(), src)], &crate::geopackage::Carried::default(), false, false).unwrap();
         let layers = crate::geopackage::read_layers(&gpkg).unwrap();
         let fgb = flatgeobuf::write(&layers[0].1);
         let back = flatgeobuf::read(&fgb).unwrap();
@@ -1640,7 +1640,7 @@ mod tests {
     #[test]
     fn geopackage_round_trips_a_boolean_as_a_boolean() {
         let fc = declared("flag", crate::schema::DeclType::Bool, json::JsonValue::Bool(true));
-        let bytes = crate::geopackage::write_layers(None, &[("t".into(), fc)], false, false).unwrap();
+        let bytes = crate::geopackage::write_layers(None, &[("t".into(), fc)], &crate::geopackage::Carried::default(), false, false).unwrap();
         let back = crate::geopackage::read_layers(&bytes).unwrap().remove(0).1;
         assert_eq!(back.features[0].properties[0].1, json::JsonValue::Bool(true));
         assert_eq!(decl_of(&back, "flag"), Some(crate::schema::DeclType::Bool));
@@ -1664,7 +1664,7 @@ mod tests {
         for (ty, value) in cases {
             let fc = declared("v", ty, value.clone());
             let bytes =
-                crate::geopackage::write_layers(None, &[("t".into(), fc)], false, false).unwrap();
+                crate::geopackage::write_layers(None, &[("t".into(), fc)], &crate::geopackage::Carried::default(), false, false).unwrap();
             let back = crate::geopackage::read_layers(&bytes).unwrap().remove(0).1;
             assert_eq!(decl_of(&back, "v"), Some(ty), "{ty:?} did not survive");
             assert_eq!(back.features[0].properties[0].1, value, "{ty:?} value changed");
@@ -1948,7 +1948,7 @@ mod tests {
         match format {
             Format::Gpkg => {
                 let layers = vec![("l".to_string(), fc.clone())];
-                let bytes = crate::geopackage::write_layers(None, &layers, false, false).unwrap();
+                let bytes = crate::geopackage::write_layers(None, &layers, &crate::geopackage::Carried::default(), false, false).unwrap();
                 crate::geopackage::read_layers(&bytes).unwrap().remove(0).1
             }
             Format::FlatGeobuf => {
@@ -2216,7 +2216,7 @@ mod tests {
 
         // Out and back through this crate's own writer.
         let layers = vec![("cities".to_string(), source.clone())];
-        let bytes = crate::geopackage::write_layers(None, &layers, false, false).unwrap();
+        let bytes = crate::geopackage::write_layers(None, &layers, &crate::geopackage::Carried::default(), false, false).unwrap();
         let back = crate::geopackage::read_layers(&bytes).unwrap();
         assert_eq!(*gpkg_native(&back[0].1), native, "the layer's members did not survive");
     }
@@ -2242,10 +2242,9 @@ mod tests {
 
         let bytes = crate::geopackage::write_layers(
             None,
-            &[("second".to_string(), source)],
+            &[("second".to_string(), source)], &crate::geopackage::Carried::default(),
             false,
-            false,
-        )
+            false)
         .unwrap();
         assert_eq!(last_change_of(&bytes, "second"), carried, "the source's stamp was overwritten");
 
@@ -2254,10 +2253,9 @@ mod tests {
         let bare = crate::FeatureCollection::new(Vec::new());
         let bytes = crate::geopackage::write_layers(
             None,
-            &[("fresh".to_string(), bare)],
+            &[("fresh".to_string(), bare)], &crate::geopackage::Carried::default(),
             false,
-            false,
-        )
+            false)
         .unwrap();
         assert_eq!(
             last_change_of(&bytes, "fresh"),
@@ -2282,7 +2280,7 @@ mod tests {
     fn our_own_last_change_sentinel_is_not_carried_back() {
         let layer = crate::FeatureCollection::new(Vec::new());
         let bytes =
-            crate::geopackage::write_layers(None, &[("fresh".to_string(), layer)], false, false)
+            crate::geopackage::write_layers(None, &[("fresh".to_string(), layer)], &crate::geopackage::Carried::default(), false, false)
                 .unwrap();
         let back = crate::geopackage::read_layers(&bytes).unwrap();
         assert!(
@@ -2351,7 +2349,7 @@ mod tests {
         }
         fc.schema.retain(|decl| decl.name != "price");
         let layers = vec![("cities".to_string(), fc)];
-        let bytes = crate::geopackage::write_layers(None, &layers, false, false).unwrap();
+        let bytes = crate::geopackage::write_layers(None, &layers, &crate::geopackage::Carried::default(), false, false).unwrap();
         let back = crate::geopackage::read_layers(&bytes).unwrap();
         let native = gpkg_native(&back[0].1);
 

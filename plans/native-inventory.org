@@ -262,10 +262,12 @@ dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
 | =gpkg_metadata= / =_reference=   | *no*      | opaque |
 | =gpkg_extensions=                | *no*      | opaque |
 | =gpkg_data_columns= (+constraints)| *yes*, since 2026-08-21 | opaque, but *layer* content -- its rows are keyed by =(table_name, column_name)=, so the spoke carries them and this table is not M3b's after all |
-| =gpkg_ogr_contents=              | *no*      | derived-capability |
+| =gpkg_ogr_contents=              | *no*      | derived-capability -- /and reported as such since 2026-08-24; it had been named as destroyed *content*, handoff.org entry 13/ |
 | R*Tree tables + triggers (8)     | *no*      | derived-capability |
-| =gpkg_tile_matrix= / =_set=      | *no*      | the § collision -- raster |
-| =gpkg_contents= bboxes           | yes       | derived-information, recomputed correctly |
+| a tile pyramid's table + triggers | ***yes*, since 2026-08-24** | independent container content, carried verbatim by =geopackage/carry.rs= -- D8 |
+| =gpkg_tile_matrix= / =_set=      | ***yes*, since 2026-08-24** | carried with the pyramid they describe. /The matrix is carried **whole**: it defines the tiling scheme, and a real pyramid declares far more zoom levels than it populates -- 14 for 2 in =gdal_tiles.gpkg=./ |
+| =ogr2ogr='s 10 triggers on =gpkg_tile_matrix= | *no*      | derived-capability. **The standard does not mandate them** -- Requirements 46--52 constrain the table's *values*, and the tiles clause names no trigger -- so output without them is conformant while the values are carried verbatim |
+| =gpkg_contents= bboxes           | yes       | derived-information, recomputed correctly. /A carried pyramid's bbox is the exception: it is **carried**, because this crate never decodes a tile and so has nothing to recompute one from/ |
 
 =--rtree= rebuilds the indexes for every layer and the result passes
 =rtreecheck()= /(measured)/, so the derived-capability half needs a trigger,

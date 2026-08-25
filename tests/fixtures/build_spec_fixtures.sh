@@ -105,6 +105,35 @@ CREATE TABLE gpkg_data_column_constraints (
   CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value)
 );
 
+-- The two tile-pyramid registry tables, added 2026-08-24 when the writer
+-- gained the ability to emit them (M3b's carrying half). Same annex, same
+-- pinned commit as everything above. Left empty: this fixture is an oracle for
+-- what the standard *declares*, and a populated pyramid would make it a
+-- fixture about tiles -- which is gdal_tiles.gpkg's job.
+CREATE TABLE gpkg_tile_matrix_set (
+  table_name TEXT NOT NULL PRIMARY KEY,
+  srs_id INTEGER NOT NULL,
+  min_x DOUBLE NOT NULL,
+  min_y DOUBLE NOT NULL,
+  max_x DOUBLE NOT NULL,
+  max_y DOUBLE NOT NULL,
+  CONSTRAINT fk_gtms_table_name FOREIGN KEY (table_name) REFERENCES gpkg_contents(table_name),
+  CONSTRAINT fk_gtms_srs FOREIGN KEY (srs_id) REFERENCES gpkg_spatial_ref_sys (srs_id)
+);
+
+CREATE TABLE gpkg_tile_matrix (
+  table_name TEXT NOT NULL,
+  zoom_level INTEGER NOT NULL,
+  matrix_width INTEGER NOT NULL,
+  matrix_height INTEGER NOT NULL,
+  tile_width INTEGER NOT NULL,
+  tile_height INTEGER NOT NULL,
+  pixel_x_size DOUBLE NOT NULL,
+  pixel_y_size DOUBLE NOT NULL,
+  CONSTRAINT pk_ttm PRIMARY KEY (table_name, zoom_level),
+  CONSTRAINT fk_tmm_table_name FOREIGN KEY (table_name) REFERENCES gpkg_contents(table_name)
+);
+
 CREATE TABLE gpkg_metadata (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   md_scope TEXT NOT NULL DEFAULT 'dataset',

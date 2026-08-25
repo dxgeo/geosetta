@@ -225,11 +225,19 @@ destination and inserted the source's content.* Six things stand between M3b
 and that, and they are not equal -- one is needed with or without append, three
 are the reconciliation layer, one is a decision reversal, one is a contract.
 
-*** 1. =srs_id= reconciliation -- ***MOVED TO M3b, 2026-08-23 (D3)***
+*** 1. =srs_id= reconciliation -- ***MOVED TO M3b, 2026-08-23 (D3); BUILT THERE 2026-08-24***
 /It lives in [[file:same-format-fidelity.org][same-format-fidelity.org]] § MILESTONES
 M3b now. The text is kept here because D3 turned on it and because this plan's
 other requirements still refer to the renumbering it describes -- but M3b owns
 the work, and this plan **depends on** it rather than containing it./
+
+*It shipped there on 2026-08-24, with D8's carrying half*, and **D3 is
+vindicated by the way it had to ship**: it could not be built alone. Until
+something carried an =srs_id= there was no dangling reference to fix, so a
+requirement filed here -- in a plan about *two* containers -- was only testable
+on the one-container path this plan declares out of scope. /What this plan now
+consumes: =writer::reconcile_carried_srs=, which maps a carried id into the
+output's numbering and renumbers it when it collides with a different CRS./
 
 **What decided D3 was a contradiction between this requirement and this plan's
 own gate.** Line 25 says M3b can carry a source container into a *fresh*
@@ -307,7 +315,7 @@ the entry generalised it to the wrong scope -- a =range= constraint's missing
 =gpkg_data_columns=.** It has to compare the columns the § 6 contract names,
 treating NULL as a value that equals itself -- which is what =ogr2ogr= does,
 and the reason its append gets the right answer.
-=gpkg_range_constraints.gpkg= in =tests/fixtures/PLANNED.org= pins the
+=sqlite_nullkey.gpkg= in =tests/fixtures/PLANNED.org= pins the
 =gdcc_ntv= half; the =ge_tce= half needs no new fixture, because *any two
 =ogr2ogr= outputs* exhibit it.
 
@@ -782,5 +790,6 @@ the case that should reopen it./
   create-or-append write path this plan is about.
 - [[file:edit-composability.org][edit-composability.org]] :: the edit loop,
   which is why M3b is being built and which does *not* reach this case.
-- =tests/fixtures/PLANNED.org= :: =gpkg_range_constraints.gpkg=, which pins § 3's
-  NULL trap, and =gpkg_tiles.gpkg=, which trips § 1.
+- =tests/fixtures/PLANNED.org= :: =sqlite_nullkey.gpkg=, which pins § 3's
+  NULL trap. /The fixture that trips § 1 was built on 2026-08-24 and is
+  =gdal_tiles.gpkg= in =HOSTILE.org=./

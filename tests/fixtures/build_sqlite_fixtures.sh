@@ -54,6 +54,18 @@ CREATE INDEX idx_events_kind ON events(kind);
 -- rather than constructed, because constructing it would need NOCASE.
 CREATE TABLE people (id INTEGER PRIMARY KEY, email TEXT UNIQUE COLLATE NOCASE);
 INSERT INTO people VALUES (1,'A@example.com'), (2,'b@example.com');
+
+-- A trigger on a *user's own* table, added 2026-08-24. Every trigger in every
+-- other fixture is attached to a table the write rebuilds -- a layer, or a
+-- registry table -- and those are classed *derived* by
+-- container.rs::is_derived_trigger, because what they enforce comes back with
+-- the table. This one is attached to a table that is genuinely destroyed, so
+-- it must still be reported. Without it the negative half of that rule is
+-- untested, and a widening of it would go unnoticed.
+CREATE TRIGGER events_stamp AFTER INSERT ON events
+BEGIN
+  UPDATE events SET at = '2026-01-01' WHERE id = NEW.id AND NEW.at IS NULL;
+END;
 SQL
 
 echo "built:"

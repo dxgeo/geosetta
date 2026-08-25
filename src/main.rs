@@ -699,6 +699,11 @@ fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs
 /// Write a layer into a GeoPackage, creating it or appending (upserting the
 /// layer if it already exists). The layer name defaults to the input file stem.
 fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Crs>) -> Result<()> {
+    // Independent container content the source holds — a tile pyramid today —
+    // read once here and handed to the writer, which is what stops a
+    // `gpkg -> gpkg` run from destroying it (defect 3, the carrying half).
+    // Empty for every other source format: there is no container to carry.
+    let mut carried = geopackage::Carried::default();
     let mut new_layers = if args.from == Format::Gpkg {
         // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
         let input = read_bytes(&args.input)?;
@@ -712,14 +717,21 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
                 return Err(Error::Usage(format!("no layer named \"{name}\"")));
             }
         }
-        // Defect 3: the write below reproduces the layers and the tables they
-        // require, and nothing else the source container holds. Reported here,
-        // where the source's bytes are still in hand.
+        // Carried *before* the warning is built, because the warning's job is
+        // to name what does not survive and this is what does. `--layer` does
+        // not narrow it: a pyramid is not a layer, so selecting one layer is
+        // not a statement about the container around it.
+        carried = geopackage::read_container(&input)?;
+        // Defect 3: the write below reproduces the layers, the tables they
+        // require, and whatever `carried` holds — and nothing else the source
+        // container has. Reported here, where the source's bytes are still in
+        // hand.
         print_warnings(
             &geopackage::container_drop_warnings(
                 &input,
                 io_label(&args.input, "stdin"),
                 &names_of(&ls),
+                &carried.reproduced_names(),
                 args.rtree,
             ),
             args.quiet,
@@ -769,10 +781,16 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
         && !(args.from == Format::Gpkg && args.input == out.path)
     {
         print_warnings(
+            // The *destination's* container content is still destroyed: what
+            // the source carries is carried, but reconciling two containers is
+            // `plans/container-reconciliation.org` and is not built. So this
+            // call passes no carried names — nothing of the destination's own
+            // survives, which is exactly what it has always reported.
             &geopackage::container_drop_warnings(
                 bytes,
                 io_label(out.path, "stdout"),
                 &names_of(&new_layers),
+                &[],
                 args.rtree,
             ),
             args.quiet,
@@ -784,8 +802,13 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
         let env = if args.envelope { " (+envelopes)" } else { "" };
         eprintln!("{verb} {}{idx}{env}...", io_label(out.path, "stdout"));
     }
-    let bytes =
-        geopackage::write_layers(existing.as_deref(), &new_layers, args.rtree, args.envelope)?;
+    let bytes = geopackage::write_layers(
+        existing.as_deref(),
+        &new_layers,
+        &carried,
+        args.rtree,
+        args.envelope,
+    )?;
     write_bytes(out.path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", io_label(out.path, "stdout"), bytes.len());
     Ok(())

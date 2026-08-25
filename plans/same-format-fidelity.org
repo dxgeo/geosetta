@@ -4,7 +4,7 @@
 
 * Same-Format Fidelity -- The Round-Trip Invariant
 
-** STATUS -- M1 and M2 done; M3 begun (2026-08-20)
+** STATUS -- M1 and M2 done; M3 begun (2026-08-20); M3b begun (2026-08-24)
 *Implemented, the opaque half:* the mechanism itself and the GeoJSON spoke --
 =src/native.rs= (=Native=/=NativePayload= and the tag-matched =payload_for=),
 =Feature::native=, =FeatureCollection::native=. The GeoJSON reader stashes
@@ -26,18 +26,27 @@ Cross-format drops of a declaration now *warn*
 (=FeatureCollection::schema_drop_warning=), because reading a member the crate
 then discards is precisely what =lossy-conversion-warnings.org= governs.
 
-*530 tests pass* as of the review pass, and =cargo clippy --all-targets=
-is clean. That figure is the whole of =cargo test -p geosetta= -- 482 lib, 47
-integration, 1 doc, plus 2 GDAL cross-checks that are =#[ignore]=d by default
-(=cargo test --test gdal_types -- --ignored=) -- recorded that way because an earlier bare "482" left the
-next reader unable to tell which suites it counted, and so unable to tell drift
-from a different denominator.
+***562 tests pass*** as of 2026-08-24, and =cargo clippy --all-targets= and
+=cargo doc= are clean. That figure is the whole of =cargo test -p geosetta= --
+505 lib, 56 integration, 1 doc, plus the =#[ignore]=d GDAL and PROJ
+cross-checks -- recorded that way because an earlier bare "482" left the next
+reader unable to tell which suites it counted, and so unable to tell drift from
+a different denominator. /It read 530 (482 + 47 + 1) until 2026-08-24./
 
 *M3 in progress:* the *FlatGeobuf*, *GeoParquet* and *GeoPackage* spokes are
 done. Still to do: CSV, WKT, KML, and Shapefile's remaining *natives*, then
-both containers (M3b/M3c), *defect 3's fix* -- its *warning* shipped
-2026-08-21, see § THE DEFECTS -- and the exhaustive-match fixture registry
-(M5/D6). Four readers still pass =native: None=.
+M3c, the *rest* of M3b, and the exhaustive-match fixture registry (M5/D6). Four
+readers still pass =native: None=.
+
+***M3b is begun rather than pending, as of 2026-08-24.*** Its carrying channel
+exists -- =src/geopackage/carry.rs= -- and reaches the first class of container
+content: a **tile pyramid** survives a =gpkg -> gpkg= write, with its rows, its
+autoindex, its =sqlite_sequence= mark, its six triggers and the two tile
+registry tables. *M3b requirement 1* (=srs_id= reconciliation) shipped with it,
+because it could not be verified without it. So *defect 3's fix* is **partly
+built** rather than wholly outstanding: what is left is the other independent
+content -- a user's own table, =gpkg_metadata= and its references,
+=gpkg_extensions= rows -- and the layer-coupled class.
 
 *M4 is done (2026-08-20), and it closed three defects rather than two.*
 =FieldDecl= gained a declared *type* in a vocabulary wide enough for the
@@ -416,6 +425,14 @@ already been renamed once./
 
    Exit 0, no warning. =ogr2ogr= on the same input kept all of it. The two
    feature layers survive; the user's own table does not.
+
+   ***Partly fixed 2026-08-24, and the "after" line above is now wrong for one
+   row of it.*** =gpkg_tile_matrix(_set)= and a populated tile table now
+   *survive*, carried by =src/geopackage/carry.rs= -- the first class of
+   container content this defect covers, and D8's case. /Everything else in the
+   "before" line is still destroyed, so the defect stays open: =side_notes=,
+   =gpkg_metadata=, =gpkg_metadata_reference= and =gpkg_extensions= rows./
+   The warning shipped 2026-08-21 and still names them.
 
    Unlike defects 1--2 this one *does* need the mechanism (§ THE DOMAIN OF THE
    RULE), so it could not ship with M4. /(This sentence read "unlike defects
@@ -1331,9 +1348,14 @@ travels with D1's =name= modelling.
 - *Making natives survive a pipe.* D5.
 - *Cross-format preservation of anything.* The rule is explicitly asymmetric;
   a cross-format run that drops a native is correct behaviour, not a gap.
-- *Raster GeoPackages.* Out by rejection rather than by exemption, if
-  § The collision's recommendation is taken -- a vector tool declines a tile
-  container instead of silently dropping the imagery.
+- ~~*Raster GeoPackages.*~~ **No longer out of scope, and the reversal is
+  complete.** § The collision recommended rejection -- a vector tool declines a
+  tile container rather than silently dropping the imagery. *D8 overturned that
+  on 2026-08-23* (wrong layer: the loss is on the write path, and a
+  =gpkg -> geojson= read destroys nothing), and the carrying shipped on
+  **2026-08-24**. A tile pyramid is *independent container content*, carried by
+  the same operation that will carry any other user table, with no
+  raster-specific code -- and nothing in this crate decodes a tile.
 
 ** MILESTONES
 - *M1* -- the inventory: for each of the nine spokes, what the reader discards
@@ -1655,6 +1677,16 @@ travels with D1's =name= modelling.
      below -- a tile pyramid is *independent* content, so carrying it is the
      same operation as carrying =side_notes=, with no raster-specific code.
      Cost is memory, not complexity.
+
+     ***BUILT 2026-08-24, and the prediction held.*** =geopackage/carry.rs= is
+     the channel; the pyramid is read as *independent content* and re-emitted
+     with **no code that decodes a tile** -- =tile_data= is a blob this crate
+     moves and never inspects. /Measured against =gdal_tiles.gpkg=: 80 tiles
+     blob-for-blob, =gdalinfo -checksum= identical through the output, and a
+     second pass byte-identical to the first./ What it did *not* need was any
+     new file-format work: =TableSpec='s =autoindexes= and =autoincrement=,
+     both closed on 2026-08-23, were exactly the two capabilities a tile table
+     obliges.
   2. *=run_geopackage_write= keeps rewriting.* Unchanged, but on a better
      argument than the cost one recorded above: in-place mutation makes
      *preservation the default and destruction the exception*, which is
@@ -1677,11 +1709,21 @@ travels with D1's =name= modelling.
   *derived* (recompute, never carry).
 
   Two consequences, both concrete:
-  - *=gpkg_ogr_contents= is currently misclassified.* Defect 3's warning names
-    it as destroyed content; it is =(table_name TEXT PRIMARY KEY,
-    feature_count INTEGER)=, a row-count cache, and belongs in the second
-    message beside the R*Tree. Same shape as the =gpkg_extensions= mistake
-    caught on 2026-08-21. /Found 2026-08-22, live, fix it here./ Under editing
+  - ~~*=gpkg_ogr_contents= is currently misclassified.*~~ **FIXED 2026-08-24.**
+    Defect 3's warning named it as destroyed content; it is =(table_name TEXT
+    PRIMARY KEY, feature_count INTEGER)=, a row-count cache. /Reported
+    silently rather than "in the second message beside the R*Tree" as this
+    entry asked: that message exists because =--rtree= is a **remedy**, and a
+    cache with no remedy and no information lost would be furniture on every
+    =ogr2ogr= file. The =gpkg_extensions= precedent this entry cites went the
+    same way -- wholly derived rows are not reported at all./
+
+    ***It was the smaller half of its own class.*** The same pass found that
+    every trigger attached to a table the write *rebuilds* is derived too --
+    including the **ten** =ogr2ogr= puts on =gpkg_tile_matrix=, which the
+    standard does not mandate (Requirements 46--52 constrain the values, and
+    the tiles clause names no trigger). On a pyramid file those ten were the
+    dominant term in the warning. Under editing
     it is the sharpest case in the container: carry it after a middle stage
     deletes a feature and the output states a count that is a lie.
   - *A carried index is =wrong=, not stale, once geometry has been touched.*
@@ -1738,12 +1780,25 @@ travels with D1's =name= modelling.
   into a brand-new file dangles just as badly. The failure occurs where there
   is *one* container and nothing to reconcile, which puts it here.
 
+  ***SHIPPED 2026-08-24***, together with D8's carrying half, because it could
+  not be shipped apart from it: until something carried an =srs_id= there was
+  nothing to reconcile, and =foreign_key_check= on the output was clean only
+  because the row was gone. =writer::reconcile_carried_srs= is the mechanism --
+  three cases, /reuse/ when the output already registers that id for the same
+  CRS, /renumber/ when it registers a *different* one, and /register/ when it
+  has none -- and a carried reference whose source held no definition maps to
+  the undefined SRS rather than being reproduced as a dangle.
+
   **So this is work M3b does first and that plan consumes.** The general case
   is rewriting a carried =srs_id= reference into the space =resolve_srs= has
   just built; a merge reuses that and adds nothing to it.
-  =gpkg_tiles.gpkg= in =tests/fixtures/PLANNED.org= is the fixture that trips
-  it, and =foreign_key_check= is the oracle that catches it -- neither needs
-  the merge layer to exist.
+  =gdal_tiles.gpkg= is the fixture that trips it -- **built 2026-08-24**, and
+  documented in =tests/fixtures/HOSTILE.org= rather than =PLANNED.org= where
+  this line first pointed -- and =foreign_key_check= is the oracle that catches
+  it. Neither needs the merge layer to exist. /What makes that fixture trip it
+  is not the pyramid alone: its tiles are EPSG:3857 and its one feature layer
+  EPSG:4326, so it holds an =srs_id= the layer set does not account for and
+  =resolve_srs= will not write./
 
   *Finally, =container.rs= should invert.* =REPRODUCED= is a hand-maintained
   constant that must move whenever =writer::build= does, which its module doc

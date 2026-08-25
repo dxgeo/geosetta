@@ -26,27 +26,42 @@ Cross-format drops of a declaration now *warn*
 (=FeatureCollection::schema_drop_warning=), because reading a member the crate
 then discards is precisely what =lossy-conversion-warnings.org= governs.
 
-***562 tests pass*** as of 2026-08-24, and =cargo clippy --all-targets= and
+***571 tests pass*** as of 2026-08-25, and =cargo clippy --all-targets= and
 =cargo doc= are clean. That figure is the whole of =cargo test -p geosetta= --
-505 lib, 56 integration, 1 doc, plus the =#[ignore]=d GDAL and PROJ
+514 lib, 56 integration, 1 doc, plus the =#[ignore]=d GDAL, PROJ and =sqlite3=
 cross-checks -- recorded that way because an earlier bare "482" left the next
 reader unable to tell which suites it counted, and so unable to tell drift from
-a different denominator. /It read 530 (482 + 47 + 1) until 2026-08-24./
+a different denominator. /It read 530 (482 + 47 + 1) until 2026-08-24, and 562
+until 2026-08-25./
+
+*One of the =#[ignore]=d suites is new and is a **sweep** rather than a case*:
+=tests/gpkg_oracles.rs= runs =integrity_check= and =foreign_key_check= over
+every =.gpkg= fixture's output. It exists because the tile carry shipped on
+2026-08-24 with those oracles reported clean -- *on one file* -- while a second
+fixture came out as a database =sqlite3= refuses to open (=handoff.org= entry
+20). A fixture added later is covered without anyone editing that file.
 
 *M3 in progress:* the *FlatGeobuf*, *GeoParquet* and *GeoPackage* spokes are
 done. Still to do: CSV, WKT, KML, and Shapefile's remaining *natives*, then
 M3c, the *rest* of M3b, and the exhaustive-match fixture registry (M5/D6). Four
 readers still pass =native: None=.
 
-***M3b is begun rather than pending, as of 2026-08-24.*** Its carrying channel
-exists -- =src/geopackage/carry.rs= -- and reaches the first class of container
-content: a **tile pyramid** survives a =gpkg -> gpkg= write, with its rows, its
-autoindex, its =sqlite_sequence= mark, its six triggers and the two tile
-registry tables. *M3b requirement 1* (=srs_id= reconciliation) shipped with it,
-because it could not be verified without it. So *defect 3's fix* is **partly
-built** rather than wholly outstanding: what is left is the other independent
-content -- a user's own table, =gpkg_metadata= and its references,
-=gpkg_extensions= rows -- and the layer-coupled class.
+***M3b is begun rather than pending, as of 2026-08-24, and its first content
+class is closed as of 2026-08-25.*** Its carrying channel exists --
+=src/geopackage/carry.rs= -- and the **independent** class is complete: a tile
+pyramid survives a =gpkg -> gpkg= write with its rows, its autoindex, its
+=sqlite_sequence= mark, its six triggers and the two tile registry tables, and
+so does **a user's own table** with its DDL verbatim, its rows, its rowids, its
+triggers and its indexes. *M3b requirement 1* (=srs_id= reconciliation) shipped
+with the first, because it could not be verified without it.
+
+So *defect 3's fix* is **partly built** rather than wholly outstanding, and
+what remains is all one class: =gpkg_metadata= with its references and
+=gpkg_extensions= rows are **layer-coupled**, not independent. /The metadata
+pair is next and is now unblocked: Requirement 95 makes it a pair, Requirement
+97 obliges dropping a reference to a table the write does not produce, and
+Requirement 99 -- a row-scoped reference names a *rowid* -- is satisfied since
+decision 27 stopped the writer renumbering features./
 
 *M4 is done (2026-08-20), and it closed three defects rather than two.*
 =FieldDecl= gained a declared *type* in a vocabulary wide enough for the
@@ -1543,6 +1558,45 @@ travels with D1's =name= modelling.
   obligation as M3b at a fraction of the cost -- the entries are already bytes
   and =src/zip.rs= already reads them. Not part of the KML spoke: that is an
   XML document, this is an archive.
+*** The feature id -- DECIDED 2026-08-25, decision 27: *carry it*
+/Raised, measured, filed with a recommendation and taken the same day./
+
+=gpkg_contents.last_change='s lesson, one column over. A =gpkg -> gpkg= run
+renumbered every feature to a dense =1..n= (=handoff.org= § BUGS FOUND entry
+19), and no document in this tree listed the id as something a reader discards
+-- because the GeoPackage entry in =native-inventory.org= had a *layer* level
+and a *container* level and no **feature** level at all.
+
+**What settles the class is that the standard states a purpose.** Requirement
+29 mandates the INTEGER primary key acting as a =rowid= alias, and the note
+under it says what for: it is how features are linked to row-level records in
+=gpkg_metadata= *by rowid value*, through =gpkg_metadata_reference=. So other
+rows point at it. /Nothing obliges a **writer** to preserve the values, so
+renumbered output was conformant -- exactly =last_change='s posture, and
+exactly as irrelevant: the question is whether real information is destroyed./
+
+*Carried under D16, which is what makes it free.* A dense =1..n= is what this
+writer emits anyway, so it is **derived** and no payload is constructed --
+measured, not argued: after the change, all eleven pre-existing =.gpkg=
+fixtures produce byte-identical output to the previous binary.
+
+***And it is layer-coupled, not independent, which the filing did not say.***
+An id describes a feature at a position, and =FeatureCollection::features= is a
+public field a consumer mutates directly (decision 23: validity is computed at
+write, never tracked). Delete from the middle and the carried ids no longer
+describe the features being written -- they can collide, which is a malformed
+=INTEGER PRIMARY KEY=, or run backwards, which cannot be packed into a b-tree.
+So =writer::feature_ids= checks the sequence strictly ascends and **falls back
+to a dense sequence for the whole layer** when it does not. /Per-feature
+fallback was rejected: it yields a set that is neither the source's numbering
+nor a fresh one./
+
+*The R\*Tree is the coupling that nearly got missed.* =rtree::build= numbered
+its leaf entries by position too. An index built against one numbering beside a
+table written under another names rows that do not exist -- and
+=integrity_check= says nothing, because the shadow tables are well-formed and
+merely wrong. The ids are computed once per layer and handed to both.
+
 - *M3b* -- the GeoPackage container (§ THE DOMAIN OF THE RULE). Separated from
   M3 because it is not a spoke's payload but a database's: unmodelled
   =sqlite_master= objects carried structurally, registry rows preserved,
@@ -1561,6 +1615,20 @@ travels with D1's =name= modelling.
   expressible operation* -- read its DDL and its rows, push a =TableSpec=. That
   covers most of defect 3's damage (=side_notes=, =gpkg_metadata=,
   =gpkg_metadata_reference=, =gpkg_ogr_contents=) with no new file-format work.
+
+  ***Two of the four members that sentence names are now carried*** --
+  =side_notes= and its kind, 2026-08-25, by =geopackage/carry.rs= -- and the
+  prediction held exactly: no new file-format work, just DDL plus rows through
+  =TableSpec=. /=gpkg_ogr_contents= turned out not to belong in that list at
+  all: it is *derived*, which was bug 13. The metadata pair is the remainder,
+  and Requirement 95 makes it a pair./
+
+  *One thing the survey did not anticipate, and it cost a shipped bug.* An
+  arbitrary user table's indexes must be **re-packed** from the source, not
+  built: only its DDL knows whether it declares a =UNIQUE=, and building one
+  for a table that does not is a malformed database (=handoff.org= § BUGS
+  FOUND entry 20). D10's "one bounded construction case" is gone; re-packing
+  now covers the pyramid too.
 
   Four gaps stand between that and a faithful container:
   1. ~~*Index b-trees are supported by neither side.*~~ **CLOSED 2026-08-23**,

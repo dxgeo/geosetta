@@ -253,13 +253,19 @@ Two levels, and decision 2a put both in scope.
 | =gpkg_data_columns= / constraints         | opaque   | *DONE 2026-08-21*: carried per layer, rows re-emitted for columns that still exist |
 | =gpkg_contents.last_change=               | opaque   | ***DONE 2026-08-24***: carried verbatim; the writer's epoch sentinel is dropped on read so our own output stays payload-free. **This one had been missed by the inventory entirely** -- see § GeoPackage spoke |
 
+*Feature level:* /added 2026-08-25, and this level had been absent from the
+entry entirely -- see § A second discard the table missed./
+| member                                   | class    | note |
+|------------------------------------------+----------+------|
+| the =INTEGER PRIMARY KEY= feature id      | identity | ***DONE 2026-08-25*** (decision 27): carried on =GpkgFeatureNative=, but only when it differs from the dense =1..n= the writer emits anyway. Same member and same class as GeoJSON's feature =id= above. Requirement 29's note makes it the target of =gpkg_metadata_reference='s row-level links |
+
 *Container level* /(measured)/ -- a =.gpkg= with two layers, a user table,
 dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
 | content                          | survives? | class |
 |----------------------------------+-----------+-------|
 | feature layers                   | yes       | -- |
-| =side_notes= (plain user table)  | *no*      | opaque |
-| =gpkg_metadata= / =_reference=   | *no*      | opaque |
+| =side_notes= (plain user table)  | ***yes*, since 2026-08-25** | independent container content, carried verbatim by =geopackage/carry.rs= -- DDL, rows, *rowids*, triggers and indexes. /Its index is **re-packed** from the source rather than rebuilt, which is how a =COLLATE NOCASE= key survives a crate that implements no collation at all./ |
+| =gpkg_metadata= / =_reference=   | *no*      | opaque. **The pair travels together or not at all** -- Requirement 95: a GeoPackage containing the first SHALL contain the second -- and the second cannot be carried correctly until feature ids are (Requirement 99; § A second discard the table missed) |
 | =gpkg_extensions=                | *no*      | opaque |
 | =gpkg_data_columns= (+constraints)| *yes*, since 2026-08-21 | opaque, but *layer* content -- its rows are keyed by =(table_name, column_name)=, so the spoke carries them and this table is not M3b's after all |
 | =gpkg_ogr_contents=              | *no*      | derived-capability -- /and reported as such since 2026-08-24; it had been named as destroyed *content*, handoff.org entry 13/ |
@@ -291,6 +297,92 @@ catch a destroyed *value*. The same blind spot appeared in the test suite the
 same day -- see =same-format-fidelity.org= § The blob the schema check could
 not see.
 
+*** A second discard the table missed -- the *feature id*, 2026-08-25
+/Found by pulling on =gpkg_metadata_reference=, the same way =last_change= was
+found by pulling on its timestamp./
+
+***A =gpkg -> gpkg= run renumbered every feature.*** Measured 2026-08-25 on a
+=cities= layer holding fids =1, 9, 40=:
+
+#+begin_src text
+  geosetta gap.gpkg out.gpkg   ->  fids 1, 2, 3     <- the finding
+  ogr2ogr  -f GPKG ogr.gpkg    ->  fids 1, 9, 40
+  geosetta, after decision 27  ->  fids 1, 9, 40
+#+end_src
+
+***Fixed the same day it was found***, by decision 27. What follows is the
+argument as it was made, because the classification is the durable part and
+the two requirements it turns on will come up again for the metadata pair.
+
+Silently: no warning fires, because nothing classifies the id at all.
+=reader.rs:148= filters the rowid alias out of the properties it builds, and
+=writer.rs:900= assigns =(i + 1)= to each row on the way out. The value is not
+carried, not warned about, and not listed anywhere in this document.
+
+**Why this document missed it, and the reason is structural rather than an
+oversight.** The GeoPackage entry above has exactly two levels -- *layer* and
+*container* -- and the feature id is at neither. It is a *feature*-level
+member, and the inventory has no such level for this spoke, so there was no
+row for it to be absent from. *The concept was never missing from the
+document* -- the GeoJSON entry has a =level= column and lists =id= at
+=feature= level, classed *identity*, which is the same member of the same kind
+by the same name. It was the GeoPackage entry that had no shelf at that level,
+which makes this a gap in one table rather than in the method. /Third time this
+week in a different disguise:
+=last_change= was missed because a timestamp reads as bookkeeping, the blob was
+missed because the table asked what a reader fails to **model** and not what it
+fails to **carry**, and this one was missed because the table has no shelf at
+the level it lives on./
+
+**The standard gives the column a stated purpose, which is what settles its
+class.** Requirement 29 (OGC 12-128r19 § 2.1.6, read at pinned =fe83fdd=)
+mandates the INTEGER primary key acting as a =rowid= alias, and the note
+immediately under it says what it is *for*: /"The integer primary key of a
+feature table allows features to be linked to row level metadata records in the
+=gpkg_metadata= table by rowid values in the =gpkg_metadata_reference= table."/
+So the id is an **externally referenced value with a meaning the standard
+defines**, not an allocation detail -- the same argument that reclassified
+=last_change=, which was the one column in =gpkg_contents= with a stated
+meaning about the data.
+
+/Stated precisely, because the =gdal_tiles.gpkg= lesson applies: nothing in the
+standard requires a **writer** to preserve the values across a rewrite, so
+renumbered output is conformant. That is not the question. =last_change= was
+conformant either way too, and the value was still real./
+
+*And =ogr2ogr= preserves them exactly*, which is producer practice and evidence
+of what a consumer will expect -- never evidence of a requirement
+(=same-format-fidelity.org= § THE ORACLE RULE). It is recorded because a user
+moving between the two tools sees one preserve identity and the other not.
+
+**Nothing in the tree could test this, and the reason is uncomfortable**: all
+eleven =.gpkg= fixtures held feature ids that are dense =1..n=, so every one of
+them round-tripped through the renumbering unchanged and the whole corpus was
+blind to it. =sqlite_fid_gap.gpkg= was built for exactly that gap.
+
+/That fact is also the containment result, and it was confirmed rather than
+assumed: after the fix, the outputs for all eleven older fixtures are
+byte-identical to the previous binary's./
+
+**The channel already exists and already carries exactly this member for
+another spoke.** =Feature::native='s own doc names /"a GeoJSON =id="/ as its
+example of what it holds. What is missing is that =NativePayload::Gpkg= is
+*collection-level only* by construction, so a per-feature form is the one
+structural addition -- and D16 contains the cost, because a dense =1..n=
+sequence is precisely what the writer emits anyway and so is **derived**, not
+carried.
+
+***The consequence that reaches an already-taken decision.***
+=container-reconciliation.org= D5 refuses a user-table merge on the
+=row_id_value= hazard -- a =gpkg_metadata_reference= row pointing at a rowid
+that renumbering silently invalidates, with no foreign key for
+=foreign_key_check= to catch. D5 attributes that hazard to *merging*. It is not
+confined to merging: this writer renumbers on the plain **one-container** path
+as well, so the hazard is already live in shipped behaviour wherever a source
+holds a row-scoped reference. /The reference in an ordinary =ogr2ogr= file is
+=table=-scoped and therefore untouched -- measured -- which is why this has not
+bitten yet./
+
 *** The IR's own discards -- 2026-08-21
 Not a spoke's, so they belong outside the table. Both were found by pulling on
 entries above, and both are now closed:
@@ -305,10 +397,18 @@ entries above, and both are now closed:
   =hand_mixed_number.geojson=; the open call is whether it warrants a warning,
   recorded in =lossy-conversion-warnings.org=.
 
-*** GeoPackage spoke -- DONE 2026-08-21, extended 2026-08-24
+*** GeoPackage spoke -- DONE 2026-08-21, extended 2026-08-24 and 2026-08-25
 =GpkgNative= (=src/native.rs=) carries =gpkg_contents.identifier=,
 =description= and =last_change=, plus the layer's =gpkg_data_columns= rows and
 the =gpkg_data_column_constraints= they name.
+
+***And =GpkgFeatureNative= carries the feature id*** /(added 2026-08-25,
+decision 27)/ -- the spoke's first **feature-level** payload, on its own
+=NativePayload= variant rather than a member of the layer's, because the two
+levels answer different questions. Same conditional rule as the two below: the
+id is dropped when it equals the dense =1..n= the writer emits anyway. /How
+this member came to be missing from the table above for as long as it was is
+§ A second discard the table missed./
 
 ***=last_change= was missed by this inventory, and the way it was missed is the
 lesson.*** The =gpkg_contents= row was surveyed for what it says *about* a

@@ -18,12 +18,18 @@
 //!   is actually written rather than replayed blindly.
 //! - **derived** — recomputed, never carried. An R*Tree, a row-count cache.
 //!
-//! This module carries the *first* class, and today reaches one member of it:
-//! the tile pyramid, which is D8's case in `plans/same-format-fidelity.org`.
-//! **Nothing here is raster-specific**, which is D8's own argument for carrying
-//! rather than rejecting: a pyramid is carried because it is independent
-//! content, by the same operation that will carry `side_notes`, and the tile
-//! *bytes* are opaque blobs this crate never decodes.
+//! This module carries the *first* class, and reaches two members of it: the
+//! tile pyramid (D8's case in `plans/same-format-fidelity.org`, 2026-08-24)
+//! and a user's own table (2026-08-25). **Nothing here is raster-specific**,
+//! which was D8's own argument for carrying rather than rejecting — a pyramid
+//! is carried because it is independent content, and `side_notes` arrives by
+//! the same operation, as that argument predicted it would.
+//!
+//! *What the second member cost was one distinction the first had blurred.* A
+//! pyramid's key is Requirement 54's, so it could be **built**; an arbitrary
+//! user table declares whatever it likes, so its indexes must be **re-packed**
+//! from the source. Building for both was the shipped bug that re-packing for
+//! both now fixes — `handoff.org` § BUGS FOUND entry 20.
 //!
 //! # Why the pyramid is where it starts
 //!
@@ -41,6 +47,13 @@
 //! that already has one is `plans/container-reconciliation.org`, which gates
 //! M3b's completion and is not started here — a destination's own container
 //! content is still destroyed, and still warned about, exactly as before.
+//!
+//! And it does not yet carry the **metadata pair**. `gpkg_metadata` and
+//! `gpkg_metadata_reference` travel together or not at all (Requirement 95: a
+//! GeoPackage containing the first SHALL contain the second), and carrying the
+//! second correctly needs feature ids this writer does not preserve
+//! (Requirement 99, and `handoff.org` § BUGS FOUND entry 19). See
+//! `user_tables` for the full list of what is deliberately left behind.
 
 use crate::error::Result;
 use crate::sqlite::{Autoincrement, Database, Table, Value};
@@ -54,13 +67,16 @@ use crate::sqlite::{Autoincrement, Database, Table, Value};
 pub struct Carried {
     /// Tile pyramids, in `gpkg_contents` order.
     pub pyramids: Vec<Pyramid>,
+    /// Tables the container held that belong to no layer and to no registry
+    /// this writer constructs, in `sqlite_master` order.
+    pub tables: Vec<UserTable>,
 }
 
 impl Carried {
     /// Nothing was carried, so the write proceeds exactly as it did before this
     /// channel existed.
     pub fn is_empty(&self) -> bool {
-        self.pyramids.is_empty()
+        self.pyramids.is_empty() && self.tables.is_empty()
     }
 
     /// Every `sqlite_master` name this content will put back into the output.
@@ -80,6 +96,11 @@ impl Carried {
         if !self.pyramids.is_empty() {
             names.push("gpkg_tile_matrix_set".into());
             names.push("gpkg_tile_matrix".into());
+        }
+        for table in &self.tables {
+            names.push(table.name.clone());
+            names.extend(table.triggers.iter().map(|(name, _)| name.clone()));
+            names.extend(table.indexes.iter().map(|(name, _, _)| name.clone()));
         }
         names
     }
@@ -126,9 +147,20 @@ pub struct Pyramid {
     /// The tile rows as `(rowid, values)`, with the rowid-alias column left
     /// `Null` — the shape `crate::sqlite::TableSpec` wants.
     pub rows: Vec<(i64, Vec<Value>)>,
-    /// Column positions of the `UNIQUE (zoom_level, tile_column, tile_row)`
-    /// key, for the autoindex the DDL obliges.
-    pub key_columns: Vec<usize>,
+    /// The `sqlite_autoindex_*` b-trees this table's DDL obliges, re-packed
+    /// from the source exactly as [`UserTable::autoindexes`] describes.
+    ///
+    /// **Read from the source rather than built from Requirement 54's key, and
+    /// that distinction is load-bearing.** Until 2026-08-25 this was a list of
+    /// column positions found *by name*, and the writer built an index over
+    /// them — which writes `sqlite_autoindex_<name>_1` for any table holding
+    /// columns called `zoom_level`, `tile_column` and `tile_row` whether or not
+    /// its DDL declares the `UNIQUE`. A table with the index and no constraint
+    /// to justify it is a **malformed database**: SQLite reports
+    /// `orphan index`, and every query against the file fails. See
+    /// `handoff.org` § BUGS FOUND entry 20, and note that it is entry 15
+    /// exactly inverted — that one supplied a constraint with no index.
+    pub autoindexes: Vec<Vec<Vec<u8>>>,
     /// The `sqlite_sequence` state for this table, when its DDL declares
     /// `AUTOINCREMENT`.
     pub autoincrement: Option<Autoincrement>,
@@ -136,6 +168,57 @@ pub struct Pyramid {
     /// nothing else to reconstruct one from. A GeoPackage tile table carries
     /// six, enforcing `zoom_level`, `tile_column` and `tile_row` on insert and
     /// on update.
+    pub triggers: Vec<(String, String)>,
+}
+
+/// An explicit `CREATE INDEX` as `(name, sql, records)`: its `sqlite_master`
+/// name, the statement that declared it, and its records in index order.
+pub type CarriedIndex = (String, String, Vec<Vec<u8>>);
+
+/// One table the container held that belongs to no layer and to no registry
+/// this writer constructs — `side_notes` and its kind.
+///
+/// This is the *plainest* member of the independent class and the one
+/// `plans/same-format-fidelity.org` § MILESTONES M3b names when it says
+/// carrying an arbitrary user table verbatim "is already an expressible
+/// operation". Everything here is read back out of the source and handed to
+/// the writer untouched; nothing interprets a column.
+///
+/// # Why its rowids survive when a feature layer's do not
+///
+/// A carried table's rows keep the rowids SQLite gave them, because the whole
+/// point is to put back what was there. A *feature layer* is rebuilt from the
+/// IR instead, and `super::writer` reissues its ids dense from 1 — which is
+/// `handoff.org` § BUGS FOUND entry 19 and is **not** a property this module
+/// shares. The distinction matters here for one concrete reason: an index
+/// record embeds the rowid it points at, so a carried index is only
+/// re-packable while the rowids under it are unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UserTable {
+    pub name: String,
+    /// The `CREATE TABLE` text, carried verbatim.
+    pub sql: String,
+    /// Rows as `(rowid, values)` with the rowid-alias column blanked, the shape
+    /// `crate::sqlite::TableSpec` wants. See `rows_blanking_alias` for why.
+    pub rows: Vec<(i64, Vec<Value>)>,
+    /// The `sqlite_autoindex_*` b-trees the DDL obliges, **re-packed from the
+    /// source** rather than rebuilt: each entry is that index's records in
+    /// index order, exactly as `crate::sqlite::Database::read_index`
+    /// returned them, ordered by the `_1`, `_2`, … suffix SQLite assigns.
+    ///
+    /// *This is the case D10 scoped the index work for.* An index on disk is
+    /// already sorted, so re-packing needs no comparison semantics at all —
+    /// no type ordering, no collation. The pyramid takes the other path
+    /// (`super::writer::tile_table` builds its autoindex, because its key is
+    /// three integers); an arbitrary user table may declare `UNIQUE` over
+    /// anything, so it takes this one.
+    pub autoindexes: Vec<Vec<Vec<u8>>>,
+    /// Explicit `CREATE INDEX` objects as `(name, sql, records)`, re-packed on
+    /// the same terms as [`Self::autoindexes`].
+    pub indexes: Vec<CarriedIndex>,
+    /// The `sqlite_sequence` state, when the DDL declares `AUTOINCREMENT`.
+    pub autoincrement: Option<Autoincrement>,
+    /// The table's triggers as `(name, sql)`, carried verbatim.
     pub triggers: Vec<(String, String)>,
 }
 
@@ -188,7 +271,7 @@ pub fn read(bytes: &[u8]) -> Result<Carried> {
             continue;
         };
         let Some(matrix_set) = matrix_set_row(&db, &tables, &name)? else { continue };
-        let rows = tile_rows(&db, table, rowid_col)?;
+        let rows = rows_blanking_alias(&db, table, rowid_col)?;
         pyramids.push(Pyramid {
             identifier,
             description,
@@ -199,14 +282,173 @@ pub fn read(bytes: &[u8]) -> Result<Carried> {
             matrix_set,
             matrix: matrix_rows(&db, &tables, &name)?,
             sql: table_sql(&objects, &name).unwrap_or_default(),
-            key_columns: tile_key_columns(table),
+            autoindexes: autoindex_records(&db, &objects, &name)?,
             autoincrement: autoincrement_of(&name, &table_sql(&objects, &name), &sequences),
             triggers: triggers_of(&objects, &name),
             rows,
             name,
         });
     }
-    Ok(Carried { pyramids })
+    let tables = user_tables(&db, &tables, &objects, &sequences, &pyramids)?;
+    Ok(Carried { pyramids, tables })
+}
+
+/// Registry tables this writer builds for itself, so carrying one would put
+/// back a stale copy of something reconstructed from the layers.
+///
+/// **Kept in step with `super::container`'s `REPRODUCED`, `CONSTRUCTED`,
+/// `LAYER_SCOPED` and `DERIVED` by the test at the bottom of this file**,
+/// which fails if either list grows without the other. The lists cannot simply
+/// be shared: that module is classifying *what a write destroys* and this one
+/// is choosing *what to carry*, and the two agree today only because nothing
+/// is yet carried that the warning still reports.
+pub(crate) const CONSTRUCTED_TABLES: [&str; 9] = [
+    "gpkg_spatial_ref_sys",
+    "gpkg_contents",
+    "gpkg_geometry_columns",
+    "gpkg_extensions",
+    "gpkg_tile_matrix",
+    "gpkg_tile_matrix_set",
+    "gpkg_data_columns",
+    "gpkg_data_column_constraints",
+    "gpkg_ogr_contents",
+];
+
+/// Tables belonging to the independent class: everything the container holds
+/// that is not a layer, not a registry table this writer constructs, not
+/// derived, and not already carried as part of a pyramid.
+///
+/// # What is deliberately left behind, and why each is not an oversight
+///
+/// - **`gpkg_metadata` and `gpkg_metadata_reference`.** Requirement 95 makes
+///   them a *pair* — a GeoPackage containing the first SHALL contain the
+///   second — so carrying one without the other writes a non-conformant file,
+///   and carrying the second correctly needs feature ids this writer does not
+///   yet preserve (Requirement 99; `handoff.org` entry 19). They travel
+///   together or not at all.
+/// - **A dataset registered in `gpkg_contents`** under `attributes`. The table
+///   is carryable on exactly these terms, but its registry row is not carried
+///   with it, and a table present without its `gpkg_contents` row is content
+///   that no reader will find. Skipped whole rather than carried half.
+/// - **R\*Tree shadow tables and `gpkg_ogr_contents`**, which are *derived*:
+///   `super::container`'s `DERIVED` and the `--rtree` remedy own them.
+fn user_tables(
+    db: &Database,
+    tables: &[Table],
+    objects: &[crate::sqlite::MasterObject],
+    sequences: &[(String, i64)],
+    pyramids: &[Pyramid],
+) -> Result<Vec<UserTable>> {
+    let registered = contents_names(db, tables)?;
+    let mut out = Vec::new();
+    for object in objects {
+        if object.kind != "table" || object.root_page == 0 {
+            continue;
+        }
+        let name = object.name.as_str();
+        if name.starts_with("sqlite_")
+            || name.starts_with("rtree_")
+            || CONSTRUCTED_TABLES.contains(&name)
+            || name == "gpkg_metadata"
+            || name == "gpkg_metadata_reference"
+            || registered.iter().any(|n| n == name)
+            || pyramids.iter().any(|p| p.name == name)
+        {
+            continue;
+        }
+        let Some(table) = tables.iter().find(|t| t.name == name) else { continue };
+        let Some(sql) = object.sql.clone() else { continue };
+        // A table this cannot decode is skipped rather than fatal, on
+        // `read`'s own ruling: a partial carry beats no output at all, and
+        // `super::container` still names whatever was skipped.
+        let Ok(rows) = carried_rows(db, table) else { continue };
+        out.push(UserTable {
+            autoindexes: autoindex_records(db, objects, name)?,
+            indexes: explicit_indexes(db, objects, name)?,
+            autoincrement: autoincrement_of(name, &Some(sql.clone()), sequences),
+            triggers: triggers_of(objects, name),
+            name: name.to_string(),
+            sql,
+            rows,
+        });
+    }
+    Ok(out)
+}
+
+/// Every `gpkg_contents.table_name`, whatever its `data_type`.
+///
+/// Used as an exclusion: a registered dataset is either a layer the writer
+/// rebuilds, a pyramid carried elsewhere, or an `attributes` table whose
+/// registry row this pass does not carry. None of the three is a plain user
+/// table.
+fn contents_names(db: &Database, tables: &[Table]) -> Result<Vec<String>> {
+    let Some(t) = tables.iter().find(|t| t.name == "gpkg_contents") else {
+        return Ok(Vec::new());
+    };
+    let Some(name_col) = t.columns.iter().position(|c| c == "table_name") else {
+        return Ok(Vec::new());
+    };
+    Ok(db.read_rows(t)?.iter().filter_map(|row| text_at(row, name_col)).collect())
+}
+
+/// Rows as `(rowid, values)` with the rowid alias blanked, for a table that may
+/// not have one.
+///
+/// A table with no `INTEGER PRIMARY KEY` still has rowids — SQLite gives every
+/// non-`WITHOUT ROWID` table one — they are simply not exposed as a column, so
+/// there is nothing to blank and [`Database::read_rows`] backfills nothing.
+/// The rowid is then the row's position, which is what SQLite itself assigns.
+fn carried_rows(db: &Database, table: &Table) -> Result<Vec<(i64, Vec<Value>)>> {
+    match table.rowid_alias() {
+        Some(col) => rows_blanking_alias(db, table, col),
+        None => Ok(db
+            .read_rows(table)?
+            .into_iter()
+            .enumerate()
+            .map(|(i, row)| ((i + 1) as i64, row))
+            .collect()),
+    }
+}
+
+/// The `sqlite_autoindex_<name>_N` records, ordered by `N`.
+///
+/// Re-packed rather than rebuilt: `read_index` walks the source's b-tree in
+/// index order, so the records come out already sorted and no key is ever
+/// compared. See [`UserTable::autoindexes`].
+fn autoindex_records(
+    db: &Database,
+    objects: &[crate::sqlite::MasterObject],
+    name: &str,
+) -> Result<Vec<Vec<Vec<u8>>>> {
+    let prefix = format!("sqlite_autoindex_{name}_");
+    let mut found: Vec<(u32, u32)> = objects
+        .iter()
+        .filter(|o| o.kind == "index" && o.tbl_name == name && o.name.starts_with(&prefix))
+        .filter_map(|o| {
+            o.name[prefix.len()..].parse::<u32>().ok().map(|n| (n, o.root_page))
+        })
+        .collect();
+    found.sort_by_key(|(n, _)| *n);
+    found.iter().map(|(_, root)| db.read_index(*root)).collect()
+}
+
+/// Explicit `CREATE INDEX` objects on `name`, as `(name, sql, records)`.
+fn explicit_indexes(
+    db: &Database,
+    objects: &[crate::sqlite::MasterObject],
+    name: &str,
+) -> Result<Vec<CarriedIndex>> {
+    let mut out = Vec::new();
+    for object in objects {
+        if object.kind != "index" || object.tbl_name != name || object.root_page == 0 {
+            continue;
+        }
+        // An autoindex has no `sql` — SQLite created it on its own behalf — and
+        // is carried by `autoindex_records` instead.
+        let Some(sql) = object.sql.clone() else { continue };
+        out.push((object.name.clone(), sql, db.read_index(object.root_page)?));
+    }
+    Ok(out)
 }
 
 /// The `gpkg_contents` rows registering a tile pyramid, in stored order.
@@ -329,14 +571,14 @@ fn srs_definition(db: &Database, tables: &[Table], srs_id: i64) -> Result<Option
     Ok(None)
 }
 
-/// The tile rows as `(rowid, values)`, with the rowid-alias column blanked.
+/// Rows as `(rowid, values)`, with the rowid-alias column blanked.
 ///
 /// [`Database::read_rows`] backfills the rowid into that column so a reader
 /// sees the value SQLite reports; `crate::sqlite::TableSpec` wants the
 /// inverse, because the rowid is the cell's key rather than part of its record.
 /// Writing the id back into the record as well would store it twice and change
 /// every row's bytes.
-fn tile_rows(db: &Database, table: &Table, rowid_col: usize) -> Result<Vec<(i64, Vec<Value>)>> {
+fn rows_blanking_alias(db: &Database, table: &Table, rowid_col: usize) -> Result<Vec<(i64, Vec<Value>)>> {
     let mut out = Vec::new();
     for mut row in db.read_rows(table)? {
         let rowid = match row.get(rowid_col) {
@@ -347,25 +589,6 @@ fn tile_rows(db: &Database, table: &Table, rowid_col: usize) -> Result<Vec<(i64,
         out.push((rowid, row));
     }
     Ok(out)
-}
-
-/// Column positions of a tile table's declared key.
-///
-/// Requirement 54 makes `(zoom_level, tile_column, tile_row)` a tile table's
-/// key, so this reads the columns by name rather than parsing the constraint —
-/// and an autoindex over three integers needs no collation, which is what
-/// `plans/container-reconciliation.org` § THE MEASUREMENT established when it
-/// found no producer emitting a non-`BINARY` one.
-///
-/// Empty when the table does not have all three, which leaves the spec with no
-/// autoindex — correct for a table whose DDL then declares no `UNIQUE`.
-fn tile_key_columns(table: &Table) -> Vec<usize> {
-    let wanted = ["zoom_level", "tile_column", "tile_row"];
-    let found: Vec<usize> = wanted
-        .iter()
-        .filter_map(|w| table.columns.iter().position(|c| c == w))
-        .collect();
-    if found.len() == wanted.len() { found } else { Vec::new() }
 }
 
 /// This table's `CREATE TABLE` text as `sqlite_master` stored it.

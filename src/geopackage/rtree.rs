@@ -39,15 +39,19 @@ pub struct Rtree {
 /// Build the R*Tree extension for feature table `table` (geometry column
 /// `geom`), or `None` if the layer has no geometry to index (an empty index is
 /// still emitted so downstream tools find the virtual table).
-pub fn build(table: &str, fc: &FeatureCollection) -> Rtree {
+pub fn build(table: &str, fc: &FeatureCollection, ids: &[i64]) -> Rtree {
     // One leaf entry per feature that has geometry: (rowid, bbox). The rowid is
-    // the feature's fid — its 1-based position, matching the feature table.
+    // the feature's fid, which `super::writer::feature_ids` decides — its
+    // 1-based position unless the source carried a different id. **Passed in
+    // rather than recomputed**: an index built against one numbering and a
+    // table written under another produces entries pointing at rows that do not
+    // exist, and no oracle in this tree would catch it.
     let mut entries: Vec<(i64, Bbox)> = Vec::new();
     for (i, feat) in fc.features.iter().enumerate() {
         if let Some(g) = &feat.geometry {
             let b = g.bbox();
             if !b.is_empty() {
-                entries.push(((i + 1) as i64, b));
+                entries.push((ids[i], b));
             }
         }
     }
@@ -387,7 +391,7 @@ mod tests {
     #[test]
     fn empty_layer_still_has_a_root_node() {
         let fc = FeatureCollection::new(vec![]);
-        let rt = build("empty", &fc);
+        let rt = build("empty", &fc, &(1..=fc.features.len() as i64).collect::<Vec<_>>());
         let node = rt.tables.iter().find(|t| t.name == "rtree_empty_geom_node").unwrap();
         assert_eq!(node.rows.len(), 1); // the (empty) root
         assert_eq!(node.rows[0].0, 1); // nodeno 1
@@ -398,7 +402,7 @@ mod tests {
         let fc = FeatureCollection::new(
             (0..10).map(|i| point_feat(i as f64, i as f64)).collect(),
         );
-        let rt = build("pts", &fc);
+        let rt = build("pts", &fc, &(1..=fc.features.len() as i64).collect::<Vec<_>>());
         let node = rt.tables.iter().find(|t| t.name == "rtree_pts_geom_node").unwrap();
         let rowid = rt.tables.iter().find(|t| t.name == "rtree_pts_geom_rowid").unwrap();
         // Ten features fit one leaf, which is the root.
@@ -417,7 +421,7 @@ mod tests {
         let fc = FeatureCollection::new(
             (0..n).map(|i| point_feat(i as f64, (i * 7 % 13) as f64)).collect(),
         );
-        let rt = build("big", &fc);
+        let rt = build("big", &fc, &(1..=fc.features.len() as i64).collect::<Vec<_>>());
         let node = rt.tables.iter().find(|t| t.name == "rtree_big_geom_node").unwrap();
         let parent = rt.tables.iter().find(|t| t.name == "rtree_big_geom_parent").unwrap();
         let rowid = rt.tables.iter().find(|t| t.name == "rtree_big_geom_rowid").unwrap();

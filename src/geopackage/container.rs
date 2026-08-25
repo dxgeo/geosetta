@@ -3,15 +3,23 @@
 //!
 //! [`super::writer::write_layers`] is read-modify-write: it decodes the layers,
 //! upserts, and re-emits a complete file built from the tables [`super::writer`]
-//! knows how to construct. Anything else the source container held — a user's
-//! own tables, `gpkg_metadata`, extension registrations, spatial indexes,
-//! triggers, views — is not carried, and so does not survive. That is
+//! knows how to construct, **plus whatever `super::carry` hands it**. What is
+//! neither built nor carried does not survive: `gpkg_metadata` and its
+//! references, extension registrations, spatial indexes, views. That is
 //! *defect 3* in `plans/same-format-fidelity.org`, whose fix travels with the
-//! container milestone (M3b).
+//! container milestone (M3b) and is *partly landed* — a tile pyramid survives
+//! as of 2026-08-24 and a user's own tables as of 2026-08-25, so this warning
+//! now reports a shrinking remainder rather than everything.
+//!
+//! **Which means the `carried` argument is load-bearing rather than
+//! decorative.** A table this module still names while the writer puts it back
+//! is a warning that lies, and the coupling has no compiler behind it — see
+//! [`REPRODUCED`] and `super::carry::Carried::reproduced_names`.
 //!
 //! This module is the *warning*, shipped ahead of the fix per that plan's
-//! § SCOPE ("defect 3's warning now and its fix with the container work"). Until
-//! M3b lands, a `gpkg -> gpkg` run destroys container content at exit 0; the
+//! § SCOPE ("defect 3's warning now and its fix with the container work").
+//! Until M3b lands in full, a `gpkg -> gpkg` run destroys container content at
+//! exit 0; the
 //! standing rule in `plans/lossy-conversion-warnings.org` says a silent drop of
 //! information the source actually carries is a bug regardless of whether the
 //! fix is ready, so the loss is reported now and repaired later.
@@ -516,6 +524,53 @@ mod tests {
         // bearing on whether the source carries a spatial index.
         assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[1].contains("R*Tree spatial index on cities"), "{warnings:?}");
+    }
+
+    /// ***The two modules' lists of "tables this writer builds for itself" say
+    /// the same thing***, and nothing but this test makes them.
+    ///
+    /// `super::carry` uses its list to decide **what to carry**; this module
+    /// uses its four to decide **what a write destroys**. They are separate
+    /// judgements over the same set, so they cannot simply share a constant —
+    /// but a table appearing in one and not the other is a bug in whichever
+    /// direction it goes: carried *and* reported is a lie in the warning,
+    /// reported *and* not carried is a table that silently vanishes.
+    #[test]
+    fn the_two_lists_of_constructed_tables_agree() {
+        let mut here: Vec<&str> = REPRODUCED
+            .iter()
+            .chain(CONSTRUCTED.iter())
+            .chain(LAYER_SCOPED.iter())
+            .chain(DERIVED.iter())
+            .copied()
+            .collect();
+        here.sort_unstable();
+        let mut there = crate::geopackage::carry::CONSTRUCTED_TABLES.to_vec();
+        there.sort_unstable();
+        assert_eq!(here, there);
+    }
+
+    /// A table that is *carried* stops being named as destroyed, which is the
+    /// whole coupling between `super::carry` and this module.
+    ///
+    /// /Asserted as a **count** of what remains, not as the absence of one
+    /// name: the 2026-08-24 lesson is that a message can satisfy a phrase for
+    /// reasons unrelated to what is being tested./
+    #[test]
+    fn a_carried_table_is_no_longer_reported_as_destroyed() {
+        const HOSTILE: &[u8] = include_bytes!("../../tests/fixtures/gdal_hostile.gpkg");
+        let written = vec!["cities".to_string(), "second".to_string()];
+
+        let before = container_drop_warnings(HOSTILE, "in.gpkg", &written, &[], false);
+        assert!(before[0].contains("side_notes (1 row)"), "the premise: {}", before[0]);
+
+        let after =
+            container_drop_warnings(HOSTILE, "in.gpkg", &written, &["side_notes".into()], false);
+        assert!(!after[0].contains("side_notes"), "{}", after[0]);
+        // And nothing else moved: the two metadata tables are still reported,
+        // because they are still destroyed.
+        assert!(after[0].contains("gpkg_metadata (1 row)"), "{}", after[0]);
+        assert!(after[0].contains("gpkg_metadata_reference (1 row)"), "{}", after[0]);
     }
 
     /// A trigger on a table that is **genuinely destroyed** is still reported,

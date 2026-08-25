@@ -57,20 +57,23 @@ still pass =native: None=.*
   M3b has to honour and rules out dirty-flag invalidation on structural
   grounds (§ THE EDIT LOOP).
 
-562 tests pass (=cargo test -p geosetta=: 505 lib, 56 integration, 1 doc),
+571 tests pass (=cargo test -p geosetta=: 514 lib, 56 integration, 1 doc),
 clippy clean, *and =cargo doc= is green* -- add that third command to your
 verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
 else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). The
 =#[ignore]=d cross-checks against =sqlite3=, GDAL and the PROJ oracle run with
 =cargo test -p geosetta -- --ignored= and all pass; that command also runs the
 two =perf.rs= benchmarks, which take about ninety seconds and are not
-cross-checks. /Stated without a number on 2026-08-23: it had said "six", which
+cross-checks. **The one to run when you touch the GeoPackage writer is
+=tests/gpkg_oracles.rs=** /(new 2026-08-25)/: it puts every fixture's output in
+front of =sqlite3= rather than one, which is the gap entry 20 fell through. /Stated without a number on 2026-08-23: it had said "six", which
 counted the lib tests only and had been wrong since =tests/gdal_types.rs=
 added two more on 2026-08-20 -- § THE THREE LESSONS, lesson 1, in this
 document's own change log./ The newest of them is
 =sqlite_itself_validates_the_index_this_writer_builds=, which hands this
 crate's b-tree to the =sqlite3= binary and asks *it* whether the file is well
-formed. See
+formed -- the same second opinion the fixture sweep now takes for the whole
+corpus. See
 [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
 § STATUS for the precise line between done and not.
 
@@ -115,7 +118,9 @@ In this order. The first two are the load-bearing ones:
    =HOSTILE.org= under a new =spec_= prefix; =gdal_tiles.gpkg= followed on
    2026-08-24 -- designed there as =gpkg_tiles.gpkg=, renamed to the =gdal_=
    prefix because provenance is what these names carry -- and it is the fixture
-   M3b § 1 needs./
+   M3b § 1 needs. =sqlite_fid_gap.gpkg= followed on 2026-08-25, and unlike the
+   others was not designed in advance at all: it exists because a bug turned out
+   to be invisible to every fixture in the tree at once./
 6. [[file:plans/container-reconciliation.org][plans/container-reconciliation.org]]
    -- /new 2026-08-23/. What happens to container content when the destination
    =.gpkg= already has some. **Read it before finishing M3b**, which it gates:
@@ -343,7 +348,10 @@ One line each so you know what has already been settled.
 /This was "THE NINE DECISIONS" and stopped being nine on 2026-08-20. Rows
 10--15 are M4's and the GeoParquet spoke's; 16--22 are 2026-08-21's -- the
 GeoPackage spoke, the recast matrix, the value-model work and D7. Row 23 is
-2026-08-22's, from the edit-loop question. The section is an index of what is
+2026-08-22's, from the edit-loop question. Rows 24--26 are 2026-08-23's and
+row 27 is 2026-08-25's -- the first decision in this table taken because a
+*measurement* of shipped behaviour contradicted a document, rather than to
+unblock work. The section is an index of what is
 settled, so it grows rather than freezing at the count it happened to start
 with. /Row 23 is the only one whose "where" is not a plan file -- it was forced
 by a property of the public API rather than argued in a design document, and it
@@ -377,6 +385,7 @@ should move to =edit-composability.org= when that plan is next opened./
 | 24 | A tile pyramid is *carried*, and no file is rejected for holding one -- the refusal had been drawn at the reader, where nothing is lost | =same-format-fidelity.org= D8; § The collision |
 | 25 | =run_geopackage_write= keeps *rewriting*, and the question is closed -- in-place would make preservation the default, which is backwards for editing | =same-format-fidelity.org= D9 |
 | 26 | An index's fate follows the *content class of the table it indexes*, not a cost comparison -- so the R*Tree is always rebuilt, a verbatim-carried table's index is carried, and index b-trees turn out to be *mandatory* rather than optional | =same-format-fidelity.org= D10 |
+| 27 | The GeoPackage **feature id is carried**, on a *feature-level* native -- Requirement 29's note makes it the target of =gpkg_metadata_reference='s row links, so renumbering breaks a reference the standard defines. D16 contains the cost: a dense =1..n= is what the writer emits anyway, so it is derived and the common case pays nothing | =same-format-fidelity.org= § MILESTONES, M3 GeoPackage; =native-inventory.org= § A second discard |
 
 *Three later rulings extended D1*, all worth knowing before you design
 anything, and *all three now implemented*. The third is =FieldDecl='s
@@ -394,6 +403,22 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
 =crate::FieldDecl= and =FeatureCollection::schema=.
 
 ** WHAT IS BUILT
+- ***The feature id*** (/2026-08-25/, decision 27) -- a =gpkg -> gpkg= run
+  preserves each feature's =INTEGER PRIMARY KEY= instead of renumbering it,
+  carried on =NativePayload::GpkgFeature= and *only* where it differs from the
+  dense =1..n= the writer emits anyway. Validated at write rather than replayed:
+  ids that no longer strictly ascend are discarded and the layer is renumbered,
+  because a duplicate is a malformed database. The R*Tree is built against the
+  same ids. /Byte-invisible to all eleven pre-existing =.gpkg= fixtures, which
+  is D16's containment measured rather than claimed./
+- ***A user's own tables*** (/2026-08-25/) -- =side_notes=, =events=,
+  =registry=, =tags=, =people= and their kind survive a =gpkg -> gpkg= run
+  with their DDL verbatim, their rows, **their rowids**, their triggers and
+  their indexes. The plainest member of the independent class, and the one
+  M3b's survey predicted would need no new file-format work -- correctly.
+  /Its indexes are re-packed from the source rather than rebuilt, which is why
+  a =UNIQUE ... COLLATE NOCASE= key survives a crate that implements no
+  collation: an index read in index order is already sorted./
 - ***The container carrying channel*** (M3b's first half, /2026-08-24/) --
   =geopackage/carry.rs=. Independent container content is read out of a source
   =.gpkg= and re-emitted, which is the first part of *defect 3's fix* rather
@@ -471,11 +496,22 @@ of it was planned work* -- each item was found by measuring the one above it:
 ** WHAT IS NOT BUILT
 - The remaining spokes' *natives* (M3 -- CSV, WKT, KML, Shapefile) and both
   containers (M3c =kmz=, and *the rest of* M3b). /M3b is no longer wholly
-  unbuilt: its carrying channel and requirement 1 shipped 2026-08-24. What is
-  left is the other independent content -- a user's own table, =gpkg_metadata=
-  and its references, =gpkg_extensions= rows -- plus the layer-coupled class,
-  and =container-reconciliation.org= for a destination that already has a
-  container./ *Column declarations are done everywhere they can be*: all four
+  unbuilt: its carrying channel and requirement 1 shipped 2026-08-24, and the
+  independent class was **finished** on 2026-08-25 with a user's own tables.
+  What is left is the *layer-coupled* class -- the =gpkg_metadata= pair,
+  =gpkg_extensions= rows -- plus =container-reconciliation.org= for a
+  destination that already has a container./
+
+  ***The metadata pair is the next piece and it has a prerequisite.***
+  Requirement 95 makes =gpkg_metadata= and =gpkg_metadata_reference= a pair:
+  a GeoPackage containing the first SHALL contain the second, so neither can
+  be carried alone. And Requirement 99 makes a =row=-scoped reference point at
+  a *rowid*, which this writer renumbers (entry 19) -- so the pair cannot be
+  carried faithfully until the feature-id question is decided. /Requirement 97
+  is the easy half and needs no decision: a reference whose =table_name= names
+  something the write does not produce must be dropped, which is the
+  layer-coupled class's "validate against what is written" rule arriving as a
+  conformance obligation rather than a design choice./ *Column declarations are done everywhere they can be*: all four
   declaring spokes carry one as of M4, so =Format::carries_column_schema= has
   stopped shrinking and the four remaining =false= answers (GeoJSON, CSV, WKT,
   KML) are permanent -- those formats have no slot.
@@ -485,9 +521,11 @@ of it was planned work* -- each item was found by measuring the one above it:
   already owns the same D4 "rebuild it when the source had one" pattern for
   FlatGeobuf's and GeoPackage's indexes. Blocked on the writer's flat schema:
   it has never emitted a nested struct column.
-- *Defect 3* -- the only entry left in § LIVE BUGS, and now **partly fixed**
-  rather than wholly open: a tile pyramid survives a =gpkg -> gpkg= write as of
-  2026-08-24, and everything else the container holds still does not. Note that
+- *Defect 3* -- and now **partly fixed** rather than wholly open: a tile
+  pyramid survives a =gpkg -> gpkg= write as of 2026-08-24 and a user's own
+  tables as of 2026-08-25. What still does not survive is the =gpkg_metadata=
+  pair and =gpkg_extensions= rows -- the *layer-coupled* class, not the
+  independent one, which is closed. Note that
   section's numbering is *not* the plan's defect numbering; see its own note.
 - The exhaustive-match fixture registry (D6).
 - The format-check deletion. *Drawn last in the diagram, no longer forced
@@ -541,9 +579,10 @@ their own text, which is the only place that cannot drift./
 
 **Open at the end of 2026-08-23:** entry 3 (defect 3, the GeoPackage
 container) and entry 13 (=gpkg_ogr_contents= misclassified). /Entry 3 became
-*partly fixed* on 2026-08-24: a tile pyramid is carried, everything else the
-container holds is still destroyed. It stays LIVE, because "partly" is not
-fixed and the entry is about the container, not about tiles. **Entry 13 is
+*partly fixed* on 2026-08-24 and more so on 2026-08-25: a tile pyramid and a
+user's own tables are carried, and the =gpkg_metadata= pair is not. It stays
+LIVE, because "partly" is not fixed and the entry is about the container, not
+about any one member of it. **Entry 13 is
 fixed** the same day -- and it turned out to be the smaller half of its own
 class; see the doc-change entry on the ten triggers./ Entry 15 is not a
 bug in shipped behaviour but a constraint on M3b, and its missing capability
@@ -551,10 +590,16 @@ shipped. Entry 16 (*defect 6*) was found and fixed the same day, once the
 index-writing work it was gated on existed. The fixed entries stay because each
 records how it was measured and what the fix turned on.
 
+**Found and fixed 2026-08-25:** entries 19 (feature ids renumbered silently)
+and 20 (a carried tile table written as a malformed database). /19 is the
+second entry in this list found by pulling on a =gpkg_metadata_reference=
+question rather than by testing anything, after =last_change=; 20 came from
+running an oracle over every fixture instead of one./
+
 /Four more were found on 2026-08-21 and all four are fixed. Three on
 2026-08-22, two fixed and one open. Three on 2026-08-23, one fixed and two
-open. Each group is in its own subsection at the end, because in each case what
-*found* them is the useful part./
+open. One on 2026-08-25, live. Each group is in its own subsection at the end,
+because in each case what *found* them is the useful part./
 
 *Note the two countings, since they have collided before.* "Defect /n/" is
 =same-format-fidelity.org= § THE DEFECTS and is canonical; the numbered
@@ -599,6 +644,14 @@ things. /Reconciled 2026-08-20./
    tables, =gpkg_metadata=, =gpkg_extensions=, every R*Tree. This is
    *defect 3*, and after M4 it is *the only defect left* -- the destruction
    travels with the GeoPackage container (M3b).
+
+   ***Still LIVE, but the list above is now out of date in its favour.*** A
+   tile pyramid survives as of 2026-08-24; **user tables** survive as of
+   2026-08-25, which closes the *independent* class outright. What remains is
+   =gpkg_metadata= with its references and =gpkg_extensions= rows -- all
+   layer-coupled -- and the R*Tree, which is *derived* and was never part of
+   this entry's loss. /So the entry is down to its last two members, and both
+   are in one class./
 
    *No longer silent, as of 2026-08-21.* "Exit 0, no warning" was the original
    finding; the exit code is unchanged (§ THE RULE is loud, not blocking) but
@@ -912,6 +965,149 @@ constraint-free DDL. The writer could not write an index, so the DDL that
 needed one never got written, and what was left read like a house style. The
 way it was found was not a test; it was asking what a *different* feature would
 cost.
+
+*** 2026-08-25 -- by asking what a decision already taken was really about
+/Two entries, both fixed the same day they were found. 19 came out of D5 in
+=container-reconciliation.org=, which refuses a user-table merge because
+renumbering rowids silently invalidates =gpkg_metadata_reference=. The question
+was whether that hazard is confined to merging, as the decision assumes. It is
+not. **20 came from running an oracle over every fixture instead of one**, and
+it is a database the previous day's work could write that SQLite refuses to
+open./
+
+19. ~~***A =gpkg -> gpkg= run renumbers every feature, silently.***~~ **Found
+    2026-08-25 and FIXED the same day**, by decision 27. =reader.rs:148= filters the =rowid= alias out of the
+    properties it builds and =writer.rs:900= assigns =(i + 1)= on the way out,
+    so feature ids are reissued dense from 1 on every write. Measured on a
+    =cities= layer holding fids =1, 9, 40=:
+
+    #+begin_src text
+      geosetta gap.gpkg out.gpkg   ->  1, 2, 3
+      ogr2ogr  -f GPKG ogr.gpkg    ->  1, 9, 40
+    #+end_src
+
+    No warning fires, because nothing classifies the id at all -- it is not
+    modelled, not carried, and was not listed in =native-inventory.org=, the
+    document whose whole job is enumerating what each reader discards.
+
+    **The standard gives the column a stated purpose**, which is what makes
+    this a loss rather than an allocation detail. Requirement 29 mandates the
+    INTEGER primary key as a =rowid= alias, and the note under it says what it
+    is for: linking features to row-level records in =gpkg_metadata= *by rowid
+    value* through =gpkg_metadata_reference=. /Nothing requires a **writer** to
+    preserve those values, so renumbered output is conformant -- the same
+    posture as =last_change=, which was conformant either way and was still
+    real information being destroyed./
+
+    ***Why it reaches a decision already taken.***
+    =container-reconciliation.org= D5 refuses a user-table merge specifically
+    on the =row_id_value= hazard: a reference the DDL declares no foreign key
+    on, so =foreign_key_check= cannot see it and =integrity_check= cannot
+    either, because the file is not malformed -- merely lying. D5 attributes
+    that hazard to merging. **It is already live on the plain one-container
+    path**, which D5 treats as safe. The decision is not wrong; its stated
+    scope is too narrow.
+
+    /It has not bitten because an ordinary =ogr2ogr= file's metadata reference
+    is =table=-scoped, not =row=-scoped -- measured on the same file. That is
+    luck about producer practice, not a property of the code./
+
+    **Nothing in the tree could have caught it.** All eleven =.gpkg= fixtures
+    hold dense =1..n= ids, so every one round-trips through the renumbering
+    unchanged. /The same fact is the containment result: carrying the id would
+    be byte-invisible to the entire existing corpus./
+
+    *The channel exists already.* =Feature::native='s doc names /"a GeoJSON
+    =id="/ as its example, and the GeoJSON spoke carries that member today,
+    classed *identity*. What is missing is that =NativePayload::Gpkg= is
+    collection-level only by construction, so a per-feature form is the one
+    structural addition -- with D16 containing the cost, since a dense =1..n=
+    sequence is what the writer emits anyway and is therefore derived.
+
+    ***FIXED by carrying it*** -- decision 27, taken by the project owner on
+    the recommendation filed here. =NativePayload::GpkgFeature= is the
+    feature-level variant the enum's =#[non_exhaustive]= was written for, and
+    the shape above survived contact with the code exactly: the reader attaches
+    an id only when it differs from the position, so `second` in the new
+    fixture carries nothing while `cities` carries two of three.
+
+    *One thing the filing did not anticipate.* A carried id is **layer-coupled**
+    rather than independent, and had to be validated at write per decision 23 --
+    delete a feature from the middle and the survivors' ids no longer describe
+    them, which can duplicate an =INTEGER PRIMARY KEY= (a malformed database) or
+    run backwards (unpackable into a b-tree). The whole layer falls back to a
+    dense sequence when the carried ids do not strictly ascend. /Falling back
+    per feature would hand back a set that is neither the source's numbering nor
+    a fresh one./
+
+    *And the R\*Tree had to be told.* =rtree::build= numbered its leaf entries
+    by position too, so an index built beside a carried numbering would have
+    pointed at rows that do not exist -- **which =integrity_check= does not
+    object to**, because the shadow tables are well-formed and merely wrong.
+    The ids are now computed once per layer and passed to both.
+
+20. ~~***A carried tile table could be written as a malformed database.***~~
+    **Found and FIXED 2026-08-25**, in code shipped the day before.
+    =carry::tile_key_columns= located the pyramid's key by looking for columns
+    *named* =zoom_level=, =tile_column= and =tile_row=, and the writer built a
+    =sqlite_autoindex_<name>_1= over whichever it found. **A table's DDL is
+    what decides whether it owns an autoindex, and column names are not that.**
+    =sqlite_contents.gpkg='s =imagery= has all three columns and declares no
+    =UNIQUE=, so the write fabricated an index SQLite cannot attribute to any
+    constraint:
+
+    #+begin_src text
+      $ sqlite3 out.gpkg "SELECT count(*) FROM cities;"
+      Error: malformed database schema (sqlite_autoindex_imagery_1)
+             - orphan index (11)
+    #+end_src
+
+    Not a degraded file -- one that **will not open at all**, for any query.
+
+    ***This is entry 15 exactly inverted***, and that is the part worth
+    keeping. Entry 15 was a DDL declaring =UNIQUE= with no index behind it;
+    this is an index with no constraint in front of it. Both are malformed,
+    both were reasoned about correctly in the *same doc comment* -- the
+    original said /"Empty when the table does not have all three, which leaves
+    the spec with no autoindex -- correct for a table whose DDL then declares
+    no =UNIQUE="/ -- and the code then tested the wrong condition, because
+    *having the three columns* and *declaring a constraint over them* are not
+    the same fact. **The author saw the case and checked its proxy.**
+
+    *Fixed by re-packing instead of building.* =Pyramid= now carries the
+    source's own autoindex records, exactly as the user-table carrying does:
+    the source's b-tree is the only thing that knows what its DDL declared, and
+    an index read in index order needs no comparison at all. /D10's
+    construction case is gone; re-packing covers both./
+
+    ***How it got through, and this is the fourth time for this class.*** The
+    tile carry shipped with 562 passing tests, clean clippy, green =cargo doc=,
+    and =integrity_check=/=foreign_key_check=/=gdalinfo -checksum= all clean --
+    *on =gdal_tiles.gpkg=*, which is GDAL-produced and therefore conformant and
+    therefore **does** declare the =UNIQUE=. The one fixture in the tree that
+    would have caught it is hand-built, and nothing ran an oracle over its
+    output. It was found by running =PRAGMA integrity_check= across *every*
+    =.gpkg= fixture's output while measuring something else entirely.
+
+    /The regression test is
+    =no_autoindex_is_written_for_a_carried_ddl_that_declares_no_unique=, and
+    restoring the construction fails it and nothing else in 567 tests -- which
+    is the measurement of how invisible this was./
+
+*What entry 20 adds to the lesson list*, beyond its own class: **the oracle you
+did not run is the one that would have caught you.** Yesterday's write-up said
+=integrity_check= was clean on the carried output, and it was -- on the file it
+was run against. Running it on *one* file is a statement about that file.
+/The fix is not more discipline; it is running the oracle over every fixture,
+which is a loop, and now is one./
+
+*What entry 19 adds to the lesson list.* **A decision can be right and still be
+scoped wrong**, and the way to find out is to ask what the hazard it names
+actually depends on rather than where it was noticed. D5's hazard depends on
+*renumbering*, not on *merging*; merging is merely where someone happened to be
+standing when they saw it. /Nothing about D5's conclusion changes -- the refusal
+still holds -- but a reader would have finished that section believing the
+one-container path was safe./
 
 ** WHAT CHANGED IN EXISTING DOCS
 Listed explicitly because each entry was written before its work was committed.

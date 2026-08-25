@@ -259,6 +259,29 @@ envelope), little-endian =srs_id= 4326, then little-endian WKB.
 opens it and reports both features with the right extent, and geosetta reads it
 and round-trips it to a =.gpkg= that passes =integrity_check= in turn./
 
+*** =sqlite_fid_gap.gpkg= -- /added 2026-08-25, and not hostile/
+Pins *bug 19*: a =gpkg -> gpkg= run renumbered every feature to a dense =1..n=,
+silently. **The whole fixture set was structurally unable to catch it** -- every
+=.gpkg= in this tree held ids that already *were* their positions, so all
+eleven round-tripped through the renumbering unchanged and looked correct.
+
+| content | what it pins |
+|---------+--------------|
+| =cities= with fids =1, 9, 40= | ids that are *not* positions. Three rows, and each is wrong in a different way under renumbering -- one right by luck, one shifted by one, one far off -- so an off-by-one fix and a real fix are distinguishable |
+| =second= with fids =1, 2=, untouched | the *derived* case, in the same file. D16 says an id equal to what the writer emits anyway carries no payload; without a dense layer beside the gapped one, a reader that carried every id unconditionally would pass |
+
+*The two layers together are the point.* A fixture with only the gap tests that
+ids survive; a fixture with only dense ids tests that nothing is carried. One
+file with both tests the *rule* -- and the rule, not the behaviour, is what
+=GpkgFeatureNative= exists to implement.
+
+*Built by* =tests/fixtures/build_fid_fixture.sh= from =gdal_hostile.gpkg=. The
+script drops =ogr2ogr='s =ST_*= validation triggers before editing, because
+=sqlite3= without spatialite cannot evaluate them; the geometries it writes are
+copied unchanged from rows that already passed those triggers, so nothing
+unvalidated enters the file. /Confirmed readable by geosetta and
+=PRAGMA integrity_check= = =ok= before being committed./
+
 *** =sqlite_contents.gpkg= -- /added 2026-08-23, and not hostile/
 Pins *bug 14*: a =gpkg_contents= row whose =data_type= is not =features= used
 to be treated by =container.rs= as a layer, which meant the survey skipped it
@@ -274,6 +297,18 @@ warning whose whole job is to say what a rewrite destroys saying nothing.
 decision was taken against: the state D8 was decided out of was not "silently
 returns a =.gpkg= with the imagery gone", which is what § The collision assumed.
 It was worse -- the imagery was gone *and unmentioned*.
+
+***And its =imagery= caught bug 20 on 2026-08-25, by being non-conformant in a
+way nobody designed.*** Hand-built, its DDL declares **no**
+=UNIQUE (zoom_level, tile_column, tile_row)= though Requirement 54 says a tile
+table has one -- so it is the only file in the tree that distinguishes /"has
+those three columns"/ from /"declares a key over them"/. The tile carry shipped
+conflating the two and wrote an =orphan index= here: a database =sqlite3=
+refuses to open at all. =gdal_tiles.gpkg= could never have caught it, because
+GDAL writes the constraint.
+
+/A fixture's *deviation* from the standard is a test case, not a defect in the
+fixture. Do not "fix" this DDL./
 
 *** =sqlite_constraints.gpkg= -- /added 2026-08-23, and not hostile/
 The constraint shapes that need an *index b-tree*, none of which any earlier
@@ -296,6 +331,13 @@ lesson as =sqlite_altered.gpkg= one table further out: the only user table
 anywhere in the tree was =side_notes(id INTEGER PRIMARY KEY, note TEXT)= --
 *the one shape that needs no index at all*. The gap was invisible because the
 single example happened to be the exception.
+
+**Promoted from anticipation to use on 2026-08-25**, when the carrying this
+was built for arrived. All five tables now survive a =gpkg -> gpkg= run, and
+each row above stopped being a prediction: =people= is the first index in this
+tree whose *collation* had to survive, and it does, because a carried index is
+**re-packed** in index order rather than compared -- so =NOCASE= never has to
+be implemented. /D10's bargain, collected./
 
 */Both files are rebuilt by/* =tests/fixtures/build_sqlite_fixtures.sh=, which
 takes =gdal_hostile.gpkg= as its base and applies the =sqlite3= statements

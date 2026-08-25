@@ -12,7 +12,7 @@ use crate::format::Format;
 use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
 use crate::sqlite::{MasterEntry, TableSpec, Value, autoindex_records, write_database};
 
-use super::carry::{Carried, Pyramid};
+use super::carry::{Carried, Pyramid, UserTable};
 use super::reader::read_layers;
 use super::rtree;
 
@@ -178,13 +178,17 @@ fn build(
     // resolved, on D5's grounds in `plans/container-reconciliation.org` — a
     // silent wrong answer here passes `integrity_check` in some shapes and
     // fails it in others, and neither is something to guess at.
-    for pyramid in &carried.pyramids {
-        if layers.iter().any(|(name, _)| *name == pyramid.name) {
+    let carried_names = carried
+        .pyramids
+        .iter()
+        .map(|p| ("tile pyramid", &p.name))
+        .chain(carried.tables.iter().map(|t| ("table", &t.name)));
+    for (kind, name) in carried_names {
+        if layers.iter().any(|(layer, _)| layer == name) {
             return Err(Error::Convert(format!(
-                "gpkg: the source carries a tile pyramid named \"{}\" and a feature layer of \
+                "gpkg: the source carries a {kind} named \"{name}\" and a feature layer of \
                  the same name; refusing to write a container where one would overwrite the \
-                 other",
-                pyramid.name
+                 other"
             )));
         }
     }
@@ -200,7 +204,11 @@ fn build(
         gpkg_contents(layers, &srs.per_layer, carried, &srs.per_pyramid)?,
         geometry_columns(layers, &srs.per_layer),
     ];
-    if !carried.is_empty() {
+    // The two tile registry tables exist to describe pyramids, so they are
+    // emitted for pyramids and not merely for "something was carried" — a
+    // container carrying only a user table must not gain two empty registry
+    // tables it never had.
+    if !carried.pyramids.is_empty() {
         specs.push(tile_matrix_set(carried, &srs.per_pyramid));
         specs.push(tile_matrix(carried));
     }
@@ -220,8 +228,12 @@ fn build(
     // is not something a producer would have left behind, and D3 says a spoke
     // that recovered nothing writes nothing.
     specs.extend(schema_extension_tables(layers));
-    for ((name, fc), &srs_id) in layers.iter().zip(&srs.per_layer) {
-        specs.push(feature_table(name, fc, srs_id, envelope));
+    // Computed once per layer and shared: the feature table's rowids and the
+    // R*Tree's leaf entries have to be the same numbers or the index points at
+    // rows that do not exist.
+    let ids: Vec<Vec<i64>> = layers.iter().map(|(_, fc)| feature_ids(fc)).collect();
+    for (((name, fc), &srs_id), ids) in layers.iter().zip(&srs.per_layer).zip(&ids) {
+        specs.push(feature_table(name, fc, srs_id, envelope, ids));
     }
 
     // The spatial indexes (shadow tables) and their virtual-table + trigger
@@ -229,8 +241,8 @@ fn build(
     // feature tables so their b-trees are built alongside the rest.
     let mut master: Vec<MasterEntry> = Vec::new();
     if rtree {
-        for (name, fc) in layers {
-            let index = rtree::build(name, fc);
+        for ((name, fc), ids) in layers.iter().zip(&ids) {
+            let index = rtree::build(name, fc, ids);
             specs.extend(index.tables);
             master.extend(index.master);
         }
@@ -242,14 +254,20 @@ fn build(
     // crate's own output byte-identical for a file that carries nothing.
     for pyramid in &carried.pyramids {
         specs.push(tile_table(pyramid));
-        master.extend(pyramid.triggers.iter().map(|(name, sql)| MasterEntry {
-            kind: "trigger".into(),
+        master.extend(triggers(&pyramid.name, &pyramid.triggers));
+    }
+    for table in &carried.tables {
+        specs.push(user_table(table));
+        master.extend(triggers(&table.name, &table.triggers));
+        // An explicit `CREATE INDEX` owns a b-tree, so unlike a trigger it
+        // supplies records — re-packed from the source, never compared. See
+        // `super::carry::UserTable::autoindexes`.
+        master.extend(table.indexes.iter().map(|(name, sql, records)| MasterEntry {
+            kind: "index".into(),
             name: name.clone(),
-            tbl_name: pyramid.name.clone(),
+            tbl_name: table.name.clone(),
             sql: sql.clone(),
-            // A trigger owns no b-tree; it is pure schema, and there is nothing
-            // to reconstruct one from but the text SQLite stored.
-            records: None,
+            records: Some(records.clone()),
         }));
     }
 
@@ -821,19 +839,50 @@ fn tile_table(pyramid: &Pyramid) -> TableSpec {
     TableSpec {
         name: pyramid.name.clone(),
         sql: pyramid.sql.clone(),
-        // Requirement 54's `UNIQUE (zoom_level, tile_column, tile_row)`, built
-        // rather than re-packed: its key is three integers, so the ordering
-        // needs no collation this crate does not implement — which is what
-        // `plans/container-reconciliation.org` § THE MEASUREMENT established
-        // when it found no producer emitting a non-`BINARY` index at all.
-        autoindexes: if pyramid.key_columns.is_empty() {
-            Vec::new()
-        } else {
-            vec![autoindex_records(&pyramid.rows, &pyramid.key_columns)]
-        },
+        // Re-packed from the source, never built. Requirement 54 says a tile
+        // table's key is `(zoom_level, tile_column, tile_row)`, and until
+        // 2026-08-25 this built an index over whichever of those columns it
+        // found by name — which fabricates an autoindex for a table whose DDL
+        // declares no `UNIQUE`, and that is a malformed database rather than a
+        // harmless extra. The source's own b-tree is the only thing that knows
+        // what the DDL actually declared. See `super::carry::Pyramid`.
+        autoindexes: pyramid.autoindexes.clone(),
         autoincrement: pyramid.autoincrement,
         rows: pyramid.rows.clone(),
     }
+}
+
+/// A carried table, put back exactly as it was read.
+///
+/// Nothing here interprets a column: the DDL is the source's text, the rows are
+/// its rows with their original rowids, and the autoindexes are its own b-trees
+/// re-packed. That is the whole of the independent class's contract — see
+/// `super::carry::UserTable`.
+fn user_table(table: &UserTable) -> TableSpec {
+    TableSpec {
+        name: table.name.clone(),
+        sql: table.sql.clone(),
+        autoindexes: table.autoindexes.clone(),
+        autoincrement: table.autoincrement,
+        rows: table.rows.clone(),
+    }
+}
+
+/// `MasterEntry` for each of a carried table's triggers.
+///
+/// A trigger owns no b-tree; it is pure schema, and there is nothing to
+/// reconstruct one from but the text SQLite stored.
+fn triggers<'a>(
+    tbl_name: &'a str,
+    list: &'a [(String, String)],
+) -> impl Iterator<Item = MasterEntry> + 'a {
+    list.iter().map(move |(name, sql)| MasterEntry {
+        kind: "trigger".into(),
+        name: name.clone(),
+        tbl_name: tbl_name.to_string(),
+        sql: sql.clone(),
+        records: None,
+    })
 }
 
 fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64]) -> TableSpec {
@@ -869,7 +918,55 @@ fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64
     }
 }
 
-fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64, envelope: bool) -> TableSpec {
+/// The rowids a layer's features are written under.
+///
+/// Dense `1..n` unless the source carried ids that differ — see
+/// `super::reader`'s `carried_fid` and [`crate::GpkgFeatureNative::fid`]. A
+/// feature carrying none takes its 1-based position, which is exactly the id
+/// it had in a source whose ids the reader classed derived, so the two halves
+/// reconstruct the original set between them.
+///
+/// # Why this validates rather than replays
+///
+/// **A carried id is only valid against the features actually being written**,
+/// which is the layer-coupled rule in `handoff.org` § M3B NEEDS A THIRD CLASS,
+/// and validity has to be *computed here* because `FeatureCollection::features`
+/// is a public field a consumer mutates directly — there is no setter to hook.
+/// Delete a feature from the middle and the survivors' carried ids no longer
+/// line up with their positions; two of them can collide, or run backwards.
+///
+/// Either would be fatal rather than untidy: `fid` is `INTEGER PRIMARY KEY`, so
+/// a duplicate is a malformed database, and `write_database` requires rows in
+/// ascending rowid order to pack a b-tree at all. So the sequence is checked
+/// for both, and **the whole layer falls back to dense `1..n`** when it fails.
+/// Falling back per feature would be worse than useless: it would hand back a
+/// set that is neither the source's numbering nor a fresh one.
+fn feature_ids(fc: &FeatureCollection) -> Vec<i64> {
+    let ids: Vec<i64> = fc
+        .features
+        .iter()
+        .enumerate()
+        .map(|(i, feat)| match feat.native.as_ref().and_then(|n| n.payload_for(Format::Gpkg)) {
+            Some(NativePayload::GpkgFeature(g)) => g.fid.unwrap_or((i + 1) as i64),
+            _ => (i + 1) as i64,
+        })
+        .collect();
+    // Strictly ascending covers both hazards at once: it rules out a duplicate
+    // and it is what the b-tree writer needs.
+    if ids.windows(2).all(|w| w[0] < w[1]) && ids.first().is_none_or(|&first| first > 0) {
+        ids
+    } else {
+        (1..=fc.features.len() as i64).collect()
+    }
+}
+
+fn feature_table(
+    name: &str,
+    fc: &FeatureCollection,
+    srs_id: i64,
+    envelope: bool,
+    ids: &[i64],
+) -> TableSpec {
     // `columns_for`, not `infer_columns`: a column the source declared a type
     // for is declared as *that* type here, which is what lets a `BOOLEAN`, a
     // `DATETIME` or a `SMALLINT` survive rather than collapsing to the four
@@ -897,7 +994,10 @@ fn feature_table(name: &str, fc: &FeatureCollection, srs_id: i64, envelope: bool
             for col in &columns {
                 values.push(cell_to_value(&col.values[i]));
             }
-            ((i + 1) as i64, values)
+            // The rowid is the carried id when there was one — see
+            // `feature_ids`, which is also what the R*Tree is built against, so
+            // an index entry cannot point at a row that is not there.
+            (ids[i], values)
         })
         .collect();
 
@@ -1301,6 +1401,269 @@ mod tests {
         assert!(kinds.contains(&("cities".into(), "features".into())), "{kinds:?}");
     }
 
+    /// ***A feature id survives a `gpkg -> gpkg` write*** — `handoff.org`
+    /// § BUGS FOUND entry 19, and the property Requirement 29's note makes
+    /// content: other rows point at these values by rowid.
+    ///
+    /// `sqlite_fid_gap.gpkg` is the only file in the tree whose ids are not
+    /// their positions — `cities` holds 1, 9, 40 — which is why the whole
+    /// corpus was blind to the renumbering until it was built.
+    #[test]
+    fn a_feature_id_survives_a_geopackage_write() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+
+        let ours = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = ours.tables().unwrap();
+        let cities = tables.iter().find(|t| t.name == "cities").unwrap();
+        let ids: Vec<i64> = ours
+            .read_rows(cities)
+            .unwrap()
+            .iter()
+            .map(|row| match row[cities.rowid_alias().unwrap()] {
+                Value::Int(n) => n,
+                ref other => panic!("a non-integer fid: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, [1, 9, 40], "the source's own numbering, not the positions");
+    }
+
+    /// ***And a dense sequence carries no payload at all*** — D16, and the
+    /// containment that makes carrying ids free.
+    ///
+    /// `second` in the same fixture holds 1, 2. A reader that carried ids
+    /// unconditionally would put a `Native` on every feature of every
+    /// GeoPackage ever written; this asserts it puts one on none of them.
+    /// /That is the `is_empty` mistake `last_change` made on 2026-08-24,
+    /// avoided here on purpose./
+    #[test]
+    fn a_dense_feature_id_sequence_is_derived_and_carries_nothing() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+
+        let carried_in = |name: &str| -> usize {
+            let (_, fc) = layers.iter().find(|(n, _)| n == name).unwrap();
+            fc.features
+                .iter()
+                .filter(|f| {
+                    matches!(
+                        f.native.as_ref().and_then(|n| n.payload_for(Format::Gpkg)),
+                        Some(NativePayload::GpkgFeature(_))
+                    )
+                })
+                .count()
+        };
+        // `second` is 1, 2 — exactly what the writer emits, so nothing is carried.
+        assert_eq!(carried_in("second"), 0, "a dense layer must cost no payload");
+        // `cities` is 1, 9, 40 — the first is what the writer would emit anyway
+        // and is derived; the other two are not.
+        assert_eq!(carried_in("cities"), 2, "only the ids that actually differ");
+    }
+
+    /// ***Carried ids that no longer describe the features being written are
+    /// discarded, and the whole layer falls back to a dense sequence.***
+    ///
+    /// This is the layer-coupled rule doing its job. `Feature`'s fields are
+    /// public, so a consumer deletes from the middle of a collection with no
+    /// method call to intercept — after which the survivors' ids may collide or
+    /// run backwards. A duplicate `INTEGER PRIMARY KEY` is a malformed
+    /// database and an unsorted one cannot be packed into a b-tree at all, so
+    /// neither may be written.
+    ///
+    /// /Reversing the order is the mutation: replaying the ids blindly writes
+    /// 40, 9, 1 and `write_database` has no ascending sequence to pack./
+    #[test]
+    fn carried_ids_that_no_longer_ascend_fall_back_to_a_dense_sequence() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let mut layers = read_layers(SRC).unwrap();
+        let (_, fc) = layers.iter_mut().find(|(n, _)| n == "cities").unwrap();
+        // The edit a consumer makes directly, with nothing to hook.
+        fc.features.reverse();
+
+        let bytes =
+            write_layers(None, &layers, &crate::geopackage::Carried::default(), false, false)
+                .unwrap();
+        let ours = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = ours.tables().unwrap();
+        let cities = tables.iter().find(|t| t.name == "cities").unwrap();
+        let ids: Vec<i64> = ours
+            .read_rows(cities)
+            .unwrap()
+            .iter()
+            .map(|row| match row[cities.rowid_alias().unwrap()] {
+                Value::Int(n) => n,
+                ref other => panic!("a non-integer fid: {other:?}"),
+            })
+            .collect();
+        assert_eq!(ids, [1, 2, 3], "a fresh dense sequence, not the stale numbering");
+    }
+
+    /// The R*Tree is built against the ids the feature table is written under,
+    /// not against positions.
+    ///
+    /// An index whose leaf entries name rowids that no row has is not
+    /// something `integrity_check` objects to — the shadow tables are
+    /// well-formed and merely wrong — so nothing but this would catch it.
+    #[test]
+    fn the_spatial_index_points_at_the_ids_actually_written() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let bytes =
+            write_layers(None, &layers, &crate::geopackage::Carried::default(), true, false)
+                .unwrap();
+
+        let ours = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = ours.tables().unwrap();
+        let rowid_map = tables.iter().find(|t| t.name == "rtree_cities_geom_rowid").unwrap();
+        let mut indexed: Vec<i64> = ours
+            .read_rows(rowid_map)
+            .unwrap()
+            .iter()
+            .filter_map(|row| match row[0] {
+                Value::Int(n) => Some(n),
+                _ => None,
+            })
+            .collect();
+        indexed.sort_unstable();
+        assert_eq!(indexed, [1, 9, 40], "the index must name the rows that exist");
+    }
+
+    /// A user's own tables survive a `gpkg -> gpkg` write, with their DDL,
+    /// their rows, their rowids, their triggers and their indexes.
+    ///
+    /// `sqlite_constraints.gpkg` is the hostile fixture for this: five tables
+    /// no layer owns, between them a `UNIQUE`, a `TEXT PRIMARY KEY`, an
+    /// explicit `CREATE INDEX`, a trigger and a `COLLATE NOCASE`.
+    #[test]
+    fn a_users_own_tables_survive_a_geopackage_write() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_constraints.gpkg");
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let names: Vec<&str> = carried.tables.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, ["side_notes", "tags", "registry", "events", "people"], "{names:?}");
+
+        let layers = read_layers(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let source = crate::sqlite::Database::open(SRC).unwrap();
+        let ours = crate::sqlite::Database::open(&bytes).unwrap();
+
+        let rows = |db: &crate::sqlite::Database, name: &str| {
+            let tables = db.tables().unwrap();
+            let t = tables
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("{name} is missing from the output"));
+            db.read_rows(t).unwrap()
+        };
+        for name in &names {
+            assert_eq!(rows(&ours, name), rows(&source, name), "{name}'s rows");
+        }
+
+        // The DDL is the source's text, not a re-rendering of it: a carried
+        // table is put back, not rebuilt, so anything this crate cannot model
+        // (a `CHECK`, a `COLLATE`, a `DEFAULT`) rides along in the statement.
+        let ddl = |db: &crate::sqlite::Database, name: &str| {
+            db.master_objects()
+                .unwrap()
+                .into_iter()
+                .find(|o| o.kind == "table" && o.name == name)
+                .and_then(|o| o.sql)
+                .unwrap_or_else(|| panic!("no DDL for {name}"))
+        };
+        for name in &names {
+            assert_eq!(ddl(&ours, name), ddl(&source, name), "{name}'s DDL");
+        }
+
+        // The schema objects hanging off them. **Counts, not names**: the
+        // 2026-08-24 lesson is that asserting a phrase a fixture satisfies by
+        // accident proves nothing, and a count fails the moment either one
+        // stops being carried.
+        let objects = ours.master_objects().unwrap();
+        let of = |kind: &str, tbl: &str| {
+            objects.iter().filter(|o| o.kind == kind && o.tbl_name == tbl).count()
+        };
+        assert_eq!(of("trigger", "events"), 1, "events_stamp");
+        assert_eq!(of("index", "events"), 1, "idx_events_kind");
+        assert_eq!(of("index", "people"), 1, "the UNIQUE COLLATE NOCASE autoindex");
+        assert_eq!(of("index", "registry"), 1, "the TEXT PRIMARY KEY autoindex");
+        assert_eq!(of("index", "side_notes"), 0, "no constraint, so no index");
+    }
+
+    /// ***An autoindex is written only for a DDL that declares one*** — the
+    /// regression test for `handoff.org` § BUGS FOUND entry 20, and the exact
+    /// inverse of entry 15.
+    ///
+    /// Entry 15: a DDL declaring `UNIQUE` with no index behind it is a
+    /// malformed database. **This is the other direction**, and it is just as
+    /// fatal: an index SQLite cannot attribute to a constraint is an
+    /// `orphan index`, and the whole file stops opening.
+    ///
+    /// `sqlite_contents.gpkg`'s `imagery` is a tile table whose DDL declares
+    /// **no** `UNIQUE`, though it has all three of the columns Requirement 54
+    /// names. Carrying it by *building* an index over the columns found by name
+    /// — which is what shipped on 2026-08-24 — produced a file `sqlite3` will
+    /// not open at all. /Restoring that construction fails this test; nothing
+    /// else in the suite notices, because the other tile fixture is
+    /// conformant and does declare the constraint./
+    #[test]
+    fn no_autoindex_is_written_for_a_carried_ddl_that_declares_no_unique() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let source = crate::sqlite::Database::open(SRC).unwrap();
+        // The premise, asserted rather than assumed: the source's own `imagery`
+        // owns no index, because its DDL declares no constraint needing one.
+        let src_indexes = source
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == "index" && o.tbl_name == "imagery")
+            .count();
+        assert_eq!(src_indexes, 0, "the fixture's premise");
+
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        assert_eq!(carried.pyramids.len(), 1, "imagery is carried as a pyramid");
+        let layers = read_layers(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+
+        let ours = crate::sqlite::Database::open(&bytes).unwrap();
+        let ours_indexes = ours
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == "index" && o.tbl_name == "imagery")
+            .count();
+        assert_eq!(ours_indexes, 0, "an index here is an orphan and the file will not open");
+    }
+
+    /// A carried index keeps its collation, and **no collation code exists to
+    /// make that true**.
+    ///
+    /// `people` declares `UNIQUE COLLATE NOCASE`. Re-packing reads the source's
+    /// b-tree in index order, so the records arrive already sorted by SQLite's
+    /// own `NOCASE` ordering and no key is ever compared — which is exactly the
+    /// bargain D10 struck when it scoped the index work to re-packing, and the
+    /// first case that actually depends on it.
+    #[test]
+    fn a_carried_index_keeps_a_collation_this_crate_cannot_compute() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_constraints.gpkg");
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let people = carried.tables.iter().find(|t| t.name == "people").unwrap();
+        assert!(people.sql.contains("NOCASE"), "the fixture's premise: {}", people.sql);
+
+        // One autoindex, holding one record per row — re-packed, not rebuilt.
+        assert_eq!(people.autoindexes.len(), 1);
+        assert_eq!(people.autoindexes[0].len(), people.rows.len());
+
+        let source = crate::sqlite::Database::open(SRC).unwrap();
+        let root = source
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.name == "sqlite_autoindex_people_1")
+            .expect("the source's own autoindex");
+        assert_eq!(people.autoindexes[0], source.read_index(root.root_page).unwrap());
+    }
+
     /// ***A carried pyramid's CRS is registered although no feature layer uses
     /// it*** — M3b requirement 1, and the reason it is a requirement at all.
     ///
@@ -1389,6 +1752,7 @@ mod tests {
                     definition: "PROJCS[\"Not Lambert at all\"]".into(),
                 },
             )],
+            tables: Vec::new(),
         };
 
         let bytes = write_layers(None, &[("l".into(), layer)], &carried, false, false).unwrap();
@@ -1431,6 +1795,7 @@ mod tests {
                 organization_coordsys_id: 4326,
                 definition: WGS84_WKT.into(),
             })],
+            tables: Vec::new(),
         };
         let layer = fc(vec![Feature {
             geometry: point(1.0, 2.0),
@@ -1461,7 +1826,11 @@ mod tests {
                   tile_data BLOB NOT NULL, UNIQUE (zoom_level, tile_column, tile_row))"
                 .into(),
             rows: Vec::new(),
-            key_columns: vec![1, 2, 3],
+            // The DDL above declares `UNIQUE`, so the table owes exactly one
+            // autoindex — empty, because it holds no rows. Supplying none
+            // would be the entry-15 shape; supplying one for a DDL without the
+            // constraint would be entry 20's.
+            autoindexes: vec![Vec::new()],
             autoincrement: Some(crate::sqlite::Autoincrement::Declared),
             triggers: Vec::new(),
         }

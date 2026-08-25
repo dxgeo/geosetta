@@ -16,6 +16,13 @@ thing this plan had recorded as settled: =ge_tce= does not make a set either,
 so § 3's trap is a property of the registry keys generally and not a
 =gdcc_ntv= peculiarity.
 
+*One correction from outside this plan, 2026-08-25:* D5's hazard was filed as
+a property of *merging*. It is a property of **renumbering**, and the writer
+renumbered on the one-container path too -- so the hazard was already live
+where this plan says it is not. That half is now closed (decision 27 carries
+feature ids); the merge half is untouched and is what D5 still governs. See
+§ THE SCOPE OF THIS HAZARD IS WIDER.
+
 *§ 6's "same row" contract is written*, which was step 2 of § THE SEQUENCING
 and the thing blocking steps 3 and 4. It settles every registry table and the
 tile table, and raised two questions it could not settle -- **D4** (a tile
@@ -697,10 +704,37 @@ it, because the database is not malformed -- it is merely *lying*.
 
 ***That is the same class as =handoff.org= § BUGS FOUND entry 15 and the
 =sqlite_sequence= gap*** -- a file every verification ritual in this tree
-reports green on. This project has been caught by that class twice in a week,
-and the second time only because someone measured a case they had reasoned
-about. **Refusing makes it structurally impossible** rather than guarded
-against.
+reports green on. This project has been caught by that class twice in a
+week, and the second time only because someone measured a case they had
+reasoned about. **Refusing makes it structurally impossible** rather than
+guarded against.
+
+***** THE SCOPE OF THIS HAZARD IS WIDER THAN THIS SECTION SAYS -- 2026-08-25
+/Correction to the paragraph above, not to the decision below. D5 stands./
+
+"Merging a user table renumbers its rowids" is true and it is not the only
+place renumbering happens. **This writer renumbers feature ids on the plain
+one-container path as well** -- =writer.rs= assigns =(i + 1)= per row, so a
+source holding fids =1, 9, 40= writes out =1, 2, 3=, measured 2026-08-25 and
+filed as =handoff.org= § BUGS FOUND entry 19. So the unchecked reference this
+section describes is *already live in shipped behaviour*, on the path this plan
+treats as the safe one.
+
+Two consequences, and neither reverses D5. First, the argument for refusing is
+**stronger** than filed: the hazard is not a cost the merge introduces, it is
+one the merge would compound. Second, and this is the part a reader of this
+section would have got wrong -- *the one-container path was not safe either*.
+
+***The one-container half is now closed*** (decision 27, 2026-08-25): feature
+ids are carried, so a plain =gpkg -> gpkg= run no longer renumbers and no
+row-scoped reference is invalidated by it. **The merge half is untouched and is
+what D5 governs** -- merging two containers renumbers by necessity, because two
+files' ids collide.
+
+/The general lesson survives the fix: the hazard depends on **renumbering**,
+and merging is only where it was standing when someone noticed. When §§ 3--5
+are built, the =row_id_value= guard belongs wherever a rowid changes, not
+wherever a merge happens./
 
 **** Why refusing is affordable here, where D2 rejected the same move
 D2 threw out "refuse for indexed tables" because it fired on **every ordinary

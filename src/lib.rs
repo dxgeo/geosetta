@@ -70,8 +70,8 @@ pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection};
 pub use format::Format;
 pub use native::{
-    FgbColumnNative, FgbNative, GpkgConstraint, GpkgDataColumn, GpkgNative, Native, NativePayload,
-    ParquetNative,
+    FgbColumnNative, FgbNative, GpkgConstraint, GpkgDataColumn, GpkgFeatureNative, GpkgNative,
+    Native, NativePayload, ParquetNative,
 };
 pub use geometry::{Bbox, Geometry, Position};
 // `schema` is crate-internal (its column materialization is a writer detail),

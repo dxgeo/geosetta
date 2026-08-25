@@ -113,6 +113,51 @@ pub enum NativePayload {
     /// layer and is M3b's, not this payload's — see
     /// `plans/same-format-fidelity.org` § THE DOMAIN OF THE RULE.
     Gpkg(GpkgNative),
+    /// A GeoPackage *feature*'s unmodelled members. **Feature level only**;
+    /// [`Self::Gpkg`] is its layer counterpart.
+    ///
+    /// A separate variant rather than a member on `GpkgNative`, because the two
+    /// levels answer different questions and a payload that is meaningful at
+    /// one and meaningless at the other invites exactly the confusion
+    /// `GpkgNative`'s own doc warns about. /GeoJSON puts both levels in one
+    /// variant because its members genuinely are the same members; these are
+    /// not./
+    GpkgFeature(GpkgFeatureNative),
+}
+
+/// A GeoPackage feature's members the IR does not model.
+///
+/// Today that is one: the feature id. See [`Self::fid`] for why it is content
+/// rather than bookkeeping, which was not obvious and cost a defect to learn.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct GpkgFeatureNative {
+    /// The feature's `INTEGER PRIMARY KEY` — its rowid — when the writer would
+    /// not produce it anyway.
+    ///
+    /// **The standard gives this column a stated purpose**, which is what makes
+    /// it content: Requirement 29 mandates the integer primary key acting as a
+    /// `rowid` alias, and the note under it says what for — *"allows features
+    /// to be linked to row level metadata records in the `gpkg_metadata` table
+    /// by rowid values in the `gpkg_metadata_reference` table"*. So other rows
+    /// point at it, and renumbering silently invalidates them (Requirement 99).
+    /// It is the same argument that reclassified `gpkg_contents.last_change`,
+    /// and it was missed for the same kind of reason: an integer key reads like
+    /// allocation. See `handoff.org` § BUGS FOUND entry 19.
+    ///
+    /// *`None` — the ordinary case — when the id is exactly what the writer
+    /// emits anyway*, which is a dense `1..n`. That is D16: a member equal to
+    /// what the writer would produce is **derived**, not carried. Every
+    /// GeoPackage whose features were never deleted out of therefore carries
+    /// nothing here, and so does every file this crate wrote itself.
+    pub fid: Option<i64>,
+}
+
+impl GpkgFeatureNative {
+    /// Whether the feature recorded none of this, in which case no [`Native`]
+    /// need be constructed (D3).
+    pub fn is_empty(&self) -> bool {
+        self.fid.is_none()
+    }
 }
 
 /// A GeoPackage layer's descriptive members: its `gpkg_contents` title and

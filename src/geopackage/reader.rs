@@ -6,7 +6,9 @@ use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::from_wkb;
 use crate::json::JsonValue;
 use crate::format::Format;
-use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, Native, NativePayload};
+use crate::native::{
+    GpkgConstraint, GpkgDataColumn, GpkgFeatureNative, GpkgNative, Native, NativePayload,
+};
 use crate::schema::{DeclType, FieldDecl};
 use crate::sqlite::{Database, Table, Value};
 use std::rc::Rc;
@@ -125,6 +127,35 @@ fn spatial_ref_systems(db: &Database, tables: &[Table]) -> Result<Vec<SrsRow>> {
     Ok(out)
 }
 
+/// The feature id as a [`Native`], or `None` when the writer would emit it
+/// anyway.
+///
+/// **D16 in one line:** a member equal to what the writer produces on its own
+/// is *derived*, not carried. `super::writer` numbers features densely from 1,
+/// so a layer nobody has deleted a row out of carries nothing here — which is
+/// every file this crate wrote and most files anyone else did.
+///
+/// The value is real content when it differs: Requirement 29's note makes the
+/// feature id the target of `gpkg_metadata_reference`'s row-level links, so
+/// renumbering breaks a reference the standard defines. Destroying it silently
+/// was `handoff.org` § BUGS FOUND entry 19.
+fn carried_fid(row: &[Value], rowid_alias: Option<usize>, position: usize) -> Option<Native> {
+    let fid = match rowid_alias.and_then(|i| row.get(i)) {
+        Some(Value::Int(n)) => *n,
+        // No rowid-alias column, so the source exposes no id to carry. The
+        // table still has rowids; they are simply not addressable as data, and
+        // nothing can reference one it cannot name.
+        _ => return None,
+    };
+    if fid == (position + 1) as i64 {
+        return None;
+    }
+    Some(Native::new(
+        Format::Gpkg,
+        NativePayload::GpkgFeature(GpkgFeatureNative { fid: Some(fid) }),
+    ))
+}
+
 fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<FeatureCollection> {
     let rowid_alias = table.rowid_alias();
     let mut features = Vec::new();
@@ -136,7 +167,7 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
         .map(|i| table.column_types.get(i).and_then(|t| t.as_deref()).and_then(decl_type))
         .collect();
 
-    for row in db.read_rows(table)? {
+    for (position, row) in db.read_rows(table)?.into_iter().enumerate() {
         let geometry = match geom_idx.and_then(|i| row.get(i)) {
             Some(Value::Blob(b)) => Some(from_wkb(strip_gpkg_header(b)?)?),
             _ => None,
@@ -151,7 +182,7 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
         features.push(Feature {
             geometry,
             properties,
-            native: None,
+            native: carried_fid(&row, rowid_alias, position),
         });
     }
     // Carry each column's declared type into the IR, so it survives to a

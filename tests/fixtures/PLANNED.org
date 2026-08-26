@@ -243,8 +243,11 @@ hand and re-checksum nothing -- SQLite has no page checksums by default).
 byte-preserving, which is currently a claim in the plan with nothing behind it.
 
 * WHAT IS ALREADY COVERED, SO NOBODY REBUILDS IT
-- =WITHOUT ROWID= -- =sqlite_altered.gpkg=, and its rows are now *counted*
-  rather than reported as uncountable.
+- =WITHOUT ROWID= -- =sqlite_altered.gpkg=. /Its rows were *counted* rather
+  than reported as uncountable from 2026-08-23, and since 2026-08-26 the table
+  is **carried**: it is the only member of this storage shape in the tree, so it
+  also pins =carry::Storage::Records= and the rule that the shape follows the
+  **DDL** rather than a failed table walk./
 - =ALTER TABLE ADD COLUMN= short records with a =DEFAULT= -- same fixture.
 - =UNIQUE=, =TEXT PRIMARY KEY=, an explicit =CREATE INDEX=, and a
   =UNIQUE COLLATE NOCASE= -- =sqlite_constraints.gpkg=.

@@ -52,7 +52,15 @@ validated against DuckDB / GDAL.
     `foreign_key_check`, enforces those constraints, and is read and rewritten
     by GDAL. Their DDL is checked against the OGC standard's own normative SQL
     rather than against another implementation's output, via a fixture built
-    from the published annexes with no GDAL in its provenance. An opt-in
+    from the published annexes with no GDAL in its provenance. A `.gpkg` is a
+    whole SQLite database rather than one layer, so a GeoPackage-to-GeoPackage
+    run also **carries the container around the layers**: tile pyramids, a
+    user's own tables (including `WITHOUT ROWID` ones), aspatial `attributes`
+    datasets with their registrations, the metadata extension's records and
+    references, and the extension registrations the output's own contents
+    oblige. Eleven of the twelve GeoPackage fixtures in this repository
+    round-trip with nothing dropped; what a run cannot carry it says so, on
+    stderr, rather than dropping it silently. An opt-in
     `--rtree` flag also writes the GeoPackage RTree extension (SQLite's R\*Tree
     virtual table, built from scratch); the index passes `rtreecheck()` and
     answers GDAL/DuckDB bbox queries. A second opt-in flag, `--envelope`, caches

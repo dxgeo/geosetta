@@ -2449,8 +2449,11 @@ than assumes./
 ***Measured on =sqlite_contents.gpkg=:*** the drop warning is silent, both
 oracles are clean, =ogrinfo= reads =notes_aspatial= as a layer with its two
 metadata items attached and its rows at ids **1 and 9**, and =ogr2ogr= rewrites
-the result as =attributes=. **Ten of twelve fixtures now round-trip silent**;
-the two that speak are =kv= and =gpkg_crs_wkt_1_1=, exactly as predicted.
+the result as =attributes=. **Ten of twelve fixtures round-trip silent as of
+this work**; the two that then spoke were =kv= and =gpkg_crs_wkt_1_1=, exactly
+as predicted. /=kv= followed on 2026-08-26, taking it to eleven -- see
+/The =WITHOUT ROWID= table/ below. The figure above is left as the measurement
+it was./
 
 ***Nine mutations, each caught by the intended test*** -- and one is worth
 noting: restoring the carried trigger is caught by =tests/gpkg_oracles.rs= as

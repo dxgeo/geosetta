@@ -567,7 +567,7 @@ of it was planned work* -- each item was found by measuring the one above it:
   did not incur. /The last was caught in review before it left the working
   tree. All three share a shape: **the report and the write derived their
   answers separately.**/ =gdal_tiles.gpkg= now round-trips saying nothing at
-  all, and nine of the twelve =.gpkg= fixtures do.
+  all, and eleven of the twelve =.gpkg= fixtures do.
 - *The recast matrix* -- =DeclType::admits= (the widening relation),
   =Format::recast= (what each format does to each type),
   =decl_recast_warning=, =DeclType::ALL=, two sweeps, four *inbound* tables
@@ -695,6 +695,14 @@ logic. Three things came with it that were not the point of it: defect 6's fix,
 a =WITHOUT ROWID= table now reporting a real row count instead of
 =(rows not counted)=, and the reason the fourth =sqlite.rs= gap was never
 merely M3b's.
+
+/A **fourth**, and nobody noticed it for three days: this also made the writer
+able to emit a =WITHOUT ROWID= table, because such a table **is** an index
+b-tree and =write_database='s rootpage assignment never asks what kind of
+=MasterEntry= it is holding. Three documents went on describing that as
+unbuilt file-format work until it was measured on 2026-08-26. **Work that
+closes something it was not aimed at does not announce itself**, which is the
+transferable half./
 
 ** BUGS FOUND
 /This heading has been renamed four times and the count in it is the reason --

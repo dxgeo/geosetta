@@ -192,6 +192,15 @@ valid and readable.
   a =UNIQUE= or =TEXT PRIMARY KEY= obliges produces a file SQLite reports as
   malformed (entry 15). Both directions shipped 2026-08-23; the scope is
   re-packing plus one bounded construction case, per D10.
+
+  /And that shipment quietly answered the first clause too, which nobody
+  noticed until 2026-08-26./ **=WITHOUT ROWID= became writable the same day**,
+  because such a table *is* an index b-tree and =write_database= builds one
+  from any =MasterEntry= carrying records without asking the entry's kind. =kv=
+  is carried as of 2026-08-26. /The remaining limit is narrow and is recorded
+  in =same-format-fidelity.org= § MILESTONES: a =WITHOUT ROWID= table owning a
+  =sqlite_autoindex_*= -- which only an **additional** =UNIQUE= creates --
+  still cannot be emitted, because =MasterEntry::sql= cannot be NULL./
 - CRS/SRS: resolved — see the Status section above.
 - Raster/tile and attribute-only tables in a GPKG: skip (only =data_type =
   'features'= tables are converted).
@@ -205,4 +214,7 @@ valid and readable.
   *not carried* are different claims, and only the first one was ever decided
   here. D8 in =same-format-fidelity.org= settles the second: a tile pyramid is
   *carried*, as independent container content, and no file is rejected for
-  holding one.
+  holding one. /And **D14 settles it for the attribute-only case**, 2026-08-25:
+  an =attributes= dataset is carried together with the =gpkg_contents= row
+  Requirement 118 obliges, and no other =data_type= is. So both halves of this
+  note's subject are now carried without either being converted./

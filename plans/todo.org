@@ -37,10 +37,10 @@ check it off and remove it once the item ships or is shelved.
   with M4 (2026-08-20)*; the =gpkg= → =gpkg= run destroying the container
   around its layers *warned from 2026-08-21* and is **mostly fixed as of
   2026-08-25** — a tile pyramid, a user's own tables, the =gpkg_metadata= pair,
-  an =attributes= dataset and both extensions' registrations are carried, and
-  **ten** of the twelve =.gpkg= fixtures round-trip with the warning silent.
-  /What is left is two missing capabilities — a =WITHOUT ROWID= table and the
-  CRS-WKT extension's column — plus the merge path, which is
+  an =attributes= dataset, a =WITHOUT ROWID= table and both extensions'
+  registrations are carried, and **eleven** of the twelve =.gpkg= fixtures
+  round-trip with the warning silent. /What is left is one missing capability —
+  the CRS-WKT extension's column — plus the merge path, which is
   =container-reconciliation.org=./ Since then: the *GeoPackage spoke*, defect 5's *recast
   matrix* (with =DeclType::admits=, =Format::recast= and a fourth warning), a
   *byte-level value type* — a =gpkg= run had been destroying every blob it read
@@ -107,6 +107,16 @@ check it off and remove it once the item ships or is shelved.
   Next is this plan's §§ 3--5. /The line that stood here until 2026-08-25 --
   "Next is =same-format-fidelity.org= M3b, which now owns § 1" -- is spent:
   M3b's one-container half is done, and §§ 3--5 are what is left of the gate./
+
+  /2026-08-26:/ **a =WITHOUT ROWID= table is carried**, which was the last
+  carrying-shaped item in defect 3 and needed **no new writer capability**.
+  Three documents (this one included) said the writer "has never emitted one"
+  and called it real file-format work; that half was never measured, only
+  inferred from the absence of code saying =WITHOUT ROWID=. =write_database=
+  has built index b-trees from =MasterEntry::records= since 2026-08-23 with no
+  test on the entry's kind, and such a table *is* an index b-tree. Second day
+  running that a blocker turned out to be a **reason** falsified by other work
+  in the same plan.
 
   /2026-08-25:/ **an =attributes= dataset is carried**, with the
   =gpkg_contents= row Requirement 118 obliges -- the second of defect 3's three

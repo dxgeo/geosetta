@@ -18,9 +18,10 @@
 //!   is actually written rather than replayed blindly.
 //! - **derived** — recomputed, never carried. An R*Tree, a row-count cache.
 //!
-//! This module carries the *first* class, and reaches two members of it: the
-//! tile pyramid (D8's case in `plans/same-format-fidelity.org`, 2026-08-24)
-//! and a user's own table (2026-08-25). **Nothing here is raster-specific**,
+//! This module carries the *first* class, and reaches four members of it: the
+//! tile pyramid (D8's case in `plans/same-format-fidelity.org`, 2026-08-24), a
+//! user's own table and an `attributes` dataset (2026-08-25), and a
+//! `WITHOUT ROWID` table (2026-08-26). **Nothing here is raster-specific**,
 //! which was D8's own argument for carrying rather than rejecting — a pyramid
 //! is carried because it is independent content, and `side_notes` arrives by
 //! the same operation, as that argument predicted it would.
@@ -194,6 +195,36 @@ pub struct Pyramid {
 /// name, the statement that declared it, and its records in index order.
 pub type CarriedIndex = (String, String, Vec<Vec<u8>>);
 
+/// How a carried table is stored on disk.
+///
+/// **Not a detail, and not two fields with one left empty.** The two shapes
+/// need different writers — a `TableSpec` and a
+/// `MasterEntry` carrying records — and a table is exactly one of them. An
+/// enum makes "both" and "neither" unrepresentable, which matters here because
+/// getting it wrong does not fail: it writes a **malformed database** that
+/// `SELECT` may still answer.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Storage {
+    /// A **table b-tree**, keyed by rowid. Rows as `(rowid, values)` with the
+    /// rowid-alias column blanked, the shape `TableSpec` wants — see
+    /// `rows_blanking_alias`.
+    Rows(Vec<(i64, Vec<Value>)>),
+    /// An **index b-tree**: a `WITHOUT ROWID` table, whose records carry the
+    /// whole row rather than pointing at one, and which has no rowid at all.
+    ///
+    /// Re-packed exactly as a carried index is — `read_index` walks the
+    /// source's b-tree in index order, so the records arrive already sorted and
+    /// no key is ever compared. D10's bargain, collected a second time: the
+    /// primary key's collation never has to be implemented.
+    ///
+    /// /`sqlite.rs` has been able to write this since the index work landed on
+    /// 2026-08-23. Three documents said the writer "has never emitted one" and
+    /// called it real file-format work; measured 2026-08-26, `write_database`
+    /// builds the b-tree from `MasterEntry::records` with **no test on the
+    /// entry's kind**, so the capability was there and untried./
+    Records(Vec<Vec<u8>>),
+}
+
 /// One table the container held that belongs to no layer and to no registry
 /// this writer constructs — `side_notes` and its kind.
 ///
@@ -217,9 +248,9 @@ pub struct UserTable {
     pub name: String,
     /// The `CREATE TABLE` text, carried verbatim.
     pub sql: String,
-    /// Rows as `(rowid, values)` with the rowid-alias column blanked, the shape
-    /// `crate::sqlite::TableSpec` wants. See `rows_blanking_alias` for why.
-    pub rows: Vec<(i64, Vec<Value>)>,
+    /// The table's contents, and which b-tree shape holds them. See
+    /// [`Storage`].
+    pub storage: Storage,
     /// The `sqlite_autoindex_*` b-trees the DDL obliges, **re-packed from the
     /// source** rather than rebuilt: each entry is that index's records in
     /// index order, exactly as `crate::sqlite::Database::read_index`
@@ -537,19 +568,22 @@ fn user_tables(
         }
         let Some(table) = tables.iter().find(|t| t.name == name) else { continue };
         let Some(sql) = object.sql.clone() else { continue };
+        let autoindexes = autoindex_records(db, objects, name)?;
         // A table this cannot decode is skipped rather than fatal, on
         // `read`'s own ruling: a partial carry beats no output at all, and
         // `super::container` still names whatever was skipped.
-        let Ok(rows) = carried_rows(db, table) else { continue };
+        let Some(storage) = storage_of(db, table, &sql, object.root_page, &autoindexes)? else {
+            continue;
+        };
         out.push(UserTable {
-            autoindexes: autoindex_records(db, objects, name)?,
             indexes: explicit_indexes(db, objects, name)?,
             autoincrement: autoincrement_of(name, &Some(sql.clone()), sequences),
             triggers: triggers_of(objects, name),
             name: name.to_string(),
             registration,
+            autoindexes,
+            storage,
             sql,
-            rows,
         });
     }
     Ok(out)
@@ -570,6 +604,59 @@ fn contents_names(db: &Database, tables: &[Table]) -> Result<Vec<String>> {
         return Ok(Vec::new());
     };
     Ok(db.read_rows(t)?.iter().filter_map(|row| text_at(row, name_col)).collect())
+}
+
+/// Which [`Storage`] this table uses, or `None` when it cannot be carried.
+///
+/// # The decision is made on the DDL, not on whether the table walk failed
+///
+/// A `WITHOUT ROWID` table is stored as an index b-tree, so reading it as a
+/// table b-tree returns `Err` — and it would be tempting to treat that `Err`
+/// as the signal. **That would be a corrupting inference.** A table walk can
+/// fail for reasons that have nothing to do with the storage shape, and
+/// re-reading such a table as an index and writing it back as one produces a
+/// file whose bytes say something its DDL does not. So the DDL is asked
+/// directly, the same way [`autoincrement_of`] asks it about `AUTOINCREMENT`,
+/// and a table that fails its walk while claiming a rowid is skipped as it
+/// always was.
+///
+/// # The one shape still left behind, and it is a writer limit
+///
+/// A `WITHOUT ROWID` table owning a `sqlite_autoindex_*` is **skipped**. Only
+/// an *additional* `UNIQUE` creates one — measured 2026-08-26: a single-column
+/// primary key and a composite primary key each own no separate b-tree,
+/// because for these tables the primary key *is* the table. SQLite numbers the
+/// one it does create `_2`, since `_1` is notionally that primary key, and
+/// there is no way to emit it: `MasterEntry::sql` is a `String` where SQLite
+/// stores NULL for an autoindex, and [`crate::sqlite::TableSpec::autoindexes`]
+/// would renumber it `_1`. /Writing the constraint without its index is
+/// `handoff.org` entry 15 — a malformed database — so the honest answer is to
+/// carry nothing and let `super::container` keep reporting it./
+fn storage_of(
+    db: &Database,
+    table: &Table,
+    sql: &str,
+    root_page: u32,
+    autoindexes: &[Vec<Vec<u8>>],
+) -> Result<Option<Storage>> {
+    if !declares_without_rowid(sql) {
+        return Ok(carried_rows(db, table).ok().map(Storage::Rows));
+    }
+    if !autoindexes.is_empty() {
+        return Ok(None);
+    }
+    Ok(db.read_index(root_page).ok().map(Storage::Records))
+}
+
+/// Whether this DDL declares `WITHOUT ROWID`.
+///
+/// Text, on the same terms as [`autoincrement_of`]'s `AUTOINCREMENT` test:
+/// this crate does not parse SQL, and `sqlite_master.sql` is stored exactly as
+/// the producer wrote it. Both are SQLite keywords that cannot appear
+/// unquoted as anything else.
+fn declares_without_rowid(sql: &str) -> bool {
+    let upper = sql.to_ascii_uppercase();
+    upper.split_whitespace().collect::<Vec<_>>().windows(2).any(|w| w == ["WITHOUT", "ROWID"])
 }
 
 /// Rows as `(rowid, values)` with the rowid alias blanked, for a table that may

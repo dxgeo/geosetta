@@ -378,7 +378,7 @@ fixture could have caught -- =ogr2ogr= writes neither construct.
 |---------+--------------|
 | =cities.grade TEXT DEFAULT 'B'=, added by =ALTER TABLE= *after* the rows existed | the rows keep *short records*, so =B= lives only in the DDL. =read_rows= padded with NULL and returned an empty column, on every output format |
 | =cities.rank INT DEFAULT 5=, same | the same bug with a numeric literal, so the fix is not text-only |
-| =kv=, a =WITHOUT ROWID= user table | stored as an *index* b-tree, which =sqlite.rs= cannot walk. The resulting =Err= used to abort the whole container survey, and =container_drop_warnings= swallowed it -- so this one table silenced *every* defect 3 warning for the file |
+| =kv=, a =WITHOUT ROWID= user table | stored as an *index* b-tree, which =sqlite.rs= could not walk. The resulting =Err= used to abort the whole container survey, and =container_drop_warnings= swallowed it -- so this one table silenced *every* defect 3 warning for the file. **Carried since 2026-08-26**, and it is the only table in the tree with this storage shape, so it is also what pins =Storage::Records= and the rule that the shape follows the *DDL* rather than a failed read |
 
 *The =cities= layer is the common source's two rows*, so the non-ASCII and
 leading-zero cases come along for free.

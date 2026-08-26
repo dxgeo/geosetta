@@ -12,7 +12,7 @@ use crate::format::Format;
 use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
 use crate::sqlite::{Autoincrement, MasterEntry, TableSpec, Value, autoindex_records, write_database};
 
-use super::carry::{Carried, Metadata, MetadataReference, Pyramid, SrsDef, UserTable};
+use super::carry::{Carried, Metadata, MetadataReference, Pyramid, SrsDef, Storage, UserTable};
 use super::reader::read_layers;
 use super::rtree;
 
@@ -345,7 +345,22 @@ fn build(
         master.extend(triggers(&pyramid.name, &pyramid.triggers));
     }
     for table in &carried.tables {
-        specs.push(user_table(table));
+        match &table.storage {
+            Storage::Rows(_) => specs.push(user_table(table)),
+            // A `WITHOUT ROWID` table *is* an index b-tree, so it is written as
+            // one — `write_database` builds a real rootpage from any
+            // `MasterEntry` carrying records and never asks what kind of entry
+            // it is. It takes no `TableSpec` because it has no rows to key by
+            // rowid, no rowid alias to blank, and (SQLite forbids it) no
+            // `AUTOINCREMENT` to book-keep.
+            Storage::Records(records) => master.push(MasterEntry {
+                kind: "table".into(),
+                name: table.name.clone(),
+                tbl_name: table.name.clone(),
+                sql: table.sql.clone(),
+                records: Some(records.clone()),
+            }),
+        }
         master.extend(triggers(&table.name, &table.triggers));
         // An explicit `CREATE INDEX` owns a b-tree, so unlike a trigger it
         // supplies records — re-packed from the source, never compared. See
@@ -1419,7 +1434,14 @@ fn user_table(table: &UserTable) -> TableSpec {
         sql: table.sql.clone(),
         autoindexes: table.autoindexes.clone(),
         autoincrement: table.autoincrement,
-        rows: table.rows.clone(),
+        rows: match &table.storage {
+            Storage::Rows(rows) => rows.clone(),
+            // Unreachable: `build` sends a `Records` table down the
+            // `MasterEntry` path and never calls this. Empty rather than a
+            // panic, because the cost of being wrong here is an empty table
+            // and the cost of a panic is no output at all.
+            Storage::Records(_) => Vec::new(),
+        },
     }
 }
 
@@ -2697,7 +2719,8 @@ mod tests {
 
         // One autoindex, holding one record per row — re-packed, not rebuilt.
         assert_eq!(people.autoindexes.len(), 1);
-        assert_eq!(people.autoindexes[0].len(), people.rows.len());
+        let Storage::Rows(rows) = &people.storage else { panic!("people has a rowid") };
+        assert_eq!(people.autoindexes[0].len(), rows.len());
 
         let source = crate::sqlite::Database::open(SRC).unwrap();
         let root = source
@@ -3639,7 +3662,8 @@ mod tests {
         const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
         let carried = crate::geopackage::read_container(SRC).unwrap();
         let notes = carried.tables.iter().find(|t| t.name == "notes_aspatial").unwrap();
-        let ids: Vec<i64> = notes.rows.iter().map(|(rowid, _)| *rowid).collect();
+        let Storage::Rows(rows) = &notes.storage else { panic!("an attributes table has a rowid") };
+        let ids: Vec<i64> = rows.iter().map(|(rowid, _)| *rowid).collect();
         assert_eq!(ids, vec![1, 9], "the gap is the fixture's whole point");
 
         let layers = read_layers(SRC).unwrap();
@@ -3944,6 +3968,221 @@ mod tests {
             events.triggers.iter().any(|(name, _)| name == "events_stamp"),
             "a trigger this crate has no quarrel with is carried: {:?}",
             events.triggers
+        );
+    }
+
+    /// ***A `WITHOUT ROWID` table survives a `gpkg -> gpkg` run***, and the
+    /// writer needed no new capability to do it.
+    ///
+    /// Such a table has no rowid: SQLite stores it as an **index b-tree**
+    /// keyed by the declared primary key, with the whole row living in the
+    /// key. `handoff.org`, `todo.org` and `same-format-fidelity.org` all
+    /// described this as real file-format work on the grounds that "the
+    /// *writer* has never emitted one" — **measured 2026-08-26 and false**.
+    /// `write_database` builds a real rootpage from any `MasterEntry` carrying
+    /// records and never tests the entry's kind, so the capability arrived
+    /// with the index work on 2026-08-23 and nobody tried it. The whole of the
+    /// change is reading the source's b-tree with `read_index` instead of
+    /// `read_rows` and emitting a `MasterEntry` instead of a `TableSpec`.
+    ///
+    /// /Like a carried index, the records are **re-packed** in the order the
+    /// source stored them and never compared — so the primary key's collation
+    /// never has to be implemented. D10's bargain, collected a second time./
+    #[test]
+    fn a_without_rowid_table_is_carried_as_the_index_btree_it_is() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_altered.gpkg");
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let kv = carried
+            .tables
+            .iter()
+            .find(|t| t.name == "kv")
+            .expect("kv is carried, not skipped");
+        assert!(kv.sql.contains("WITHOUT ROWID"), "the fixture's premise: {}", kv.sql);
+        let Storage::Records(records) = &kv.storage else {
+            panic!("a WITHOUT ROWID table is stored as records, not rows")
+        };
+        assert_eq!(records.len(), 2);
+        // The records are the source's own bytes, re-packed rather than rebuilt.
+        let source = crate::sqlite::Database::open(SRC).unwrap();
+        let root = source
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.name == "kv")
+            .unwrap()
+            .root_page;
+        assert_eq!(*records, source.read_index(root).unwrap());
+
+        // And it reaches the output as a `table` entry owning a real b-tree.
+        let layers = read_layers(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let out = db
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .find(|o| o.name == "kv")
+            .expect("kv is in the output");
+        assert_eq!(out.kind, "table");
+        assert!(out.root_page > 0, "a schema-only entry would lose every row");
+        assert!(out.sql.as_deref().is_some_and(|s| s.contains("WITHOUT ROWID")));
+        assert_eq!(db.read_index(out.root_page).unwrap(), *records);
+    }
+
+    /// The storage shape is decided by the **DDL**, not by whether the table
+    /// walk failed — and reading it the other way would corrupt a file.
+    ///
+    /// A `WITHOUT ROWID` table's table-walk returns `Err`, so that `Err` looks
+    /// like a usable signal. It is not: a walk can fail for reasons unrelated
+    /// to storage, and re-reading such a table as an index and writing it back
+    /// as one produces bytes that say something its own DDL does not. `kv`
+    /// declares the clause and every other carried table does not, which is
+    /// the pair that pins the rule.
+    #[test]
+    fn the_storage_shape_follows_the_ddl_and_not_a_failed_read() {
+        // Two fixtures, because no single one holds both arms:
+        // `sqlite_altered.gpkg` carries only `kv`, and `sqlite_constraints.gpkg`
+        // carries four ordinary tables and no `WITHOUT ROWID` one.
+        const ALTERED: &[u8] = include_bytes!("../../tests/fixtures/sqlite_altered.gpkg");
+        const CONSTRAINTS: &[u8] =
+            include_bytes!("../../tests/fixtures/sqlite_constraints.gpkg");
+        let mut records = 0;
+        let mut rows = 0;
+        for src in [ALTERED, CONSTRAINTS] {
+            for table in &crate::geopackage::read_container(src).unwrap().tables {
+                let declares = table.sql.to_ascii_uppercase().contains("WITHOUT ROWID");
+                match &table.storage {
+                    Storage::Records(_) => {
+                        assert!(declares, "{} does not declare it", table.name);
+                        records += 1;
+                    }
+                    Storage::Rows(_) => {
+                        assert!(!declares, "{} declares it", table.name);
+                        rows += 1;
+                    }
+                }
+            }
+        }
+        // Neither assertion above is vacuous.
+        assert_eq!(records, 1, "kv");
+        assert!(rows >= 4, "the ordinary tables: {rows}");
+    }
+
+    /// ***A table that fails its walk while claiming a rowid is skipped, not
+    /// re-read as an index*** — the half of the rule the correlation above
+    /// cannot see.
+    ///
+    /// On every fixture, "the table walk failed" and "the DDL says
+    /// `WITHOUT ROWID`" coincide, so a `storage_of` that branched on the failed
+    /// read instead of on the DDL passes every other test in this suite. **The
+    /// first mutation pass found exactly that**, which is why this test exists.
+    ///
+    /// The distinguishing input is a source where the two disagree: an index
+    /// b-tree sitting under a DDL that declares an ordinary rowid table. Read
+    /// by the DDL, it is uncarryable and is reported. Read by the failed walk,
+    /// it is carried as records and written back as a `WITHOUT ROWID`-shaped
+    /// b-tree under a DDL that says otherwise — a malformed database this crate
+    /// would have authored from a source it merely received.
+    #[test]
+    fn a_table_that_claims_a_rowid_is_never_re_read_as_an_index() {
+        use crate::sqlite::{TableSpec, write_database};
+
+        let bytes = write_database(
+            &[TableSpec {
+                name: "gpkg_contents".into(),
+                sql: CONTENTS_DDL.into(),
+                rows: Vec::new(),
+                autoindexes: vec![Vec::new(), Vec::new()],
+                autoincrement: None,
+            }],
+            &[MasterEntry {
+                kind: "table".into(),
+                name: "liar".into(),
+                tbl_name: "liar".into(),
+                // No `WITHOUT ROWID`, so this DDL claims a table b-tree …
+                sql: "CREATE TABLE liar (k TEXT PRIMARY KEY, v TEXT)".into(),
+                // … while the root page it gets is an index b-tree.
+                records: Some(vec![vec![3, 15, 15, b'a', b'1']]),
+            }],
+            APPLICATION_ID,
+            USER_VERSION,
+        )
+        .unwrap();
+
+        let carried = crate::geopackage::read_container(&bytes).unwrap();
+        assert!(
+            !carried.tables.iter().any(|t| t.name == "liar"),
+            "carrying this would write bytes its own DDL contradicts"
+        );
+        let warnings =
+            super::super::container_drop_warnings(&bytes, "liar.gpkg", &[], &[], false);
+        assert!(
+            warnings.iter().any(|w| w.contains("liar")),
+            "and skipped means reported: {warnings:?}"
+        );
+    }
+
+    /// A `WITHOUT ROWID` table owning a `sqlite_autoindex_*` is **left
+    /// behind**, and that boundary is a writer limit rather than a choice.
+    ///
+    /// Measured 2026-08-26: only an *additional* `UNIQUE` creates one. A
+    /// single-column primary key and a composite primary key each own no
+    /// separate b-tree, because for these tables the primary key **is** the
+    /// table — SQLite numbers the one it does create `_2`, since `_1` is
+    /// notionally that key. There is no way to emit it: `MasterEntry::sql` is a
+    /// `String` where SQLite stores NULL for an autoindex, and
+    /// `TableSpec::autoindexes` would renumber it `_1`.
+    ///
+    /// Carrying the table without its index would declare a `UNIQUE` with no
+    /// b-tree behind it, which is `handoff.org` entry 15 — a malformed
+    /// database. So it is skipped, and `super::container` keeps reporting it.
+    #[test]
+    fn a_without_rowid_table_with_an_extra_unique_is_left_behind_and_reported() {
+        use crate::sqlite::{TableSpec, write_database};
+
+        // Built here because no fixture holds one and no producer emits one.
+        // `records` are never read back for this table — the point is that the
+        // autoindex exists at all.
+        let bytes = write_database(
+            &[TableSpec {
+                name: "gpkg_contents".into(),
+                sql: CONTENTS_DDL.into(),
+                rows: Vec::new(),
+                autoindexes: vec![Vec::new(), Vec::new()],
+                autoincrement: None,
+            }],
+            &[
+                MasterEntry {
+                    kind: "table".into(),
+                    name: "wr".into(),
+                    tbl_name: "wr".into(),
+                    sql: "CREATE TABLE wr (k TEXT PRIMARY KEY, e TEXT UNIQUE) WITHOUT ROWID"
+                        .into(),
+                    records: Some(vec![vec![3, 15, 15, b'a', b'e']]),
+                },
+                MasterEntry {
+                    kind: "index".into(),
+                    name: "sqlite_autoindex_wr_2".into(),
+                    tbl_name: "wr".into(),
+                    sql: String::new(),
+                    records: Some(vec![vec![3, 15, 15, b'e', b'a']]),
+                },
+            ],
+            APPLICATION_ID,
+            USER_VERSION,
+        )
+        .unwrap();
+
+        let carried = crate::geopackage::read_container(&bytes).unwrap();
+        assert!(
+            !carried.tables.iter().any(|t| t.name == "wr"),
+            "carrying it without its autoindex would be a malformed database"
+        );
+        let warnings =
+            super::super::container_drop_warnings(&bytes, "wr.gpkg", &[], &[], false);
+        assert!(
+            warnings.iter().any(|w| w.contains("wr")),
+            "and left behind means reported: {warnings:?}"
         );
     }
 }

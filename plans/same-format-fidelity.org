@@ -60,14 +60,13 @@ So *defect 3's fix* is **mostly built** rather than wholly outstanding. The
 (decisions 28--30) and the =gpkg_extensions= registrations for both extensions
 this crate implements -- the second of those a **shipped conformance defect**
 rather than uncarried content, =handoff.org= entry 21 -- and the =attributes=
-dataset the same day. ***Ten of the twelve =.gpkg= fixtures now round-trip with
-the drop warning silent.***
+dataset the same day, and a =WITHOUT ROWID= table on 2026-08-26. ***Eleven of
+the twelve =.gpkg= fixtures now round-trip with the drop warning silent.***
 
-/What is left is no longer a class this crate has failed to carry. Two fixtures
-still lose something, and each is a capability it does not have: a
-=WITHOUT ROWID= table the writer cannot emit, and the CRS-WKT extension's
-**column** on =gpkg_spatial_ref_sys=. The merge path is untouched and is
-=container-reconciliation.org=./
+/What is left is no longer a class this crate has failed to carry. **One**
+fixture still loses something, and it is a capability rather than a carry: the
+CRS-WKT extension's **column** on =gpkg_spatial_ref_sys=. The merge path is
+untouched and is =container-reconciliation.org=./
 
 *M4 is done (2026-08-20), and it closed three defects rather than two.*
 =FieldDecl= gained a declared *type* in a vocabulary wide enough for the
@@ -484,18 +483,21 @@ already been renamed once./
    and the first class of container content this defect covers. =side_notes=
    and its kind, the =gpkg_metadata= pair, and the =gpkg_extensions=
    registrations for both extensions this crate implements all followed on
-   2026-08-25, and the =attributes= dataset the same day. /**Ten of the twelve
-   =.gpkg= fixtures now round-trip with the warning silent** -- measured, not
-   estimated -- and =gdal_tiles.gpkg= and =sqlite_contents.gpkg=, the two with
-   the richest containers, are both among them./
+   2026-08-25, the =attributes= dataset the same day, and a =WITHOUT ROWID=
+   table on 2026-08-26. /**Eleven of the twelve =.gpkg= fixtures now round-trip
+   with the warning silent** -- measured, not estimated -- and
+   =gdal_tiles.gpkg= and =sqlite_contents.gpkg=, the two with the richest
+   containers, are both among them./
 
-   *What keeps the defect open is no longer a class of content.* Two fixtures
-   still lose something and each is a **capability** this crate lacks: a
-   =WITHOUT ROWID= table the writer cannot emit, and the CRS-WKT extension's
-   *column*. /The =attributes= dataset was the third until 2026-08-25, and the
-   reason recorded against it -- that its =gpkg_contents= registration was not
-   carried -- had been stale for a day when it was read./ The merge path is
-   separate and untouched.
+   *What keeps the defect open is no longer a class of content.* **One**
+   fixture still loses something, and it is a capability rather than a carry:
+   the CRS-WKT extension's *column*. /Both of the other two turned out to rest
+   on a reason that had expired. The =attributes= dataset's said its
+   =gpkg_contents= registration could not be carried, which the pyramid work
+   had falsified a day earlier; the =WITHOUT ROWID= table's said the writer had
+   never emitted one, which the **index work had falsified on 2026-08-23** --
+   =write_database= builds a b-tree from any =MasterEntry= carrying records and
+   never asks the entry's kind./ The merge path is separate and untouched.
 
    Unlike defects 1--2 this one *does* need the mechanism (§ THE DOMAIN OF THE
    RULE), so it could not ship with M4. /(This sentence read "unlike defects
@@ -2615,6 +2617,87 @@ re-runnable:
 | =carry.rs= | =UserTable= gains a =Registration= (=data_type=, =identifier=, =description=, =last_change=, =bbox=, nullable =srs_id=, =SrsDef=); =user_tables= stops excluding an =attributes= name; =triggers_of= drops a =gpkg_ogr_contents= maintainer |
 | =writer.rs= | =reconcile_carried_srs= generalised off =&Pyramid= to =(srs_id, Option<&SrsDef>)=; =ResolvedSrs= gains =per_table=; =gpkg_contents= emits the carried registrations, under the same =identifier= UNIQUE refusal the pyramid path uses; =retained_references= counts a registered carried table as satisfying Requirement 97 |
 | =container.rs= | *nothing* -- the survey already reports =notes_aspatial= and already subtracts =Carried::reproduced_names=. /Asserted rather than assumed: the check is that the warning goes silent, not that the module was edited./ |
+
+*** The =WITHOUT ROWID= table -- ***BUILT 2026-08-26***
+/The last carrying-shaped item in defect 3, and it needed **no new writer
+capability at all**. The estimate three documents carried was wrong, and how it
+was wrong is the transferable part./
+
+**** The claim, and the measurement that refuted it
+=handoff.org=, =plans/todo.org= and this file all described =kv= the same way:
+/"a =WITHOUT ROWID= table -- readable since 2026-08-23, but the **writer** has
+never emitted one. Real file-format work."/ The reading half was measured. The
+writing half was **never tested** -- it was inferred from the absence of any
+code that said "WITHOUT ROWID", and =grep= is not a capability test.
+
+***Measured 2026-08-26, and it took one throwaway test.*** A =WITHOUT ROWID=
+table is stored as an **index b-tree**, keyed by the declared primary key with
+the whole row in the key. =sqlite.rs= has been able to write an index b-tree
+since D10's work landed on 2026-08-23, and =write_database='s rootpage
+assignment branches on =MasterEntry::records= **with no test on the entry's
+kind**:
+
+#+begin_src rust
+  let root = match &e.records {
+      Some(records) => w.build_index_btree(records)?,
+      None => 0,
+  };
+#+end_src
+
+So handing it =kind: "table"= with the source's records writes a valid
+=WITHOUT ROWID= table. Asked of =sqlite3= directly: =integrity_check= = =ok=,
+=SELECT= returns both rows, and an =INSERT= succeeds and leaves the file
+=ok=. /The capability had existed for three days and nobody had tried it./
+
+***The lesson is not "we were pessimistic".*** It is that a cost estimate
+written as a *reason* -- "the writer has never emitted one" -- reads like a
+measurement and was not one, and the work that falsified it (D10's index
+writing) was **in this same plan**, three days earlier, and did not know it had
+done so. /Compare the =attributes= dataset the day before: its blocker was also
+a reason, also expired, also by work recorded in this same file. Twice in two
+days./
+
+**** What it actually cost
+=UserTable.rows= became =UserTable.storage: Storage=, an enum of =Rows= and
+=Records=. That is deliberate rather than an added field: the two shapes need
+different writers, a table is exactly one of them, and **getting it wrong does
+not fail** -- it writes a malformed database that =SELECT= may still answer. An
+enum makes "both" and "neither" unrepresentable.
+
+/The records are **re-packed** in the order the source stored them and never
+compared, exactly as a carried index is -- so the primary key's collation never
+has to be implemented. **D10's bargain, collected a second time**, and this is
+the case that shows the bargain was worth more than it looked: it was scoped for
+carried *indexes* and it paid for a carried *table*./
+
+**** The one shape still left behind, and it is a writer limit
+A =WITHOUT ROWID= table owning a =sqlite_autoindex_*= is skipped and stays
+reported. /Measured 2026-08-26: only an **additional** =UNIQUE= creates one. A
+single-column primary key and a composite primary key each own no separate
+b-tree, because for these tables the primary key **is** the table -- and SQLite
+numbers the one it does create =_2=, since =_1= is notionally that key./
+
+There is no way to emit it today: =MasterEntry::sql= is a =String= where SQLite
+stores NULL for an autoindex, and =TableSpec::autoindexes= would renumber it
+=_1=. Carrying the table without it would declare a =UNIQUE= with no b-tree
+behind it, which is =handoff.org= entry 15 -- a malformed database. **So the
+honest answer is to carry nothing and keep reporting it.**
+
+**** The mutation that survived, and the test that had to be invented for it
+Five mutations; **four were caught and the fifth was not**. Deciding the storage
+shape from *"the table walk returned =Err="* rather than from the DDL passed
+every test in the suite, because on every fixture the two coincide.
+
+***That inference is corrupting, not merely sloppy.*** A table walk can fail
+for reasons unrelated to storage, and re-reading such a table as an index and
+writing it back as one produces bytes that **its own DDL contradicts** -- a
+malformed database this crate would have authored from a source it merely
+received. The distinguishing input had to be built: an index b-tree sitting
+under a DDL that declares an ordinary rowid table. Read by the DDL it is
+uncarryable and reported; read by the failed walk it is carried and rewritten.
+/=a_table_that_claims_a_rowid_is_never_re_read_as_an_index=. A rule with one
+branch tested is a rule half tested -- the same finding as the metadata pair's
+Requirement 98 branch, one milestone earlier./
 
 ** TESTING
 - *The invariant, table-driven, per format*: read a hostile fixture, write the

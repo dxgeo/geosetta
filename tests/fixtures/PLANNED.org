@@ -2,7 +2,7 @@
 #+AUTHOR: Daniel Okuniewicz Jr.
 #+DATE: 2026-08-23
 
-* Designed 2026-08-23, to be built next session
+* Designed 2026-08-23 and 2026-08-25; the built ones say so in their heading
 
 Each entry below is a fixture this tree *needs* and does not have, with what it
 pins and how to build it. They came out of reading the GeoPackage Encoding
@@ -28,6 +28,77 @@ per table, and =MasterObject= gained a =sql= field so that comparison could be
 written at all. **All six registry tables this crate emits match the
 standard exactly**, so the 2026-08-23 spec pass holds up under a check that
 does not depend on anyone remembering what to assert.
+
+** BUILT 2026-08-25: =sqlite_fid_gap.gpkg= extended
+/Designed and built the same day, for the metadata pair. Documented in
+=HOSTILE.org= with the rest of that fixture; the entry is kept here because
+what it pins is a **corpus-wide** gap rather than one file's contents, and that
+is the part worth not rediscovering./
+
+*Not a new file.* The fixture already existed (built 2026-08-25 for
+=handoff.org= entry 19) and needed two more rows in a table it already carried,
+which is why this entry names an extension rather than a =gpkg_= stem of its
+own.
+
+***What is uncovered, and it is the same blindness that hid entry 19.***
+Measured across every =.gpkg= in this tree on 2026-08-25, *every*
+=gpkg_metadata_reference= row is =table=-scoped with a NULL =row_id_value=:
+
+#+begin_src text
+  gdal_hostile        table   row_id_value NULL
+  gdal_linestring_z   table   row_id_value NULL
+  gdal_tiles          table   row_id_value NULL   (x2)
+  sqlite_altered      table   row_id_value NULL
+  sqlite_constraints  table   row_id_value NULL
+  sqlite_contents     table   row_id_value NULL
+  sqlite_fid_gap      table   row_id_value NULL
+  spec_conformant     (the pair present, zero reference rows)
+#+end_src
+
+So not one =row=, =column= or =row/col= reference exists anywhere. **The entire
+class of reference that Requirement 99, decision 27 and
+=container-reconciliation.org= D5 are about is untestable**, and an
+implementation that silently dropped every row-scoped reference -- or carried
+one pointing at a rowid that no longer exists -- would pass the whole suite and
+both oracles in =tests/gpkg_oracles.rs=.
+
+*Why this fixture and not another.* =sqlite_fid_gap.gpkg= is the only file in
+the tree whose feature ids are **not** their positions (=cities= at =1, 9, 40=),
+so it is the only place a row-scoped reference can point at an id that a
+renumbering would move. Putting the reference anywhere else tests that a
+pointer survives a rewrite that was never going to disturb it.
+
+*Build:* extend =build_fid_fixture.sh=, after the =cities= edits, with
+
+#+begin_src text
+  INSERT INTO gpkg_metadata_reference
+    (reference_scope, table_name, column_name, row_id_value, md_file_id)
+    VALUES ('row', 'cities', NULL, 9, 1);
+  INSERT INTO gpkg_metadata_reference
+    (reference_scope, table_name, column_name, row_id_value, md_file_id)
+    VALUES ('column', 'cities', 'name', NULL, 1);
+#+end_src
+
+Point the =row= scope at **9**, the middle gap id: =1= is where a renumbering
+would coincidentally still be right and =40= is where it would obviously be
+wrong, and 9 is the one that is wrong *without looking wrong*. The =column= row
+costs nothing extra and covers the third scope; =name= is a column the write
+keeps, so it exercises the *surviving* branch rather than the dropped one.
+
+*Pins* /(all three now have tests named for them)/: that a carried =row=-scoped reference still names the feature it named,
+that a =column=-scoped reference is validated against =writer::columns_for='s
+output rather than replayed, and -- once =writer::feature_ids= reissues a
+layer's ids because a consumer deleted from the middle -- that the reference
+into that layer is dropped rather than left lying. /That last one is the guard
+=container-reconciliation.org= D5 says belongs wherever a **rowid changes**, and
+this is the fixture that can fail without it./
+
+*Note on the parent file's DDL:* =sqlite_fid_gap.gpkg= inherits
+=gdal_hostile.gpkg='s hand-built =gpkg_metadata_reference=, which declares
+**neither** =crmr_*_fk= foreign key. That is deliberate and is what makes the
+fixture sharp: =foreign_key_check= cannot see a dangling reference here, so
+whatever catches it has to be this crate's own validation. Do not add the
+constraints to the fixture.
 
 ** =sqlite_sequence.gpkg= -- /narrowed 2026-08-23; renamed 2026-08-24; still worth building/
 /Designed as =gpkg_metadata_autoincrement.gpkg=. Renamed when =gdal_tiles.gpkg=

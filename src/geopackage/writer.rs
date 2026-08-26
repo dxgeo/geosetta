@@ -10,9 +10,9 @@ use crate::geometry::{to_wkb, Bbox, Geometry};
 use crate::schema::{columns_for, Cell, Column, ColumnType, DeclType};
 use crate::format::Format;
 use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
-use crate::sqlite::{MasterEntry, TableSpec, Value, autoindex_records, write_database};
+use crate::sqlite::{Autoincrement, MasterEntry, TableSpec, Value, autoindex_records, write_database};
 
-use super::carry::{Carried, Pyramid, UserTable};
+use super::carry::{Carried, Metadata, MetadataReference, Pyramid, UserTable};
 use super::reader::read_layers;
 use super::rtree;
 
@@ -140,6 +140,60 @@ const TILE_MATRIX_DDL: &str = "CREATE TABLE gpkg_tile_matrix (table_name TEXT NO
 /// `gpkg_extensions` — one row per extension in use.
 const EXTENSIONS_DDL: &str = "CREATE TABLE gpkg_extensions (table_name TEXT, column_name TEXT, extension_name TEXT NOT NULL, definition TEXT NOT NULL, scope TEXT NOT NULL, CONSTRAINT ge_tce UNIQUE (table_name, column_name, extension_name))";
 
+/// `gpkg_metadata` — the Metadata extension's document table.
+///
+/// Transcribed from OGC 12-128r19 `spec/core/annexes/extension_metadata.adoc`
+/// at the pinned commit `fe83fdd`, the same source and commit as the tile
+/// registry tables above.
+///
+/// **Constructed rather than carried, and Requirement 93 is why**: "A
+/// GeoPackage MAY contain a table named `gpkg_metadata`. If present it SHALL be
+/// defined per clauses … `gpkg_metadata_sql`." The DDL is normative, so a
+/// source's own spelling is not this crate's to reproduce — GDAL 3.13.2 writes
+/// `id INTEGER CONSTRAINT m_pk PRIMARY KEY ASC NOT NULL`, which is a rowid
+/// alias like the standard's but is not what the clause says. The *rows* are
+/// carried; only the table definition is this crate's.
+///
+/// /Declaring `AUTOINCREMENT` obliges the matching `sqlite_sequence` state, and
+/// a source that never declared it has none to carry — see
+/// [`metadata_tables`], where the mark is computed rather than carried. A
+/// declared `AUTOINCREMENT` with no sequence row is the malformed shape of
+/// `handoff.org` § BUGS FOUND entry 15./
+const METADATA_DDL: &str = "CREATE TABLE gpkg_metadata (id INTEGER PRIMARY KEY AUTOINCREMENT, md_scope TEXT NOT NULL DEFAULT 'dataset', md_standard_uri TEXT NOT NULL, mime_type TEXT NOT NULL DEFAULT 'text/xml', metadata TEXT NOT NULL DEFAULT '')";
+
+/// `gpkg_metadata_reference` — what each metadata document is *about*.
+///
+/// Same source and commit as [`METADATA_DDL`]. **The two `crmr_*_fk` foreign
+/// keys are the reason constructing beats carrying**: they are what lets
+/// `foreign_key_check` see a reference whose `md_file_id` no longer resolves
+/// (Requirement 101), and five of this tree's eight fixtures holding the pair
+/// declare neither, so a verbatim carry would produce output no oracle can
+/// check. /Those five inherit the omission from `gdal_hostile.gpkg`'s
+/// hand-built container content; GDAL's own output declares both — measured
+/// 2026-08-25, and `tests/fixtures/HOSTILE.org` recorded the opposite until
+/// that day./
+const METADATA_REFERENCE_DDL: &str = "CREATE TABLE gpkg_metadata_reference (reference_scope TEXT NOT NULL, table_name TEXT, column_name TEXT, row_id_value INTEGER, timestamp DATETIME NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')), md_file_id INTEGER NOT NULL, md_parent_id INTEGER, CONSTRAINT crmr_mfi_fk FOREIGN KEY (md_file_id) REFERENCES gpkg_metadata(id), CONSTRAINT crmr_mpi_fk FOREIGN KEY (md_parent_id) REFERENCES gpkg_metadata(id))";
+
+/// The `gpkg_extensions` rows Requirement 140 obliges for the Metadata
+/// extension, with the values the annex's *Extension Table Records* fixes:
+/// both rows under `extension_name` `gpkg_metadata`, `column_name` NULL, scope
+/// `read-write`.
+///
+/// The `definition` cell is the one the annex leaves to the implementation —
+/// "a hyperlink that describes the current implementation of this extension" —
+/// and names `http://www.geopackage.org/spec121/#extension_metadata` as the
+/// permalink pattern for 1.2.1. That is the version whose text this crate's
+/// DDL is transcribed from, so it is the link written here. /GDAL writes the
+/// `spec120` form./
+const METADATA_EXTENSION_DEFINITION: &str =
+    "http://www.geopackage.org/spec121/#extension_metadata";
+
+/// The `definition` permalink for the Schema extension's registrations, from
+/// its annex's note — same pattern and same version as
+/// [`METADATA_EXTENSION_DEFINITION`], because the two annexes were read at the
+/// same pinned commit and this crate's DDL for both is transcribed from it.
+const SCHEMA_EXTENSION_DEFINITION: &str = "http://www.geopackage.org/spec121/#extension_schema";
+
 const WGS84_WKT: &str = "GEOGCS[\"WGS 84\",DATUM[\"WGS_1984\",SPHEROID[\"WGS 84\",6378137,298.257223563,AUTHORITY[\"EPSG\",\"7030\"]],AUTHORITY[\"EPSG\",\"6326\"]],PRIMEM[\"Greenwich\",0,AUTHORITY[\"EPSG\",\"8901\"]],UNIT[\"degree\",0.0174532925199433,AUTHORITY[\"EPSG\",\"9122\"]],AUTHORITY[\"EPSG\",\"4326\"]]";
 
 /// Upsert `new_layers` into an existing GeoPackage (or a fresh one if `existing`
@@ -155,6 +209,23 @@ pub fn write_layers(
     rtree: bool,
     envelope: bool,
 ) -> Result<Vec<u8>> {
+    build(&compose_layers(existing, new_layers)?, carried, rtree, envelope)
+}
+
+/// The layer set the output will actually hold: the destination's, with
+/// `new_layers` upserted over it by name.
+///
+/// **Extracted so that nothing else has to reproduce it.** A caller that wants
+/// to know what a write *will* do — [`metadata_drop_warnings`] is the one that
+/// does — has to reason about the same layer set the write reasons about, and
+/// an append makes those two different: the destination supplies layers the
+/// caller never passed. /Reproducing the upsert at the call site is how the
+/// metadata warning shipped claiming "3 of 3 metadata references could not be
+/// carried" about three references the same run then wrote./
+fn compose_layers(
+    existing: Option<&[u8]>,
+    new_layers: &[(String, FeatureCollection)],
+) -> Result<Vec<(String, FeatureCollection)>> {
     let mut layers: Vec<(String, FeatureCollection)> = match existing {
         Some(bytes) => read_layers(bytes)?,
         None => Vec::new(),
@@ -163,7 +234,7 @@ pub fn write_layers(
         layers.retain(|(n, _)| n != name);
         layers.push((name.clone(), fc.clone()));
     }
-    build(&layers, carried, rtree, envelope)
+    Ok(layers)
 }
 
 fn build(
@@ -220,18 +291,35 @@ fn build(
         let names: Vec<String> = layers.iter().map(|(n, _)| n.clone()).collect();
         extension_rows.extend(rtree::extension_rows(&names));
     }
+    if carried.metadata.is_some() {
+        extension_rows.extend(metadata_extension_rows());
+    }
+    // The Schema extension's tables, replayed from the layers' natives. Written
+    // only when some layer carried rows: an empty `gpkg_data_columns` is not
+    // something a producer would have left behind, and D3 says a spoke that
+    // recovered nothing writes nothing.
+    //
+    // Built *before* `gpkg_extensions` is pushed because it decides what goes
+    // in it — Requirement 141 registers the tables that exist — but pushed
+    // after, which is the position it has always had.
+    let schema_tables = schema_extension_tables(layers);
+    extension_rows.extend(schema_extension_rows(&schema_tables));
     if !extension_rows.is_empty() {
         specs.push(extensions_table(extension_rows));
     }
-    // The Schema extension's two tables, replayed from the layers' natives.
-    // Written only when some layer carried rows: an empty `gpkg_data_columns`
-    // is not something a producer would have left behind, and D3 says a spoke
-    // that recovered nothing writes nothing.
-    specs.extend(schema_extension_tables(layers));
+    specs.extend(schema_tables);
     // Computed once per layer and shared: the feature table's rowids and the
     // R*Tree's leaf entries have to be the same numbers or the index points at
     // rows that do not exist.
     let ids: Vec<Vec<i64>> = layers.iter().map(|(_, fc)| feature_ids(fc)).collect();
+    // The Metadata extension's pair, after `ids` because a `row`-scoped
+    // reference is checked against the very numbers the feature tables are
+    // about to be written with. What is dropped here is reported by
+    // `super::metadata_drop_warnings`, which runs the same rule.
+    if let Some(metadata) = &carried.metadata {
+        let (references, _dropped) = retained_references(metadata, layers, &ids, carried);
+        specs.extend(metadata_tables(metadata, &references));
+    }
     for (((name, fc), &srs_id), ids) in layers.iter().zip(&srs.per_layer).zip(&ids) {
         specs.push(feature_table(name, fc, srs_id, envelope, ids));
     }
@@ -274,12 +362,23 @@ fn build(
     write_database(&specs, &master, APPLICATION_ID, USER_VERSION)
 }
 
-/// One `gpkg_extensions` registration row. Every extension in use (RTree,
-/// R5's CRS-WKT) contributes rows of this shape, combined by [`build`] into a
-/// single `gpkg_extensions` table.
+/// One `gpkg_extensions` registration row.
+///
+/// A GeoPackage has one `gpkg_extensions` table however many extensions are in
+/// use, so each contributes rows of this shape and [`build`] combines them into
+/// a single table. Three contribute today: the R\*Tree under `--rtree`
+/// ([`rtree::extension_rows`]), the Metadata extension when a pair is carried
+/// ([`metadata_extension_rows`], Requirement 140), and the Schema extension
+/// whenever a layer's column declarations are written
+/// ([`schema_extension_rows`], Requirement 141).
 pub(crate) struct ExtensionRow {
     pub(crate) table_name: String,
-    pub(crate) column_name: String,
+    /// NULL for a *table*-scoped registration, which is what the Metadata
+    /// extension's two rows are (Requirement 140's record table writes them
+    /// null, and GDAL stores NULL — measured 2026-08-25). An empty string
+    /// would be a different value: `ge_tce UNIQUE (table_name, column_name,
+    /// extension_name)` distinguishes them, and so does every consumer.
+    pub(crate) column_name: Option<String>,
     pub(crate) extension_name: String,
     pub(crate) definition: String,
     pub(crate) scope: String,
@@ -427,7 +526,7 @@ fn extensions_table(rows: Vec<ExtensionRow>) -> TableSpec {
                     (i + 1) as i64,
                     vec![
                         Value::Text(r.table_name),
-                        Value::Text(r.column_name),
+                        r.column_name.map_or(Value::Null, Value::Text),
                         Value::Text(r.extension_name),
                         Value::Text(r.definition),
                         Value::Text(r.scope),
@@ -443,6 +542,369 @@ fn extensions_table(rows: Vec<ExtensionRow>) -> TableSpec {
         autoincrement: None,
         rows,
     }
+}
+
+/// One carried metadata reference that does not reach the output, and why.
+///
+/// Kept as data rather than formatted on the spot so the same computation
+/// serves both the write and `metadata_drop_warnings` — a rule
+/// evaluated in two places is a rule that drifts, and this one decides what is
+/// destroyed.
+pub(crate) struct DroppedReference {
+    pub(crate) scope: String,
+    pub(crate) table_name: Option<String>,
+    pub(crate) reason: &'static str,
+}
+
+/// Which carried `gpkg_metadata_reference` rows reach the output, and why the
+/// rest do not.
+///
+/// **This is the layer-coupled rule, and it is the whole difference between
+/// this member and everything else `carry.rs` holds.** A pyramid or a user
+/// table is valid whatever the write produces; a reference names a table, a
+/// column and a rowid, so it is valid only against *this* write. Decision 23
+/// forbids tracking that — `FeatureCollection::features` is a public field a
+/// consumer mutates directly — so it is computed here, at write, by comparing
+/// each reference with what is actually going into the file.
+///
+/// # What each scope is checked against
+///
+/// | scope | check | requirement |
+/// |---|---|---|
+/// | `geopackage` | nothing; the three locating columns are forced NULL | 97, 98, 99 |
+/// | `table` | `table_name` is registered in the output's `gpkg_contents` | 97 |
+/// | `column` | that, and the column exists in what is written | 97, 98 |
+/// | `row` | that, and the rowid exists in what is written | 97, 99 |
+/// | `row/col` | all of the above | 97, 98, 99 |
+///
+/// ***The authority for `table_name` is `gpkg_contents`, not the layer set.***
+/// Requirement 97 says the value "references a value in the `gpkg_contents`
+/// `table_name` column", and since 2026-08-24 this crate registers *carried
+/// tile pyramids* there too. Checking against the layers alone would drop
+/// `gdal_tiles.gpkg`'s reference to `imagery` from a file that still contains
+/// `imagery` — a valid reference destroyed by a check that was stricter than
+/// the standard.
+///
+/// # Why a reference into carried content is kept without inspecting it
+///
+/// A pyramid is carried **verbatim** — its DDL, its rows and its rowids — so
+/// the table the reference identifies is, column for column and rowid for
+/// rowid, the table the source had. The reference is therefore exactly as
+/// valid in the output as it was in the source. Where the source itself was
+/// wrong, that is a dangling reference this crate did not create and does not
+/// repair, on the same terms as [`super::carry::Pyramid::srs`].
+///
+/// A written *layer* is the opposite case: its columns come from
+/// [`crate::schema::columns_for`] and its rowids from [`feature_ids`], and
+/// neither need match what the source held.
+pub(crate) fn retained_references(
+    metadata: &Metadata,
+    layers: &[(String, FeatureCollection)],
+    ids: &[Vec<i64>],
+    carried: &Carried,
+) -> (Vec<MetadataReference>, Vec<DroppedReference>) {
+    let record_ids: Vec<i64> = metadata.records.iter().map(|r| r.id).collect();
+    let mut kept = Vec::new();
+    let mut dropped = Vec::new();
+
+    for reference in &metadata.references {
+        let mut r = reference.clone();
+        let drop = |dropped: &mut Vec<DroppedReference>, reason| {
+            dropped.push(DroppedReference {
+                scope: reference.scope.clone(),
+                table_name: reference.table_name.clone(),
+                reason,
+            });
+        };
+
+        // Requirement 96: five values, lowercase. Anything else names no scope
+        // this can check, so there is no way to carry it correctly.
+        if !matches!(r.scope.as_str(), "geopackage" | "table" | "column" | "row" | "row/col") {
+            drop(&mut dropped, "its reference_scope is not one the standard defines");
+            continue;
+        }
+        // Requirement 101. Kept ahead of the scope work because a reference to
+        // no document is not a reference, whatever it points at.
+        if !record_ids.contains(&r.md_file_id) {
+            drop(&mut dropped, "its md_file_id names no gpkg_metadata row");
+            continue;
+        }
+        // Requirement 102: a parent that is not a record, or is this row's own
+        // `md_file_id`, is normalised to NULL rather than costing the whole
+        // reference. NULL is the standard's own spelling for "roots a
+        // hierarchy", so the result is conformant and loses only the part that
+        // was invalid — the reference still says which document is about what.
+        if let Some(parent) = r.md_parent_id
+            && (!record_ids.contains(&parent) || parent == r.md_file_id)
+        {
+            r.md_parent_id = None;
+        }
+
+        // Requirements 97, 98 and 99 each say which columns SHALL be NULL for
+        // which scopes. Normalised rather than propagated: a stray value in a
+        // column the standard requires empty is the source's non-conformance,
+        // and copying it forward would make it this crate's output's.
+        let (wants_column, wants_row) = match r.scope.as_str() {
+            "geopackage" => {
+                r.table_name = None;
+                r.column_name = None;
+                r.row_id_value = None;
+                kept.push(r);
+                continue;
+            }
+            "table" => (false, false),
+            "column" => (true, false),
+            "row" => (false, true),
+            _ => (true, true),
+        };
+        if !wants_column {
+            r.column_name = None;
+        }
+        if !wants_row {
+            r.row_id_value = None;
+        }
+
+        // Requirement 97 for every non-`geopackage` scope.
+        let Some(table) = r.table_name.clone() else {
+            drop(&mut dropped, "it names no table");
+            continue;
+        };
+        let layer = layers.iter().position(|(name, _)| *name == table);
+        let pyramid = carried.pyramids.iter().any(|p| p.name == table);
+        if layer.is_none() && !pyramid {
+            drop(&mut dropped, "the table it names is not in the output");
+            continue;
+        }
+        if wants_column && r.column_name.is_none() {
+            drop(&mut dropped, "its scope requires a column_name and it has none");
+            continue;
+        }
+        if wants_row && r.row_id_value.is_none() {
+            drop(&mut dropped, "its scope requires a row_id_value and it has none");
+            continue;
+        }
+        // Carried content is the source's table unchanged, so there is nothing
+        // further to check — see this function's doc comment.
+        if let Some(i) = layer {
+            let (_, fc) = &layers[i];
+            if let Some(column) = &r.column_name {
+                // `fid` and `geom` are written by `feature_table` ahead of the
+                // properties, so they are columns of the output even though no
+                // property is named for them.
+                let known = column == "fid"
+                    || column == "geom"
+                    || crate::schema::columns_for(fc).iter().any(|c| c.name == *column);
+                if !known {
+                    drop(&mut dropped, "the column it names is not in the output");
+                    continue;
+                }
+            }
+            if let Some(rowid) = r.row_id_value
+                && !ids.get(i).is_some_and(|ids| ids.contains(&rowid))
+            {
+                drop(&mut dropped, "the feature it names is not in the output");
+                continue;
+            }
+        }
+        kept.push(r);
+    }
+    (kept, dropped)
+}
+
+/// What a carried metadata pair loses to *this* write, as warnings.
+///
+/// ***The first content in this crate that can be carried in **part**.*** The
+/// container survey's vocabulary is carried-or-destroyed: a table either comes
+/// back or it does not. A reference is finer than that — three may survive and
+/// one be dropped because the layer it named was not selected — and neither
+/// existing precedent covers the case. `gpkg_ogr_contents` is reported
+/// silently because it is *derived* and nothing is lost; the R\*Tree earns a
+/// message because `--rtree` is a **remedy**. A dropped reference has no
+/// remedy and does lose information, so it is reported and the reason is
+/// named: the drop follows from a choice the caller made, which is what makes
+/// the message worth reading.
+///
+/// Recomputes `feature_ids` rather than being handed them, so that one rule —
+/// `retained_references` — decides both what is written and what is
+/// reported. `feature_ids` is a pure function of the collection, so the two
+/// calls cannot disagree.
+pub fn metadata_drop_warnings(
+    existing: Option<&[u8]>,
+    new_layers: &[(String, FeatureCollection)],
+    carried: &Carried,
+) -> Vec<String> {
+    let Some(metadata) = &carried.metadata else {
+        return Vec::new();
+    };
+    // The *output's* layer set, not the caller's — see `compose_layers`. On an
+    // append the destination supplies layers this run never passed, and a
+    // reference naming one of them survives.
+    let Ok(layers) = compose_layers(existing, new_layers) else {
+        // An unreadable destination is the write's error to report, not this
+        // warning's to guess at.
+        return Vec::new();
+    };
+    let layers = &layers[..];
+    let ids: Vec<Vec<i64>> = layers.iter().map(|(_, fc)| feature_ids(fc)).collect();
+    let (kept, dropped) = retained_references(metadata, layers, &ids, carried);
+    if dropped.is_empty() {
+        return Vec::new();
+    }
+    let mut named: Vec<String> = dropped
+        .iter()
+        .take(MAX_NAMED_REFERENCES)
+        .map(|d| match &d.table_name {
+            Some(table) => format!("{} scope on \"{table}\" ({})", d.scope, d.reason),
+            None => format!("{} scope ({})", d.scope, d.reason),
+        })
+        .collect();
+    if dropped.len() > MAX_NAMED_REFERENCES {
+        named.push(format!("and {} more", dropped.len() - MAX_NAMED_REFERENCES));
+    }
+    vec![format!(
+        "the source's gpkg_metadata records are carried, but {} of {} metadata \
+         reference{} could not be: {}. The documents themselves are kept — a \
+         gpkg_metadata row nothing points at is still conformant — so what is lost is \
+         what each dropped reference said the document was about. \
+         (plans/same-format-fidelity.org, § The metadata pair.)",
+        dropped.len(),
+        dropped.len() + kept.len(),
+        if dropped.len() + kept.len() == 1 { "" } else { "s" },
+        named.join(", ")
+    )]
+}
+
+/// How many dropped references are named individually before the message
+/// switches to a count, on the same reasoning as `super::container`'s
+/// `MAX_NAMED`: past a handful the list stops informing and starts scrolling.
+const MAX_NAMED_REFERENCES: usize = 4;
+
+/// The Metadata extension's two tables, built from carried rows.
+///
+/// Both are emitted whenever either would be, because Requirement 95 makes
+/// them a pair — including the case where every reference was dropped, which
+/// yields `gpkg_metadata_reference` with no rows rather than no table.
+///
+/// Neither carries an index: `gpkg_metadata`'s only key is its rowid alias and
+/// `gpkg_metadata_reference` declares none at all, which is measured across
+/// every fixture in this tree and is why nothing here re-packs anything.
+fn metadata_tables(metadata: &Metadata, references: &[MetadataReference]) -> [TableSpec; 2] {
+    let records: Vec<(i64, Vec<Value>)> = metadata
+        .records
+        .iter()
+        .map(|record| {
+            let mut values = vec![Value::Null]; // `id`, carried by the rowid.
+            values.extend(record.values.iter().cloned());
+            (record.id, values)
+        })
+        .collect();
+    // The DDL this crate writes declares `AUTOINCREMENT`, so the matching
+    // `sqlite_sequence` state is not optional — see `METADATA_DDL`. It is
+    // *computed* rather than carried: a GDAL source declared no AUTOINCREMENT
+    // and so has no mark to carry, and the high-water mark of the rows being
+    // written is the honest value for a table this writer is constructing.
+    let autoincrement = Some(match records.iter().map(|(id, _)| *id).max() {
+        Some(high) => Autoincrement::HighWater(high),
+        None => Autoincrement::Declared,
+    });
+    let reference_rows: Vec<(i64, Vec<Value>)> = references
+        .iter()
+        .enumerate()
+        .map(|(i, r)| {
+            (
+                (i + 1) as i64,
+                vec![
+                    Value::Text(r.scope.clone()),
+                    r.table_name.clone().map_or(Value::Null, Value::Text),
+                    r.column_name.clone().map_or(Value::Null, Value::Text),
+                    r.row_id_value.map_or(Value::Null, Value::Int),
+                    r.timestamp.clone(),
+                    Value::Int(r.md_file_id),
+                    r.md_parent_id.map_or(Value::Null, Value::Int),
+                ],
+            )
+        })
+        .collect();
+    [
+        TableSpec {
+            name: "gpkg_metadata".into(),
+            sql: METADATA_DDL.into(),
+            autoindexes: Vec::new(),
+            autoincrement,
+            rows: records,
+        },
+        TableSpec {
+            name: "gpkg_metadata_reference".into(),
+            sql: METADATA_REFERENCE_DDL.into(),
+            autoindexes: Vec::new(),
+            autoincrement: None,
+            rows: reference_rows,
+        },
+    ]
+}
+
+/// The `gpkg_extensions` rows Requirement 141 obliges for the Schema
+/// extension — one per Schema table actually written.
+///
+/// ***Registering an extension's tables is not bookkeeping; Requirement 59
+/// makes it the thing that says what the file is.*** "In an Extended
+/// GeoPackage, every extension SHALL be registered in a corresponding row in
+/// the `gpkg_extensions` table … the absence of rows in the `gpkg_extensions`
+/// table SHALL indicate that the file is a GeoPackage (as opposed to an
+/// Extended GeoPackage)." This crate has written `gpkg_data_columns` since
+/// 2026-08-21 and registered nothing, so its output declared itself a plain
+/// GeoPackage while carrying an extension's tables. **Defect 6's shape
+/// exactly**: output that does not state what the standard says it states.
+///
+/// # Why this registers what is written rather than the annex's two rows
+///
+/// Requirement 141's record table lists `gpkg_data_columns` *and*
+/// `gpkg_data_column_constraints`, and `schema_extension_tables` writes the
+/// second only when some layer carried a constraint. Registering an absent
+/// table would point at nothing: Requirement 60 lets `table_name` "reference
+/// new tables required by that extension", and a table the file does not
+/// contain is not required by anything.
+///
+/// **The Schema annex permits that, and the Metadata annex would not**, which
+/// is the distinction worth keeping. Requirements 103 and 107 each say a
+/// GeoPackage *MAY* contain their table, independently — there is no analogue
+/// of Requirement 95, which makes `gpkg_metadata` and
+/// `gpkg_metadata_reference` a pair that travels together or not at all. So
+/// `gpkg_data_columns` alone is a conformant file and one registration is the
+/// honest description of it.
+fn schema_extension_rows(tables: &[TableSpec]) -> Vec<ExtensionRow> {
+    tables
+        .iter()
+        .map(|spec| ExtensionRow {
+            table_name: spec.name.clone(),
+            // NULL: the registration is of the table, not of a column in it
+            // (Requirement 61 permits NULL, and the annex's record table
+            // writes it).
+            column_name: None,
+            extension_name: "gpkg_schema".into(),
+            definition: SCHEMA_EXTENSION_DEFINITION.into(),
+            scope: "read-write".into(),
+        })
+        .collect()
+}
+
+/// The two `gpkg_extensions` rows Requirement 140 obliges when the pair is
+/// written.
+fn metadata_extension_rows() -> Vec<ExtensionRow> {
+    ["gpkg_metadata", "gpkg_metadata_reference"]
+        .into_iter()
+        .map(|table_name| ExtensionRow {
+            table_name: table_name.into(),
+            // NULL, per the annex's record table — a table-scoped
+            // registration names no column. This is the first such row this
+            // crate writes, and why `ExtensionRow::column_name` is an
+            // `Option`.
+            column_name: None,
+            extension_name: "gpkg_metadata".into(),
+            definition: METADATA_EXTENSION_DEFINITION.into(),
+            scope: "read-write".into(),
+        })
+        .collect()
 }
 
 /// A `gpkg_spatial_ref_sys` row for a CRS beyond the three mandatory defaults.
@@ -1500,6 +1962,496 @@ mod tests {
         assert_eq!(ids, [1, 2, 3], "a fresh dense sequence, not the stale numbering");
     }
 
+    /// Build a layer carrying a `gpkg_data_columns` native, with or without a
+    /// constraint — which is what decides whether the *second* Schema table is
+    /// written, and so how many registrations Requirement 141 obliges.
+    fn layer_with_schema_native(constrained: bool) -> FeatureCollection {
+        let mut layer = fc(vec![Feature {
+            geometry: point(1.0, 2.0),
+            properties: vec![("name".into(), JsonValue::String("a".into()))],
+            native: None,
+        }]);
+        layer.native = Some(crate::Native::new(
+            Format::Gpkg,
+            crate::NativePayload::Gpkg(crate::GpkgNative {
+                identifier: None,
+                description: None,
+                last_change: None,
+                data_columns: vec![crate::GpkgDataColumn {
+                    column_name: "name".into(),
+                    name: Some("Name".into()),
+                    title: None,
+                    description: None,
+                    mime_type: None,
+                    constraint_name: constrained.then(|| "nonempty".to_string()),
+                }],
+                constraints: if constrained {
+                    vec![crate::GpkgConstraint {
+                        constraint_name: "nonempty".into(),
+                        constraint_type: "glob".into(),
+                        value: Some("*".into()),
+                        min: None,
+                        min_is_inclusive: None,
+                        max: None,
+                        max_is_inclusive: None,
+                        description: None,
+                    }]
+                } else {
+                    Vec::new()
+                },
+            }),
+        ));
+        layer
+    }
+
+    /// Every `gpkg_extensions` row in `bytes` as
+    /// `(table_name, column_name, extension_name, scope)`.
+    fn extension_rows_in(bytes: &[u8]) -> Vec<(String, String, String, String)> {
+        let db = crate::sqlite::Database::open(bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let Some(t) = tables.iter().find(|t| t.name == "gpkg_extensions") else {
+            return Vec::new();
+        };
+        let at = |c: &str| t.columns.iter().position(|n| n == c).unwrap();
+        let (tn, cn, en, sc) =
+            (at("table_name"), at("column_name"), at("extension_name"), at("scope"));
+        db.read_rows(t)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let cell = |i: usize| match &row[i] {
+                    Value::Text(s) => s.clone(),
+                    Value::Null => "-".to_string(),
+                    other => panic!("unexpected cell {other:?}"),
+                };
+                (cell(tn), cell(cn), cell(en), cell(sc))
+            })
+            .collect()
+    }
+
+    /// ***Writing an extension's tables without registering them makes the file
+    /// lie about what it is*** — Requirement 59, and this crate did it from
+    /// 2026-08-21 until 2026-08-25.
+    ///
+    /// "In an Extended GeoPackage, every extension SHALL be registered in a
+    /// corresponding row in the `gpkg_extensions` table … the absence of rows
+    /// in the `gpkg_extensions` table SHALL indicate that the file is a
+    /// GeoPackage (as opposed to an Extended GeoPackage)." So an output holding
+    /// `gpkg_data_columns` and no registration declares itself *plain* while
+    /// carrying an extension's table. **Defect 6's shape**: output that does
+    /// not state what the standard says it states, and no oracle in this tree
+    /// objected because the file is perfectly well-formed SQLite.
+    ///
+    /// Requirement 141 fixes the values; this asserts them, `column_name`
+    /// included — NULL, not the empty string (Requirement 61 permits NULL and
+    /// the annex's record table writes it).
+    #[test]
+    fn writing_the_schema_extension_registers_it() {
+        let layer = layer_with_schema_native(true);
+        let bytes = write_layers(
+            None,
+            &[("places".into(), layer)],
+            &crate::geopackage::Carried::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        let rows = extension_rows_in(&bytes);
+        let schema: Vec<_> = rows.iter().filter(|(_, _, name, _)| name == "gpkg_schema").collect();
+        assert_eq!(schema.len(), 2, "both Schema tables are registered: {rows:?}");
+        for (table, column, _, scope) in &schema {
+            assert_eq!(column, "-", "a table-scoped registration names no column");
+            assert_eq!(scope, "read-write");
+            assert!(
+                table == "gpkg_data_columns" || table == "gpkg_data_column_constraints",
+                "{table}"
+            );
+        }
+    }
+
+    /// ***Only the Schema tables actually written are registered, and that is
+    /// where this extension parts company with the Metadata one.***
+    ///
+    /// `schema_extension_tables` writes `gpkg_data_column_constraints` only
+    /// when some layer carried a constraint, so a layer with a plain column
+    /// declaration produces one table — and registering the absent one would
+    /// point at nothing (Requirement 60 lets `table_name` reference "new tables
+    /// required by that extension", and a table the file does not contain is
+    /// not required).
+    ///
+    /// **The annexes differ and that is the whole reason this is not the
+    /// metadata rule.** Requirements 103 and 107 each say a GeoPackage *MAY*
+    /// contain their table, independently; Requirement 95 makes `gpkg_metadata`
+    /// and `gpkg_metadata_reference` a pair that travels together or not at
+    /// all. Reading one annex and applying it to the other would have been
+    /// wrong in both directions.
+    #[test]
+    fn an_unwritten_schema_table_is_not_registered() {
+        let layer = layer_with_schema_native(false);
+        let bytes = write_layers(
+            None,
+            &[("places".into(), layer)],
+            &crate::geopackage::Carried::default(),
+            false,
+            false,
+        )
+        .unwrap();
+
+        // The premise: one Schema table, not two.
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let names: Vec<String> = db.tables().unwrap().into_iter().map(|t| t.name).collect();
+        assert!(names.iter().any(|n| n == "gpkg_data_columns"), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n == "gpkg_data_column_constraints"),
+            "no constraint was carried, so the table is not written: {names:?}"
+        );
+
+        let schema: Vec<_> = extension_rows_in(&bytes)
+            .into_iter()
+            .filter(|(_, _, name, _)| name == "gpkg_schema")
+            .collect();
+        assert_eq!(
+            schema.iter().map(|(t, _, _, _)| t.as_str()).collect::<Vec<_>>(),
+            ["gpkg_data_columns"],
+            "a registration must not name a table the file does not contain"
+        );
+    }
+
+    // --- the metadata pair -------------------------------------------------
+
+    /// Every `gpkg_metadata_reference` row in the output, as
+    /// `(scope, table_name, column_name, row_id_value)`.
+    fn references_in(bytes: &[u8]) -> Vec<(String, String, String, String)> {
+        let db = crate::sqlite::Database::open(bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let Some(t) = tables.iter().find(|t| t.name == "gpkg_metadata_reference") else {
+            return Vec::new();
+        };
+        let at = |t: &crate::sqlite::Table, c: &str| t.columns.iter().position(|n| n == c).unwrap();
+        let (s, tn, cn, ri) = (
+            at(t, "reference_scope"),
+            at(t, "table_name"),
+            at(t, "column_name"),
+            at(t, "row_id_value"),
+        );
+        db.read_rows(t)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let cell = |i: usize| match &row[i] {
+                    Value::Text(s) => s.clone(),
+                    Value::Int(n) => n.to_string(),
+                    Value::Null => "-".to_string(),
+                    other => panic!("unexpected cell {other:?}"),
+                };
+                (cell(s), cell(tn), cell(cn), cell(ri))
+            })
+            .collect()
+    }
+
+    /// How many `gpkg_metadata` rows the output holds.
+    fn metadata_rows(bytes: &[u8]) -> usize {
+        let db = crate::sqlite::Database::open(bytes).unwrap();
+        let tables = db.tables().unwrap();
+        tables
+            .iter()
+            .find(|t| t.name == "gpkg_metadata")
+            .map(|t| db.read_rows(t).unwrap().len())
+            .unwrap_or(0)
+    }
+
+    /// ***A `row`-scoped reference still names the feature it named.***
+    ///
+    /// The two halves of this have to hold *together*, which is why one test
+    /// asserts both: decision 27 carries `cities`'s ids as 1, 9, 40, and the
+    /// reference into it points at **9**. Carry the ids without the reference
+    /// and the file forgets what the document was about; carry the reference
+    /// without the ids and it points at a row that is no longer the one it
+    /// meant. /Before 2026-08-25 no fixture in this tree held a row-scoped
+    /// reference at all, so neither failure was observable./
+    #[test]
+    fn a_row_scoped_reference_still_names_the_feature_it_named() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+
+        let refs = references_in(&bytes);
+        assert!(
+            refs.contains(&("row".into(), "cities".into(), "-".into(), "9".into())),
+            "the row-scoped reference did not survive: {refs:?}"
+        );
+        // And the feature it names is in the output under that same id.
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let cities = tables.iter().find(|t| t.name == "cities").unwrap();
+        let ids: Vec<i64> = db
+            .read_rows(cities)
+            .unwrap()
+            .iter()
+            .map(|row| match row[cities.rowid_alias().unwrap()] {
+                Value::Int(n) => n,
+                ref other => panic!("a non-integer fid: {other:?}"),
+            })
+            .collect();
+        assert!(ids.contains(&9), "the reference names a rowid the table does not have: {ids:?}");
+    }
+
+    /// ***A reference into a layer whose ids were reissued is dropped.***
+    ///
+    /// **Decision 27 did not close this and the write-up nearly said it had.**
+    /// `feature_ids` still falls back to a dense sequence for the whole layer
+    /// when a consumer's edit leaves the carried ids not strictly ascending —
+    /// and *that* is a renumbering with live row-scoped references pointing
+    /// into it, on the plain one-container path.
+    ///
+    /// `container-reconciliation.org` D5 states the general form: the
+    /// `row_id_value` guard belongs wherever a **rowid changes**, not wherever
+    /// a merge happens. This is that guard.
+    ///
+    /// /Nothing else would catch it. The DDL declares no foreign key on
+    /// `row_id_value`, so `foreign_key_check` cannot see the dangle and
+    /// `integrity_check` cannot either — the file is not malformed, merely
+    /// lying./
+    #[test]
+    fn a_row_scoped_reference_is_dropped_when_the_layer_is_renumbered() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let mut layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        // The edit a consumer makes directly, with nothing to hook: after this
+        // the carried ids run 40, 9, 1 and the whole layer is reissued 1, 2, 3.
+        let (_, fc) = layers.iter_mut().find(|(n, _)| n == "cities").unwrap();
+        fc.features.reverse();
+
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let refs = references_in(&bytes);
+        assert!(
+            !refs.iter().any(|(scope, _, _, _)| scope == "row"),
+            "a row-scoped reference survived a renumbering that invalidated it: {refs:?}"
+        );
+        // The `table`- and `column`-scoped references are untouched: renumbering
+        // says nothing about which table exists or which columns it has.
+        assert!(
+            refs.iter().any(|(scope, _, _, _)| scope == "table")
+                && refs.iter().any(|(scope, _, _, _)| scope == "column"),
+            "renumbering dropped references that do not depend on a rowid: {refs:?}"
+        );
+    }
+
+    /// ***A `column`-scoped reference to a column the write does not produce is
+    /// dropped*** — Requirement 98's other branch.
+    ///
+    /// The fixture's own column reference names `name`, which survives, so it
+    /// exercises only the *keeping* half. **A rule with one branch tested is a
+    /// rule half tested**, and this one is the D14 precedent applied to a
+    /// second table: `ARROW:schema` is replayed only while the column names
+    /// still match, and a metadata reference is kept on the same terms.
+    ///
+    /// /Added after mutation-checking found that deleting the column check
+    /// broke no test at all./
+    #[test]
+    fn a_column_scoped_reference_to_a_missing_column_is_dropped() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let mut carried = crate::geopackage::read_container(SRC).unwrap();
+        let metadata = carried.metadata.as_mut().unwrap();
+        let reference =
+            metadata.references.iter_mut().find(|r| r.scope == "column").unwrap();
+        assert_eq!(reference.column_name.as_deref(), Some("name"), "the premise");
+        reference.column_name = Some("a_column_no_layer_has".into());
+
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let refs = references_in(&bytes);
+        assert!(
+            !refs.iter().any(|(scope, _, _, _)| scope == "column"),
+            "a reference to a column that is not written survived: {refs:?}"
+        );
+        // The other two do not depend on a column and are untouched.
+        assert_eq!(refs.len(), 2, "only the column reference should go: {refs:?}");
+    }
+
+    /// ***A reference to a carried tile pyramid survives, and the authority is
+    /// `gpkg_contents`.***
+    ///
+    /// Requirement 97 says `table_name` "references a value in the
+    /// `gpkg_contents` `table_name` column" — not "names a feature layer".
+    /// Since 2026-08-24 this crate registers carried pyramids there, so
+    /// `gdal_tiles.gpkg`'s reference to `imagery` is valid in the output and
+    /// must be kept.
+    ///
+    /// /This test exists because the plan's first draft wrote the check against
+    /// the layer set, which would have destroyed this reference from a file
+    /// that still contains `imagery`. Caught by reading the normative text
+    /// rather than by anything failing./
+    #[test]
+    fn a_reference_to_a_carried_pyramid_is_not_a_reference_to_nothing() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/gdal_tiles.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        assert!(
+            !layers.iter().any(|(name, _)| name == "imagery"),
+            "the point of this fixture is that `imagery` is not a layer"
+        );
+
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let refs = references_in(&bytes);
+        assert!(
+            refs.iter().any(|(scope, table, _, _)| scope == "table" && table == "imagery"),
+            "the pyramid's own metadata reference was dropped: {refs:?}"
+        );
+    }
+
+    /// ***The document outlives the reference that named it*** — D12.
+    ///
+    /// Dropping a reference must not cascade into the `gpkg_metadata` row it
+    /// pointed at. Requirement 95 makes the two tables a pair and says nothing
+    /// about every record being referenced; `spec_conformant.gpkg` holds the
+    /// pair with zero references and is the fixture built from the normative
+    /// text. The foreign keys agree: both run reference → metadata, so
+    /// deleting a record can break a surviving reference and deleting a
+    /// reference can never break a record.
+    #[test]
+    fn dropping_every_reference_keeps_the_metadata_it_referenced() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        // Write only `second`: every reference in the fixture names `cities`.
+        let only_second: Vec<_> =
+            layers.iter().filter(|(n, _)| n == "second").cloned().collect();
+        assert_eq!(only_second.len(), 1);
+
+        let bytes = write_layers(None, &only_second, &carried, false, false).unwrap();
+        assert_eq!(references_in(&bytes).len(), 0, "the references should all be gone");
+        assert_eq!(metadata_rows(&bytes), 1, "the document itself must survive");
+        // Requirement 95: the pair travels together, so the reference table is
+        // still there — empty, not absent.
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let names: Vec<String> =
+            db.tables().unwrap().into_iter().map(|t| t.name).collect();
+        assert!(names.iter().any(|n| n == "gpkg_metadata"), "{names:?}");
+        assert!(names.iter().any(|n| n == "gpkg_metadata_reference"), "{names:?}");
+    }
+
+    /// ***And the drop is reported*** — D13, the first content this crate can
+    /// carry in *part*.
+    #[test]
+    fn a_partially_carried_pair_says_what_it_lost() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let only_second: Vec<_> =
+            layers.iter().filter(|(n, _)| n == "second").cloned().collect();
+
+        let warnings =
+            crate::geopackage::metadata_drop_warnings(None, &only_second, &carried);
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("3 of 3"), "{}", warnings[0]);
+        assert!(warnings[0].contains("cities"), "{}", warnings[0]);
+
+        // And a write that loses nothing says nothing — the noise bar in
+        // `plans/lossy-conversion-warnings.org` § THE RULE.
+        assert!(crate::geopackage::metadata_drop_warnings(None, &layers, &carried).is_empty());
+    }
+
+    /// ***And an append counts the destination's layers, because the write
+    /// does.***
+    ///
+    /// `write_layers` upserts `new_layers` over whatever the destination holds,
+    /// so a reference naming a layer only the *destination* has still survives.
+    /// A warning computed from `new_layers` alone therefore reports losses the
+    /// same run does not incur — which is exactly what this shipped doing:
+    /// "3 of 3 metadata references could not be" about three references that
+    /// were written into the file.
+    ///
+    /// /Both callers now go through `compose_layers`, so the message and the
+    /// output cannot disagree without the shared function being wrong./
+    #[test]
+    fn an_append_does_not_report_losses_the_destination_prevents() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let pick = |want: &str| -> Vec<(String, FeatureCollection)> {
+            layers.iter().filter(|(n, _)| n == want).cloned().collect()
+        };
+
+        // A destination holding `cities` — which every reference names.
+        let destination =
+            write_layers(None, &pick("cities"), &Carried::default(), false, false).unwrap();
+        // Appending `second` into it: the output will hold both layers.
+        let appending = pick("second");
+
+        let warnings = crate::geopackage::metadata_drop_warnings(
+            Some(&destination),
+            &appending,
+            &carried,
+        );
+        assert!(warnings.is_empty(), "nothing is lost on this append: {warnings:?}");
+
+        // And the file agrees, which is the half that was already correct.
+        let bytes =
+            write_layers(Some(&destination), &appending, &carried, false, false).unwrap();
+        assert_eq!(references_in(&bytes).len(), 3, "all three references are written");
+    }
+
+    /// ***Requirement 140's two registration rows are written, with a NULL
+    /// `column_name`.***
+    ///
+    /// The annex's record table writes both rows' `column_name` as null and
+    /// GDAL stores NULL (measured 2026-08-25). An empty string is a different
+    /// value — `ge_tce UNIQUE (table_name, column_name, extension_name)` tells
+    /// them apart, and so does every consumer — which is why
+    /// `ExtensionRow::column_name` became an `Option`.
+    #[test]
+    fn writing_the_metadata_pair_registers_the_extension() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let ext = tables.iter().find(|t| t.name == "gpkg_extensions").expect("registered");
+        let at = |c: &str| ext.columns.iter().position(|n| n == c).unwrap();
+        let rows = db.read_rows(ext).unwrap();
+        let registered: Vec<&Vec<Value>> = rows
+            .iter()
+            .filter(|r| matches!(&r[at("extension_name")], Value::Text(n) if n == "gpkg_metadata"))
+            .collect();
+        assert_eq!(registered.len(), 2, "both tables are registered: {rows:?}");
+        for row in registered {
+            assert!(
+                matches!(row[at("column_name")], Value::Null),
+                "a table-scoped registration names no column: {row:?}"
+            );
+            assert!(matches!(&row[at("scope")], Value::Text(s) if s == "read-write"));
+        }
+    }
+
+    /// ***A reference whose `md_file_id` names no document is dropped***, per
+    /// Requirement 101 — and this is the check the constructed DDL's
+    /// `crmr_mfi_fk` also gives `foreign_key_check`, which five of this tree's
+    /// eight metadata-bearing fixtures could not supply because their
+    /// hand-built DDL declares no such key.
+    #[test]
+    fn a_reference_to_no_document_is_not_carried() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_fid_gap.gpkg");
+        let layers = read_layers(SRC).unwrap();
+        let mut carried = crate::geopackage::read_container(SRC).unwrap();
+        let metadata = carried.metadata.as_mut().unwrap();
+        // Point the row-scoped reference at a document that is not there.
+        let reference = metadata.references.iter_mut().find(|r| r.scope == "row").unwrap();
+        reference.md_file_id = 404;
+
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let refs = references_in(&bytes);
+        assert!(
+            !refs.iter().any(|(scope, _, _, _)| scope == "row"),
+            "a reference to a nonexistent gpkg_metadata row was written: {refs:?}"
+        );
+        assert_eq!(refs.len(), 2, "and only that one was dropped: {refs:?}");
+    }
+
     /// The R*Tree is built against the ids the feature table is written under,
     /// not against positions.
     ///
@@ -1753,6 +2705,7 @@ mod tests {
                 },
             )],
             tables: Vec::new(),
+            metadata: None,
         };
 
         let bytes = write_layers(None, &[("l".into(), layer)], &carried, false, false).unwrap();
@@ -1796,6 +2749,7 @@ mod tests {
                 definition: WGS84_WKT.into(),
             })],
             tables: Vec::new(),
+            metadata: None,
         };
         let layer = fc(vec![Feature {
             geometry: point(1.0, 2.0),
@@ -1929,10 +2883,12 @@ mod tests {
             .filter_map(|o| o.sql.map(|s| (o.name, normalize_ddl(&s))))
             .collect();
 
-        // Intersection only. The fixture also carries `gpkg_metadata` and
-        // `gpkg_metadata_reference`, which this crate does not write at all —
-        // a milestone rather than a defect, and M3b's to close when it starts
-        // carrying them. Comparing on absence would assert the wrong thing.
+        // Intersection only, which since 2026-08-25 is every `gpkg_` table
+        // `spec_conformant.gpkg` holds: the fixture's `gpkg_metadata` pair used
+        // to fall outside it because this crate wrote neither, and the carrying
+        // half now brings them in. /That is what this test is for — a new
+        // registry table joins the comparison by being written, not by anyone
+        // remembering to add an assertion./
         let mut compared = 0;
         for (table, want) in &spec_ddl {
             let Some(got) = ours_ddl.get(table) else {
@@ -1943,10 +2899,10 @@ mod tests {
         }
 
         // Without this the test passes vacuously the day a rename means
-        // nothing intersects. Eight tables: the four core ones, the Schema
-        // extension's two, and — since 2026-08-24 — the two tile registry
-        // tables the carrying half emits.
-        assert_eq!(compared, 8, "compared {compared} tables, expected 8");
+        // nothing intersects. Ten tables: the four core ones, the Schema
+        // extension's two, the two tile registry tables the carrying half emits
+        // (2026-08-24), and the Metadata extension's pair (2026-08-25).
+        assert_eq!(compared, 10, "compared {compared} tables, expected 10");
 
         // And the writer's constants are the same text, which is what makes
         // the six assertions above statements about this crate's output rather
@@ -1960,6 +2916,8 @@ mod tests {
             DATA_COLUMN_CONSTRAINTS_DDL,
             TILE_MATRIX_SET_DDL,
             TILE_MATRIX_DDL,
+            METADATA_DDL,
+            METADATA_REFERENCE_DDL,
         ] {
             let name = ddl.trim_start_matches("CREATE TABLE ").split_whitespace().next().unwrap();
             let want = spec_ddl.iter().find(|(n, _)| n == name).map(|(_, s)| s);

@@ -63,9 +63,11 @@ reason it states:
   =alphanumeric_code_falls_back_to_a_synthetic_srs_id=) with *zero* runtime
   warning until this pass — a gap that had been sitting there, known and
   tested, since =projjson-to-wkt.org='s era.
-- =geopackage::container_drop_warnings(bytes, label, written, rtree) ->
-  Vec<String>= (=geopackage/container.rs=) — *defect 3's warning*, added
-  2026-08-21. Same pure-function-of-the-source shape, but it takes the
+- =geopackage::container_drop_warnings(bytes, label, written, carried, rtree)
+  -> Vec<String>= (=geopackage/container.rs=) — *defect 3's warning*, added
+  2026-08-21. /The =carried= parameter arrived 2026-08-24: the survey subtracts
+  what =carry.rs= puts back, because a warning whose job is to name what a
+  rewrite loses must stop naming content the moment it survives./ Same pure-function-of-the-source shape, but it takes the
   container's *bytes* and no target =Format=, so it cannot be an entry in
   =collect_conversion_warnings= and is called directly from
   =run_geopackage_write= instead.
@@ -81,7 +83,34 @@ reason it states:
   symmetry should note that doing so requires the collector to take a container,
   which the other three have no use for.
 
-  It returns =Vec<String>= rather than =Option<String>= because it reports two
+- =geopackage::metadata_drop_warnings(existing, new_layers, carried) ->
+  Vec<String>= (=geopackage/writer.rs=) — added 2026-08-25, and **the first
+  warning in this crate about content carried in *part***.
+
+  /The others answer "does this survive at all". This one answers "how much of
+  it", because a carried =gpkg_metadata= pair can lose *some* of its
+  references: one naming a layer the write does not produce is dropped while
+  the document it named is kept./
+
+  ***Two things about its shape are load-bearing and neither is obvious.***
+  First, it takes the **destination bytes**, not just the layers the caller
+  passed: =write_layers= upserts =new_layers= over whatever the destination
+  holds, so an append produces a layer set the caller never named, and both now
+  compose it through the same =compose_layers=. /Getting this wrong made it
+  claim "3 of 3 metadata references could not be carried" about three
+  references the same run then wrote -- caught in review before it shipped./
+  Second, it lives in =writer.rs= rather than beside the other container
+  warning, because it must evaluate **exactly the rule the write evaluates**
+  (=retained_references=) rather than a second copy of it.
+
+  *Why it earns a message at all*, against § THE RULE's noise bar: the two
+  neighbouring precedents disagree, and the distinction between them is the
+  test. =gpkg_ogr_contents= is reported *silently* because it is derived and
+  nothing is lost; the R*Tree earns a message because =--rtree= is a
+  **remedy**. A dropped reference has no remedy and *does* lose information --
+  the combination neither precedent covers.
+
+  =container_drop_warnings= returns =Vec<String>= rather than =Option<String>= because it reports two
   losses of *different kinds*: content destroyed outright, and — separately —
   a spatial index not rebuilt, which is D4-derived and has a one-flag remedy
   (=--rtree=). Folding them into one message would either bury the remedy or

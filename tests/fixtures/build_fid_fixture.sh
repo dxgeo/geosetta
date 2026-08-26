@@ -35,6 +35,24 @@ DELETE FROM cities WHERE fid = 2;
 -- `second` keeps its dense ids, so one file holds both cases and a fix that
 -- carries ids unconditionally is distinguishable from one that carries them
 -- only where they differ.
+
+-- Added 2026-08-25 for the metadata pair. Every gpkg_metadata_reference row in
+-- this tree was `table`-scoped with a NULL row_id_value, so no fixture could
+-- exercise the scopes Requirements 98 and 99 are about, and an implementation
+-- that dropped every row-scoped reference would have passed the whole suite.
+--
+-- The `row` scope points at fid 9 on purpose: it is the *middle* gap id. A
+-- renumbering that reissues 1, 2, 3 leaves fid 1 coincidentally right and fid
+-- 40 obviously wrong, and 9 is the one that comes out wrong without looking
+-- wrong -- it still names a row that exists, just not the one it meant.
+INSERT INTO gpkg_metadata_reference
+  (reference_scope, table_name, column_name, row_id_value, md_file_id)
+  VALUES ('row', 'cities', NULL, 9, 1);
+-- And a `column` scope on a column the write keeps, so the surviving branch of
+-- Requirement 98 is covered as well as the dropped one.
+INSERT INTO gpkg_metadata_reference
+  (reference_scope, table_name, column_name, row_id_value, md_file_id)
+  VALUES ('column', 'cities', 'name', NULL, 1);
 SQL
 
 echo "built:"
@@ -42,3 +60,4 @@ printf '  %s  ' "$OUT"
 sqlite3 "$OUT" "PRAGMA integrity_check;"
 printf '  cities fids: '; sqlite3 "$OUT" "SELECT group_concat(fid, ', ') FROM cities;"
 printf '  second fids: '; sqlite3 "$OUT" "SELECT group_concat(fid, ', ') FROM second;"
+printf '  md refs:     '; sqlite3 "$OUT" "SELECT group_concat(reference_scope || '/' || coalesce(table_name,'-') || '/' || coalesce(column_name,'-') || '/' || coalesce(row_id_value,'-'), '  ') FROM gpkg_metadata_reference;"

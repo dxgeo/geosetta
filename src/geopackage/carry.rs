@@ -48,12 +48,15 @@
 //! M3b's completion and is not started here — a destination's own container
 //! content is still destroyed, and still warned about, exactly as before.
 //!
-//! And it does not yet carry the **metadata pair**. `gpkg_metadata` and
-//! `gpkg_metadata_reference` travel together or not at all (Requirement 95: a
-//! GeoPackage containing the first SHALL contain the second), and carrying the
-//! second correctly needs feature ids this writer does not preserve
-//! (Requirement 99, and `handoff.org` § BUGS FOUND entry 19). See
-//! `user_tables` for the full list of what is deliberately left behind.
+//! And since 2026-08-25 it carries the **metadata pair** — but on different
+//! terms from everything else here, which is why [`Metadata`] is a field of
+//! its own rather than another kind of table. `gpkg_metadata` and
+//! `gpkg_metadata_reference` travel together or not at all (Requirement 95),
+//! and the pair is **layer-coupled**: a reference names a table, a column and
+//! a rowid that the write may not produce. So this module reads it verbatim
+//! and decides nothing; `super::writer::retained_references` decides what
+//! reaches the output, against what is actually being written. See
+//! `user_tables` for the full list of what is still deliberately left behind.
 
 use crate::error::Result;
 use crate::sqlite::{Autoincrement, Database, Table, Value};
@@ -70,13 +73,21 @@ pub struct Carried {
     /// Tables the container held that belong to no layer and to no registry
     /// this writer constructs, in `sqlite_master` order.
     pub tables: Vec<UserTable>,
+    /// The Metadata extension's pair, when the source held it.
+    ///
+    /// `None` for a source with no `gpkg_metadata` table, which is most of
+    /// them. Read faithfully here and validated at *write* — decision 23's
+    /// rule, and it is not optional for this member: a reference's validity
+    /// depends on which layers the write produces and on the ids they get, so
+    /// there is nothing to check yet at the moment this is read.
+    pub metadata: Option<Metadata>,
 }
 
 impl Carried {
     /// Nothing was carried, so the write proceeds exactly as it did before this
     /// channel existed.
     pub fn is_empty(&self) -> bool {
-        self.pyramids.is_empty() && self.tables.is_empty()
+        self.pyramids.is_empty() && self.tables.is_empty() && self.metadata.is_none()
     }
 
     /// Every `sqlite_master` name this content will put back into the output.
@@ -101,6 +112,14 @@ impl Carried {
             names.push(table.name.clone());
             names.extend(table.triggers.iter().map(|(name, _)| name.clone()));
             names.extend(table.indexes.iter().map(|(name, _, _)| name.clone()));
+        }
+        // Requirement 95 makes the pair travel together, so both names appear
+        // or neither does — the writer emits `gpkg_metadata_reference` even
+        // when every reference in it was dropped, because a `gpkg_metadata`
+        // without it is a non-conformant file.
+        if self.metadata.is_some() {
+            names.push("gpkg_metadata".into());
+            names.push("gpkg_metadata_reference".into());
         }
         names
     }
@@ -222,6 +241,88 @@ pub struct UserTable {
     pub triggers: Vec<(String, String)>,
 }
 
+/// The Metadata extension's two tables, carried as a pair.
+///
+/// **Requirement 95 is why this is one struct and not two fields.** A
+/// GeoPackage containing `gpkg_metadata` SHALL contain
+/// `gpkg_metadata_reference`, so the two cannot be carried independently and a
+/// type that made them separable would invite exactly that.
+///
+/// Unlike everything else in [`Carried`] this is *layer-coupled*: a reference
+/// names a table, a column and a rowid, and the write may produce none of the
+/// three. What is read here is therefore the source's rows verbatim; which of
+/// them reach the output is `super::writer::retained_references`'s answer,
+/// computed against what is actually being written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Metadata {
+    /// `gpkg_metadata` rows, in `id` order.
+    pub records: Vec<MetadataRecord>,
+    /// `gpkg_metadata_reference` rows, in stored order. Empty is legal and
+    /// occurs: `spec_conformant.gpkg` holds the pair with no references at all.
+    pub references: Vec<MetadataReference>,
+}
+
+/// One `gpkg_metadata` row: an opaque metadata document and its id.
+///
+/// The id is *content*, not allocation — Requirement 101 makes it the target of
+/// every reference's `md_file_id`, and Requirement 102 of `md_parent_id`. It is
+/// carried unchanged, which is what lets both foreign keys survive the write
+/// without any rewriting: this crate emits no `gpkg_metadata` rows of its own,
+/// so on the one-container path nothing can collide with them. /Merging two
+/// containers does collide, and that is `container-reconciliation.org` § 2./
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataRecord {
+    /// `id`, an `INTEGER PRIMARY KEY` and so a rowid alias.
+    pub id: i64,
+    /// `md_scope`, `md_standard_uri`, `mime_type` and `metadata`, in the
+    /// normative column order, exactly as stored.
+    ///
+    /// Carried as `Value` rather than `String` because this crate never reads
+    /// them: the `metadata` column holds a document in any MIME encoding the
+    /// producer chose, and D1 says an opaque member is moved, not modelled.
+    /// **Read by column name and rewritten in this order**, which is what
+    /// makes the carry survive a source whose DDL orders them differently.
+    pub values: [Value; 4],
+}
+
+/// One `gpkg_metadata_reference` row, decomposed into the columns the
+/// requirements constrain.
+///
+/// The structural columns are typed because each is *checked* at write:
+/// `reference_scope` against Requirement 96's vocabulary, `table_name` against
+/// Requirement 97, `column_name` against 98, `row_id_value` against 99, and
+/// the two id columns against 101 and 102. `timestamp` alone stays a `Value`
+/// — Requirement 100 constrains only its format, and the standard pointedly
+/// declines to give it a meaning, so there is nothing here to check it against.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MetadataReference {
+    /// `reference_scope`: one of `geopackage`, `table`, `column`, `row`,
+    /// `row/col` (Requirement 96, lowercase). Carried as read, including a
+    /// value that is none of those — the write is where it is rejected.
+    pub scope: String,
+    /// `table_name`, NULL exactly for `geopackage` scope (Requirement 97).
+    pub table_name: Option<String>,
+    /// `column_name`, non-NULL only for `column` and `row/col` (Requirement 98).
+    pub column_name: Option<String>,
+    /// `row_id_value`, non-NULL only for `row` and `row/col` (Requirement 99),
+    /// and then the ROWID of a row in the table `table_name` identifies.
+    pub row_id_value: Option<i64>,
+    /// `timestamp`, carried verbatim. **Never re-stamped**, on the same rule
+    /// `writer::LAST_CHANGE` states for `gpkg_contents.last_change`: the stamp
+    /// follows whoever last changed the content, and that is never geosetta.
+    /// /`ogr2ogr` does re-stamp this table when a new record appears, measured
+    /// 2026-08-23 — evidence of what a producer does, not of what is right,
+    /// and Requirement 100 constrains only the format./
+    pub timestamp: Value,
+    /// `md_file_id`: the `gpkg_metadata.id` this reference is about
+    /// (Requirement 101).
+    pub md_file_id: i64,
+    /// `md_parent_id`: the hierarchical parent's `gpkg_metadata.id`, or NULL
+    /// when this reference roots a hierarchy. Requirement 102 additionally
+    /// forbids it equalling `md_file_id` on the same row.
+    pub md_parent_id: Option<i64>,
+}
+
 /// A `gpkg_spatial_ref_sys` row, as the source stored it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SrsDef {
@@ -289,8 +390,9 @@ pub fn read(bytes: &[u8]) -> Result<Carried> {
             name,
         });
     }
+    let metadata = metadata(&db, &tables)?;
     let tables = user_tables(&db, &tables, &objects, &sequences, &pyramids)?;
-    Ok(Carried { pyramids, tables })
+    Ok(Carried { pyramids, tables, metadata })
 }
 
 /// Registry tables this writer builds for itself, so carrying one would put
@@ -320,12 +422,12 @@ pub(crate) const CONSTRUCTED_TABLES: [&str; 9] = [
 ///
 /// # What is deliberately left behind, and why each is not an oversight
 ///
-/// - **`gpkg_metadata` and `gpkg_metadata_reference`.** Requirement 95 makes
-///   them a *pair* — a GeoPackage containing the first SHALL contain the
-///   second — so carrying one without the other writes a non-conformant file,
-///   and carrying the second correctly needs feature ids this writer does not
-///   yet preserve (Requirement 99; `handoff.org` entry 19). They travel
-///   together or not at all.
+/// - **`gpkg_metadata` and `gpkg_metadata_reference`.** Skipped *here*, and
+///   carried by [`metadata`] instead — not left behind at all since
+///   2026-08-25. They belong outside this function because its contract is
+///   content that is valid whatever the write produces, and the pair is
+///   *layer-coupled*: what survives depends on which layers are written and on
+///   the ids they get.
 /// - **A dataset registered in `gpkg_contents`** under `attributes`. The table
 ///   is carryable on exactly these terms, but its registry row is not carried
 ///   with it, and a table present without its `gpkg_contents` row is content
@@ -633,4 +735,80 @@ fn text_at(row: &[Value], index: usize) -> Option<String> {
         Some(Value::Text(s)) => Some(s.clone()),
         _ => None,
     }
+}
+
+/// The Metadata extension's pair, read verbatim.
+///
+/// `None` when the source has no `gpkg_metadata` table, which is the ordinary
+/// case. **A source holding `gpkg_metadata` and no `gpkg_metadata_reference`
+/// still yields `Some`**, with no references: that source violates Requirement
+/// 95, and the write repairs it by constructing both tables. Propagating the
+/// violation instead would be this crate emitting a non-conformant file
+/// because it was handed one.
+///
+/// Nothing is validated here. A reference whose scope is not one of
+/// Requirement 96's five, or whose `md_file_id` resolves to nothing, is read
+/// as it stands and rejected by `super::writer::retained_references` — the
+/// single place that decides what reaches the output, because most of the
+/// checks need the write in hand and splitting them across two modules is how
+/// two rules drift apart.
+fn metadata(db: &Database, tables: &[Table]) -> Result<Option<Metadata>> {
+    let Some(md) = tables.iter().find(|t| t.name == "gpkg_metadata") else {
+        return Ok(None);
+    };
+    let idx = |t: &Table, column: &str| t.columns.iter().position(|c| c == column);
+    let Some(id_col) = idx(md, "id") else {
+        // No `id` column is not a `gpkg_metadata` table this crate recognises,
+        // and every reference is keyed by it. Skipped whole rather than carried
+        // as something the references cannot point into — the same ruling
+        // `read` makes about a pyramid missing a piece it needs.
+        return Ok(None);
+    };
+    let mut records = Vec::new();
+    for row in db.read_rows(md)? {
+        let Some(Value::Int(id)) = row.get(id_col) else { continue };
+        let cell = |column: &str| {
+            idx(md, column).and_then(|i| row.get(i).cloned()).unwrap_or(Value::Null)
+        };
+        records.push(MetadataRecord {
+            id: *id,
+            values: [
+                cell("md_scope"),
+                cell("md_standard_uri"),
+                cell("mime_type"),
+                cell("metadata"),
+            ],
+        });
+    }
+    records.sort_by_key(|r| r.id);
+
+    let mut references = Vec::new();
+    if let Some(mr) = tables.iter().find(|t| t.name == "gpkg_metadata_reference") {
+        for row in db.read_rows(mr)? {
+            let cell = |column: &str| {
+                idx(mr, column).and_then(|i| row.get(i).cloned()).unwrap_or(Value::Null)
+            };
+            let text = |column: &str| match cell(column) {
+                Value::Text(s) => Some(s),
+                _ => None,
+            };
+            let int = |column: &str| match cell(column) {
+                Value::Int(n) => Some(n),
+                _ => None,
+            };
+            // `md_file_id` is `NOT NULL` and is what Requirement 101 checks, so
+            // a row without one has no reference to carry at all.
+            let Some(md_file_id) = int("md_file_id") else { continue };
+            references.push(MetadataReference {
+                scope: text("reference_scope").unwrap_or_default(),
+                table_name: text("table_name"),
+                column_name: text("column_name"),
+                row_id_value: int("row_id_value"),
+                timestamp: cell("timestamp"),
+                md_file_id,
+                md_parent_id: int("md_parent_id"),
+            });
+        }
+    }
+    Ok(Some(Metadata { records, references }))
 }

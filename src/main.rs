@@ -796,6 +796,18 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
             args.quiet,
         );
     }
+    // A carried metadata pair is the one member that can survive in *part*:
+    // references naming something the output will not contain are dropped, and
+    // the container survey no longer names the pair at all now that it is
+    // carried. Reported here, after `existing` is in hand, because **an append
+    // supplies layers `new_layers` does not** — a reference to a layer only the
+    // destination has still survives, and `write_layers` composes the two
+    // before deciding. Handing this call `new_layers` alone made it claim
+    // losses the same run did not incur.
+    print_warnings(
+        &geopackage::metadata_drop_warnings(existing.as_deref(), &new_layers, &carried),
+        args.quiet,
+    );
     if args.progress {
         let verb = if existing.is_some() { "appending to" } else { "writing" };
         let idx = if args.rtree { " (+rtree index)" } else { "" };

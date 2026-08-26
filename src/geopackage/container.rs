@@ -17,12 +17,24 @@
 //! [`REPRODUCED`] and `super::carry::Carried::reproduced_names`.
 //!
 //! This module is the *warning*, shipped ahead of the fix per that plan's
-//! § SCOPE ("defect 3's warning now and its fix with the container work").
-//! Until M3b lands in full, a `gpkg -> gpkg` run destroys container content at
-//! exit 0; the
+//! § SCOPE ("defect 3's warning now and its fix with the container work"). The
 //! standing rule in `plans/lossy-conversion-warnings.org` says a silent drop of
 //! information the source actually carries is a bug regardless of whether the
-//! fix is ready, so the loss is reported now and repaired later.
+//! fix is ready, so the loss was reported first and repaired after.
+//!
+//! **Most of it is now repaired**, which changes what this module is for. A
+//! tile pyramid survives a `gpkg -> gpkg` run as of 2026-08-24; a user's own
+//! tables, the `gpkg_metadata` pair and both extensions' `gpkg_extensions`
+//! registrations as of 2026-08-25, and nine of the twelve `.gpkg` fixtures
+//! round-trip with this warning silent. What it still reports is a genuine
+//! remainder — a `WITHOUT ROWID` table, an `attributes` dataset, an extension
+//! this crate does not implement — plus the whole of a *destination's* own
+//! container on the append path, which is `container-reconciliation.org`.
+//!
+//! /So the failure mode has inverted. This warning began as the honest report
+//! of a writer that destroyed nearly everything; it is now mostly silent, and
+//! the risk is **naming something that survives**. Three such false reports
+//! were found and fixed on 2026-08-25 alone./
 //!
 //! **This file states what the writer reproduces, so it has to move when the
 //! writer does.** [`REPRODUCED`] is that statement; a new always-emitted table
@@ -34,8 +46,9 @@ use crate::sqlite::{Database, MasterObject, Value};
 
 /// The tables [`super::writer::build`] emits unconditionally, and so the
 /// container content that survives a write today. `gpkg_extensions` is *not*
-/// here: it is written only when an index is, which [`container_drop_warnings`]
-/// handles alongside the index itself.
+/// here: it is written only when some extension is in use, and is handled by
+/// row rather than by table — see the `gpkg_extensions` arm of [`survey`],
+/// which counts only the rows nothing puts back.
 ///
 /// **Unconditional is the operative word.** Content that survives only when it
 /// was carried does not belong here — it arrives per call, as `carried`, from
@@ -85,6 +98,28 @@ const LAYER_SCOPED: [&str; 2] = ["gpkg_data_columns", "gpkg_data_column_constrai
 /// The `gpkg_extensions.extension_name` the RTree extension registers under,
 /// as [`super::rtree::extension_rows`] writes it.
 const RTREE_EXTENSION: &str = "gpkg_rtree_index";
+
+/// The `gpkg_extensions.extension_name` the Metadata extension registers
+/// under, for both of its rows (Requirement 140's record table).
+///
+/// Its rows are *reproduced* whenever the pair is carried — the writer emits
+/// them from `writer::metadata_extension_rows` — so counting them as destroyed
+/// would be **bug 13's mistake in a second table**: reporting content that
+/// survives. Unlike [`RTREE_EXTENSION`] the exclusion is conditional, because
+/// the rows come back only when there is a pair to register.
+const METADATA_EXTENSION: &str = "gpkg_metadata";
+
+/// The `gpkg_extensions.extension_name` the Schema extension registers under,
+/// as `writer::schema_extension_rows` writes it.
+///
+/// Excluded **unconditionally**, and that is [`LAYER_SCOPED`]'s reasoning
+/// rather than [`METADATA_EXTENSION`]'s: the Schema tables' rows belong to the
+/// layers, so this warning excludes the tables themselves whether or not a
+/// given write produces them. A registration of those tables is the same
+/// content one level up and gets the same treatment — anything else would
+/// report the registration as destroyed while saying nothing about the table
+/// it registers.
+const SCHEMA_EXTENSION: &str = "gpkg_schema";
 
 /// How many objects of a kind are named individually before the message
 /// switches to a count. Six is enough to name every registry table a normal
@@ -208,7 +243,7 @@ fn survey(bytes: &[u8], written: &[String], carried: &[String]) -> Result<Survey
         // other extension are a real loss and are what gets named.
         if object.name == "gpkg_extensions" {
             match tables.iter().find(|t| t.name == object.name) {
-                Some(table) => match foreign_extension_rows(&db, table) {
+                Some(table) => match foreign_extension_rows(&db, table, carried) {
                     // Nothing but R*Tree registrations (or nothing at all):
                     // wholly derived, so not a loss of its own in either the
                     // populated or the empty sense.
@@ -229,6 +264,25 @@ fn survey(bytes: &[u8], written: &[String], carried: &[String]) -> Result<Survey
             // trade one unreadable table for silence about the whole file —
             // which is what `container_drop_warnings` would do with the `Err`.
             Some(table) => match db.read_rows(table).map(|r| r.len()) {
+                // ***An empty registry table this writer constructs on demand
+                // is not destroyed content.*** It is written whenever
+                // something needs it, so its absence from an output that needs
+                // nothing loses exactly nothing — and reporting it made the
+                // drop warning fire on the most ordinary file there is: a
+                // plain `ogr2ogr` GeoPackage with no pyramid says
+                // "2 empty tables", meaning `gpkg_tile_matrix` and
+                // `gpkg_tile_matrix_set`.
+                //
+                // **Conditional on being empty, and that is the whole
+                // subtlety.** These same two tables are a *real* loss when
+                // they are populated and the pyramid they describe is not
+                // carried — which is exactly what the append path reports
+                // against a destination holding tiles. Excluding `CONSTRUCTED`
+                // outright, the way `REPRODUCED` and `LAYER_SCOPED` are
+                // excluded above, would have silenced that. /Measured before
+                // the change: a `points.gpkg` write into a tiled destination
+                // names `gpkg_tile_matrix (14 rows)`, and still does./
+                Ok(0) if CONSTRUCTED.contains(&object.name.as_str()) => {}
                 Ok(0) => survey.empty += 1,
                 Ok(n) => survey.populated.push((object.name.clone(), Some(n))),
                 // A table the *table* walk cannot decode is a `WITHOUT ROWID`
@@ -349,15 +403,28 @@ fn is_derived_trigger(object: &MasterObject, layers: &[String], carried: &[Strin
 /// How many `gpkg_extensions` rows register something other than the R*Tree
 /// index. A table whose every row is an R*Tree registration holds nothing this
 /// writer is losing independently of the index itself.
-fn foreign_extension_rows(db: &Database, table: &crate::sqlite::Table) -> Result<usize> {
+fn foreign_extension_rows(
+    db: &Database,
+    table: &crate::sqlite::Table,
+    carried: &[String],
+) -> Result<usize> {
     let Some(idx) = table.columns.iter().position(|c| c == "extension_name") else {
         // No such column: not a table this can reason about, so every row counts.
         return Ok(db.read_rows(table)?.len());
     };
+    // The Metadata extension's registrations survive exactly when its pair
+    // does, which `carried` is the record of.
+    let metadata_survives = carried.iter().any(|name| name == "gpkg_metadata");
     Ok(db
         .read_rows(table)?
         .iter()
-        .filter(|row| !matches!(row.get(idx), Some(Value::Text(name)) if name == RTREE_EXTENSION))
+        .filter(|row| {
+            let Some(Value::Text(name)) = row.get(idx) else { return true };
+            if name == RTREE_EXTENSION || name == SCHEMA_EXTENSION {
+                return false;
+            }
+            !(name == METADATA_EXTENSION && metadata_survives)
+        })
         .count())
 }
 
@@ -573,6 +640,128 @@ mod tests {
         assert!(after[0].contains("gpkg_metadata_reference (1 row)"), "{}", after[0]);
     }
 
+    /// ***The Metadata extension's own `gpkg_extensions` rows stop being
+    /// counted as destroyed once the pair is carried.***
+    ///
+    /// This is **bug 13's mistake in a second table** and nothing else would
+    /// catch it: `gpkg_extensions` is reported by *row count*, so two rows that
+    /// come back in the output would go on being reported as lost while the
+    /// table's own name never appears in `carried`. /Found by mutation-checking
+    /// the tests for the metadata pair — every other new rule had a test and
+    /// this one did not./
+    #[test]
+    fn a_reproduced_extension_registration_is_not_reported_as_destroyed() {
+        const TILES: &[u8] = include_bytes!("../../tests/fixtures/gdal_tiles.gpkg");
+        let written = vec!["cities".to_string()];
+        // `gdal_tiles.gpkg` holds five registrations: two Metadata, two Schema,
+        // one R*Tree. The R*Tree row is always excluded (it is reported as an
+        // index instead) and the Schema rows are excluded unconditionally on
+        // `LAYER_SCOPED`'s reasoning, so two are counted while the pair is not
+        // carried.
+        let carried_pyramid: Vec<String> =
+            vec!["imagery".into(), "gpkg_tile_matrix".into(), "gpkg_tile_matrix_set".into()];
+        let before = container_drop_warnings(TILES, "in.gpkg", &written, &carried_pyramid, false);
+        assert!(before[0].contains("gpkg_extensions (2 rows)"), "the premise: {}", before[0]);
+
+        // Carrying the pair reproduces its two registrations, which leaves
+        // nothing in `gpkg_extensions` to report at all — so the table stops
+        // being named rather than being named with a smaller number.
+        let mut carried_pair = carried_pyramid.clone();
+        carried_pair.push("gpkg_metadata".into());
+        carried_pair.push("gpkg_metadata_reference".into());
+        let after = container_drop_warnings(TILES, "in.gpkg", &written, &carried_pair, false);
+        assert!(!after[0].contains("gpkg_extensions"), "{}", after[0]);
+    }
+
+    /// ***And the Schema extension's own registrations are never counted***,
+    /// on the same grounds as [`LAYER_SCOPED`] itself.
+    ///
+    /// Those rows register `gpkg_data_columns` and
+    /// `gpkg_data_column_constraints`, whose *rows* travel with the layers and
+    /// which this survey therefore excludes unconditionally. Counting the
+    /// registration while excluding the table it registers would report half a
+    /// thing — and since 2026-08-25 the writer emits those rows anyway
+    /// (Requirement 141), so counting them would be reporting content that
+    /// survives.
+    ///
+    /// /Isolated by **count** rather than by absence, because no fixture in
+    /// this tree holds Schema registrations alone. `sqlite_altered.gpkg` holds
+    /// all three kinds — two Metadata, two Schema, one R\*Tree — and is asked
+    /// with nothing carried, so the two Metadata rows *are* a real loss and are
+    /// the whole of it. Reporting four would mean the Schema pair had been
+    /// counted; reporting none would mean the Metadata pair had wrongly been
+    /// excluded. Only two is right, which is what makes this assertion say
+    /// something the neighbouring test does not./
+    #[test]
+    fn a_schema_extension_registration_is_never_counted_as_destroyed() {
+        const ALTERED: &[u8] = include_bytes!("../../tests/fixtures/sqlite_altered.gpkg");
+        let db = Database::open(ALTERED).unwrap();
+        let tables = db.tables().unwrap();
+        let ext = tables.iter().find(|t| t.name == "gpkg_extensions").unwrap();
+        assert_eq!(db.read_rows(ext).unwrap().len(), 5, "the premise: 2 + 2 + 1");
+
+        let warnings =
+            container_drop_warnings(ALTERED, "in.gpkg", &["cities".to_string()], &[], false);
+        assert!(
+            warnings[0].contains("gpkg_extensions (2 rows)"),
+            "the two Metadata rows are the loss; the Schema pair is not: {}",
+            warnings[0]
+        );
+    }
+
+    /// ***An empty registry table this writer constructs on demand is not
+    /// destroyed content -- but a populated one still is.***
+    ///
+    /// Both halves are asserted here because the rule is only correct as a
+    /// pair, and the tempting simplification breaks the second half. Adding
+    /// `CONSTRUCTED` to the unconditional exclusion list beside `REPRODUCED`
+    /// and `LAYER_SCOPED` -- which is what "the survey is missing a class"
+    /// suggests -- would silence a **real** loss: the append path writes into a
+    /// destination whose tile registries are populated and whose pyramid is not
+    /// carried, and 15 rows describing a tiling scheme would vanish at exit 0.
+    ///
+    /// /The false report was the ordinary case, which is why it mattered: a
+    /// plain `ogr2ogr` GeoPackage with no pyramid at all said
+    /// "2 empty tables" -- `gpkg_tile_matrix` and `gpkg_tile_matrix_set`,
+    /// present and empty because GDAL creates them, and rebuilt by this writer
+    /// the moment anything needs them. That is furniture on every file, which
+    /// `plans/lossy-conversion-warnings.org` § THE RULE forbids./
+    #[test]
+    fn an_empty_constructed_registry_is_not_a_loss_but_a_populated_one_is() {
+        const HOSTILE: &[u8] = include_bytes!("../../tests/fixtures/gdal_hostile.gpkg");
+        const TILES: &[u8] = include_bytes!("../../tests/fixtures/gdal_tiles.gpkg");
+
+        // The premise: `gdal_hostile.gpkg` holds both tile registry tables and
+        // both are empty, because `ogr2ogr` creates them for every GeoPackage.
+        let db = Database::open(HOSTILE).unwrap();
+        let tables = db.tables().unwrap();
+        for name in ["gpkg_tile_matrix", "gpkg_tile_matrix_set"] {
+            let t = tables.iter().find(|t| t.name == name).expect(name);
+            assert_eq!(db.read_rows(t).unwrap().len(), 0, "{name} should be empty");
+        }
+        // Everything else in that file is carried, so the warning must be
+        // silent rather than quieter.
+        let carried = crate::geopackage::read_container(HOSTILE).unwrap();
+        let warnings = container_drop_warnings(
+            HOSTILE,
+            "in.gpkg",
+            &["cities".to_string(), "second".to_string()],
+            &carried.reproduced_names(),
+            true,
+        );
+        assert!(warnings.is_empty(), "an empty registry is not content: {warnings:?}");
+
+        // And the other half: populated, with the pyramid they describe not
+        // carried. This is the append path, where the destination's container
+        // is destroyed and nothing is carried at all.
+        let populated = container_drop_warnings(TILES, "dest.gpkg", &["cities".into()], &[], true);
+        assert!(
+            populated[0].contains("gpkg_tile_matrix (14 rows)"),
+            "a populated registry is a real loss and must still be named: {}",
+            populated[0]
+        );
+    }
+
     /// A trigger on a table that is **genuinely destroyed** is still reported,
     /// which is the half of [`is_derived_trigger`] that nothing else exercises.
     ///
@@ -609,9 +798,20 @@ mod tests {
         assert!(loss.contains("side_notes (1 row)"), "{loss}");
         assert!(loss.contains("gpkg_metadata (1 row)"), "{loss}");
         assert!(loss.contains("gpkg_metadata_reference (1 row)"), "{loss}");
-        // gpkg_tile_matrix and gpkg_tile_matrix_set, created and never filled.
-        assert!(loss.contains("2 empty tables"), "{loss}");
         assert!(loss.contains("in.gpkg"), "{loss}");
+        // ***And no "2 empty tables", corrected 2026-08-25.*** Those two were
+        // `gpkg_tile_matrix` and `gpkg_tile_matrix_set`, which `ogr2ogr`
+        // creates for every GeoPackage and leaves empty — and which this
+        // writer constructs whenever a pyramid needs them. An empty registry
+        // table that comes back on demand is not destroyed content, and saying
+        // so on every ordinary file is the furniture
+        // `plans/lossy-conversion-warnings.org` § THE RULE forbids.
+        //
+        // /This assertion previously read `contains("2 empty tables")` and was
+        // pinning the bug. A populated one is still reported, which
+        // `an_empty_constructed_registry_is_not_a_loss_but_a_populated_one_is`
+        // holds down./
+        assert!(!loss.contains("empty table"), "{loss}");
 
         // ***Two things this message used to say and no longer does, both
         // corrected 2026-08-24.***

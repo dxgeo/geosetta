@@ -328,7 +328,7 @@ pub fn extension_rows(layers: &[String]) -> Vec<super::writer::ExtensionRow> {
         .iter()
         .map(|name| super::writer::ExtensionRow {
             table_name: name.clone(),
-            column_name: "geom".into(),
+            column_name: Some("geom".into()),
             extension_name: "gpkg_rtree_index".into(),
             definition: "http://www.geopackage.org/spec120/#extension_rtree".into(),
             scope: "write-only".into(),

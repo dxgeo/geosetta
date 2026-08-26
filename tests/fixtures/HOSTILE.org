@@ -236,7 +236,7 @@ conformance to a standard GDAL does not follow exactly.**
 |---------+--------------|
 | the four core registry tables, verbatim from Annex C | that this crate's DDL is the *standard's*, not GDAL's -- compared whole, per table, by =the_registry_ddl_is_what_the_standard_says= |
 | =gpkg_data_columns= + =gpkg_data_column_constraints= from the Schema annex | the two tables carrying the constraints =ogr2ogr= omits (=gdc_tn=, =gdcc_ntv=) |
-| =gpkg_metadata= + =gpkg_metadata_reference= from the Metadata annex | *not yet compared* -- this crate writes neither. Present so they are ready when M3b carries them, along with the two =crmr_*_fk= foreign keys GDAL omits |
+| =gpkg_metadata= + =gpkg_metadata_reference= from the Metadata annex | ***compared since 2026-08-25***, when the crate began writing both -- =the_registry_ddl_is_what_the_standard_says= went from eight tables to ten **without anyone editing it**, which is what that test is for: a registry table joins the comparison by being written, not by being remembered. /This cell read "not yet compared -- this crate writes neither" until then, and before that it read "along with the two =crmr_*_fk= foreign keys GDAL omits" until 2026-08-25, and that was **wrong**: measured on =gdal_tiles.gpkg= and =gdal_linestring_z.gpkg=, GDAL 3.13.2 declares both. What omits them is the =sqlite3=-authored container content in =gdal_hostile.gpkg=, which the =sqlite_*= family inherits by copying that file -- so the FK-less shape is a **hand-built** deviation, not a producer one, and it is the only thing in the tree that distinguishes a declared reference from an undeclared one. Do not "fix" it./ |
 | =sample_features=, two points, =København= / =Zürich= | a dataset for the reader to find at all: =geopackage/reader.rs= errors without =gpkg_contents= and filters on =data_type='features'= |
 
 *Two departures from "verbatim", both recorded in the build script*, because
@@ -269,11 +269,23 @@ eleven round-tripped through the renumbering unchanged and looked correct.
 |---------+--------------|
 | =cities= with fids =1, 9, 40= | ids that are *not* positions. Three rows, and each is wrong in a different way under renumbering -- one right by luck, one shifted by one, one far off -- so an off-by-one fix and a real fix are distinguishable |
 | =second= with fids =1, 2=, untouched | the *derived* case, in the same file. D16 says an id equal to what the writer emits anyway carries no payload; without a dense layer beside the gapped one, a reader that carried every id unconditionally would pass |
+| three =gpkg_metadata_reference= scopes -- =table=, =row= at fid **9**, =column= on =name= | /added later the same day, for the metadata pair./ **The corpus was blind a second time and in the same shape**: every reference in every fixture was =table=-scoped with a NULL =row_id_value=, so nothing exercised Requirements 98 and 99 at all, and an implementation that silently dropped every row-scoped reference would have passed the whole suite |
 
 *The two layers together are the point.* A fixture with only the gap tests that
 ids survive; a fixture with only dense ids tests that nothing is carried. One
 file with both tests the *rule* -- and the rule, not the behaviour, is what
 =GpkgFeatureNative= exists to implement.
+
+***And the =row= scope is here rather than in any other fixture because this is
+the only file where it can fail.*** A row-scoped reference names a rowid; in
+every other =.gpkg= the ids are already their positions, so a reference to one
+survives a renumbering *by coincidence*. Pointing it at **9** -- the middle gap
+id -- is what makes it observable: under a reissued =1, 2, 3= that reference
+still names a row that exists, just not the one it meant, which is the failure
+=foreign_key_check= and =integrity_check= are both structurally unable to see.
+/The DDL inherited from =gdal_hostile.gpkg= declares neither =crmr_*_fk=, and
+that is left alone deliberately: it is what forces this crate's own validation
+to be the thing that catches it./
 
 *Built by* =tests/fixtures/build_fid_fixture.sh= from =gdal_hostile.gpkg=. The
 script drops =ogr2ogr='s =ST_*= validation triggers before editing, because
@@ -420,9 +432,12 @@ gone**. /Later the same day the carrying half shipped against this file./
 80 tiles blob-for-blob, 14 matrix rows, the =sqlite_sequence= mark, all six
 triggers -- =foreign_key_check= is clean *with the row present*, and
 =gdalinfo -checksum= reports the same four band checksums through the output as
-through this file. The drop warning still fires, for what is genuinely still
-dropped: =gpkg_ogr_contents=, =gpkg_extensions=, =gpkg_metadata= and
-=gpkg_metadata_reference=.
+through this file. ***And as of 2026-08-25 the drop warning says nothing at
+all about this fixture*** -- the first in the tree with a non-trivial container
+to reach that. /It named =gpkg_ogr_contents=, =gpkg_extensions=,
+=gpkg_metadata= and =gpkg_metadata_reference= until then. The first is
+*derived* and stopped being reported on 2026-08-24 (bug 13); the pair is
+carried and the =gpkg_extensions= rows are re-emitted, both 2026-08-25./
 
 *What it does not cover, stated so nobody assumes it does.* Its
 =sqlite_sequence= mark is 80 and =max(id)= is 80. Like every other fixture in
@@ -460,7 +475,7 @@ fixture is for./
 | content                          | why |
 |----------------------------------+-----|
 | two layers (=cities=, =second=)  | multi-layer container |
-| =side_notes= plain user table    | not a layer at all; geosetta destroys it |
+| =side_notes= plain user table    | not a layer at all. /Destroyed until 2026-08-25, **carried verbatim** since -- DDL, rows, rowids, triggers and indexes/ |
 | =gpkg_metadata= + =_reference=   | dataset lineage |
 | =gpkg_extensions= (2 rows)       | the *real* R*Tree registrations |
 | R*Tree tables + triggers         | derived-capability |

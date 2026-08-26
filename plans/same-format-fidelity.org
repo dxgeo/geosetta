@@ -26,9 +26,9 @@ Cross-format drops of a declaration now *warn*
 (=FeatureCollection::schema_drop_warning=), because reading a member the crate
 then discards is precisely what =lossy-conversion-warnings.org= governs.
 
-***571 tests pass*** as of 2026-08-25, and =cargo clippy --all-targets= and
+***585 tests pass*** as of 2026-08-25, and =cargo clippy --all-targets= and
 =cargo doc= are clean. That figure is the whole of =cargo test -p geosetta= --
-514 lib, 56 integration, 1 doc, plus the =#[ignore]=d GDAL, PROJ and =sqlite3=
+528 lib, 56 integration, 1 doc, plus the =#[ignore]=d GDAL, PROJ and =sqlite3=
 cross-checks -- recorded that way because an earlier bare "482" left the next
 reader unable to tell which suites it counted, and so unable to tell drift from
 a different denominator. /It read 530 (482 + 47 + 1) until 2026-08-24, and 562
@@ -55,13 +55,19 @@ so does **a user's own table** with its DDL verbatim, its rows, its rowids, its
 triggers and its indexes. *M3b requirement 1* (=srs_id= reconciliation) shipped
 with the first, because it could not be verified without it.
 
-So *defect 3's fix* is **partly built** rather than wholly outstanding, and
-what remains is all one class: =gpkg_metadata= with its references and
-=gpkg_extensions= rows are **layer-coupled**, not independent. /The metadata
-pair is next and is now unblocked: Requirement 95 makes it a pair, Requirement
-97 obliges dropping a reference to a table the write does not produce, and
-Requirement 99 -- a row-scoped reference names a *rowid* -- is satisfied since
-decision 27 stopped the writer renumbering features./
+So *defect 3's fix* is **mostly built** rather than wholly outstanding. The
+*layer-coupled* class closed on 2026-08-25 with the =gpkg_metadata= pair
+(decisions 28--30) and the =gpkg_extensions= registrations for both extensions
+this crate implements -- the second of those a **shipped conformance defect**
+rather than uncarried content, =handoff.org= entry 21. ***Nine of the twelve
+=.gpkg= fixtures now round-trip with the drop warning silent.***
+
+/What is left is no longer a class this crate has failed to carry. Three
+fixtures still lose something, and each is a capability it does not have: a
+=WITHOUT ROWID= table the writer cannot emit, an =attributes= dataset whose
+=gpkg_contents= registration is not carried, and the CRS-WKT extension's
+**column** on =gpkg_spatial_ref_sys=. The merge path is untouched and is
+=container-reconciliation.org=./
 
 *M4 is done (2026-08-20), and it closed three defects rather than two.*
 =FieldDecl= gained a declared *type* in a vocabulary wide enough for the
@@ -267,9 +273,20 @@ obligation bounded rather than open-ended:
   counts, =gpkg_contents= bboxes. Recomputed, never replayed. =--rtree= already
   builds the first from scratch.
 - *Identity* -- layer names, =gpkg_contents= =identifier=/=description=.
-- *Opaque* -- user tables, =gpkg_metadata=/=_reference=, =gpkg_extensions=,
-  =gpkg_data_columns= and its constraints, QGIS-style =layer_styles=, views and
-  triggers. Carried verbatim, understood by nothing.
+- *Opaque* -- user tables, =gpkg_data_columns= and its constraints,
+  QGIS-style =layer_styles=, views and triggers. Carried verbatim, understood
+  by nothing.
+
+  /Two members of this list moved out of it once they were built, 2026-08-25,
+  and both moves are informative./ **=gpkg_metadata=/=_reference= is opaque in
+  its *rows* and not in its *shape*:* the documents are carried untouched, but
+  each reference names a table, a column and a rowid, so it is **layer-coupled**
+  and validated against what the write produces (decision 28 also constructs the
+  DDL, since Requirement 93 makes it normative). **And =gpkg_extensions= is
+  *derived***: its rows are one per extension in use, so the write emits them
+  from what it is doing rather than replaying what it read. /An inventory of
+  "things this reader does not understand" will classify both as opaque, because
+  not understanding them is true and is not the question./
 So the Gpkg spoke's native payload has a mechanical definition -- *every object
 in =sqlite_master= this crate did not itself write, plus every row of the
 =gpkg_*= registry tables it does not populate* -- rather than an open-ended one.
@@ -441,13 +458,21 @@ already been renamed once./
    Exit 0, no warning. =ogr2ogr= on the same input kept all of it. The two
    feature layers survive; the user's own table does not.
 
-   ***Partly fixed 2026-08-24, and the "after" line above is now wrong for one
-   row of it.*** =gpkg_tile_matrix(_set)= and a populated tile table now
-   *survive*, carried by =src/geopackage/carry.rs= -- the first class of
-   container content this defect covers, and D8's case. /Everything else in the
-   "before" line is still destroyed, so the defect stays open: =side_notes=,
-   =gpkg_metadata=, =gpkg_metadata_reference= and =gpkg_extensions= rows./
-   The warning shipped 2026-08-21 and still names them.
+   ***Mostly fixed by the end of 2026-08-25, and the "after" line above is now
+   wrong for most of it.*** =gpkg_tile_matrix(_set)= and a populated tile table
+   survive as of 2026-08-24, carried by =src/geopackage/carry.rs= -- D8's case,
+   and the first class of container content this defect covers. =side_notes=
+   and its kind, the =gpkg_metadata= pair, and the =gpkg_extensions=
+   registrations for both extensions this crate implements all followed on
+   2026-08-25. /**Nine of the twelve =.gpkg= fixtures now round-trip with the
+   warning silent**, and =gdal_tiles.gpkg= -- the one with the richest
+   container -- is among them./
+
+   *What keeps the defect open is no longer a class of content.* Three fixtures
+   still lose something and each is a **capability** this crate lacks: a
+   =WITHOUT ROWID= table the writer cannot emit, an =attributes= dataset whose
+   =gpkg_contents= registration is not carried, and the CRS-WKT extension's
+   *column*. The merge path is separate and untouched.
 
    Unlike defects 1--2 this one *does* need the mechanism (§ THE DOMAIN OF THE
    RULE), so it could not ship with M4. /(This sentence read "unlike defects
@@ -1616,12 +1641,14 @@ merely wrong. The ids are computed once per layer and handed to both.
   covers most of defect 3's damage (=side_notes=, =gpkg_metadata=,
   =gpkg_metadata_reference=, =gpkg_ogr_contents=) with no new file-format work.
 
-  ***Two of the four members that sentence names are now carried*** --
-  =side_notes= and its kind, 2026-08-25, by =geopackage/carry.rs= -- and the
-  prediction held exactly: no new file-format work, just DDL plus rows through
-  =TableSpec=. /=gpkg_ogr_contents= turned out not to belong in that list at
-  all: it is *derived*, which was bug 13. The metadata pair is the remainder,
-  and Requirement 95 makes it a pair./
+  ***All four members that sentence names are now settled, 2026-08-25*** --
+  =side_notes= and its kind are carried by =geopackage/carry.rs=, and the
+  =gpkg_metadata= pair with them, the prediction holding exactly for the first:
+  no new file-format work, just DDL plus rows through =TableSpec=.
+  /=gpkg_ogr_contents= turned out not to belong in that list at all: it is
+  *derived*, which was bug 13. The metadata pair needed more than the sentence
+  promised -- not file-format work, but a **validation** layer, because it is
+  layer-coupled where the other three are independent./
 
   *One thing the survey did not anticipate, and it cost a shipped bug.* An
   arbitrary user table's indexes must be **re-packed** from the source, not
@@ -1965,6 +1992,418 @@ merely wrong. The ids are computed once per layer and handed to both.
   =format.rs='s *compiler-caught* list with the fixture-registry pattern named,
   =README.md=, and the conversion of
   =display_name_uses_each_format_s_own_spelling= off its array literal (D6).
+
+*** The metadata pair -- ***BUILT 2026-08-25***
+/Written up before any code, because three of its questions were decisions.
+**All three recommendations below were taken**, and one of them stopped being a
+judgement call once the normative text was read. The plan text is kept as filed
+-- what it got wrong is corrected in place and marked, because the correction
+is the useful part./
+
+***What shipped.*** =carry::Metadata= reads the pair verbatim;
+=writer::retained_references= decides what reaches the output;
+=writer::metadata_tables= constructs both tables from the annex's DDL;
+=writer::metadata_drop_warnings= reports a partial carry. /Measured on every
+fixture holding the pair: =integrity_check= ok, =foreign_key_check= clean, and
+=gdal_tiles.gpkg='s reference to its **pyramid** survives -- which is the case
+the re-read caught and the first draft would have destroyed./
+
+***And the mutation check earned its place twice.*** Eight mutations, each
+caught by the intended test and by no other -- but only after **two of the
+eight were caught by nothing at all** on the first pass: the =column=-scoped
+branch of Requirement 98 (the fixture's own column reference names a column
+that survives, so only the keeping half was exercised) and the
+=gpkg_extensions= row accounting below. /Both now have a test named for what it
+protects. A rule with one branch tested is a rule half tested./
+
+**** The row accounting nobody would have noticed
+Making the pair survive silently made a *second* thing wrong:
+=container::foreign_extension_rows= counts =gpkg_extensions= rows rather than
+the table, and the two Metadata registrations it had rightly counted as
+destroyed are now reproduced. Left alone, the warning reports content that
+survives -- ***bug 13's mistake exactly, in a second table***, and reachable
+only because the fix to one thing changed the truth of another.
+
+/The general shape is worth keeping: a table reported **by row count** has to
+be re-examined every time anything new starts writing rows into it, and nothing
+in the type system says so./
+
+=gpkg_metadata= and =gpkg_metadata_reference= are what is left of defect 3 now
+that the independent class is closed, and **they are not more of the same
+work**. =carry.rs= excludes them by name, in =user_tables='s "what is
+deliberately left behind" list, and the exclusion is the point rather than a
+gap: everything that module carries is *independent* content, valid whatever
+the write turns out to produce. The pair is **layer-coupled**. A
+=gpkg_metadata_reference= row names a =table_name=, a =column_name= and a
+=row_id_value=, and a write may produce none of the three.
+
+So the governing rule is the middle row of the three-class contract --
+*validate against what is actually being written, never replay blindly* -- and
+the precedent to follow rather than reinvent is **decision 14**, which replays
+=ARROW:schema= only while the column names still match.
+
+**** What the read side costs, and it is the cheapest carry yet
+/Measured 2026-08-25 across the eight fixtures that hold the pair./
+
+| fact | value | consequence |
+|------+-------+-------------|
+| indexes on either table | ***0*, in all eight** | none of D10's re-packing applies. This is the first carried table with *nothing to re-pack*, which is why entry 20's whole class cannot recur here |
+| reference rows per file | 1 or 2, and =spec_conformant='s *0* | sizing is a non-issue; these are single-digit tables |
+| =sqlite_sequence= for =gpkg_metadata= | present in the four AUTOINCREMENT fixtures, absent in the rest | =Autoincrement::Declared= / =HighWater= already covers both, closed 2026-08-23 |
+
+*So the read side is a =Metadata= member on =Carried= and little else.* The
+cost of this milestone is entirely in the *write* side's validation.
+
+**** Three DDL shapes are in the tree, and the split is not where HOSTILE.org said
+/Measured 2026-08-25, and it corrects that file's =spec_conformant= entry --
+see the fix landed there the same day./
+
+| provenance | =gpkg_metadata.id= | =_reference='s =crmr_*_fk= | =sqlite_sequence= |
+|------------+--------------------+---------------------------+-------------------|
+| =spec_conformant= (annexes at =fe83fdd=) | =INTEGER PRIMARY KEY AUTOINCREMENT= | *declared* | declared, never inserted |
+| *GDAL 3.13.2* (=gdal_tiles=, =gdal_linestring_z=) | =INTEGER CONSTRAINT m_pk PRIMARY KEY ASC NOT NULL= | *declared* | none -- never declared AUTOINCREMENT |
+| hand-built =sqlite3= (=gdal_hostile='s container content, and the =sqlite_*= family that =cp=s it) | =INTEGER PRIMARY KEY AUTOINCREMENT= | ***absent*** | =gpkg_metadata=1= |
+
+***GDAL declares both foreign keys.*** =HOSTILE.org= recorded them as "the two
+=crmr_*_fk= foreign keys GDAL omits", which is measurably wrong on GDAL's own
+output. What omits them is the =sqlite3=-authored container content in
+=gdal_hostile.gpkg=, and the =sqlite_*= fixtures inherit the omission by
+copying that file. /Same standing as =sqlite_contents.gpkg='s constraint-free
+=imagery=: a hand-built accident, and **do not "fix" it** -- it is the only
+thing in the tree that distinguishes a declared reference from an undeclared
+one./
+
+***** D11 -- construct the DDL, do not carry it. ***TAKEN 2026-08-25**; and Requirement 93 settles it.*
+/Filed as a judgement call. It is not one: **Requirement 93 makes the DDL
+normative** -- "if present it SHALL be defined per clauses ...
+=<<gpkg_metadata_sql>>=" -- so carrying GDAL's =m_pk ... ASC NOT NULL= spelling
+would emit a table not defined per the clause. The argument below is why it is
+*also* the right call on this crate's own terms./
+
+The pyramid and =side_notes= are carried DDL-and-all because *only their own
+DDL knows what they are*. These two are **standard-defined tables**, and this
+crate already holds a position on those: defect 6 is the position, and
+=the_registry_ddl_is_what_the_standard_says= enforces it by comparing whole
+normalised DDL per table against =spec_conformant=. A seventh and eighth
+registry table arriving by verbatim carry would walk around that test rather
+than extend it.
+
+*And constructing buys an oracle the source may not have carried.* Declare
+=crmr_mfi_fk= and =foreign_key_check= catches a reference whose =md_file_id= no
+longer resolves -- on **every** fixture, including the five whose input
+declares no such key. Carry verbatim from one of those and there is no key to
+check, which is D5's exact phrasing one table over: *not malformed, merely
+lying*.
+
+/The hazard against it, stated because it is entry 15's class and this plan
+should not walk into it twice:/ constructing AUTOINCREMENT over a GDAL source
+that declared =m_pk= **adds a =sqlite_sequence= obligation the source had
+none of**. Declaring the keyword and omitting the row is the malformed-database
+shape. The obligation is mechanical rather than subtle -- if the constructed
+DDL says AUTOINCREMENT, write =HighWater(max(id))= -- but it has to be written
+down, because nothing in the carried rows will remind anyone.
+
+*This makes the pair the first content that is carried as **rows into
+constructed DDL***, rather than carried whole or built whole. D1 is untouched
+by that: the =metadata= column is an opaque blob this crate never parses, and a
+standard-defined table's *DDL* is not its content.
+
+**** The validation, which is the actual work
+***** The normative text, read 2026-08-25 at the pin
+/=spec/core/annexes/extension_metadata.adoc= at =fe83fdd=, the same commit
+=build_spec_fixtures.sh= transcribes. Read because this plan's first draft cited
+Requirement 97 from memory and **got its authority wrong** -- see the correction
+below, which would have shipped as a bug./
+
+| req | what it obliges | bearing here |
+|-----+-----------------+--------------|
+| 93 | =gpkg_metadata=, if present, *SHALL be defined per* =<<gpkg_metadata_sql>>= | **the DDL is normative**, which settles D11 by text rather than by defect 6's precedent alone |
+| 95 | a GeoPackage with =gpkg_metadata= SHALL contain =gpkg_metadata_reference= | the pair, as already recorded |
+| 96 | =reference_scope= SHALL be one of the five, *lowercase* | a fixed vocabulary to match on, not an open string |
+| 97 | =geopackage= scope SHALL have NULL =table_name=; **every other row's =table_name= SHALL reference a value in the =gpkg_contents= =table_name= column** | *see the correction* |
+| 98 | =geopackage=, =table=, =row= SHALL have NULL =column_name=; the rest SHALL name a column in the table =table_name= identifies | =column= / =row/col= only, and the columns are the *identified table's*, not a layer's |
+| 99 | =geopackage=, =table=, =column= SHALL have NULL =row_id_value=; the rest SHALL hold the ROWID of a row in that table | =row= / =row/col= only |
+| 101 | =md_file_id= SHALL be an id from =gpkg_metadata= | the dangling-reference oracle D11 buys |
+| 102 | =md_parent_id=, when NOT NULL, SHALL be an id from =gpkg_metadata= *and not equal to =md_file_id= for that row* | confirms D12's direction, and adds a constraint nobody had recorded |
+
+/Requirement 94 -- the =md_scope= vocabulary -- is **struck through** in the
+source (=[line-through]#...#=), so the scope names in Table /Metadata Scopes/
+are informative. **Do not validate =md_scope=.**/
+
+****** ***The correction: the authority is =gpkg_contents=, not the layer set***
+Requirement 97 says =table_name= must reference *"a value in the =gpkg_contents=
+=table_name= column"*. This plan's first draft said "the layer", and that is
+**narrower than the standard and would have destroyed a valid reference**:
+=gpkg_contents= registers tile pyramids and =attributes= datasets too, and this
+crate has carried pyramids since 2026-08-24.
+
+/The case is already in the tree and would have failed silently./
+=gdal_tiles.gpkg= holds a =table=-scoped reference to **=imagery=** -- the tile
+pyramid -- beside one to =cities=. Validated against the written *layers*, the
+=imagery= reference is dropped from a file that still contains =imagery=.
+Validated against the output's =gpkg_contents=, it survives, which is correct
+and is also *cheaper*: the writer already assembles that table.
+
+**So the check is one lookup against the output's own =gpkg_contents=**, and it
+composes with carrying by construction -- anything the write registers keeps
+its references, whether it came from a layer or from =carry.rs=.
+
+***** The five scopes, as the requirements divide them
+| =reference_scope= | =table_name= | =column_name= | =row_id_value= | what must survive |
+|-------------------+--------------+---------------+----------------+-------------------|
+| =geopackage= | NULL (r97) | NULL (r98) | NULL (r99) | nothing -- carry unconditionally |
+| =table= | in =gpkg_contents= | NULL | NULL | the registration |
+| =column= | in =gpkg_contents= | a real column (r98) | NULL | the registration *and* the column |
+| =row= | in =gpkg_contents= | NULL | a real ROWID (r99) | the registration *and* the rowid |
+| =row/col= | in =gpkg_contents= | a real column | a real ROWID | all three |
+
+/A row that arrives violating its own scope's NULL-ness rules is a
+non-conformant source, not a case to carry: normalise it to the requirement or
+drop it, rather than propagating the violation into this crate's output./
+
+***** D12 -- drop the reference, never the metadata record. ***TAKEN 2026-08-25.***
+Dropping a reference can leave a =gpkg_metadata= row that nothing points at,
+and the temptation is to garbage-collect it. **Don't**, for three reasons that
+agree:
+
+1. *An unreferenced record is conformant.* Requirement 95 makes the two tables
+   a pair; it says nothing about every record being referenced. The proof is in
+   the tree: =spec_conformant.gpkg= holds the pair with **zero** reference rows
+   and is the fixture built from the normative text.
+2. *The foreign keys run one way.* Both =crmr_mfi_fk= and =crmr_mpi_fk= point
+   *from* the reference *to* =gpkg_metadata(id)=. Deleting a metadata row can
+   break a surviving reference; deleting a reference can never break a metadata
+   row. The safe direction falls out of the DDL.
+3. *=md_parent_id= makes it a graph.* Collecting orphans properly means walking
+   a parent chain to decide what is unreachable, and getting it wrong destroys
+   opaque content the reference's removal did not touch.
+
+**** Where this session's correction lands in code, and it is easy to miss
+=writer::feature_ids= falls back to a dense sequence **for the whole layer**
+when the carried ids do not strictly ascend -- which a consumer triggers by
+deleting from the middle of the public =FeatureCollection::features=. Decision
+27 closed the *unconditional* renumbering. **It did not close the conditional
+one**, and when the fallback fires, every =row=-scoped reference into that
+layer is invalidated: the =row_id_value= hazard =container-reconciliation.org=
+D5 describes, live on the one-container path, *after* the fix that was supposed
+to have closed it there.
+
+/That plan's D5 already carries the general form of this -- the guard belongs
+wherever a **rowid changes**, not wherever a merge happens. This is the first
+place it has to be built rather than stated./
+
+***The implementation consequence is concrete and is not in the current
+signature.*** =feature_ids= returns =Vec<i64>=; the metadata write needs to
+know *whether it fell back*, not merely what it returned. A layer whose ids
+were carried and a layer whose ids were reissued are indistinguishable in the
+output vector whenever the source happened to be dense.
+
+**** The two =gpkg_extensions= rows the pair obliges
+Writing the pair obliges its registration, and **Requirement 140 makes those
+two rows normative** with their values fixed by the annex's /Extension Table
+Records/: =table_name= of =gpkg_metadata= and =gpkg_metadata_reference=,
+=column_name= NULL, =extension_name= =gpkg_metadata=, =scope= =read-write=.
+/Measured identical in =gdal_tiles.gpkg=. The =definition= column is the one
+free cell -- the annex asks for "a hyperlink that describes the current
+implementation", naming =http://www.geopackage.org/spec121/#extension_metadata=
+as the permalink pattern; GDAL writes the =spec120= form./ Today =gpkg_extensions=
+is constructed only when an R*Tree is written, so it needs a **second
+contributor** rather than a new table. /The rest of =gpkg_extensions= separated cleanly, as this line predicted, and
+the Schema half shipped the **same day** -- see § The Schema extension's
+registration, where it turned out to be a shipped conformance defect rather
+than uncarried content. What is still unregistered is only an extension this
+crate does not implement: =gpkg_crs_wkt_1_1=./
+
+**** What =container.rs= needs, including a warning it cannot currently say
+=Carried::reproduced_names= gains the pair, and
+=the_two_lists_of_constructed_tables_agree= is the test that will hold it
+honest.
+
+***** D13 -- a partial carry must be reported. ***TAKEN 2026-08-25.***
+****** The warning has to reason about the *output's* layer set, not the caller's
+/Caught in review the same day, before the work left the working tree, and
+recorded because the shape recurs./
+
+The first implementation handed =metadata_drop_warnings= the layers the *caller*
+passed. =write_layers= does not write those: it **upserts them over whatever
+the destination already holds**, so an append produces a layer set the caller
+never named. Measured:
+
+#+begin_src text
+  geosetta fid_gap.gpkg dest.gpkg --layer cities   # dest now holds `cities`
+  geosetta fid_gap.gpkg dest.gpkg --layer second
+    warning: ... 3 of 3 metadata references could not be ...
+    actually written: 3
+#+end_src
+
+***A warning that names losses the same run did not incur*** -- the exact
+inverse of the failure this crate keeps finding, and arguably worse than
+silence: it teaches a reader to distrust the message that is usually right.
+
+*Fixed by extracting =compose_layers=*, which =write_layers= and the warning now
+both call. /The rule was already single -- =retained_references= -- and it was
+still possible to disagree, because **the two callers computed different
+inputs to it**. Sharing the rule is not enough when the arguments are derived
+twice./
+The survey's vocabulary today is **carried or destroyed**, and this is the
+first content that can be *carried in part*: three references in, two out,
+because a layer was not selected. The precedents cut in opposite directions and
+the distinction between them is the rule --
+=gpkg_ogr_contents= is reported silently because it is *derived* and no
+information is lost, and the R*Tree earns a message because =--rtree= is a
+**remedy**. A dropped reference has no remedy and **does** lose information,
+which is the combination neither precedent covers. Report it, and name the
+table whose absence caused the drop -- the drop is a consequence of a layer
+selection the user made, so the message is actionable even without a flag.
+
+**** The corpus is blind again, in exactly the shape that hid entry 19
+/Measured 2026-08-25, every =gpkg_metadata_reference= row in the tree./
+
+#+begin_src text
+  gdal_hostile        table   row_id_value NULL
+  gdal_linestring_z   table   row_id_value NULL
+  gdal_tiles          table   row_id_value NULL   (x2)
+  sqlite_altered      table   row_id_value NULL
+  sqlite_constraints  table   row_id_value NULL
+  sqlite_contents     table   row_id_value NULL
+  sqlite_fid_gap      table   row_id_value NULL
+  spec_conformant     (pair present, zero reference rows)
+#+end_src
+
+***Every reference in the corpus is =table=-scoped.*** Not one =row=, =column=
+or =row/col= -- so the entire class of reference that Requirement 99, decision
+27 and D5's hazard are *about* is untestable against this tree. A build that
+silently dropped every row-scoped reference, or carried one pointing at a rowid
+that no longer exists, would have passed all 571 tests **and both oracles**
+/(the count at the moment this was measured)/, for the same structural reason
+all eleven fixtures once round-tripped their dense ids unchanged.
+
+*The fixture is =sqlite_fid_gap.gpkg= extended, not a new file*, and the
+reasoning is that fixture's own: it already holds =cities= at =1, 9, 40= beside
+a dense =second= so that one file tests the **rule** rather than either half.
+Add a =row=-scoped reference at =cities= fid **9** -- the gap id -- and a
+=column=-scoped row on a column the write keeps, and one file then tests a
+carried gap id *and* a reference into it together. ***BUILT 2026-08-25***: =build_fid_fixture.sh= extended, and the fixture now
+carries =table=, =row= and =column= scopes in one file. /Confirmed readable by
+geosetta without error, per =HOSTILE.org='s standing rule./
+
+**** What this piece is not, so the boundary is not argued twice
+*Not the merge.* =container-reconciliation.org= § 2 owns renumbering
+=gpkg_metadata.id= and rewriting =md_file_id= / =md_parent_id= behind it, and
+§ 6 owns the same-row contract including the timestamp ruling /(keep the
+destination's stamp on a dedup)/. On the one-container path **nothing
+collides**: this writer emits no =gpkg_metadata= rows of its own, so the
+source's ids are carried untouched and § 2 is not needed to write a correct
+file. That is D3's shape again -- work M3b does first and that plan consumes.
+
+**** The oracle is already in place this time, which is the point of it
+=tests/gpkg_oracles.rs= runs =sqlite3= and GDAL over *every* =.gpkg= fixture's
+output and picks up a fixture added later without anyone editing it. So under
+D11's constructed DDL, =foreign_key_check= covers a dangling =md_file_id= on
+every fixture **from the first commit of this work** rather than after the bug.
+/Entry 20 is the reason that sentence is worth writing down: the loop existing
+before the work is the whole remedy that entry produced./
+*** The Schema extension's registration -- ***BUILT 2026-08-25***
+/Started as the smallest item left in defect 3's survey and turned out to be a
+**shipped conformance defect** rather than uncarried content -- =handoff.org=
+§ BUGS FOUND entry 21, live since 2026-08-21./
+
+After the metadata pair landed, =gpkg_extensions (2 rows)= was still reported
+against most fixtures. Reading *which* rows those were is the whole finding:
+=gpkg_data_columns= and =gpkg_data_column_constraints= registering
+=gpkg_schema= -- **tables this crate writes itself and had never registered**.
+
+***Requirement 59 makes the registration constitutive rather than
+bookkeeping.*** /"In an Extended GeoPackage, every extension SHALL be
+registered … the absence of rows in the =gpkg_extensions= table SHALL indicate
+that the file is a GeoPackage (as opposed to an Extended GeoPackage)."/ The
+output was not missing a note about itself; it was **asserting the wrong thing
+about itself**. Requirement 141 then fixes the two rows' values, in the same
+/Extension Table Records/ shape as Requirement 140.
+
+**** Why defect 6 could not have caught it, which is the transferable part
+Defect 6 asked, per table, *"is this table defined the way the standard defines
+it?"* -- and fixed five that were not, by comparing whole normalised DDL
+against =spec_conformant.gpkg=. ***A check of that shape cannot see a
+requirement of the form "if you have this table you must also have that row in
+another table."*** Both of this crate's extensions have exactly that
+requirement, and it took writing the second one to notice the first was missing.
+
+/Nor could any oracle. The file is well-formed SQLite -- =integrity_check= ok,
+=foreign_key_check= clean, =ogrinfo= reading the declarations back, =ogr2ogr=
+rewriting the result, all measured on 2026-08-21 and all true. **A missing
+=gpkg_extensions= row is invisible to every oracle that asks whether the file
+works**, because it does; it is only wrong about what it is./
+
+**** One decision, and the two annexes disagree in a way that matters
+=schema_extension_rows= registers **the tables actually written**, not the
+annex's two rows. Requirements 103 and 107 each say a GeoPackage *MAY* contain
+their table, *independently* -- so =gpkg_data_columns= without
+=gpkg_data_column_constraints= is a conformant file, which is what this writer
+produces whenever no layer carried a constraint, and registering the absent one
+would name a table the file does not contain (Requirement 60 admits
+=table_name= values that "reference new tables required by that extension", and
+an absent table is required by nothing).
+
+***The Metadata annex is the opposite and the contrast is the guard rail.***
+Requirement 95 makes =gpkg_metadata= and =gpkg_metadata_reference= a **pair**
+that travels together or not at all. /Reading one annex and applying its rule to
+the other would have been wrong in both directions, which is why both rules
+have a test naming the requirement it comes from./
+
+**** And the warning had to move with it, on LAYER_SCOPED's reasoning
+=container::foreign_extension_rows= counts =gpkg_extensions= by *row*, so the
+newly written registrations would have gone on being reported as destroyed.
+Excluded **unconditionally** -- not conditionally as the Metadata rows are --
+because the Schema tables are already excluded unconditionally as
+=LAYER_SCOPED=: their rows belong to the layers, and a registration of those
+tables is the same content one level up. /Reporting the registration as
+destroyed while saying nothing about the table it registers would have been
+half an answer./
+
+***The result is that =gdal_tiles.gpkg= now round-trips with the drop warning
+saying nothing at all*** -- the first fixture in this tree with a non-trivial
+container to reach that.
+
+*** The empty tables that were never destroyed -- ***FIXED 2026-08-25***
+The last thing in the survey after the two registrations landed, and it was not
+a loss at all: **a plain =ogr2ogr= GeoPackage with no pyramid reported
+"2 empty tables"**. They are =gpkg_tile_matrix= and =gpkg_tile_matrix_set=,
+which GDAL creates for every GeoPackage and leaves empty, and which this writer
+constructs the moment a pyramid needs them. /Furniture on the most ordinary
+file there is, which =lossy-conversion-warnings.org= § THE RULE forbids./
+
+**** The obvious fix is wrong, and the fixture that says so already existed
+=container::survey= excludes =REPRODUCED=, =LAYER_SCOPED= and =DERIVED= and not
+=CONSTRUCTED=, so "the survey is missing a class" is the reading that suggests
+itself -- add =CONSTRUCTED= beside the other three and be done. ***That would
+silence a real loss.*** The append path writes into a destination whose tile
+registries are *populated* and whose pyramid is not carried, and those rows are
+genuinely destroyed:
+
+#+begin_src text
+  geosetta points.gpkg tiled-destination.gpkg
+    -> gpkg_tile_matrix_set (1 row), gpkg_tile_matrix (14 rows), imagery (80 rows)
+#+end_src
+
+/Measured before the change and again after, because this is precisely the
+shape of bug 13 in reverse -- there the code reported something that survived,
+here the tempting fix would hide something that does not./
+
+**** So the rule is about *emptiness*, not about the class
+An empty registry table this writer constructs on demand is not destroyed
+content, because its absence from an output that needs nothing loses nothing.
+A populated one is content and is reported exactly as before. **One arm of one
+match**, and the test asserts *both* halves together -- a rule that is only
+correct as a pair should not be pinned by a test that can pass on half of it.
+
+***And a test was pinning the bug.***
+=the_container_around_the_layers_is_reported_object_by_object= asserted
+=contains("2 empty tables")= with a comment naming the two tables, so the false
+report had been written down as expected behaviour and read as correct for four
+days. /It now asserts the negative. Worth noticing how it happened: the
+assertion was true of the output, accurately described, and nobody asked
+whether it *should* be./
 
 ** TESTING
 - *The invariant, table-driven, per format*: read a hostile fixture, write the

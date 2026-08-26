@@ -12,7 +12,7 @@ use crate::format::Format;
 use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
 use crate::sqlite::{Autoincrement, MasterEntry, TableSpec, Value, autoindex_records, write_database};
 
-use super::carry::{Carried, Metadata, MetadataReference, Pyramid, UserTable};
+use super::carry::{Carried, Metadata, MetadataReference, Pyramid, SrsDef, UserTable};
 use super::reader::read_layers;
 use super::rtree;
 
@@ -272,7 +272,7 @@ fn build(
 
     let mut specs = vec![
         spatial_ref_sys(&srs.registrations),
-        gpkg_contents(layers, &srs.per_layer, carried, &srs.per_pyramid)?,
+        gpkg_contents(layers, &srs.per_layer, carried, &srs.per_pyramid, &srs.per_table)?,
         geometry_columns(layers, &srs.per_layer),
     ];
     // The two tile registry tables exist to describe pyramids, so they are
@@ -670,8 +670,18 @@ pub(crate) fn retained_references(
             continue;
         };
         let layer = layers.iter().position(|(name, _)| *name == table);
-        let pyramid = carried.pyramids.iter().any(|p| p.name == table);
-        if layer.is_none() && !pyramid {
+        // Requirement 97's authority is the output's `gpkg_contents`, not its
+        // layer set — so every kind of entry that table gains has to appear
+        // here. A carried table qualifies exactly when it brought a
+        // registration: an unregistered one (`side_notes` and its kind) is in
+        // the file but in no registry, so a reference naming it would dangle
+        // under a requirement that says it SHALL NOT.
+        let registered = carried.pyramids.iter().any(|p| p.name == table)
+            || carried
+                .tables
+                .iter()
+                .any(|t| t.name == table && t.registration.is_some());
+        if layer.is_none() && !registered {
             drop(&mut dropped, "the table it names is not in the output");
             continue;
         }
@@ -924,6 +934,13 @@ struct ResolvedSrs {
     /// **The output's** srs_id for each carried object, which is not the
     /// source's — see [`reconcile_carried_srs`].
     per_pyramid: Vec<i64>,
+    /// The same, for each entry of `carried.tables` — `None` where the table
+    /// carries no [`Registration`] (so no `gpkg_contents` row is written for
+    /// it and the value is never read) *or* where its registration left
+    /// `srs_id` NULL, which Requirement 13 permits. The two cases are not
+    /// distinguished because nothing downstream distinguishes them: both write
+    /// no srs_id.
+    per_table: Vec<Option<i64>>,
     registrations: Vec<SrsReg>,
 }
 
@@ -1004,13 +1021,37 @@ fn resolve_srs(layers: &[(String, FeatureCollection)], carried: &Carried) -> Res
     // Carried content is resolved *after* every layer, so a layer's numbering
     // is exactly what it was before this channel existed and a file carrying
     // nothing is byte-identical.
-    let per_pyramid = carried
+    let per_pyramid: Vec<i64> = carried
         .pyramids
         .iter()
-        .map(|pyramid| reconcile_carried_srs(pyramid, &mut registrations, &mut next_synthetic))
+        .map(|pyramid| {
+            reconcile_carried_srs(
+                pyramid.srs_id,
+                pyramid.srs.as_ref(),
+                &mut registrations,
+                &mut next_synthetic,
+            )
+        })
+        .collect();
+    // Registered carried tables last, so a pyramid's numbering is unchanged by
+    // the arrival of this channel — the same rule that puts carried content
+    // after every layer.
+    let per_table = carried
+        .tables
+        .iter()
+        .map(|table| {
+            let registration = table.registration.as_ref()?;
+            let srs_id = registration.srs_id?;
+            Some(reconcile_carried_srs(
+                srs_id,
+                registration.srs.as_ref(),
+                &mut registrations,
+                &mut next_synthetic,
+            ))
+        })
         .collect();
 
-    ResolvedSrs { per_layer, per_pyramid, registrations }
+    ResolvedSrs { per_layer, per_pyramid, per_table, registrations }
 }
 
 /// Map a carried object's `srs_id` from the **source's** numbering into the
@@ -1042,31 +1083,39 @@ fn resolve_srs(layers: &[(String, FeatureCollection)], carried: &Carried) -> Res
 /// [`UNDEFINED_SRS_ID`] rather than carried through: the reference was already
 /// dangling in the source, and reproducing it would put this crate's name on a
 /// file that fails `foreign_key_check`. The CRS is not knowable from anything
-/// else in the file — a tile is an opaque blob here — so "undefined" is the
-/// true statement.
+/// else in the file — a tile is an opaque blob here, and an `attributes`
+/// dataset has no geometry at all — so "undefined" is the true statement.
+///
+/// Called for a [`Pyramid`] and for a carried table's
+/// [`super::carry::Registration`], which is why it takes the two fields rather
+/// than either struct. **Requirement 16 is what makes it owed in both cases**:
+/// a non-NULL `gpkg_contents.srs_id` SHALL reference a `gpkg_spatial_ref_sys`
+/// row, and `resolve_srs` rebuilds that numbering from the layer set on every
+/// write.
 fn reconcile_carried_srs(
-    pyramid: &Pyramid,
+    srs_id: i64,
+    def: Option<&SrsDef>,
     registrations: &mut Vec<SrsReg>,
     next_synthetic: &mut i64,
 ) -> i64 {
     // The three rows `spatial_ref_sys` always writes. A carried reference to
     // one of them needs no registration and no renumbering.
-    if pyramid.srs_id == UNDEFINED_SRS_ID || pyramid.srs_id == -1 {
-        return pyramid.srs_id;
+    if srs_id == UNDEFINED_SRS_ID || srs_id == -1 {
+        return srs_id;
     }
-    let Some(def) = &pyramid.srs else {
+    let Some(def) = def else {
         return UNDEFINED_SRS_ID;
     };
-    if pyramid.srs_id == WGS84_SRS_ID {
+    if srs_id == WGS84_SRS_ID {
         return WGS84_SRS_ID;
     }
 
-    if let Some(existing) = registrations.iter().find(|r| r.srs_id == pyramid.srs_id) {
+    if let Some(existing) = registrations.iter().find(|r| r.srs_id == srs_id) {
         let same = existing.organization == def.organization
             && existing.organization_coordsys_id == def.organization_coordsys_id
             && existing.definition == def.definition;
         if same {
-            return pyramid.srs_id;
+            return srs_id;
         }
         // Case 2: renumber onto an id nothing has taken. Stepping past taken
         // ids matters because a *carried* id may itself sit in the synthetic
@@ -1087,13 +1136,13 @@ fn reconcile_carried_srs(
     }
 
     registrations.push(SrsReg {
-        srs_id: pyramid.srs_id,
+        srs_id,
         name: def.srs_name.clone(),
         organization: def.organization.clone(),
         organization_coordsys_id: def.organization_coordsys_id,
         definition: def.definition.clone(),
     });
-    pyramid.srs_id
+    srs_id
 }
 
 fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
@@ -1134,11 +1183,19 @@ fn spatial_ref_sys(registrations: &[SrsReg]) -> TableSpec {
     TableSpec { name: "gpkg_spatial_ref_sys".into(), sql: sql.into(), rows, autoindexes: Vec::new(), autoincrement: None }
 }
 
+/// `gpkg_contents` — one row per feature layer, then one per carried pyramid,
+/// then one per carried table that arrived with a [`super::carry::Registration`].
+///
+/// The rowid order is layers, pyramids, datasets, and it is positional rather
+/// than meaningful: keeping the constructed rows in the positions they have
+/// always had is what leaves this crate's output byte-identical for a file
+/// that carries nothing.
 fn gpkg_contents(
     layers: &[(String, FeatureCollection)],
     per_layer_srs: &[i64],
     carried: &Carried,
     per_pyramid_srs: &[i64],
+    per_table: &[Option<i64>],
 ) -> Result<TableSpec> {
     let rows: Vec<(i64, Vec<Value>)> = layers
         .iter()
@@ -1209,6 +1266,42 @@ fn gpkg_contents(
                 pyramid.bbox[2].clone(),
                 pyramid.bbox[3].clone(),
                 Value::Int(srs_id),
+            ],
+        ));
+    }
+    for (i, (table, srs_id)) in carried.tables.iter().zip(per_table).enumerate() {
+        let Some(registration) = &table.registration else { continue };
+        // Requirement 13 makes `identifier` UNIQUE, so the same refusal the
+        // pyramid arm makes applies here — and a NULL identifier is exempt,
+        // because two NULLs do not collide under a SQL UNIQUE. That is the
+        // whole reason `Registration::identifier` is an `Option`.
+        if let Some(identifier) = &registration.identifier
+            && rows
+                .iter()
+                .any(|(_, values)| values.get(2) == Some(&Value::Text(identifier.clone())))
+        {
+            return Err(Error::Convert(format!(
+                "gpkg: the source carries a dataset whose gpkg_contents identifier \"{identifier}\" \
+                 is already used by another entry in the output; refusing to write a container \
+                 with a duplicate identifier"
+            )));
+        }
+        rows.push((
+            (layers.len() + carried.pyramids.len() + i + 1) as i64,
+            vec![
+                Value::Text(table.name.clone()),
+                Value::Text(registration.data_type.clone()),
+                text_or_null(registration.identifier.clone()),
+                text_or_null(registration.description.clone()),
+                Value::Text(registration.last_change.clone()),
+                registration.bbox[0].clone(),
+                registration.bbox[1].clone(),
+                registration.bbox[2].clone(),
+                registration.bbox[3].clone(),
+                match srs_id {
+                    Some(id) => Value::Int(*id),
+                    None => Value::Null,
+                },
             ],
         ));
     }
@@ -3472,5 +3565,385 @@ mod tests {
         let layers = read_layers(&g3).unwrap();
         assert_eq!(layers.len(), 2);
         assert_eq!(layers.iter().find(|(n, _)| n == "a").unwrap().1.features.len(), 3);
+    }
+
+    /// ***An `attributes` dataset is carried, and its `gpkg_contents` row with
+    /// it*** — Requirement 118, and the second of defect 3's three remaining
+    /// capabilities.
+    ///
+    /// The registration is not decoration on the table: Requirement 118 says
+    /// the `gpkg_contents` table SHALL hold a row with `data_type` of
+    /// `attributes` for each attributes data table, so the row is what makes
+    /// the table a dataset at all. Carrying one without the other is the
+    /// half-carry `carry::user_tables` refused to do until 2026-08-25 — and
+    /// the reason it gave, that the registry row could not come along, had
+    /// been false since the pyramid started carrying its own a day earlier.
+    #[test]
+    fn an_attributes_dataset_is_carried_with_the_row_requirement_118_obliges() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let notes = carried
+            .tables
+            .iter()
+            .find(|t| t.name == "notes_aspatial")
+            .expect("the attributes dataset is carried, not skipped");
+        let registration = notes.registration.as_ref().expect("with its registration");
+        assert_eq!(registration.data_type, "attributes");
+        assert_eq!(registration.identifier.as_deref(), Some("notes_aspatial"));
+
+        // A plain user table in the same file carries none, which is the other
+        // arm of the rule: `side_notes` is in the file and in no registry.
+        let side = carried.tables.iter().find(|t| t.name == "side_notes").unwrap();
+        assert!(side.registration.is_none(), "an unregistered table stays unregistered");
+
+        let layers = read_layers(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+
+        // The registration reaches the output, spelled as the source spelled it.
+        let contents = tables.iter().find(|t| t.name == "gpkg_contents").unwrap();
+        let name_col = contents.columns.iter().position(|c| c == "table_name").unwrap();
+        let type_col = contents.columns.iter().position(|c| c == "data_type").unwrap();
+        let row = db
+            .read_rows(contents)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.get(name_col) == Some(&Value::Text("notes_aspatial".into())))
+            .expect("a gpkg_contents row for the carried dataset");
+        assert_eq!(row.get(type_col), Some(&Value::Text("attributes".into())));
+
+        // And the table itself, with its rows.
+        let notes_out = tables.iter().find(|t| t.name == "notes_aspatial").unwrap();
+        assert_eq!(db.read_rows(notes_out).unwrap().len(), 2);
+    }
+
+    /// ***A carried dataset keeps the rowids Requirement 119's NOTE gives a
+    /// purpose*** — and the property arrives free, which is why it needs a
+    /// test.
+    ///
+    /// Requirement 119 obliges an attributes table to have an INTEGER primary
+    /// key acting as a `rowid` alias, and its NOTE says what for: linking to
+    /// row-level records in `gpkg_metadata` **by rowid value** through
+    /// `gpkg_metadata_reference`. That is word for word what Requirement 29's
+    /// NOTE says about a feature table, which is the sentence decision 27 was
+    /// taken on.
+    ///
+    /// `carry::UserTable` already keeps its rowids, so nothing had to be built
+    /// — and nothing in the code says the property is load-bearing. The
+    /// fixture's ids are **1 and 9**, not 1 and 2: a dense pair cannot tell a
+    /// carried rowid from a reissued one, which is the blindness that hid
+    /// `handoff.org` entry 19 for four days.
+    #[test]
+    fn a_carried_datasets_rowids_are_the_sources_own() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let notes = carried.tables.iter().find(|t| t.name == "notes_aspatial").unwrap();
+        let ids: Vec<i64> = notes.rows.iter().map(|(rowid, _)| *rowid).collect();
+        assert_eq!(ids, vec![1, 9], "the gap is the fixture's whole point");
+
+        let layers = read_layers(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let out = tables.iter().find(|t| t.name == "notes_aspatial").unwrap();
+        let col = out.columns.iter().position(|c| c == "id").unwrap();
+        let written: Vec<Value> =
+            db.read_rows(out).unwrap().into_iter().map(|r| r[col].clone()).collect();
+        assert_eq!(
+            written,
+            vec![Value::Int(1), Value::Int(9)],
+            "a reissue would write 1, 2 and every row-scoped reference at 9 would rot"
+        );
+    }
+
+    /// ***Requirement 97's authority is the output's `gpkg_contents`, so
+    /// registering a dataset keeps its references*** — the composition
+    /// `plans/same-format-fidelity.org` predicted in the abstract and that had
+    /// never had a case.
+    ///
+    /// Both arms are asserted, because only one of them is new. A reference
+    /// naming the carried **dataset** now survives; one naming a carried but
+    /// **unregistered** table is still dropped, and must be — Requirement 97
+    /// says `table_name` SHALL reference a value in `gpkg_contents`, and
+    /// `side_notes` is in the file and in no registry, so a reference to it
+    /// would dangle under the very requirement it is being checked against.
+    #[test]
+    fn a_reference_to_a_carried_dataset_survives_and_one_to_a_plain_table_does_not() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let mut carried = crate::geopackage::read_container(SRC).unwrap();
+        let layers = read_layers(SRC).unwrap();
+
+        // The fixture's own reference to the dataset, plus one manufactured at
+        // the plain user table beside it.
+        let metadata = carried.metadata.as_mut().unwrap();
+        let template = metadata.references[0].clone();
+        metadata.references.push(MetadataReference {
+            table_name: Some("side_notes".into()),
+            ..template
+        });
+
+        let ids: Vec<Vec<i64>> = layers.iter().map(|(_, fc)| feature_ids(fc)).collect();
+        let metadata = carried.metadata.clone().unwrap();
+        let (kept, dropped) = retained_references(&metadata, &layers, &ids, &carried);
+
+        let named: Vec<&str> =
+            kept.iter().filter_map(|r| r.table_name.as_deref()).collect();
+        assert!(named.contains(&"notes_aspatial"), "the dataset is registered: {named:?}");
+        assert!(!named.contains(&"side_notes"), "an unregistered table is not: {named:?}");
+        assert!(
+            dropped.iter().any(|d| d.table_name.as_deref() == Some("side_notes")),
+            "and the drop is reported rather than silent"
+        );
+    }
+
+    /// ***A `row`-scoped reference into a carried dataset survives at the id
+    /// it names*** — Requirement 99, in the one place outside a feature layer
+    /// it can arise.
+    ///
+    /// The fixture's reference points at rowid **9**, the gap id, and the
+    /// carried table keeps it. This is `container-reconciliation.org` D5's
+    /// `row_id_value` hazard reaching a second kind of table: the reference
+    /// carries no foreign key, so a renumbering here would rot it silently,
+    /// past `integrity_check` and past `foreign_key_check` alike.
+    #[test]
+    fn a_row_scoped_reference_into_a_carried_dataset_keeps_its_rowid() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let layers = read_layers(SRC).unwrap();
+        let ids: Vec<Vec<i64>> = layers.iter().map(|(_, fc)| feature_ids(fc)).collect();
+        let metadata = carried.metadata.clone().unwrap();
+        let (kept, _) = retained_references(&metadata, &layers, &ids, &carried);
+
+        let row_scoped: Vec<&MetadataReference> = kept
+            .iter()
+            .filter(|r| r.scope == "row" && r.table_name.as_deref() == Some("notes_aspatial"))
+            .collect();
+        assert_eq!(row_scoped.len(), 1, "the fixture's row-scoped reference survives");
+        assert_eq!(row_scoped[0].row_id_value, Some(9), "at the id it named");
+    }
+
+    /// A carried dataset whose `gpkg_contents.identifier` a layer already holds
+    /// is **refused**, on the same grounds as the pyramid's collision.
+    ///
+    /// Requirement 13 makes `identifier` UNIQUE, so writing both would build an
+    /// index over two equal keys — a database SQLite reports as malformed.
+    #[test]
+    fn a_carried_dataset_whose_identifier_is_already_taken_is_refused() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let mut carried = crate::geopackage::read_container(SRC).unwrap();
+        let layers = read_layers(SRC).unwrap();
+        // `second`'s layer identifier is its own name, so claiming it collides.
+        let notes = carried.tables.iter_mut().find(|t| t.name == "notes_aspatial").unwrap();
+        notes.registration.as_mut().unwrap().identifier = Some("second".into());
+
+        let err = write_layers(None, &layers, &carried, false, false)
+            .expect_err("a duplicate identifier is refused, not resolved");
+        assert!(
+            format!("{err}").contains("duplicate identifier"),
+            "and the message says why: {err}"
+        );
+    }
+
+    /// A registration's NULL `srs_id` is written NULL, not coerced to a number.
+    ///
+    /// Requirement 13's table makes the column nullable and Requirement 16
+    /// makes any *non-NULL* value a reference that SHALL resolve — so NULL and
+    /// `0` are different statements, and `0` is the one that claims an
+    /// undefined geographic CRS. `Registration::srs_id` is an `Option` for
+    /// this, and `Pyramid`'s `i64` could not express it.
+    #[test]
+    fn a_null_srs_id_on_a_carried_registration_is_written_null() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let mut carried = crate::geopackage::read_container(SRC).unwrap();
+        let layers = read_layers(SRC).unwrap();
+        // The fixture stores 0; assert that first, so the mutation below is
+        // known to be a change rather than a no-op.
+        let notes = carried.tables.iter_mut().find(|t| t.name == "notes_aspatial").unwrap();
+        assert_eq!(notes.registration.as_ref().unwrap().srs_id, Some(0));
+        notes.registration.as_mut().unwrap().srs_id = None;
+
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let contents = tables.iter().find(|t| t.name == "gpkg_contents").unwrap();
+        let name_col = contents.columns.iter().position(|c| c == "table_name").unwrap();
+        let srs_col = contents.columns.iter().position(|c| c == "srs_id").unwrap();
+        let row = db
+            .read_rows(contents)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.get(name_col) == Some(&Value::Text("notes_aspatial".into())))
+            .unwrap();
+        assert_eq!(row.get(srs_col), Some(&Value::Null));
+    }
+
+    /// ***A carried dataset's CRS is registered although no layer uses it***,
+    /// exactly as a pyramid's is — Requirement 16, and the reason
+    /// `reconcile_carried_srs` had to stop taking a `&Pyramid`.
+    ///
+    /// `resolve_srs` rebuilds `gpkg_spatial_ref_sys` from the *layer set* on
+    /// every write, so a registration pointing at an id no layer accounts for
+    /// dangles unless it is reconciled. That is invisible to
+    /// `integrity_check` and is caught by `foreign_key_check` through
+    /// `fk_gc_r_srs_id`.
+    #[test]
+    fn a_carried_datasets_crs_is_registered_though_no_layer_uses_it() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        let mut carried = crate::geopackage::read_container(SRC).unwrap();
+        let layers = read_layers(SRC).unwrap();
+        // Move the dataset onto a CRS nothing else in the file uses. 3857 is
+        // not one of the three rows `spatial_ref_sys` always writes, so it has
+        // to be registered or the reference dangles.
+        let notes = carried.tables.iter_mut().find(|t| t.name == "notes_aspatial").unwrap();
+        let registration = notes.registration.as_mut().unwrap();
+        registration.srs_id = Some(3857);
+        registration.srs = Some(SrsDef {
+            srs_name: "WGS 84 / Pseudo-Mercator".into(),
+            organization: "EPSG".into(),
+            organization_coordsys_id: 3857,
+            definition: "PROJCS[\"WGS 84 / Pseudo-Mercator\"]".into(),
+        });
+
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let srs = tables.iter().find(|t| t.name == "gpkg_spatial_ref_sys").unwrap();
+        let id_col = srs.columns.iter().position(|c| c == "srs_id").unwrap();
+        let ids: Vec<Value> =
+            db.read_rows(srs).unwrap().into_iter().map(|r| r[id_col].clone()).collect();
+        assert!(
+            ids.contains(&Value::Int(3857)),
+            "the dataset's CRS has to be registered too: {ids:?}"
+        );
+    }
+
+    /// ***D14: a dataset registered under a `data_type` this crate does not
+    /// model is left behind*** — and still reported, rather than carried as
+    /// opaque bytes.
+    ///
+    /// Requirement 14 permits "an implementer-defined value for other data
+    /// tables per clause in an Extended GeoPackage", so carrying one is
+    /// expressible: the table is just bytes and the registration is just a
+    /// row. **Requirement 59 is what rules it out.** An implementer-defined
+    /// `data_type` comes from an extension clause, and the absence of rows in
+    /// `gpkg_extensions` SHALL indicate the file is *not* an Extended
+    /// GeoPackage — so registering the dataset while emitting no registration
+    /// for its extension is `handoff.org` entry 21 committed deliberately, and
+    /// about somebody else's extension rather than our own.
+    ///
+    /// Synthesised here rather than added to a fixture: no producer in this
+    /// tree emits one, and putting an uncarryable dataset into
+    /// `sqlite_contents.gpkg` would cost that fixture its silence.
+    #[test]
+    fn a_dataset_under_an_implementer_defined_data_type_is_not_carried() {
+        use crate::sqlite::{TableSpec, write_database};
+
+        let contents = TableSpec {
+            name: "gpkg_contents".into(),
+            sql: CONTENTS_DDL.into(),
+            rows: vec![(
+                1,
+                vec![
+                    Value::Text("coverage_stub".into()),
+                    Value::Text("2d-gridded-coverage".into()),
+                    Value::Text("coverage_stub".into()),
+                    Value::Text("".into()),
+                    Value::Text(LAST_CHANGE.into()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Int(4326),
+                ],
+            )],
+            autoindexes: vec![Vec::new(), Vec::new()],
+            autoincrement: None,
+        };
+        let stub = TableSpec {
+            name: "coverage_stub".into(),
+            sql: "CREATE TABLE coverage_stub (id INTEGER PRIMARY KEY, v BLOB)".into(),
+            rows: vec![(1, vec![Value::Null, Value::Blob(vec![1, 2, 3])])],
+            autoindexes: Vec::new(),
+            autoincrement: None,
+        };
+        let bytes =
+            write_database(&[contents, stub], &[], APPLICATION_ID, USER_VERSION).unwrap();
+
+        let carried = crate::geopackage::read_container(&bytes).unwrap();
+        assert!(
+            !carried.tables.iter().any(|t| t.name == "coverage_stub"),
+            "an unmodelled data_type is left behind, not carried as bytes"
+        );
+        // And left behind means *reported*: the survey still names it, which is
+        // what keeps this a stated capability gap rather than a silent drop.
+        let warnings =
+            super::super::container_drop_warnings(&bytes, "stub.gpkg", &[], &[], false);
+        assert!(
+            warnings.iter().any(|w| w.contains("coverage_stub")),
+            "and it is still reported: {warnings:?}"
+        );
+    }
+
+    /// ***A trigger that maintains `gpkg_ogr_contents` is dropped with the
+    /// table it maintains, and keeping it makes a file that cannot be written
+    /// to.***
+    ///
+    /// `gpkg_ogr_contents` is `super::container`'s entire `DERIVED` class —
+    /// recomputable from the layers, so this writer never emits it. `ogr2ogr`
+    /// attaches two maintenance triggers to every table it registers,
+    /// including an aspatial one, and an `attributes` dataset is the first
+    /// carried table that is neither a layer nor a registry table. So the rule
+    /// was always in force and this is the first time it needed code.
+    ///
+    /// Measured with `sqlite3` on 2026-08-25: a trigger naming a missing table
+    /// is created without complaint, `integrity_check` answers `ok`,
+    /// `foreign_key_check` says nothing, and every `INSERT` then fails with
+    /// `no such table: main.gpkg_ogr_contents`. The behavioural half of that is
+    /// `tests/gpkg_oracles.rs`; this test owns the structural half.
+    ///
+    /// **Both arms, because a filter that drops everything would pass the
+    /// first.** `sqlite_constraints.gpkg`'s `events_stamp` is a trigger on a
+    /// user's own table and must still be carried verbatim.
+    #[test]
+    fn a_gpkg_ogr_contents_maintenance_trigger_is_not_carried() {
+        const SRC: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
+        // The fixture's premise: the source really does hold them.
+        let source = crate::sqlite::Database::open(SRC).unwrap();
+        let src_triggers: Vec<String> = source
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == "trigger" && o.tbl_name == "notes_aspatial")
+            .map(|o| o.name)
+            .collect();
+        assert_eq!(src_triggers.len(), 2, "ogr2ogr's pair: {src_triggers:?}");
+
+        let carried = crate::geopackage::read_container(SRC).unwrap();
+        let notes = carried.tables.iter().find(|t| t.name == "notes_aspatial").unwrap();
+        assert!(notes.triggers.is_empty(), "not carried: {:?}", notes.triggers);
+
+        let layers = read_layers(SRC).unwrap();
+        let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
+        let db = crate::sqlite::Database::open(&bytes).unwrap();
+        let orphaned: Vec<String> = db
+            .master_objects()
+            .unwrap()
+            .into_iter()
+            .filter(|o| o.kind == "trigger" && o.sql.as_deref().is_some_and(|s| s.contains("gpkg_ogr_contents")))
+            .map(|o| o.name)
+            .collect();
+        assert!(orphaned.is_empty(), "these would break every INSERT: {orphaned:?}");
+
+        // The other arm: an ordinary trigger on a user's own table survives.
+        const CONSTRAINTS: &[u8] =
+            include_bytes!("../../tests/fixtures/sqlite_constraints.gpkg");
+        let other = crate::geopackage::read_container(CONSTRAINTS).unwrap();
+        let events = other.tables.iter().find(|t| t.name == "events").unwrap();
+        assert!(
+            events.triggers.iter().any(|(name, _)| name == "events_stamp"),
+            "a trigger this crate has no quarrel with is carried: {:?}",
+            events.triggers
+        );
     }
 }

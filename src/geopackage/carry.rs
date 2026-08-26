@@ -237,8 +237,62 @@ pub struct UserTable {
     pub indexes: Vec<CarriedIndex>,
     /// The `sqlite_sequence` state, when the DDL declares `AUTOINCREMENT`.
     pub autoincrement: Option<Autoincrement>,
-    /// The table's triggers as `(name, sql)`, carried verbatim.
+    /// The table's triggers as `(name, sql)`, carried verbatim — **less any
+    /// that maintain `gpkg_ogr_contents`**, which this writer does not emit.
+    /// See `triggers_of` for why one table is named there.
     pub triggers: Vec<(String, String)>,
+    /// The `gpkg_contents` row registering this table as a dataset, when it
+    /// had one. See [`Registration`].
+    pub registration: Option<Registration>,
+}
+
+/// The `gpkg_contents` row that registers a carried table as a *dataset*.
+///
+/// `None` on a [`UserTable`] means the source held the table but registered
+/// nothing for it — `side_notes` and its kind, which are content no reader
+/// enumerates and which this crate carries anyway because they are content.
+/// `Some` means **Requirement 118**: a `data_type` of `attributes` obliges a
+/// `gpkg_contents` row, so the row is not decoration on the table, it is what
+/// makes the table a dataset. Carrying one without the other is the half-carry
+/// this module refused to do until 2026-08-25.
+///
+/// Only `attributes` reaches here — D14. `features` is rebuilt from the IR and
+/// `tiles` is [`Pyramid`]'s, which has carried its own registration since
+/// 2026-08-24; an implementer-defined `data_type` (Requirement 14 permits one)
+/// belongs to an extension this crate does not register, and registering a
+/// dataset while denying its extension is bug 21 committed on purpose.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Registration {
+    /// As stored. `attributes` today, and read back rather than assumed so the
+    /// write is a carry rather than a re-derivation.
+    pub data_type: String,
+    /// `gpkg_contents.identifier`, which is **UNIQUE and nullable**. Modelled
+    /// as written rather than coerced to the empty string, because two NULLs
+    /// do not collide under a SQL `UNIQUE` and two empty strings do.
+    ///
+    /// /`tile_contents` does coerce, via `unwrap_or_default`. No producer
+    /// leaves a tiles row's identifier NULL, so nothing reaches it today; the
+    /// difference is recorded here rather than fixed in passing./
+    pub identifier: Option<String>,
+    /// `gpkg_contents.description` — nullable, and defaulting to `''` rather
+    /// than to NULL, so the two are distinguishable and both are carried.
+    pub description: Option<String>,
+    /// Carried, never re-stamped, on `writer::LAST_CHANGE`'s rule.
+    pub last_change: String,
+    /// The registration's bounding box as stored, which for an `attributes`
+    /// dataset is four NULLs in every file measured. Requirement 13's table
+    /// makes all four nullable and the prose makes them *informative*, so
+    /// there is nothing to recompute and nothing that must be present.
+    pub bbox: [Value; 4],
+    /// **In the source's numbering**, and `None` when the row left it NULL —
+    /// which Requirement 13 permits and which an `i64` cannot express.
+    /// Requirement 16 makes a non-NULL value a reference that SHALL resolve,
+    /// so `writer::reconcile_carried_srs` maps it exactly as it maps a
+    /// pyramid's.
+    pub srs_id: Option<i64>,
+    /// The source's `gpkg_spatial_ref_sys` row for [`Self::srs_id`], so the
+    /// output can register a CRS no layer accounts for.
+    pub srs: Option<SrsDef>,
 }
 
 /// The Metadata extension's two tables, carried as a pair.
@@ -347,6 +401,15 @@ pub struct MatrixRow {
 /// The `gpkg_contents.data_type` a tile pyramid registers under.
 const TILES_DATA_TYPE: &str = "tiles";
 
+/// The `gpkg_contents.data_type` an aspatial dataset registers under —
+/// Requirement 118, and the only other value this crate carries. See
+/// [`Registration`] and D14 in `plans/same-format-fidelity.org`.
+const ATTRIBUTES_DATA_TYPE: &str = "attributes";
+
+/// The table whose maintenance triggers are dropped with it. See
+/// `triggers_of`.
+const OGR_CONTENTS: &str = "gpkg_ogr_contents";
+
 /// Read every carryable piece of container content out of `bytes`.
 ///
 /// A source that holds none returns an empty [`Carried`] rather than an error,
@@ -428,10 +491,17 @@ pub(crate) const CONSTRUCTED_TABLES: [&str; 9] = [
 ///   content that is valid whatever the write produces, and the pair is
 ///   *layer-coupled*: what survives depends on which layers are written and on
 ///   the ids they get.
-/// - **A dataset registered in `gpkg_contents`** under `attributes`. The table
-///   is carryable on exactly these terms, but its registry row is not carried
-///   with it, and a table present without its `gpkg_contents` row is content
-///   that no reader will find. Skipped whole rather than carried half.
+/// - **A dataset registered in `gpkg_contents` under a `data_type` this crate
+///   does not carry** — `features`, which is rebuilt from the IR, `tiles`,
+///   which is [`Pyramid`]'s, and any implementer-defined value, which D14
+///   leaves behind because registering a dataset whose extension the output
+///   does not declare is bug 21 committed on purpose.
+///
+///   /An `attributes` dataset **is** carried, since 2026-08-25, together with
+///   the `gpkg_contents` row Requirement 118 obliges. The exclusion that used
+///   to sit here gave as its reason that "its registry row is not carried with
+///   it" — true when written on 2026-08-23 and false a day later, when the
+///   pyramid started carrying its own./
 /// - **R\*Tree shadow tables and `gpkg_ogr_contents`**, which are *derived*:
 ///   `super::container`'s `DERIVED` and the `--rtree` remedy own them.
 fn user_tables(
@@ -442,18 +512,25 @@ fn user_tables(
     pyramids: &[Pyramid],
 ) -> Result<Vec<UserTable>> {
     let registered = contents_names(db, tables)?;
+    let datasets = attribute_contents(db, tables)?;
     let mut out = Vec::new();
     for object in objects {
         if object.kind != "table" || object.root_page == 0 {
             continue;
         }
         let name = object.name.as_str();
+        let registration = datasets.iter().find(|(n, _)| n == name).map(|(_, r)| r.clone());
         if name.starts_with("sqlite_")
             || name.starts_with("rtree_")
             || CONSTRUCTED_TABLES.contains(&name)
             || name == "gpkg_metadata"
             || name == "gpkg_metadata_reference"
-            || registered.iter().any(|n| n == name)
+            // Registered under a `data_type` this does not carry. An
+            // `attributes` row is registered *and* carried, so it is the one
+            // exception — and it is expressed as "has a registration we read"
+            // rather than as a second `data_type` test, so the two cannot
+            // disagree about which datasets are in.
+            || (registered.iter().any(|n| n == name) && registration.is_none())
             || pyramids.iter().any(|p| p.name == name)
         {
             continue;
@@ -470,6 +547,7 @@ fn user_tables(
             autoincrement: autoincrement_of(name, &Some(sql.clone()), sequences),
             triggers: triggers_of(objects, name),
             name: name.to_string(),
+            registration,
             sql,
             rows,
         });
@@ -479,10 +557,11 @@ fn user_tables(
 
 /// Every `gpkg_contents.table_name`, whatever its `data_type`.
 ///
-/// Used as an exclusion: a registered dataset is either a layer the writer
-/// rebuilds, a pyramid carried elsewhere, or an `attributes` table whose
-/// registry row this pass does not carry. None of the three is a plain user
-/// table.
+/// Used as an exclusion: a registered dataset is never a *plain* user table.
+/// It is a layer the writer rebuilds, a pyramid [`read`] carries as a
+/// [`Pyramid`], an `attributes` dataset carried with its [`Registration`], or
+/// a `data_type` D14 leaves behind. Only the last is a loss, and only that one
+/// still reaches `super::container`'s survey.
 fn contents_names(db: &Database, tables: &[Table]) -> Result<Vec<String>> {
     let Some(t) = tables.iter().find(|t| t.name == "gpkg_contents") else {
         return Ok(Vec::new());
@@ -549,6 +628,59 @@ fn explicit_indexes(
         // is carried by `autoindex_records` instead.
         let Some(sql) = object.sql.clone() else { continue };
         out.push((object.name.clone(), sql, db.read_index(object.root_page)?));
+    }
+    Ok(out)
+}
+
+/// The `gpkg_contents` rows registering an `attributes` dataset, in stored
+/// order, as `(table_name, registration)`.
+///
+/// The `attributes` counterpart of [`tile_contents`], and separate from it for
+/// one reason that is not style: Requirement 13 makes `srs_id`, `identifier`
+/// and `description` **nullable**, and the pyramid path represents all three as
+/// non-optional. Reading them through the same function would mean coercing a
+/// NULL here or widening the pyramid there, and the pyramid's shape is what
+/// keeps this crate's tile output byte-identical.
+fn attribute_contents(db: &Database, tables: &[Table]) -> Result<Vec<(String, Registration)>> {
+    let Some(t) = tables.iter().find(|t| t.name == "gpkg_contents") else {
+        return Ok(Vec::new());
+    };
+    let idx = |name: &str| t.columns.iter().position(|c| c == name);
+    let (Some(name_col), Some(type_col)) = (idx("table_name"), idx("data_type")) else {
+        return Ok(Vec::new());
+    };
+
+    let mut out = Vec::new();
+    for row in db.read_rows(t)? {
+        if text_at(&row, type_col).as_deref() != Some(ATTRIBUTES_DATA_TYPE) {
+            continue;
+        }
+        let Some(name) = text_at(&row, name_col) else { continue };
+        let cell = |column: &str| {
+            idx(column).and_then(|i| row.get(i).cloned()).unwrap_or(Value::Null)
+        };
+        // NULL and the empty string are different values in a UNIQUE column,
+        // so `text_at`'s `None` is carried as `None` rather than flattened.
+        let text = |column: &str| idx(column).and_then(|i| text_at(&row, i));
+        let srs_id = match idx("srs_id").and_then(|i| row.get(i)) {
+            Some(Value::Int(n)) => Some(*n),
+            _ => None,
+        };
+        out.push((
+            name,
+            Registration {
+                data_type: ATTRIBUTES_DATA_TYPE.to_string(),
+                identifier: text("identifier"),
+                description: text("description"),
+                last_change: text("last_change").unwrap_or_default(),
+                bbox: [cell("min_x"), cell("min_y"), cell("max_x"), cell("max_y")],
+                srs: match srs_id {
+                    Some(id) => srs_definition(db, tables, id)?,
+                    None => None,
+                },
+                srs_id,
+            },
+        ));
     }
     Ok(out)
 }
@@ -721,12 +853,46 @@ fn autoincrement_of(
     })
 }
 
-/// Every trigger attached to `name`, as `(name, sql)` in `sqlite_master` order.
+/// Every trigger attached to `name`, as `(name, sql)` in `sqlite_master` order
+/// — **less any whose body maintains `gpkg_ogr_contents`**.
+///
+/// # Why one table is named here, and what it costs to keep the others
+///
+/// `gpkg_ogr_contents` is `super::container`'s entire `DERIVED` class: a row
+/// count recomputable from the layers, so this writer does not emit it. A
+/// trigger that maintains it is derived on exactly the same grounds and is
+/// dropped with it.
+///
+/// ***Keeping it produces a file that reads perfectly, passes both oracles,
+/// and cannot be written to.*** Measured with `sqlite3`, 2026-08-25: a trigger
+/// whose body names a missing table is created without complaint,
+/// `PRAGMA integrity_check` answers `ok` and `PRAGMA foreign_key_check` says
+/// nothing, and then every `INSERT` on the table fails with
+/// `no such table: main.gpkg_ogr_contents` and stores no row. /Note the shape
+/// against `handoff.org` entry 21: that was a file that worked and was wrong
+/// about what it is; this is a file that is right about what it is and does
+/// not work. Neither pragma asks a question about behaviour, so neither can
+/// see either one./
+///
+/// **The rule is older than the code.** Every trigger of this kind in the tree
+/// hangs off a feature layer, and a layer is rebuilt from the IR and carries
+/// none of its triggers — so the policy has always been in force and never
+/// needed expressing. An `attributes` dataset is the first carried table that
+/// is neither a layer nor a registry table, which is what turned it into a
+/// line of code. See `tests/fixtures/HOSTILE.org`, `sqlite_constraints.gpkg`.
+///
+/// *Nothing else is filtered.* A trigger this crate does not understand is
+/// carried verbatim, which is the whole posture of this module — the six a
+/// tile table owns, `events_stamp` on a user's own table, and anything a
+/// producer invents. Matching on the body text is narrow enough to be safe
+/// because `gpkg_ogr_contents` is a reserved GeoPackage name: a trigger
+/// mentioning it means it, and a trigger that means it cannot run here.
 fn triggers_of(objects: &[crate::sqlite::MasterObject], name: &str) -> Vec<(String, String)> {
     objects
         .iter()
         .filter(|o| o.kind == "trigger" && o.tbl_name == name)
         .filter_map(|o| o.sql.clone().map(|sql| (o.name.clone(), sql)))
+        .filter(|(_, sql)| !sql.contains(OGR_CONTENTS))
         .collect()
 }
 

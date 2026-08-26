@@ -762,6 +762,37 @@ mod tests {
         );
     }
 
+    /// ***`sqlite_contents.gpkg` round-trips with the drop warning silent***,
+    /// which is what carrying the `attributes` dataset was for.
+    ///
+    /// The file holds every class this crate models at once — two feature
+    /// layers, a tile pyramid, a plain user table, the `gpkg_metadata` pair and
+    /// an `attributes` dataset — and the last of those was the only thing left
+    /// speaking. **Asserted end to end rather than by inspecting a class list**:
+    /// this module was not edited for the dataset at all, so the claim worth
+    /// pinning is that the survey and the carry still agree, not that either
+    /// one was changed.
+    #[test]
+    fn the_file_holding_every_modelled_class_at_once_is_carried_whole() {
+        let carried = crate::geopackage::read_container(CONTENTS).unwrap();
+        let written = vec!["cities".to_string(), "second".to_string()];
+        let warnings = container_drop_warnings(
+            CONTENTS,
+            "in.gpkg",
+            &written,
+            &carried.reproduced_names(),
+            true,
+        );
+        assert!(warnings.is_empty(), "nothing in this file is a loss now: {warnings:?}");
+
+        // The premise, so a carry that silently stopped carrying would fail
+        // here rather than pass by reporting nothing about nothing.
+        assert!(carried.tables.iter().any(|t| t.name == "notes_aspatial"));
+        assert!(carried.tables.iter().any(|t| t.name == "side_notes"));
+        assert_eq!(carried.pyramids.len(), 1);
+        assert!(carried.metadata.is_some());
+    }
+
     /// A trigger on a table that is **genuinely destroyed** is still reported,
     /// which is the half of [`is_derived_trigger`] that nothing else exercises.
     ///

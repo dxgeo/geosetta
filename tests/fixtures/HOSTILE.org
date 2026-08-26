@@ -302,8 +302,18 @@ warning whose whole job is to say what a rewrite destroys saying nothing.
 
 | content | what it pins |
 |---------+--------------|
-| =notes_aspatial=, registered =data_type='attributes'= | what =ogr2ogr= registers an *aspatial* table as. Reachable from ordinary GDAL output; absent from every fixture in the tree until now |
+| =notes_aspatial=, registered =data_type='attributes'= | what =ogr2ogr= registers an *aspatial* table as. Reachable from ordinary GDAL output; absent from every fixture in the tree until now. **Carried since 2026-08-25**, registration and all |
+| its two =gpkg_ogr_contents= maintenance triggers -- /added 2026-08-25/ | the pair =ogr2ogr= attaches to every table it registers. Carrying them verbatim writes a file that reads perfectly, answers =ok= to =integrity_check=, says nothing to =foreign_key_check= and **fails every =INSERT=** with =no such table: main.gpkg_ogr_contents=, because this writer never emits that table. Without them =carry::triggers_of='s drop rule can be deleted and nothing fails |
+| its rows at ids **1 and 9** -- /changed from 1 and 2 on 2026-08-25/ | Requirement 119's NOTE gives an attributes table's rowids the same stated purpose Requirement 29's gives a feature table's. A dense =1, 2= cannot tell a carried rowid from a reissued one -- the blindness that hid bug 19 -- and =9= is the id a reissue silently moves |
+| a =table=- and a =row=-scoped =gpkg_metadata_reference= naming it -- /added 2026-08-25/ | Requirement 97's authority is the output's =gpkg_contents=, so registering the dataset is what keeps these. Nothing else in the tree references anything but a feature layer and a tile pyramid |
 | =imagery= + its =gpkg_tile_matrix_set=/=gpkg_tile_matrix= rows, registered =data_type='tiles'= | a *tile pyramid*, the case =same-format-fidelity.org= § The collision is about. D8 decided these are *carried*, not rejected |
+
+***And it is now the file that holds every class this crate models at once***
+-- two feature layers, a tile pyramid, a plain user table, the =gpkg_metadata=
+pair and an =attributes= dataset -- which is why
+=the_file_holding_every_modelled_class_at_once_is_carried_whole= asserts
+end-to-end silence against it rather than inspecting any one class. /It reached
+that state on 2026-08-25, the day the last of those was built./
 
 *The one to keep in view is the tile row*, because it is what the raster
 decision was taken against: the state D8 was decided out of was not "silently

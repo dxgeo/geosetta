@@ -114,6 +114,84 @@ fn every_fixtures_geopackage_output_satisfies_sqlite3() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// ***Every table in every fixture's output can still have an `INSERT`
+/// compiled against it.***
+///
+/// The third oracle, added 2026-08-25, and it exists because the other two
+/// cannot express the question. A trigger whose body names a table the output
+/// does not contain is created without complaint, `integrity_check` answers
+/// `ok` and `foreign_key_check` says nothing — and then every `INSERT` on the
+/// table it guards fails with `no such table`, storing no row. **A file that
+/// reads perfectly, satisfies both structural pragmas, and cannot be written
+/// to.**
+///
+/// That is reachable from ordinary GDAL output: `ogr2ogr` attaches two
+/// `gpkg_ogr_contents` maintenance triggers to every table it registers,
+/// including an aspatial one, and `gpkg_ogr_contents` is the one table this
+/// writer deliberately does not emit. `carry::triggers_of` drops them; this is
+/// the oracle that says so without knowing anything about that rule.
+///
+/// # Why `EXPLAIN`, and why `DEFAULT VALUES`
+///
+/// SQLite resolves a trigger's body at **prepare** time, so the failure
+/// happens while compiling the statement — `EXPLAIN` gets that far and then
+/// stops, which means the check runs against the real file and mutates
+/// nothing. `DEFAULT VALUES` needs no column list, so one statement works for
+/// any table whatever its shape; a `NOT NULL` it would violate is a *run*-time
+/// constraint and never reached.
+#[test]
+#[ignore = "needs the sqlite3 binary; run with --ignored"]
+fn every_fixtures_geopackage_output_can_be_inserted_into() {
+    if !sqlite3_present() {
+        eprintln!("skipping: no sqlite3 on PATH");
+        return;
+    }
+    let dir = tempdir();
+    let mut failures = Vec::new();
+    for fixture in gpkg_fixtures() {
+        let name = fixture.file_name().unwrap().to_string_lossy().to_string();
+        let bytes = std::fs::read(&fixture).expect("fixture");
+        let carried = geosetta::geopackage::read_container(&bytes).expect("read container");
+        let layers = geosetta::geopackage::read_layers(&bytes).expect("read layers");
+        let written =
+            geosetta::geopackage::write_layers(None, &layers, &carried, false, false)
+                .expect("write");
+
+        let out = dir.join(&name);
+        std::fs::write(&out, &written).expect("write output");
+
+        for table in user_tables(&out) {
+            let explained = run_sql(&out, &format!("EXPLAIN INSERT INTO \"{table}\" DEFAULT VALUES;"));
+            if explained.contains("no such table") {
+                failures.push(format!("{name}: INSERT INTO {table} will not compile: {explained}"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// Every ordinary table in `path`, skipping SQLite's own bookkeeping.
+fn user_tables(path: &Path) -> Vec<String> {
+    run_sql(path, "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+/// `sqlite3 <path> <sql>`, with stderr folded in so a prepare failure is
+/// visible rather than looking like an empty result.
+fn run_sql(path: &Path, sql: &str) -> String {
+    let out = Command::new("sqlite3")
+        .arg(path)
+        .arg(sql)
+        .output()
+        .expect("sqlite3 failed to run");
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    if stderr.is_empty() { stdout } else { format!("{stdout}{stderr}") }
+}
+
 fn tempdir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("geosetta-oracles-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");

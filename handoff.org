@@ -27,12 +27,12 @@ still pass =native: None=.*
   fixed**.* Its *warning* shipped 2026-08-21 -- a =gpkg= write says what the
   rewrite destroys instead of exiting 0 in silence -- and the *fix* arrived in
   three pieces: a **tile pyramid** survives a =gpkg -> gpkg= write as of
-  2026-08-24, and **a user's own tables** and **the =gpkg_metadata= pair** as
-  of 2026-08-25, all carried by =geopackage/carry.rs=. ***Nine of the twelve
-  =.gpkg= fixtures now round-trip with the warning silent.*** /What is left is
-  three things this crate cannot yet model rather than a class it has not
-  carried: a =WITHOUT ROWID= table, an =attributes= dataset, and the CRS-WKT
-  extension's **column**. The defect stays open on the merge path regardless --
+  2026-08-24, and **a user's own tables**, **the =gpkg_metadata= pair** and
+  **an =attributes= dataset** as of 2026-08-25, all carried by
+  =geopackage/carry.rs=. ***Ten of the twelve =.gpkg= fixtures now round-trip
+  with the warning silent.*** /What is left is two things this crate cannot yet
+  model rather than a class it has not carried: a =WITHOUT ROWID= table and the
+  CRS-WKT extension's **column**. The defect stays open on the merge path regardless --
   =container-reconciliation.org=./ /Entry 13
   closed with it: the warning had misclassified =gpkg_ogr_contents=, and ten
   triggers besides./
@@ -71,7 +71,11 @@ else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). The
 two =perf.rs= benchmarks, which take about ninety seconds and are not
 cross-checks. **The one to run when you touch the GeoPackage writer is
 =tests/gpkg_oracles.rs=** /(new 2026-08-25)/: it puts every fixture's output in
-front of =sqlite3= rather than one, which is the gap entry 20 fell through. /Stated without a number on 2026-08-23: it had said "six", which
+front of =sqlite3= rather than one, which is the gap entry 20 fell through.
+/It asks **three** questions as of the same day -- =integrity_check=,
+=foreign_key_check=, and whether an =INSERT= still *compiles* against every
+table, which is the one the first two cannot express: a trigger naming a table
+the output does not hold satisfies both pragmas and then fails every write./ /Stated without a number on 2026-08-23: it had said "six", which
 counted the lib tests only and had been wrong since =tests/gdal_types.rs=
 added two more on 2026-08-20 -- § THE THREE LESSONS, lesson 1, in this
 document's own change log./ The newest of them is
@@ -411,6 +415,30 @@ the value that outgrew it. *Both are implemented*; the schema half lives in
 =crate::FieldDecl= and =FeatureCollection::schema=.
 
 ** WHAT IS BUILT
+- ***An =attributes= dataset*** (/2026-08-25/, D14) -- an aspatial table
+  carried **with the =gpkg_contents= row Requirement 118 obliges**, which is
+  what makes it a dataset rather than a table nothing enumerates.
+  =carry::Registration= holds the row; its =srs_id= goes through the same
+  =reconcile_carried_srs= a pyramid's does (Requirement 16), and its
+  =identifier= is modelled =Option<String>= because two NULLs do not collide
+  under a SQL =UNIQUE= and two empty strings do. /The exclusion that had
+  blocked this gave as its reason that the registry row could not come along.
+  That was true on 2026-08-23 and **false on 2026-08-24**, when the pyramid
+  started carrying its own -- drift in a *reason*, which is what a reader
+  consults instead of looking./
+
+  ***It also turned up a file shape both structural oracles are blind to.***
+  =ogr2ogr= attaches two =gpkg_ogr_contents= maintenance triggers to every
+  table it registers, and this writer never emits that table. Carried verbatim
+  they produce a file that reads perfectly, answers =ok= to =integrity_check=,
+  says nothing to =foreign_key_check=, and **fails every =INSERT=** with
+  =no such table: main.gpkg_ogr_contents=. /Note the shape against entry 21:
+  that was a file that worked and was wrong about what it is; this is a file
+  that is right about what it is and does not work. Neither pragma asks a
+  question about behaviour./ =carry::triggers_of= drops them, and
+  =tests/gpkg_oracles.rs= gained a **third oracle** that catches the class
+  without knowing the rule: every table in every fixture's output must still
+  compile an =INSERT= against it, checked with =EXPLAIN= so it mutates nothing.
 - ***The =gpkg_metadata= pair*** (/2026-08-25/, decisions 28--30) -- the last
   *layer-coupled* member of defect 3, and the first content carried as **rows
   into constructed DDL**: the documents are a producer's and opaque, the table
@@ -585,20 +613,20 @@ of it was planned work* -- each item was found by measuring the one above it:
   it has never emitted a nested struct column.
 - *Defect 3* -- and now **mostly fixed** rather than wholly open: a tile
   pyramid survives a =gpkg -> gpkg= write as of 2026-08-24, and a user's own
-  tables, the =gpkg_metadata= pair and the =gpkg_extensions= registrations for
-  both of this crate's extensions as of 2026-08-25. ***=gdal_tiles.gpkg= now
-  round-trips with the drop warning saying nothing at all***, the first fixture
-  with a non-trivial container to do so. /What is left across the whole corpus:
-  =kv= (a =WITHOUT ROWID= table), =notes_aspatial= (an =attributes= dataset),
-  =gpkg_crs_wkt_1_1= (a **column** on =gpkg_spatial_ref_sys=, so a capability
-  rather than a carry). *The "2 empty tables" report was **false** and is
+  tables, the =gpkg_metadata= pair, the =gpkg_extensions= registrations for
+  both of this crate's extensions and an =attributes= dataset as of 2026-08-25.
+  ***=gdal_tiles.gpkg= now round-trips with the drop warning saying nothing at
+  all***, the first fixture with a non-trivial container to do so, and
+  =sqlite_contents.gpkg= -- which holds every class this crate models at once
+  -- followed. /What is left across the whole corpus: =kv= (a =WITHOUT ROWID=
+  table) and =gpkg_crs_wkt_1_1= (a **column** on =gpkg_spatial_ref_sys=, so a
+  capability rather than a carry). *The "2 empty tables" report was **false** and is
   fixed*: an empty =gpkg_tile_matrix= / =_set= is not destroyed content, since
   this writer builds both on demand -- but only when **empty**, because a
   populated pair whose pyramid is not carried is a real loss and the append
-  path depends on it still being named./ ***Nine of the twelve =.gpkg=
+  path depends on it still being named./ ***Ten of the twelve =.gpkg=
   fixtures now round-trip with the drop warning silent*** -- /counted, not
-  estimated: the three that still speak are =gpkg_crs_wkt_1_1=, =kv= and
-  =notes_aspatial=./ Note that
+  estimated: the two that still speak are =gpkg_crs_wkt_1_1= and =kv=./ Note that
   section's numbering is *not* the plan's defect numbering; see its own note.
 - The exhaustive-match fixture registry (D6).
 - The format-check deletion. *Drawn last in the diagram, no longer forced
@@ -732,13 +760,13 @@ things. /Reconciled 2026-08-20./
 
    *So why it stays LIVE, stated so nobody has to re-derive it.* **This entry
    is about the container, not about a list of members**, and two things keep
-   it open. The corpus still loses three things this crate cannot model -- a
-   =WITHOUT ROWID= table, an =attributes= dataset, and the CRS-WKT extension's
-   *column* -- and none of that is carrying work. And on the **merge** path
-   nothing is reconciled at all: a destination's own container is still
-   destroyed wholesale, which is =container-reconciliation.org= §§ 3--5 and
-   unbuilt. /Nine of the twelve =.gpkg= fixtures round-trip with the warning
-   silent; that is the honest measure of how far it has come./
+   it open. The corpus still loses two things this crate cannot model -- a
+   =WITHOUT ROWID= table and the CRS-WKT extension's *column* -- and neither is
+   carrying work. And on the **merge** path nothing is reconciled at all: a
+   destination's own container is still destroyed wholesale, which is
+   =container-reconciliation.org= §§ 3--5 and unbuilt. /Ten of the twelve
+   =.gpkg= fixtures round-trip with the warning silent; that is the honest
+   measure of how far it has come./
 
    *No longer silent, as of 2026-08-21.* "Exit 0, no warning" was the original
    finding; the exit code is unchanged (§ THE RULE is loud, not blocking) but

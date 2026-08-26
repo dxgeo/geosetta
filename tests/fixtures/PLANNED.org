@@ -249,7 +249,10 @@ byte-preserving, which is currently a claim in the plan with nothing behind it.
 - =UNIQUE=, =TEXT PRIMARY KEY=, an explicit =CREATE INDEX=, and a
   =UNIQUE COLLATE NOCASE= -- =sqlite_constraints.gpkg=.
 - A =data_type='attributes'= registration and a minimal tile registration --
-  =sqlite_contents.gpkg=.
+  =sqlite_contents.gpkg=. /Since 2026-08-25 it covers *carrying* the aspatial
+  dataset too, not only reporting it: the two =gpkg_ogr_contents= maintenance
+  triggers =ogr2ogr= attaches, a rowid gap at =9=, and both a =table=- and a
+  =row=-scoped =gpkg_metadata_reference= naming it./
 - Index cells past the on-page ceiling, so overflow chains -- *not a fixture*
   but =sqlite::tests::an_index_btree_survives_a_write_at_every_depth= and the
   =#[ignore]=d =sqlite_itself_validates_the_index_this_writer_builds=, both of

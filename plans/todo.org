@@ -36,10 +36,11 @@ check it off and remove it once the item ships or is shelved.
   defects it was scoped around, =fgb= null cells and =gpkg= booleans *shipped
   with M4 (2026-08-20)*; the =gpkg= → =gpkg= run destroying the container
   around its layers *warned from 2026-08-21* and is **mostly fixed as of
-  2026-08-25** — a tile pyramid, a user's own tables, the =gpkg_metadata= pair
-  and both extensions' registrations are carried, and nine of the twelve
-  =.gpkg= fixtures round-trip with the warning silent. /What is left is three
-  missing capabilities, plus the merge path, which is
+  2026-08-25** — a tile pyramid, a user's own tables, the =gpkg_metadata= pair,
+  an =attributes= dataset and both extensions' registrations are carried, and
+  **ten** of the twelve =.gpkg= fixtures round-trip with the warning silent.
+  /What is left is two missing capabilities — a =WITHOUT ROWID= table and the
+  CRS-WKT extension's column — plus the merge path, which is
   =container-reconciliation.org=./ Since then: the *GeoPackage spoke*, defect 5's *recast
   matrix* (with =DeclType::admits=, =Format::recast= and a fourth warning), a
   *byte-level value type* — a =gpkg= run had been destroying every blob it read
@@ -103,7 +104,19 @@ check it off and remove it once the item ships or is shelved.
     past =foreign_key_check=. The reopen-shape is filed for when a real case
     turns up.
 
-  Next is =same-format-fidelity.org= M3b, which now owns § 1.
+  Next is this plan's §§ 3--5. /The line that stood here until 2026-08-25 --
+  "Next is =same-format-fidelity.org= M3b, which now owns § 1" -- is spent:
+  M3b's one-container half is done, and §§ 3--5 are what is left of the gate./
+
+  /2026-08-25:/ **an =attributes= dataset is carried**, with the
+  =gpkg_contents= row Requirement 118 obliges -- the second of defect 3's three
+  remaining capabilities, and the exclusion that had blocked it gave a reason
+  (that its registry row could not come along) which the pyramid work had
+  falsified a day earlier. It also turned up a file shape that *reads*
+  perfectly, passes =integrity_check= and =foreign_key_check=, and **cannot be
+  written to**: =ogr2ogr='s =gpkg_ogr_contents= maintenance triggers, carried
+  onto a table whose maintained registry this writer never emits. **D14 filed
+  and taken** -- =attributes= only, no implementer-defined =data_type=.
 
   /2026-08-24:/ **=gpkg_contents.last_change= is now carried** -- a member the
   inventory had missed entirely, because the row was surveyed for what it says

@@ -59,13 +59,13 @@ So *defect 3's fix* is **mostly built** rather than wholly outstanding. The
 *layer-coupled* class closed on 2026-08-25 with the =gpkg_metadata= pair
 (decisions 28--30) and the =gpkg_extensions= registrations for both extensions
 this crate implements -- the second of those a **shipped conformance defect**
-rather than uncarried content, =handoff.org= entry 21. ***Nine of the twelve
-=.gpkg= fixtures now round-trip with the drop warning silent.***
+rather than uncarried content, =handoff.org= entry 21 -- and the =attributes=
+dataset the same day. ***Ten of the twelve =.gpkg= fixtures now round-trip with
+the drop warning silent.***
 
-/What is left is no longer a class this crate has failed to carry. Three
-fixtures still lose something, and each is a capability it does not have: a
-=WITHOUT ROWID= table the writer cannot emit, an =attributes= dataset whose
-=gpkg_contents= registration is not carried, and the CRS-WKT extension's
+/What is left is no longer a class this crate has failed to carry. Two fixtures
+still lose something, and each is a capability it does not have: a
+=WITHOUT ROWID= table the writer cannot emit, and the CRS-WKT extension's
 **column** on =gpkg_spatial_ref_sys=. The merge path is untouched and is
 =container-reconciliation.org=./
 
@@ -287,6 +287,26 @@ obligation bounded rather than open-ended:
   from what it is doing rather than replaying what it read. /An inventory of
   "things this reader does not understand" will classify both as opaque, because
   not understanding them is true and is not the question./
+
+  /A third correction, 2026-08-25, and it is to the **=Derived=** entry rather
+  than to this one./ ***"=gpkg_contents= bboxes -- recomputed, never replayed"
+  is true only of a feature layer.*** A tile pyramid's bbox is *carried*
+  (=carry::Pyramid::bbox=: this crate never decodes a tile, so it has nothing to
+  recompute one **from**), and an =attributes= dataset's is carried for a
+  stronger reason still -- Requirement 13 makes the four columns *informative*
+  and the dataset has **no geometry at all**, so there is nothing a bbox could
+  be derived from even in principle. /The entry was written when the only
+  =gpkg_contents= row this crate wrote was a layer's. A class is about what the
+  member depends on, and these two depend on nothing the write recomputes./
+
+  *And the =attributes= dataset itself does not need a fourth class*, which is
+  worth stating because the metadata pair did. It is **independent** content:
+  its table is opaque, its =identifier=/=description= are identity, and its
+  =srs_id= is the same reference-into-a-renumbered-space that M3b requirement 1
+  already owns for the pyramid. Nothing about it depends on which layers the
+  write produces -- which is exactly what distinguishes it from
+  =gpkg_metadata_reference=, and why one needed validation against the write and
+  the other did not.
 So the Gpkg spoke's native payload has a mechanical definition -- *every object
 in =sqlite_master= this crate did not itself write, plus every row of the
 =gpkg_*= registry tables it does not populate* -- rather than an open-ended one.
@@ -464,15 +484,18 @@ already been renamed once./
    and the first class of container content this defect covers. =side_notes=
    and its kind, the =gpkg_metadata= pair, and the =gpkg_extensions=
    registrations for both extensions this crate implements all followed on
-   2026-08-25. /**Nine of the twelve =.gpkg= fixtures now round-trip with the
-   warning silent**, and =gdal_tiles.gpkg= -- the one with the richest
-   container -- is among them./
+   2026-08-25, and the =attributes= dataset the same day. /**Ten of the twelve
+   =.gpkg= fixtures now round-trip with the warning silent** -- measured, not
+   estimated -- and =gdal_tiles.gpkg= and =sqlite_contents.gpkg=, the two with
+   the richest containers, are both among them./
 
-   *What keeps the defect open is no longer a class of content.* Three fixtures
+   *What keeps the defect open is no longer a class of content.* Two fixtures
    still lose something and each is a **capability** this crate lacks: a
-   =WITHOUT ROWID= table the writer cannot emit, an =attributes= dataset whose
-   =gpkg_contents= registration is not carried, and the CRS-WKT extension's
-   *column*. The merge path is separate and untouched.
+   =WITHOUT ROWID= table the writer cannot emit, and the CRS-WKT extension's
+   *column*. /The =attributes= dataset was the third until 2026-08-25, and the
+   reason recorded against it -- that its =gpkg_contents= registration was not
+   carried -- had been stale for a day when it was read./ The merge path is
+   separate and untouched.
 
    Unlike defects 1--2 this one *does* need the mechanism (§ THE DOMAIN OF THE
    RULE), so it could not ship with M4. /(This sentence read "unlike defects
@@ -2404,6 +2427,194 @@ report had been written down as expected behaviour and read as correct for four
 days. /It now asserts the negative. Worth noticing how it happened: the
 assertion was true of the output, accurately described, and nobody asked
 whether it *should* be./
+
+*** The =attributes= dataset -- ***BUILT 2026-08-25***
+/Written up before any code, and the plan text is kept as filed. The second of
+the three capabilities keeping defect 3 open, and the cheapest: the blocker
+recorded against it in three documents **had already stopped being true**. D14
+was filed with a recommendation and taken; the trigger finding below was never
+a decision, because measuring it removed the other option./
+
+***What shipped.*** =carry::Registration= reads the =gpkg_contents= row;
+=carry::attribute_contents= admits =attributes= and nothing else;
+=carry::triggers_of= drops a =gpkg_ogr_contents= maintainer;
+=writer::gpkg_contents= writes the registration back;
+=writer::reconcile_carried_srs= -- generalised off =&Pyramid= -- maps its
+=srs_id=; =writer::retained_references= counts it as satisfying Requirement 97.
+/=container.rs= was **not edited**, which the end-to-end test asserts rather
+than assumes./
+
+***Measured on =sqlite_contents.gpkg=:*** the drop warning is silent, both
+oracles are clean, =ogrinfo= reads =notes_aspatial= as a layer with its two
+metadata items attached and its rows at ids **1 and 9**, and =ogr2ogr= rewrites
+the result as =attributes=. **Ten of twelve fixtures now round-trip silent**;
+the two that speak are =kv= and =gpkg_crs_wkt_1_1=, exactly as predicted.
+
+***Nine mutations, each caught by the intended test*** -- and one is worth
+noting: restoring the carried trigger is caught by =tests/gpkg_oracles.rs= as
+well as by its unit test, with the message
+=INSERT INTO notes_aspatial will not compile=. /That oracle is new and general.
+It did not have to know the rule to catch the bug, which is the only kind of
+oracle worth adding./
+
+**** The stated reason is stale, and it was accurate when it was written
+=carry.rs='s =user_tables= excludes every name registered in =gpkg_contents=,
+and its "what is deliberately left behind" list gives the reason:
+
+#+begin_quote
+**A dataset registered in =gpkg_contents= under =attributes=.** The table is
+carryable on exactly these terms, but its registry row is not carried with it,
+and a table present without its =gpkg_contents= row is content that no reader
+will find. Skipped whole rather than carried half.
+#+end_quote
+
+*That was true on 2026-08-23 and false by 2026-08-24*, when the tile pyramid
+started carrying its own =gpkg_contents= registration -- =carry::tile_contents=
+reads the row, =writer::gpkg_contents= writes it back, and
+=writer::reconcile_carried_srs= maps its =srs_id= into the output's numbering.
+**The machinery the exclusion says is missing has existed for a day, one
+=data_type= over.**
+
+/Worth recording as drift of the same kind § WHAT WAS LEARNED calls the worst
+sort: this is not a status line saying "not built yet", which the next reader
+disproves by looking. It is a **reason**, and a reason is what a reader
+consults *instead* of looking./
+
+**** What the standard says, read at the pin rather than recalled
+/=spec/core/2f_attributes.adoc= and =spec/core/1_base.adoc= at =fe83fdd=./
+
+| # | what it says | what it decides here |
+|---+--------------+----------------------|
+| 118 | /"The =gpkg_contents= table SHALL contain a row with a =data_type= column value of "attributes" for each attributes data table or view"/ | the registration is **constitutive**, not decoration -- so carrying the table without the row would be the non-conformance the exclusion feared, and carrying the row is what makes the table an attributes dataset at all |
+| 119 | /"A GeoPackage MAY contain tables containing attribute sets … A table SHALL have a primary key column of type INTEGER and that column SHALL act as a =rowid= alias"/ | and its **NOTE gives those rowids the same stated purpose Requirement 29's note gives a feature table's** -- linking to =gpkg_metadata= by rowid through =gpkg_metadata_reference= |
+| 151 | /"A GeoPackage MAY contain **views** containing attributes"/ | the boundary: =user_tables= filters on =sqlite_master= kind =table=, so a registered attributes *view* stays uncarried and stays reported. Named here so it is not mistaken for an oversight later |
+| 14 | =data_type= is /"features" … "attributes" … "tiles", **or an implementer-defined value** for other data tables per clause in an Extended GeoPackage/ | D14's boundary, below |
+| 16 | /"Values of the =gpkg_contents= table =srs_id= column SHALL reference values in the =gpkg_spatial_ref_sys= table =srs_id= column"/ | the srs reconciliation M3b requirement 1 built for pyramids is **owed here too**, not optional -- and Table /Contents Table Definition/ makes the column nullable, which the pyramid's =i64= cannot express |
+
+***Requirement 119's note is the one to not skim.*** Decision 27 -- carry the
+feature id rather than reissue it -- rested on Requirement 29's note saying
+what a feature table's rowid is *for*. **Requirement 119's note is the same
+sentence about an attributes table**, so a =row=-scoped reference into one is
+exactly the =row_id_value= hazard =container-reconciliation.org= D5 is about.
+/This costs nothing to honour: =carry::UserTable= already keeps its rowids --
+"a carried table's rows keep the rowids SQLite gave them, because the whole
+point is to put back what was there" -- so the property arrives already true.
+It is worth a test **because** it is free: nothing in the code says it is
+load-bearing, and the next person to reach for =rows_blanking_alias= will not
+know./
+
+**** The finding: two triggers that make an unwritable file, past both oracles
+/Measured 2026-08-25. Not a decision -- measuring it removed the other option./
+
+=ogr2ogr= registers an aspatial table and gives it the same pair of
+=gpkg_ogr_contents= maintenance triggers it gives a feature layer:
+
+#+begin_src text
+  ogr2ogr -f GPKG asp.gpkg asp.csv -nln notes     # GDAL 3.13.2
+
+  CREATE TRIGGER "trigger_insert_feature_count_notes" AFTER INSERT ON "notes"
+    BEGIN UPDATE gpkg_ogr_contents SET feature_count = feature_count + 1
+    WHERE lower(table_name) = lower('notes'); END;
+#+end_src
+
+**This writer does not emit =gpkg_ogr_contents=** -- it is =container.rs='s
+=DERIVED= class, the one member of it, reported silently because it is
+recomputable from the layers. So carrying the table *verbatim* carries two
+triggers whose body names a table the output does not contain. Measured
+directly with =sqlite3=:
+
+#+begin_src text
+  CREATE TABLE notes (fid INTEGER PRIMARY KEY, note TEXT);
+  CREATE TRIGGER trigger_insert_feature_count_notes AFTER INSERT ON notes
+    BEGIN UPDATE gpkg_ogr_contents SET ... END;
+  INSERT INTO notes VALUES (1, 'x');
+    -> Error: no such table: main.gpkg_ogr_contents      (and no row inserted)
+
+  PRAGMA integrity_check;    -> ok
+  PRAGMA foreign_key_check;  -> (silent)
+#+end_src
+
+***A file that reads perfectly, passes both oracles, and cannot be written
+to.*** /Note the shape: bug 21 was a file that worked and was wrong about what
+it is; this is a file that is right about what it is and does not work. Both
+are invisible to =integrity_check= and =foreign_key_check= for the same reason
+-- neither pragma is a question about **behaviour**./
+
+*The rule: a trigger that maintains =gpkg_ogr_contents= belongs to the =DERIVED=
+class along with the table it maintains, and is dropped with it.* Not a new
+policy -- **the policy already applied to every trigger of this kind in the
+tree**, because until now they all hung off feature layers, which are rebuilt
+from the IR and never carry their triggers at all. =HOSTILE.org= says so in
+=sqlite_constraints.gpkg='s entry, in the course of explaining why
+=events_stamp= had to be authored: /"Every other trigger anywhere --
+=ogr2ogr='s R\*Tree ones, its =gpkg_ogr_contents= maintenance, its ten on
+=gpkg_tile_matrix= -- hangs off a layer or a registry table, and is therefore
+derived."/ **An =attributes= dataset is the first carried table that is
+neither**, which is what turns a standing rule into code.
+
+/The alternative considered and rejected: refuse to carry a table whose
+triggers cannot come with it. It trades an ordinary GDAL file's whole dataset
+for two pieces of derived furniture, and the furniture is regenerable by any
+tool that wants it./
+
+**** D14 -- which =data_type=s are carried. ***TAKEN 2026-08-25: =attributes= only.***
+Requirement 14 permits /"an implementer-defined value for other data tables per
+clause in an Extended GeoPackage"/, so the question is real: a registered
+dataset this crate does not recognise could be carried as bytes, exactly the
+way an opaque user table is.
+
+***The recommendation is to carry =attributes= and nothing else***, on bug 21's
+lesson rather than on caution. An implementer-defined =data_type= comes *from*
+an extension clause, and **Requirement 59 makes the extension's
+=gpkg_extensions= registration constitutive**: /"the absence of rows in the
+=gpkg_extensions= table SHALL indicate that the file is a GeoPackage (as opposed
+to an Extended GeoPackage)"/. This crate emits the registrations it knows about
+and no others, so carrying a =2d-gridded-coverage= row would register a dataset
+whose extension the output then denies using -- ***bug 21 committed
+deliberately***, and about someone else's extension rather than our own.
+
+/=features= and =tiles= are not part of the question: the first is rebuilt from
+the IR and the second is the pyramid path, which has owned its own registration
+since 2026-08-24./
+
+**** What is deliberately *not* validated
+Requirement 119's INTEGER-primary-key rule is **not** enforced on the way in. A
+registered attributes table without a rowid alias is non-conformant *input*,
+and this crate's posture on that is settled -- =HOSTILE.org=: /"A fixture's
+deviation from the standard is a test case, not a defect in the fixture."/
+=carried_rows= already handles a table with no alias, so the carry is faithful
+either way, and rejecting here would destroy content to punish a source for
+something the output reproduces exactly. /Contrast the pyramid, which **does**
+skip a tile table with no alias -- for a mechanical reason and not a
+conformance one: its rows are read through =rows_blanking_alias=, which needs
+the alias column to blank./
+
+**** What the corpus cannot test, which is the third occurrence
+=sqlite_contents.gpkg='s =notes_aspatial= is hand-built and carries **no
+triggers**, so the finding above is invisible to every fixture in the tree --
+the same structural blindness that hid entry 19 and that
+=gpkg_metadata_reference='s missing scopes hid on 2026-08-25. /Three times now,
+and each time the gap was *"the one example we have happens to be the
+exception"*./
+
+Two fixture additions, both to =build_sqlite_fixtures.sh= so the recipe stays
+re-runnable:
+1. **the two =gpkg_ogr_contents= triggers on =notes_aspatial=**, spelled as
+   =ogr2ogr= spells them -- without these the drop rule can be deleted and
+   nothing fails;
+2. **a =table=-scoped =gpkg_metadata_reference= row naming =notes_aspatial=**.
+   Today it is dropped, and correctly, because the table it names is not in the
+   output. Once the dataset is registered it must *survive*, which is the
+   composition § THE DOMAIN OF THE RULE predicted in the abstract -- /"anything
+   the write registers keeps its references, whether it came from a layer or
+   from =carry.rs="/ -- and has never had a case.
+
+**** Where it lands in code
+| file | change |
+|------+--------|
+| =carry.rs= | =UserTable= gains a =Registration= (=data_type=, =identifier=, =description=, =last_change=, =bbox=, nullable =srs_id=, =SrsDef=); =user_tables= stops excluding an =attributes= name; =triggers_of= drops a =gpkg_ogr_contents= maintainer |
+| =writer.rs= | =reconcile_carried_srs= generalised off =&Pyramid= to =(srs_id, Option<&SrsDef>)=; =ResolvedSrs= gains =per_table=; =gpkg_contents= emits the carried registrations, under the same =identifier= UNIQUE refusal the pyramid path uses; =retained_references= counts a registered carried table as satisfying Requirement 97 |
+| =container.rs= | *nothing* -- the survey already reports =notes_aspatial= and already subtracts =Carried::reproduced_names=. /Asserted rather than assumed: the check is that the warning goes silent, not that the module was edited./ |
 
 ** TESTING
 - *The invariant, table-driven, per format*: read a hostile fixture, write the

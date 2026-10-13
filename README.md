@@ -24,7 +24,7 @@ Design priorities for the project, in order. Geosetta aims to be:
 
 ## STATUS
 
-Current version: **0.25.0**.
+Current version: **0.26.0**.
 
 Eight formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
@@ -58,9 +58,21 @@ validated against DuckDB / GDAL.
     user's own tables (including `WITHOUT ROWID` ones), aspatial `attributes`
     datasets with their registrations, the metadata extension's records and
     references, and the extension registrations the output's own contents
-    oblige. Eleven of the twelve GeoPackage fixtures in this repository
+    oblige. Eleven of the thirteen GeoPackage fixtures in this repository
     round-trip with nothing dropped; what a run cannot carry it says so, on
-    stderr, rather than dropping it silently. An opt-in
+    stderr, rather than dropping it silently. **Appending into a `.gpkg` that
+    already holds a container merges the two** rather than keeping the
+    incoming side and discarding the destination's: the metadata extension's
+    records are deduplicated by content and their references rewritten to
+    follow, tables are kept from both sides, and **two tile pyramids of the
+    same name have their tiles unioned** on the `(zoom_level, tile_column,
+    tile_row)` key the standard declares — reissuing the incoming side's row
+    ids, rebuilding the index over the merged rows, and carrying any metadata
+    reference along to the tile it still means. Where two containers genuinely
+    disagree — two tables of one name, two field domains of one name defining
+    different things, or two different images at one tile coordinate — the run
+    **refuses and writes nothing** instead of picking a winner, leaving the
+    destination exactly as it was. An opt-in
     `--rtree` flag also writes the GeoPackage RTree extension (SQLite's R\*Tree
     virtual table, built from scratch); the index passes `rtreecheck()` and
     answers GDAL/DuckDB bbox queries. A second opt-in flag, `--envelope`, caches

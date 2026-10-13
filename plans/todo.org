@@ -38,10 +38,12 @@ check it off and remove it once the item ships or is shelved.
   around its layers *warned from 2026-08-21* and is **mostly fixed as of
   2026-08-25** — a tile pyramid, a user's own tables, the =gpkg_metadata= pair,
   an =attributes= dataset, a =WITHOUT ROWID= table and both extensions'
-  registrations are carried, and **eleven** of the twelve =.gpkg= fixtures
-  round-trip with the warning silent. /What is left is one missing capability —
-  the CRS-WKT extension's column — plus the merge path, which is
-  =container-reconciliation.org=./ Since then: the *GeoPackage spoke*, defect 5's *recast
+  registrations are carried, and **eleven** of the thirteen =.gpkg= fixtures
+  round-trip with the warning silent /(recounted 2026-10-13)/. /What is left is
+  one missing capability — the CRS-WKT extension's column./ ***The merge path
+  is closed***: =container-reconciliation.org= is **complete** as of
+  2026-10-13, so M3b has no gate left. What remains of defect 3 is the one
+  missing capability above and nothing else. Since then: the *GeoPackage spoke*, defect 5's *recast
   matrix* (with =DeclType::admits=, =Format::recast= and a fourth warning), a
   *byte-level value type* — a =gpkg= run had been destroying every blob it read
   — an exact *integer* model, and *D7*, which exported the types a caller needs
@@ -56,86 +58,39 @@ check it off and remove it once the item ships or is shelved.
   =tests/fixtures/spec_conformant.gpkg=, the first fixture in this tree with no
   GDAL in its provenance, and a test comparing whole registry DDL against it --
   all six tables match the standard exactly.
-- [ ] [[file:container-reconciliation.org][container-reconciliation.org]] —
-  what happens to container content when the *destination* GeoPackage already
-  has some. **Blocks =same-format-fidelity.org= M3b from closing**: M3b can
-  carry a source container into a fresh file without it, and cannot claim to
-  carry a container in general until it is settled. The collision is the
-  *common* case, not the rare one — any two =ogr2ogr= GeoPackages both hold
-  =gpkg_metadata= — so no "which wins" rule is right down both paths, and a
-  real merge means renumbering AUTOINCREMENT ids, rewriting the foreign keys
-  that point at them, recomputing =sqlite_sequence= rather than carrying it,
-  and *building* indexes rather than re-packing them — which reopens D10.
-  One requirement is due regardless of the merge question: carried content
-  referencing an =srs_id= points into the source's numbering, which
-  =resolve_srs= renumbers. Scoping only.
+- [X] [[file:container-reconciliation.org][container-reconciliation.org]] —
+  *COMPLETE 2026-10-13.* What happens to container content when the
+  *destination* GeoPackage already has some. All six requirements built, in two
+  passes the same day: § 3's set-union layer with § 5's refusals, then § 4's
+  index construction. =src/geopackage/reconcile.rs= is the module, wired in
+  =main.rs= — **the destination's container is merged rather than destroyed**,
+  which clears =same-format-fidelity.org= M3b's last gate.
 
-  /2026-08-23:/ **D2 is decided -- merge, and build the index** -- on § THE
-  MEASUREMENT rather than on the argument that was on file, and *both* options
-  moved when =ogr2ogr= was actually asked. Refusing a merge for indexed tables
-  is out: **every** table that would need merging carries an index, so it would
-  fire on every ordinary append. Building is in, and costs less than feared: no
-  producer emits a non-=BINARY= index, so the collation machinery stays out of
-  scope and § 5's refusal covers what does not fit. The same run overturned the
-  plan's own § 3 -- ***=ge_tce= does not make a set either***, and three of the
-  four registry keys have a nullable column, so merging two *plain* =ogr2ogr=
-  files deduped nothing at all while =integrity_check= reported =ok=. What is
-  left is ordinary work plus one piece of paper: the "same row" contract, now
-  load-bearing for three tables rather than one. *That contract is written* --
-  § 6 states identity per table, the three rules that decide it (a surrogate id
-  is allocation; NULL equals NULL; a write-time stamp is provenance), what is
-  recomputed rather than merged, and the step ordering §§ 2 and 3 cannot choose
-  freely. It raised **D4** and **D5**, and *both are now decided*, along with
-  **D3** -- so this plan has no open decisions left.
+  A merge now dedupes the metadata pair by content, applies its id map to the
+  references and dedupes those on the mapped values keeping the destination's
+  stamp; set-unions tables and pyramids by name; and for a same-named **tile
+  pyramid** unions the tiles on Requirement 54's key, reissuing the incoming
+  side's rowids, ***building*** the index from the merged rows,
+  recomputing =sqlite_sequence= behind them and *remapping* any row-scoped
+  =gpkg_metadata_reference= to the tile it still means. Six refusals cover what
+  has no union. /Measured: all **120** writing pairs across this tree's =.gpkg=
+  fixtures produce files passing all three oracles; the other 36 refuse with a
+  stated reason. For the built index the pragmas are **not** the test — a
+  mis-sorted b-tree still holds one entry per row and passes =integrity_check=,
+  so =sqlite_enforces_the_unique_behind_a_merged_pyramids_built_index= makes
+  SQLite find a duplicate through it and refuse./
 
-  - *D3 -- =srs_id= reconciliation is **M3b's**.* Not a placement preference in
-    the end: this plan's gate says M3b can carry into a *fresh* destination
-    without any of it, and =resolve_srs= renumbers on every write regardless,
-    so the failure happens where there is one container and nothing to
-    reconcile.
-  - *D4 -- a tile collision with differing bytes is **refused**.* It fires only
-    on a true overlap: adjacent pyramids union cleanly on =(z, x, y)=, which
-    Requirement 54 makes the declared key.
-  - *D5 -- a same-named user table is **refused**.* Decided, reopened, and
-    re-decided on a hazard neither option had accounted for:
-    =gpkg_metadata_reference.row_id_value= is normatively a rowid into the
-    table but carries **no foreign key**, so merging renumbers rowids and
-    every row-scoped reference rots *silently* -- past =integrity_check= and
-    past =foreign_key_check=. The reopen-shape is filed for when a real case
-    turns up.
+  *Three things worth keeping, none of them in the plan.* **§ 4 turned out
+  cheap and D10's reversal is spent**: no producer emits an index this crate
+  struggles with, so =compare_values='s =BINARY=-only scope stands and a
+  =COLLATE=/=DESC= key is refused rather than approximated. **A built index is
+  not byte-equal to a carried one** over identical rows — =encode_record=
+  writes every integer as an 8-byte serial type where SQLite picks the
+  narrowest — which is valid and worth knowing before anyone asserts byte
+  equality against GDAL's output. And **two defects came out of § 3**,
+  =handoff.org= entries 22 and 23, one of them reachable with no merge involved
+  at all.
 
-  Next is this plan's §§ 3--5. /The line that stood here until 2026-08-25 --
-  "Next is =same-format-fidelity.org= M3b, which now owns § 1" -- is spent:
-  M3b's one-container half is done, and §§ 3--5 are what is left of the gate./
-
-  /2026-08-26:/ **a =WITHOUT ROWID= table is carried**, which was the last
-  carrying-shaped item in defect 3 and needed **no new writer capability**.
-  Three documents (this one included) said the writer "has never emitted one"
-  and called it real file-format work; that half was never measured, only
-  inferred from the absence of code saying =WITHOUT ROWID=. =write_database=
-  has built index b-trees from =MasterEntry::records= since 2026-08-23 with no
-  test on the entry's kind, and such a table *is* an index b-tree. Second day
-  running that a blocker turned out to be a **reason** falsified by other work
-  in the same plan.
-
-  /2026-08-25:/ **an =attributes= dataset is carried**, with the
-  =gpkg_contents= row Requirement 118 obliges -- the second of defect 3's three
-  remaining capabilities, and the exclusion that had blocked it gave a reason
-  (that its registry row could not come along) which the pyramid work had
-  falsified a day earlier. It also turned up a file shape that *reads*
-  perfectly, passes =integrity_check= and =foreign_key_check=, and **cannot be
-  written to**: =ogr2ogr='s =gpkg_ogr_contents= maintenance triggers, carried
-  onto a table whose maintained registry this writer never emits. **D14 filed
-  and taken** -- =attributes= only, no implementer-defined =data_type=.
-
-  /2026-08-24:/ **=gpkg_contents.last_change= is now carried** -- a member the
-  inventory had missed entirely, because the row was surveyed for what it says
-  *about* a layer and this reads as bookkeeping. It is not: the standard defines
-  it as "timestamp of last change to content", and a =gpkg -> gpkg= run had been
-  overwriting it with a constant since the GeoPackage spoke shipped. Carried
-  only; the *stamp* half of the rule -- a fresh timestamp where there is nothing
-  to carry -- is deliberately unbuilt, because it would spend byte-reproducible
-  output on nearly every run and fixes nothing the carry does not.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

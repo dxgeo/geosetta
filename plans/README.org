@@ -382,7 +382,20 @@ why, not to implement the spec's table from symmetry.
   scoped out. **That last one is a decision reversal, not a task.** One
   requirement is due regardless: carried content referencing an =srs_id= points
   into the source's numbering, which =resolve_srs= has just renumbered.
-  *Scoping only.*
+
+  ***COMPLETE 2026-10-13*** -- =src/geopackage/reconcile.rs=, wired in
+  =main.rs=: the destination's container is **merged** rather than destroyed,
+  which clears M3b's last gate. Every cost listed above was paid. The =srs_id=
+  requirement had already landed in M3b (D3); the =AUTOINCREMENT= renumbering
+  and the foreign-key rewrite came out forced by § 6's order; the
+  =sqlite_sequence= recomputation had been the writer's behaviour since
+  2026-08-24; and the index construction -- **D10's reversal** -- was built for
+  the one table that can reach it, a same-named tile pyramid, whose tiles union
+  on Requirement 54's key. /The reversal cost less than feared: no producer
+  emits an index this crate struggles with, so the collation machinery stayed
+  out and a =COLLATE=/=DESC= key is refused rather than approximated. Two
+  defects came out of the first half, =handoff.org= entries 22 and 23, one of
+  them reachable with no merge involved at all./
 - [[file:edit-composability.org][edit-composability.org]] :: Read a file, let
   *some other program* modify the feature collection, write it back -- the
   third seam in the family

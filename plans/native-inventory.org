@@ -269,7 +269,7 @@ dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
 | a =WITHOUT ROWID= table          | ***yes*, since 2026-08-26** | independent container content stored as an **index b-tree** -- so it is carried as records rather than rows (=carry::Storage=), re-packed in the source's order and never compared. **No new writer capability was needed**: =write_database= has built index b-trees from =MasterEntry::records= since 2026-08-23 without testing the entry's kind, and three documents went on calling it unbuilt file-format work for three days. /Still left behind, and it is a writer limit: one owning a =sqlite_autoindex_*=, which only an **additional** =UNIQUE= creates./ |
 | =gpkg_metadata= / =_reference=   | ***yes*, since 2026-08-25** | opaque *rows* in **constructed** DDL (decision 28) -- the first content carried on those terms, and the split is the point: the rows are a producer's documents and the table definition is the standard's (Requirement 93). **Layer-coupled**, so each reference is validated against what is written: Requirement 97 against the output's =gpkg_contents= /(which registers carried pyramids too, so a reference to one survives)/, 98 against the written columns, 99 against the written feature ids. **The pair travels together or not at all** -- Requirement 95. /A reference that does not survive is dropped and **reported**, and the document it named is kept (decisions 29 and 30)./ |
 | =gpkg_extensions=                | *partly*, since 2026-08-25 | **not opaque after all** -- its rows are *derived from what the write produces*, one per extension in use. The R*Tree's have been written since =--rtree=; the Metadata pair's and the Schema extension's since 2026-08-25 (Requirements 140 and 141), the latter closing =handoff.org= entry 21. /What is still lost is a registration for an extension this crate does not implement -- =gpkg_crs_wkt_1_1= is the one in the tree, and it is a **column** on =gpkg_spatial_ref_sys= rather than a row, so it is a capability question rather than a carrying one./ |
-| =gpkg_data_columns= (+constraints)| *yes*, since 2026-08-21 | opaque, but *layer* content -- its rows are keyed by =(table_name, column_name)=, so the spoke carries them and this table is not M3b's after all |
+| =gpkg_data_columns= (+constraints)| *yes*, since 2026-08-21 | opaque, but *layer* content -- its rows are keyed by =(table_name, column_name)=, so the spoke carries them and this table is not M3b's after all. /**One qualification since 2026-10-13**, and it is not a carry gap: =gpkg_data_column_constraints= is keyed by =constraint_name= and so is *container*-scoped even though its rows ride the layers, and two layers naming one constraint differently is a collision with no union. It is **refused** (=container-reconciliation.org= § 5, =handoff.org= entry 22) rather than written as two rows the declared =gdcc_ntv= key cannot separate. Reachable on this one-container path as well as on a merge./ |
 | =gpkg_ogr_contents=              | *no*      | derived-capability -- /and reported as such since 2026-08-24; it had been named as destroyed *content*, handoff.org entry 13/. **Its two maintenance triggers go with it**, since 2026-08-25: =ogr2ogr= attaches them to every table it registers, and carrying them onto a carried table writes a file that reads perfectly, satisfies both structural pragmas and **fails every =INSERT=**. /Invisible until an =attributes= dataset became the first carried table that is neither a layer nor a registry table./ |
 | R*Tree tables + triggers (8)     | *no*      | derived-capability |
 | a tile pyramid's table + triggers | ***yes*, since 2026-08-24** | independent container content, carried verbatim by =geopackage/carry.rs= -- D8 |
@@ -280,6 +280,24 @@ dataset metadata and R*Trees, through =geosetta g2.gpkg g2.gpkg=:
 =--rtree= rebuilds the indexes for every layer and the result passes
 =rtreecheck()= /(measured)/, so the derived-capability half needs a trigger,
 not machinery.
+
+***This table is about one container, and since 2026-10-13 that is no longer
+the only path.*** =geosetta a.gpkg out.gpkg= into an *existing* =out.gpkg=
+merges the two containers -- =container-reconciliation.org=, complete -- so
+every =yes= above now holds for the **destination's** content too, where before
+the destination's was destroyed wholesale and reported.
+
+/One row reads differently on that path, and it is not a loss: a same-named
+**user table** is **refused** (D5), because a user table has no general notion
+of row identity and renumbering its rowids would rot a =row=-scoped
+=gpkg_metadata_reference= silently. A same-named **tile pyramid** does merge:
+Requirement 54 gives it a declared key, so its tiles union, its incoming
+rowids are reissued, its index is *built* rather than re-packed, and a
+reference into it is remapped to the tile it still means./
+
+/Recounted 2026-10-13: eleven of the thirteen =.gpkg= fixtures round-trip with
+the drop warning silent on the one-container path, and all **120** writing
+fixture pairs on the merge path produce files passing all three oracles./
 
 *** A discard the table missed entirely -- blob *values*, 2026-08-21
 Every entry above answers "what does this reader fail to *model*". None asked

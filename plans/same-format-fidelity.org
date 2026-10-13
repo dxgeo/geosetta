@@ -61,12 +61,17 @@ So *defect 3's fix* is **mostly built** rather than wholly outstanding. The
 this crate implements -- the second of those a **shipped conformance defect**
 rather than uncarried content, =handoff.org= entry 21 -- and the =attributes=
 dataset the same day, and a =WITHOUT ROWID= table on 2026-08-26. ***Eleven of
-the twelve =.gpkg= fixtures now round-trip with the drop warning silent.***
+the thirteen =.gpkg= fixtures now round-trip with the drop warning silent***
+/(recounted 2026-10-13, when =sqlite_nullkey.gpkg= made it thirteen and is
+refused by design)./
 
 /What is left is no longer a class this crate has failed to carry. **One**
 fixture still loses something, and it is a capability rather than a carry: the
-CRS-WKT extension's **column** on =gpkg_spatial_ref_sys=. The merge path is
-untouched and is =container-reconciliation.org=./
+CRS-WKT extension's **column** on =gpkg_spatial_ref_sys=./ ***The merge path
+is no longer untouched***: =container-reconciliation.org= § 3 shipped
+2026-10-13 and that plan is now **complete**, so a destination's own container
+is merged rather than destroyed -- a same-named tile pyramid included -- and
+**M3b has no gate left**.
 
 *M4 is done (2026-08-20), and it closed three defects rather than two.*
 =FieldDecl= gained a declared *type* in a vocabulary wide enough for the
@@ -484,10 +489,10 @@ already been renamed once./
    and its kind, the =gpkg_metadata= pair, and the =gpkg_extensions=
    registrations for both extensions this crate implements all followed on
    2026-08-25, the =attributes= dataset the same day, and a =WITHOUT ROWID=
-   table on 2026-08-26. /**Eleven of the twelve =.gpkg= fixtures now round-trip
-   with the warning silent** -- measured, not estimated -- and
-   =gdal_tiles.gpkg= and =sqlite_contents.gpkg=, the two with the richest
-   containers, are both among them./
+   table on 2026-08-26. /**Eleven of the thirteen =.gpkg= fixtures now
+   round-trip with the warning silent** -- measured, not estimated, recounted
+   2026-10-13 -- and =gdal_tiles.gpkg= and =sqlite_contents.gpkg=, the two with
+   the richest containers, are both among them./
 
    *What keeps the defect open is no longer a class of content.* **One**
    fixture still loses something, and it is a capability rather than a carry:
@@ -497,7 +502,9 @@ already been renamed once./
    had falsified a day earlier; the =WITHOUT ROWID= table's said the writer had
    never emitted one, which the **index work had falsified on 2026-08-23** --
    =write_database= builds a b-tree from any =MasterEntry= carrying records and
-   never asks the entry's kind./ The merge path is separate and untouched.
+   never asks the entry's kind./ ~~The merge path is separate and untouched.~~
+   **Built 2026-10-13** -- =container-reconciliation.org=, complete: a
+   destination's container is merged, a same-named tile pyramid included.
 
    Unlike defects 1--2 this one *does* need the mechanism (§ THE DOMAIN OF THE
    RULE), so it could not ship with M4. /(This sentence read "unlike defects
@@ -1856,10 +1863,32 @@ merely wrong. The ids are computed once per layer and handed to both.
   assumes *one* container. There are two whenever the destination
   =.gpkg= already exists -- the append path, which is a documented feature
   rather than an edge case -- and this milestone never asked what happens to
-  the destination's own container content then. Today it is destroyed, warned
+  the destination's own container content then. ~~Today it is destroyed, warned
   about by =run_geopackage_write='s second =container_drop_warnings= call,
   while the destination's *layers* survive: an asymmetry M3b would otherwise
-  inherit and enshrine.
+  inherit and enshrine.~~
+
+  ***Settled 2026-10-13, and the asymmetry is gone. This gate is closed.***
+  That plan is **complete** -- all six requirements -- so
+  =run_geopackage_write= reads the destination's container, merges it with the
+  source's through =geopackage::reconcile=, and hands the *merged* set to the
+  second =container_drop_warnings= call: the warning names what is still lost
+  rather than everything the destination had. A same-named tile pyramid merges
+  its tiles, which is where **D10's reversal was finally spent** -- its index is
+  *built* from the merged rows by =sqlite::autoindex_records=, keyed from the
+  DDL by the new =sqlite::autoindex_key_columns=.
+
+  /Two things reach back into this milestone. The reversal cost less than this
+  plan feared: no producer emits an index this crate struggles with, so
+  =compare_values='s =BINARY=-only scope stands and a =COLLATE=/=DESC= key is
+  **refused** rather than approximated. And a *built* index is not byte-equal to
+  a *carried* one over identical rows, because =encode_record= writes every
+  integer as an 8-byte serial type where SQLite picks the narrowest -- valid,
+  and the thing to know before asserting byte equality against GDAL's output./
+
+  /The paragraphs below are the question as it stood before; what they get
+  wrong is how much of the merge turned out to be forced -- see
+  § WHAT § 3 LEFT BEHIND over there./
 
   The question is not "which wins": collisions are the *common* case (any two
   =ogr2ogr= GeoPackages both hold =gpkg_metadata=), and for a table whose rows

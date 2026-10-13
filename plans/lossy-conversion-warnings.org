@@ -103,6 +103,15 @@ reason it states:
   warning, because it must evaluate **exactly the rule the write evaluates**
   (=retained_references=) rather than a second copy of it.
 
+  /Both properties got stronger on 2026-10-13 without this warning changing a
+  line, which is the payoff for the second one. =container-reconciliation.org=
+  § 3 merges the destination's container into the =Carried= handed to the
+  write, so this call now reasons about the **merged** metadata pair -- the
+  destination's documents and references included -- rather than the source's
+  alone. The neighbouring container warning gained the merged
+  =reproduced_names()= on the same terms, and stopped naming the destination's
+  content as destroyed because it no longer is./
+
   *Why it earns a message at all*, against § THE RULE's noise bar: the two
   neighbouring precedents disagree, and the distinction between them is the
   test. =gpkg_ogr_contents= is reported *silently* because it is derived and

@@ -4,7 +4,55 @@
 
 * Container Reconciliation
 
-** STATUS -- scoping only (2026-08-23). Nothing implemented.
+** STATUS -- COMPLETE 2026-10-13. All six requirements built.
+/Scoping only from 2026-08-23 until 2026-10-13, when the whole plan was built
+in two passes the same day: § 3's set-union layer with § 5's refusals, then
+§ 4's index construction. =src/geopackage/reconcile.rs= is the module;
+=main.rs= reads the destination's container and merges it before the write.
+**The destination's container is no longer destroyed** -- the asymmetry
+§ THE ASYMMETRY THAT IS ALREADY THERE describes is gone, which clears
+[[file:same-format-fidelity.org][M3b]]'s last gate./
+
+| req | what | state |
+|-----+------+-------|
+| 1 | =srs_id= reconciliation | *M3b's* (D3); built there 2026-08-24 |
+| 2 | =AUTOINCREMENT= renumbering | ***DONE*** -- forced out by § 6's order for =gpkg_metadata=, and by § 4 for a merged tile table |
+| 3 | set-union per table, on the right key | ***DONE*** |
+| 4 | index construction for a merged table | ***DONE*** -- D10's reversal, spent at last |
+| 5 | refusal where a merge is undecidable | ***DONE*** -- six of them |
+| 6 | a written contract for "the same row" | written 2026-08-23, ***implemented*** 2026-10-13 |
+
+*What a merge now does:* the metadata pair dedupes by content, its id map is
+applied to the references and they dedupe on the mapped values with the
+destination's stamp kept; user tables and pyramids set-union by name; a
+same-named **tile pyramid merges its tiles** on Requirement 54's key, reissuing
+the incoming side's rowids, **building** its index from the merged rows and
+recomputing =sqlite_sequence= behind them; and a row-scoped
+=gpkg_metadata_reference= into it is *remapped* rather than dropped.
+
+*Measured.* All **120** writing pairs across this tree's =.gpkg= fixtures
+produce files passing all three oracles in =tests/gpkg_oracles.rs=; the other
+36 refuse with a stated reason. And for the built index specifically, the
+pragmas are **not** the test —
+=sqlite_enforces_the_unique_behind_a_merged_pyramids_built_index= makes SQLite
+*find a duplicate through it* and refuse, because a mis-sorted b-tree still
+holds one entry per row and passes =integrity_check=.
+
+**Mind the two numbering schemes** when reading the rest of this file:
+§ THE SEQUENCING THAT FALLS OUT counts *steps* and § WHAT FULL CORRECTNESS
+REQUIRES counts *requirements*, and they do not line up -- step 4 is
+requirement 2 and step 5 is requirement 4. /This plan said "§§ 3--5" in three
+places meaning the steps; =plans/todo.org= inherited it./
+
+*Two defects were found by building § 3, neither of them in this plan*, and
+both are in =handoff.org= § BUGS FOUND (22 and 23). One was reachable without
+a merge at all. /Step 5 found no defect -- it found a **property**: a built
+index is not byte-equal to a carried one over identical rows, because
+=encode_record= writes every integer as an 8-byte serial type where SQLite
+picks the narrowest that fits. Valid, and worth knowing before anyone asserts
+byte equality against a GDAL-produced file./
+
+
 /Split out of [[file:same-format-fidelity.org][same-format-fidelity.org]] M3b
 on 2026-08-23, when scoping the carrying channel turned up a question M3b had
 never asked: what happens to container content when the destination already
@@ -277,7 +325,20 @@ carrying trips it on the first fixture. It is filed here because it is the same
 *kind* of problem -- a carried reference into a renumbered space -- and solving
 it here first is cheaper than solving it twice.
 
-*** 2. Identity reconciliation for =AUTOINCREMENT= tables
+*** 2. Identity reconciliation for =AUTOINCREMENT= tables -- ***BUILT 2026-10-13, in two places***
+/The =gpkg_metadata= half shipped with § 3: the renumbering and the reference
+rewrite came out forced, because § 6's order left no way to do the dedup
+without them, and the =sqlite_sequence= recomputation had been
+=metadata_tables='s behaviour since 2026-08-24./
+
+***The other half is a merged tile table, and § 4 is where it landed.*** This
+requirement's "inversion" -- carrying a high-water mark verbatim is right for a
+carried table and wrong once its ids move -- was briefly recorded as having no
+reachable case, on the reasoning that D5 refuses a merged *user* table. A
+merged **pyramid** is the case: =reconcile::merge_tiles= reissues the incoming
+side's rowids and recomputes the mark from the merged rows. /The refusal that
+made it look unreachable was § 4's own, lifted the same day./
+
 =gpkg_metadata.id= is =INTEGER PRIMARY KEY AUTOINCREMENT= in the standard's
 DDL, so both files number from 1 and their ids collide. /Measured: GDAL's own
 =gpkg_metadata= omits the AUTOINCREMENT, so it has no =sqlite_sequence= row to
@@ -292,7 +353,27 @@ That last one *inverts* what shipped on 2026-08-23: carrying the high-water
 mark verbatim is correct for a carried table and wrong the moment its ids move.
 Both behaviours are needed, and which applies is decided here.
 
-*** 3. Set-union semantics, per table, on the right key
+*** 3. Set-union semantics, per table, on the right key -- ***BUILT 2026-10-13***
+/=reconcile.rs= for the three members [[file:same-format-fidelity.org][=Carried=]]
+holds, and =writer::same_constraint= for the one registry table whose rows
+arrive on the layers instead. The placement is not a preference: =gpkg_data_columns=
+and =gpkg_data_column_constraints= reach the output through
+=writer::schema_extension_tables=, which composes them from every layer's
+=GpkgNative=, so their identity has to be enforced where the rows are./
+
+***The =range= half of the trap was a live defect on the one-container path,
+not only on a merge.*** =schema_extension_tables= deduped constraints by
+**whole-row equality**, so two rows the § 6 key makes one constraint both
+reached the output -- and a single source file can already hold that pair,
+because =gdcc_ntv= does not forbid it. So the refusal § 5 scopes to merges
+fires on a one-container =gpkg -> gpkg= run too, which is wider than this plan
+declared and is the right answer: the writer emits =gdcc_ntv= in its DDL, and
+writing rows the declared key cannot separate is output that does not state
+what the file says about itself. /Defect 6's shape, one table over./
+
+/The original text follows./
+
+**** the requirement as filed
 Each table needs its own notion of row identity -- its =UNIQUE= key where it
 has one, and nothing to appeal to where it does not.
 
@@ -326,7 +407,37 @@ and the reason its append gets the right answer.
 =gdcc_ntv= half; the =ge_tce= half needs no new fixture, because *any two
 =ogr2ogr= outputs* exhibit it.
 
-*** 4. Index rebuild -- ***this reopens D10***
+*** 4. Index rebuild -- ***BUILT 2026-10-13; D10's reversal is spent***
+/=reconcile::merge_tiles= builds each autoindex from the merged rows with
+=sqlite::autoindex_records=, after =sqlite::autoindex_key_columns= reads the
+DDL for what each one keys on. **The parser is new and had no other caller** --
+a carried index needs no key, which is exactly why D10 was cheap./
+
+***The measurement below held, and the collations were never needed.*** No
+producer emits an index this crate struggles with, so =compare_values='s
+=BINARY=-only scope stands; =sqlite_constraints.gpkg='s =COLLATE NOCASE= is
+hand-built and remains § 5's refusal case rather than a gap. A key carrying
+=COLLATE= (other than =BINARY=) or =DESC= is **refused**, not approximated.
+
+*The guard that is not obvious, and a mutation survived without it.* The parse
+yields a count of implicit indexes, and the carried =autoindexes= were read
+from the source's own b-trees -- **two independent answers to one question**.
+Where they disagree the parse did not understand the table, and building
+anyway writes either a fabricated index (=handoff.org= entry 20) or a declared
+constraint with no b-tree (entry 15). The two halves of the same defect, and
+this tree has shipped one of them. /The distinguishing input had to be built:
+in every fixture the two numbers agree./
+
+*And one property rather than a defect:* a built index is **not byte-equal** to
+a carried one over identical rows. =encode_record= writes every integer as an
+8-byte serial type where SQLite picks the narrowest that fits, so the records
+are wider. Valid -- every index this crate has ever built is encoded that way
+and =integrity_check= has always passed -- but it means a merged pyramid's
+index bytes are this crate's, not SQLite's.
+
+/The requirement as filed follows./
+
+**** the requirement as filed
 [[file:same-format-fidelity.org][same-format-fidelity.org]] D10 says a carried
 table's index is *carried verbatim*, and the whole reason that is cheap is that
 **an index on disk is already sorted**: an in-order read yields records that
@@ -353,7 +464,33 @@ them**. =sqlite_constraints.gpkg='s =COLLATE NOCASE= is hand-built, and it
 remains the right fixture for § 5's refusal rather than for the general path.
 See § THE MEASUREMENT.
 
-*** 5. Refusal where a merge is undecidable
+*** 5. Refusal where a merge is undecidable -- ***BUILT 2026-10-13***
+/Six refusals now, and two of them are ones this plan did not predict:/
+
+| collision | where | grounds |
+|-----------+-------+---------|
+| a same-named *user table* | =reconcile::merge_tables= | D5 |
+| two same-named pyramids that are **not the same pyramid** -- differing DDL, CRS, tile matrix set or matrix | =reconcile::merge_tiles= | two declarations, or two tiling schemes, have no union; under different matrices =(z, x, y)= does not even name the same ground |
+| the same =(z, x, y)= carrying different bytes | =reconcile::merge_tiles= | **D4**, and it fires only on a true overlap |
+| a pyramid whose index key the parse cannot honour, or whose DDL and file disagree on how many indexes it has | =reconcile::merge_tiles= | § 4 -- the parse did not understand the table, and building anyway writes entry 15 or entry 20 |
+| a source object naming the other side's object of the *other kind* | =reconcile::refuse_cross_kind_collisions= | =gpkg_contents.table_name= is a primary key |
+| the same =constraint_name= + =constraint_type= defining different things | =writer::schema_extension_tables= | this section's second bullet |
+
+***And a fifth that belongs to no merge.*** Two *feature layers* sharing a
+=gpkg_contents.identifier= produced a database =integrity_check= reports as
+=non-unique entry in index sqlite_autoindex_gpkg_contents_2=. The carried
+pyramid and carried dataset arms of =writer::gpkg_contents= had enforced
+Requirement 13 since 2026-08-24; **the layers had never been checked against
+each other**, because a single source cannot hold the collision -- its own
+=UNIQUE= forbade it -- and an append composes two sources. =ogr2ogr -nln= copies
+the identifier verbatim when it renames a layer, so the input is what a real
+producer hands you, and =ogr2ogr -update -append= refuses the same case and
+terminates the translation.
+
+/Measured 2026-10-13; =handoff.org= § BUGS FOUND has both entries./
+
+*/The requirement as filed./*
+
 Some collisions have no correct answer and must be *reported*, not resolved:
 - a same-named user table with **different DDL** -- no union exists;
 - the same =constraint_name= naming different constraints;
@@ -365,7 +502,7 @@ silent loss and is therefore an acceptable answer. It is only unacceptable when
 it fires on the *ordinary* path, which is why § 3's dedup has to work: without
 it, every ordinary append would land here.
 
-*** 6. A written contract for "the same row"
+*** 6. A written contract for "the same row" -- ***WRITTEN 2026-08-23; IMPLEMENTED 2026-10-13***
 Two =gpkg_metadata= rows with identical content and different ids are one
 record; the same id with different content is two. That judgement has to be
 stated per table, because §§ 2 and 3 both depend on it and neither can be
@@ -518,17 +655,45 @@ will get wrong if it treats § 3 as one pass over all tables. /This is also why
 § 2 and § 3 were filed as separate requirements and are not separable in
 practice./
 
+** WHAT § 3 LEFT BEHIND -- /2026-10-13, and it was closed the same day/
+***Written when § 3 shipped and step 5 was still open; kept because what it got
+wrong is the useful part.*** It called step 5 "the one thing left" and "a
+feature rather than a prerequisite", and both were true -- it was built hours
+later, which is the one prediction here that reads oddly in hindsight rather
+than wrongly.
+
+*What it got right and is worth not relearning:* **step 4 did not need
+building.** § 2 names three obligations -- renumber one side's
+=gpkg_metadata.id=, rewrite =md_file_id= / =md_parent_id= behind it, and
+recompute =sqlite_sequence= rather than carry it. The first two shipped with
+§ 3 because § 6's forced order left no way to do the dedup *without* them, and
+the third needed no work at all: =writer::metadata_tables= had computed that
+mark from the rows being written since 2026-08-24, with a comment saying so.
+
+***What it got wrong, and the correction is step 5's.*** It said the
+"inversion" § 2 records -- carrying a high-water mark verbatim is right for a
+carried table and wrong once its ids move -- "applies to a **carried user
+table**, and D5 refuses a merge of one", concluding it was "a live rule with no
+reachable case". **A merged tile pyramid is that case**, and step 5 made it
+reachable within the day: its rowids move, so its mark is recomputed from the
+merged rows. /The shape of the error is one this tree keeps finding: a rule
+declared unreachable because the only path to it was currently closed. The
+closure was a refusal in the same plan, scheduled to be lifted./
+
 ** THE SEQUENCING THAT FALLS OUT
 #+begin_src text
   1. srs_id reconciliation        -> MOVED to M3b (D3); this plan depends on it
   2. the "same row" contract      -> WRITTEN 2026-08-23 (§ 6); unblocks 3 and 4
-  3. set-union + refusal          -> the reconciliation layer
-  4. AUTOINCREMENT renumbering    -> needs 2; inverts the 2026-08-23 carry rule
-  5. index construction           -> REOPENS D10; needs collation semantics
+  3. set-union + refusal          -> BUILT 2026-10-13 (reconcile.rs)
+  4. AUTOINCREMENT renumbering    -> BUILT 2026-10-13, in two places: inside
+                                     step 3 for gpkg_metadata, inside step 5
+                                     for a merged tile table
+  5. index construction           -> BUILT 2026-10-13; D10 reversed, and the
+                                     collations turned out not to be needed
 #+end_src
 
-Steps 1--4 are ordinary work. **Step 5 was a decision before it was a task**,
-and D2 has now taken it: *build*. /The paragraphs below are the argument as it
+***All five steps are built as of 2026-10-13.*** Steps 1--4 were ordinary work.
+**Step 5 was a decision before it was a task**, and D2 took it: *build*. /The paragraphs below are the argument as it
 stood before the measurement, kept because what it got wrong is the useful
 part./
 

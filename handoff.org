@@ -30,10 +30,16 @@ still pass =native: None=.*
   2026-08-24, and **a user's own tables**, **the =gpkg_metadata= pair** and
   **an =attributes= dataset** as of 2026-08-25, all carried by
   =geopackage/carry.rs=, and **a =WITHOUT ROWID= table** as of 2026-08-26.
-  ***Eleven of the twelve =.gpkg= fixtures now round-trip with the warning
-  silent.*** /What is left is one thing this crate cannot yet model rather than
-  a class it has not carried: the CRS-WKT extension's **column**. The defect stays open on the merge path regardless --
-  =container-reconciliation.org=./ /Entry 13
+  ***Eleven of the thirteen =.gpkg= fixtures now round-trip with the warning
+  silent*** /(recounted 2026-10-13: =sqlite_nullkey.gpkg= made it thirteen and
+  is **refused by design**)./ /What is left is one thing this crate cannot yet
+  model rather than a class it has not carried: the CRS-WKT extension's
+  **column**./ ***And the merge path is no longer the exception*** --
+  =container-reconciliation.org= is **complete** as of 2026-10-13, so a
+  destination's own container survives an append too, a same-named tile pyramid
+  included. The only merge still refused is one with no union: two tables of a
+  name, two pyramids that are not the same pyramid, or two images at one tile
+  coordinate. /Entry 13
   closed with it: the warning had misclassified =gpkg_ogr_contents=, and ten
   triggers besides./
 - ***Defect 6 was found and fixed on 2026-08-23**, twice over, and it is the
@@ -129,10 +135,18 @@ In this order. The first two are the load-bearing ones:
    prefix because provenance is what these names carry -- and it is the fixture
    M3b § 1 needs. =sqlite_fid_gap.gpkg= followed on 2026-08-25, and unlike the
    others was not designed in advance at all: it exists because a bug turned out
-   to be invisible to every fixture in the tree at once./
+   to be invisible to every fixture in the tree at once. =sqlite_nullkey.gpkg=
+   followed on 2026-10-13 -- designed 2026-08-23 and built when § 3 needed it --
+   and it is the **only fixture in the tree whose =gpkg -> gpkg= write is
+   refused by design**, which =tests/gpkg_oracles.rs= asserts through
+   =REFUSED_BY_DESIGN= rather than skipping./
 6. [[file:plans/container-reconciliation.org][plans/container-reconciliation.org]]
-   -- /new 2026-08-23/. What happens to container content when the destination
-   =.gpkg= already has some. **Read it before finishing M3b**, which it gates:
+   -- /new 2026-08-23; **COMPLETE 2026-10-13**/. What happens to container
+   content when the destination =.gpkg= already has some. ***Read its § STATUS
+   first*** -- the destination's container is merged rather than destroyed, a
+   same-named tile pyramid included, and **all six requirements are built**.
+   The rest of this entry is the state before that landed and is kept for the
+   reasoning. It no longer gates M3b; it did, and this is why:
    M3b can carry a source container into a fresh file without any of it, and
    cannot claim to carry a container in general until it is settled. Its § 1 is
    due regardless of the rest. *Its D2 was decided the same day it was filed,
@@ -184,8 +198,10 @@ time. *Not started.*
       GeoPackage                                  [DONE]
       csv / wkt / kml / shp                       [not started]
             |
-  container-reconciliation.org  [NEW 2026-08-23 -- gates M3b's close;
-                                 D2 decided the same day: merge + build]
+  container-reconciliation.org  [COMPLETE 2026-10-13 -- all six
+                                 requirements. The merge runs, a same-named
+                                 tile pyramid included, and M3b's gate is
+                                 clear. D10's reversal is spent here]
             |
   M3b GeoPackage container   M3c KMZ container
             |
@@ -567,7 +583,8 @@ of it was planned work* -- each item was found by measuring the one above it:
   did not incur. /The last was caught in review before it left the working
   tree. All three share a shape: **the report and the write derived their
   answers separately.**/ =gdal_tiles.gpkg= now round-trips saying nothing at
-  all, and eleven of the twelve =.gpkg= fixtures do.
+  all, and eleven of the thirteen =.gpkg= fixtures do /(recounted
+  2026-10-13)/.
 - *The recast matrix* -- =DeclType::admits= (the widening relation),
   =Format::recast= (what each format does to each type),
   =decl_recast_warning=, =DeclType::ALL=, two sweeps, four *inbound* tables
@@ -648,9 +665,11 @@ of it was planned work* -- each item was found by measuring the one above it:
   fixed*: an empty =gpkg_tile_matrix= / =_set= is not destroyed content, since
   this writer builds both on demand -- but only when **empty**, because a
   populated pair whose pyramid is not carried is a real loss and the append
-  path depends on it still being named./ ***Eleven of the twelve =.gpkg=
+  path depends on it still being named./ ***Eleven of the thirteen =.gpkg=
   fixtures now round-trip with the drop warning silent*** -- /counted, not
-  estimated: the one that still speaks is =gpkg_crs_wkt_1_1=./ Note that
+  estimated: the one that still speaks is =gpkg_crs_wkt_1_1=, and the
+  thirteenth, =sqlite_nullkey.gpkg=, is refused by design. Recounted
+  2026-10-13./ Note that
   section's numbering is *not* the plan's defect numbering; see its own note.
 - The exhaustive-match fixture registry (D6).
 - The format-check deletion. *Drawn last in the diagram, no longer forced
@@ -793,11 +812,14 @@ things. /Reconciled 2026-08-20./
    *So why it stays LIVE, stated so nobody has to re-derive it.* **This entry
    is about the container, not about a list of members**, and two things keep
    it open. The corpus still loses one thing this crate cannot model -- the
-   CRS-WKT extension's *column* -- and that is not carrying work. And on the
+   CRS-WKT extension's *column* -- and that is not carrying work. ~~And on the
    **merge** path nothing is reconciled at all: a destination's own container
    is still destroyed wholesale, which is =container-reconciliation.org=
-   §§ 3--5 and unbuilt. /Eleven of the twelve =.gpkg= fixtures round-trip with
-   the warning silent; that is the honest measure of how far it has come./
+   §§ 3--5 and unbuilt.~~ **That half closed 2026-10-13**: the plan is
+   complete, and a destination's container is merged rather than destroyed --
+   a same-named tile pyramid included. /Eleven of the thirteen =.gpkg= fixtures
+   round-trip with the warning silent; that is the honest measure of how far it
+   has come./
 
    *No longer silent, as of 2026-08-21.* "Exit 0, no warning" was the original
    finding; the exit code is unchanged (§ THE RULE is loud, not blocking) but
@@ -1309,6 +1331,127 @@ actually depends on rather than where it was noticed. D5's hazard depends on
 standing when they saw it. /Nothing about D5's conclusion changes -- the refusal
 still holds -- but a reader would have finished that section believing the
 one-container path was safe./
+
+*** 2026-10-13 -- by building the merge the destination had never been given
+/Two entries, both found by implementing =container-reconciliation.org= § 3 and
+both fixed the same day. **Neither was in that plan**, and 23 is not about
+merging at all -- it is a defect an append *exposed* in a check the writer had
+been making correctly for carried content and had never made for layers./
+
+22. ~~***Two =range= constraints for one name both reached the output, and the
+    declared key could not see it.***~~ **Found and FIXED 2026-10-13**, live
+    since the Schema extension's tables shipped on 2026-08-21.
+
+    =writer::schema_extension_tables= deduped constraints by **whole-row
+    equality**: =if !constraints.contains(constraint)=. § 6's contract makes a
+    =range= row's identity =(constraint_name, constraint_type)= -- its =value=
+    is NULL *by definition*, the column being for =enum= and =glob= -- so two
+    rows disagreeing on their bounds are one constraint saying two things, and
+    whole-row equality kept both.
+
+    ***The output is conformant-looking and wrong, which is why nothing
+    caught it.*** The writer emits =CONSTRAINT gdcc_ntv UNIQUE (constraint_name,
+    constraint_type, value)=, and SQLite treats NULLs as distinct under
+    =UNIQUE= -- so the declared key accepts the pair and the file passes every
+    structural oracle:
+
+    #+begin_src text
+      two 'range' rows, same name, min 0/100 and 50/500, value NULL
+        PRAGMA integrity_check    ->  ok
+        PRAGMA foreign_key_check  ->  (silent)
+        SELECT count(*)           ->  2        -- the standard admits one
+    #+end_src
+
+    /Measured against GDAL 3.13.3 and SQLite 3.51.0, and **GDAL's own DDL does
+    declare =gdcc_ntv=** -- =PLANNED.org= said =ogr2ogr= omits it, which was
+    true of the hand-built =gdal_hostile.gpkg= table and not of =ogr2ogr=./
+
+    ***It was reachable without a merge, which is wider than the plan that
+    found it.*** A single source file can hold the pair, for exactly the reason
+    above, so the refusal fires on a one-container =gpkg -> gpkg= run too.
+    =plans/container-reconciliation.org= § 5 scopes its refusals to merges; this
+    one is not scoped to them, and should not be. **Writing rows the key you
+    declared cannot separate is output that does not state what the file says
+    about itself** -- entry 21's class, one table over.
+
+    *Fixed by* =writer::same_constraint=, which keys per =constraint_type=, and
+    a § 5 refusal where two rows share an identity and differ. /Fixture
+    =tests/fixtures/sqlite_nullkey.gpkg=, designed 2026-08-23 and built for
+    this. The =enum= half had to be built beside the =range= half: a test
+    asserting only the range case is satisfied by an implementation that drops
+    =value= from the key entirely, which **the first mutation survived** until
+    =two_range_constraints_differing_only_in_value_are_still_one_constraint=
+    gave it an input where the two rules disagree./
+
+    /=ogr2ogr -update -append= resolves the same collision silently in the
+    destination's favour, leaving the appended layer's domain quietly replaced.
+    § THE ORACLE RULE: evidence of what a producer does, not of what is right./
+
+23. ~~***An append could write a database SQLite reports as malformed, through
+    a check the writer was already making everywhere else.***~~ **Found and
+    FIXED 2026-10-13.**
+
+    =gpkg_contents.identifier= is =UNIQUE= (Requirement 13).
+    =writer::gpkg_contents= has refused a carried *pyramid* or carried
+    *dataset* whose identifier a layer already took since 2026-08-24 -- two
+    arms, two refusals, both correct. **The layers were never checked against
+    each other**, and the output was:
+
+    #+begin_src text
+      PRAGMA integrity_check  ->  non-unique entry in index
+                                  sqlite_autoindex_gpkg_contents_2
+    #+end_src
+
+    ***The reason it was invisible is the reason it is real.*** A single source
+    cannot hold the collision -- its own =UNIQUE= forbade it -- so no fixture
+    could exhibit it and no one-container test could reach it. **An append
+    composes two sources**, and =ogr2ogr -nln= copies the identifier verbatim
+    when it renames a layer, so two files with differently-named layers and one
+    identifier is what a real producer hands you rather than a constructed
+    case.
+
+    /The oracle agrees, and unusually it agrees with the *refusal*:
+    =ogr2ogr -update -append= fails the same input with
+    =UNIQUE constraint failed: gpkg_contents.identifier= and terminates the
+    translation./
+
+    *Fixed by* a uniqueness pass over the layer rows in =gpkg_contents=, with
+    the two carried arms' refusal reasoning and their NULL exemption -- two
+    NULLs do not collide under a SQL =UNIQUE=, which is why
+    =Registration::identifier= is an =Option= and why a layer's, always
+    non-NULL, needs no exemption. /Test
+    =two_layers_sharing_a_gpkg_contents_identifier_are_refused=, which asserts
+    both branches: the collision refuses and two distinct identifiers do not./
+
+*Step 5 found no defect, and one **property** worth recording.* A *built*
+index is not byte-equal to a *carried* one over identical rows:
+=encode_record= writes every integer as an 8-byte serial type where SQLite
+picks the narrowest that fits, so the records come out wider. Valid -- every
+index this crate has ever built is encoded that way and =integrity_check= has
+always passed -- but it means a merged pyramid's index bytes are *this crate's*
+rather than SQLite's, which is the thing to know before anyone asserts byte
+equality against a GDAL-produced file. /Found by writing an idempotence test
+that compared a self-merge's index against the source's records and watching it
+fail on encoding rather than on order./
+
+*What entries 22 and 23 add to the lesson list.* **A check made in two places
+out of three is a check whose third place nobody looked for.** Entry 23's two
+carried arms were written together, in one function, on one requirement, and
+the third caller of that requirement -- the layer rows, built forty lines
+above -- was never considered, because the requirement arrived while thinking
+about *carried* content. /The transferable question is not "did I handle this
+case" but "how many places does this rule have to hold, and have I enumerated
+them". Entry 21 is the same shape at the level of tables; this is it at the
+level of rows./
+
+*And entry 22 adds a sharper form of something already on the list.* /A test
+that asserts a correlation is satisfied by both sides of it/ -- learned
+2026-08-26 and **not transferred**: the first version of the range test was
+satisfied by the rule and by its plausible neighbour alike, because every
+conformant input makes the two agree. The distinguishing input had to be a
+*non-conformant* one. **When a rule's branch exists only to handle malformed
+input, only malformed input can test it**, and a corpus of well-formed files
+will never produce the case.
 
 ** WHAT CHANGED IN EXISTING DOCS
 Listed explicitly because each entry was written before its work was committed.

@@ -23,8 +23,15 @@ Design priorities for the project, in order. Geosetta aims to be:
 - Lightweight
 - Dependency-free
 
+Geosetta is a *peer* of =geoscribe= and =nazca=, not a layer above or beneath
+them: there are no dependency edges between any pair of the three crates, in
+either direction. See [[file:../architecture.org][../architecture.org]] for the
+composition model and the two boundary rules that govern it — text at the
+boundary wherever the format is externally specified, and no shared internal
+structs across a repo boundary.
+
 ** STATUS
-Current version: *0.25.0*.
+Current version: *0.26.0*.
 
 Eight formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with

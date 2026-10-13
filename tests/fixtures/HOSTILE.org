@@ -361,13 +361,45 @@ tree whose *collation* had to survive, and it does, because a carried index is
 **re-packed** in index order rather than compared -- so =NOCASE= never has to
 be implemented. /D10's bargain, collected./
 
-*/Both files are rebuilt by/* =tests/fixtures/build_sqlite_fixtures.sh=, which
-takes =gdal_hostile.gpkg= as its base and applies the =sqlite3= statements
+*/All three files are rebuilt by/* =tests/fixtures/build_sqlite_fixtures.sh=,
+which takes =gdal_hostile.gpkg= as its base and applies the =sqlite3= statements
 above. It is checked in beside them because the two fixtures exist to pin the
 gap between *what our fixtures contain* and *what the format permits*, and a
 recipe nobody can re-run reopens that gap the first time one needs changing.
 /Both were confirmed readable by geosetta and =PRAGMA integrity_check= = =ok=
 before being committed./
+
+*** =sqlite_nullkey.gpkg= -- /added 2026-10-13, and not hostile/
+***A =UNIQUE= key with a nullable member does not make a set.*** Designed in
+=PLANNED.org= on 2026-08-23 (as =gpkg_range_constraints.gpkg=) and built for
+=container-reconciliation.org= § 3, which cannot dedupe a registry table
+without it. The =range= rows are the *vehicle*; what the fixture pins is the
+key.
+
+| content | what it pins |
+|---------+--------------|
+| =gpkg_data_column_constraints= re-created with the Schema annex's **normative** DDL | the base's =ogr2ogr= DDL has =gdcc_ntv= but the hand-built =gdal_hostile.gpkg= one does not, so without this replacement there is no =UNIQUE= to pin anything about |
+| two =price_range= =range= rows, =value= **NULL**, disagreeing on =min=/=max= | *the trap*: SQLite treats NULLs as distinct under =UNIQUE=, so =gdcc_ntv= accepts both and =PRAGMA integrity_check= reports =ok=. The standard admits **one** range row per constraint name, so the pair says nothing coherent about the domain |
+| two =grade= =enum= rows, values ='a'= and ='b'= | *the negative half.* For an =enum= the value **is** the row's whole point, so these are two constraints and both SHALL survive -- which is what stops the rule being written as "drop =value= from the key" |
+| =gpkg_data_columns= row =cities.zip -> grade= | without a referring column the writer drops a constraint as describing nothing, so the =enum= rows would never reach the output to be tested |
+
+***This is the one fixture in the tree whose =gpkg -> gpkg= write is
+deliberately refused***, which is why =tests/gpkg_oracles.rs= gained
+=REFUSED_BY_DESIGN=. /The list is **asserted**, not subtracted: a fixture named
+there must actually be refused, so the exclusion is a third question those
+oracles ask rather than a hole in their sweep. A fixture quietly skipped is a
+fixture that has stopped testing anything./
+
+*A refinement that decides whether the fixture works at all:* the trap is
+=constraint_type = 'range'= with a **real NULL**. The neighbouring
+=_<domain>_domain_description= row GDAL writes has =value= = the empty
+*string*, which dedupes correctly and pins nothing. /Built with =NULL=, and
+=typeof(value)= is checked after building./
+
+*Rebuilt by* =tests/fixtures/build_sqlite_fixtures.sh= with the other two.
+/Confirmed readable by geosetta and =PRAGMA integrity_check= = =ok= before
+being committed -- the write refusal is a property of the *output* this fixture
+would produce, not of reading it./
 
 *** =sqlite_altered.gpkg= -- /added 2026-08-22, and not hostile/
 Not a fixture that fails the invariant. It pins *two bugs found on 2026-08-22*,
@@ -394,6 +426,23 @@ then the three =sqlite3= statements above. Note =VACUUM= fails on this file
 other =.gpkg= fixtures and was left alone.
 
 *** =gdal_tiles.gpkg= -- /added 2026-08-24, and not hostile/
+***Promoted again on 2026-10-13: it is the only fixture step 5 can be tested
+on.*** =container-reconciliation.org= § 4 builds a *merged* table's index rather
+than re-packing it, and this is the one tile table in the tree whose DDL
+declares the =UNIQUE (zoom_level, tile_column, tile_row)= of Requirement 54's
+informative example -- =sqlite_contents.gpkg='s hand-built =imagery= declares
+none, which is the conformant-but-unindexed case the standard explicitly
+permits. /Both are needed: without the second, nothing pins that a table
+declaring no =UNIQUE= must not be given one (=handoff.org= entry 20); without
+this one, there is no index to build./
+
+The merge is exercised by shifting its tiles ten columns east -- same DDL, same
+CRS, same tile matrix, not one tile in common -- which is the *adjacent
+gridding* D4 says unions cleanly rather than a contrived key. **And the pragmas
+are not the test**: a mis-sorted b-tree still holds one entry per row and passes
+=integrity_check=, so =sqlite_enforces_the_unique_behind_a_merged_pyramids_built_index=
+makes SQLite find a duplicate *through the index* and refuse.
+
 A **real tile pyramid**, which no other fixture here has: 80 tiles across two
 zoom levels with real JPEG payloads, beside a feature layer from
 § THE COMMON SOURCE. Built by

@@ -184,13 +184,25 @@ and owns an index -- and its index key is three integers, needing no collation.
 =gpkg= with the full DDL and **zero** tile rows, because GDAL skips blank
 tiles, and a fixture built that way would exercise nothing.
 
-** =sqlite_nullkey.gpkg= -- /renamed 2026-08-24/
+** BUILT 2026-10-13: =sqlite_nullkey.gpkg= -- /renamed 2026-08-24/
 /Designed as =gpkg_range_constraints.gpkg=, and renamed for the same reason as
 the entry above -- with the stem changed as well as the prefix. The =range=
 rows are the *vehicle*; what the fixture pins is that **a =UNIQUE= key with a
 nullable member does not make a set**, which is why the entry immediately
 generalises it to =ge_tce= and =gdc_tn=. Naming it after the vehicle would have
 buried the finding./
+
+/Built for =container-reconciliation.org= § 3 and documented in =HOSTILE.org=.
+Two things the entry below did not have: the =enum= half had to be built
+*beside* the =range= half -- without two rows whose =value= is the only
+difference, the rule can be written as "drop =value= from the key" and no test
+objects -- and **GDAL 3.13.3 does declare =gdcc_ntv=**, contrary to the line
+below, so the reason for replacing the DDL is =gdal_hostile.gpkg='s hand-built
+table rather than =ogr2ogr='s. This is also the first fixture in the tree whose
+=gpkg -> gpkg= write is deliberately **refused**, which =tests/gpkg_oracles.rs=
+now asserts rather than skips./
+
+/The entry as designed follows./
 
 *Build it on =gdal_hostile.gpkg=*, with the Schema annex's
 =gpkg_data_column_constraints= DDL applied on top -- =ogr2ogr= omits the

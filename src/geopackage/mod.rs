@@ -9,6 +9,7 @@
 pub mod carry;
 mod container;
 mod reader;
+mod reconcile;
 mod rtree;
 mod writer;
 
@@ -18,6 +19,9 @@ pub use container::container_drop_warnings;
 /// the write path's own plumbing, not part of the format-agnostic surface.
 pub use carry::{Carried, read as read_container};
 pub use reader::read_layers;
+/// Merging a destination container's carried content with a source's, for the
+/// append path — `plans/container-reconciliation.org` § 3.
+pub use reconcile::reconcile as reconcile_containers;
 pub use writer::{metadata_drop_warnings, write_layers};
 /// The sentinel `gpkg_contents.last_change` written where a layer carried none.
 /// Crate-visible so the reader can recognise its own output and drop it rather

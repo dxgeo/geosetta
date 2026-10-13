@@ -1492,6 +1492,206 @@ fn write_interior(page: &mut [u8], header_offset: usize, group: &[(u32, i64)]) -
 /// collation [`compare_values`] does not implement is refused rather than
 /// built — see its note, and D2 for why that refusal stays off the ordinary
 /// path.
+/// The column names a `CREATE TABLE` statement declares, in order.
+///
+/// Exposed for [`autoindex_key_columns`]'s callers: a key is returned as
+/// *positions*, and a caller that needs to find a column Requirement 54 names
+/// rather than one the DDL happens to put first needs the same list the
+/// positions index into.
+pub fn table_columns(sql: &str) -> Vec<String> {
+    parse_columns(sql).names
+}
+
+/// The key columns of each `sqlite_autoindex_<table>_N` a `CREATE TABLE`
+/// statement obliges, in `_1, _2, …` order, as positions into the table's
+/// column list.
+///
+/// `Err` carries the reason the DDL declares something this module cannot
+/// honour. **An `Err` is a refusal, never a fallback**: building an index whose
+/// order is not SQLite's, or numbering one wrongly, writes a malformed database
+/// that `SELECT` may still answer.
+///
+/// # Why this exists, and why nothing used to need it
+///
+/// A *carried* index is re-packed from the source's own b-tree and so needs no
+/// key at all — D10 in `plans/same-format-fidelity.org`, and the whole reason
+/// that decision was cheap. A **merged** table's rows are in neither source's
+/// order, so its indexes have to be built, and building one means knowing what
+/// it keys on. That is `plans/container-reconciliation.org` step 5, and this is
+/// the piece of it that had no other caller.
+///
+/// # The rules, measured rather than assumed
+///
+/// /Against SQLite 3.51.0 on 2026-10-13, because getting the **numbering**
+/// wrong attaches the right records to the wrong index and SQLite reports that
+/// as a corrupt index rather than as a key mismatch./
+///
+/// SQLite creates one implicit index per `UNIQUE` and per non-`INTEGER`
+/// `PRIMARY KEY`, numbered in **declaration order** — column constraints and
+/// table constraints in one sequence, with no reordering and no
+/// primary-key-first rule. Four findings that are not guessable from the
+/// documentation:
+///
+/// - `PRIMARY KEY` and `UNIQUE` on the *same single column* collapse to **one**
+///   index, not two.
+/// - A named `CONSTRAINT k UNIQUE (…)` still produces `sqlite_autoindex_*`;
+///   the constraint's name does not name the index.
+/// - `FOREIGN KEY` and `CHECK` produce none, so a `CHECK` whose expression
+///   happens to contain the word `UNIQUE` must not be counted — which is why
+///   this scans tokens outside quotes and parentheses rather than searching the
+///   text.
+/// - A `WITHOUT ROWID` table's primary key **consumes number 1 without
+///   materialising a b-tree**, so an extra `UNIQUE` on one is numbered `_2`.
+///   That breaks the positional mapping this function returns, so such a table
+///   is refused rather than numbered. /Unreachable in practice: the only merged
+///   table there can be is a tile pyramid, and D5 refuses a merged user table./
+pub fn autoindex_key_columns(sql: &str) -> std::result::Result<Vec<Vec<usize>>, String> {
+    let ddl = parse_columns(sql);
+    let Some(open) = sql.find('(') else { return Ok(Vec::new()) };
+    let Some(close) = sql.rfind(')') else { return Ok(Vec::new()) };
+    if sql[close..].to_ascii_uppercase().contains("WITHOUT ROWID") {
+        return Err("it is a WITHOUT ROWID table, whose primary key takes an autoindex                     number without owning a b-tree"
+            .into());
+    }
+
+    let mut keys: Vec<Vec<usize>> = Vec::new();
+    for part in split_top_level(&sql[open + 1..close]) {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if is_table_constraint(part) {
+            // `CONSTRAINT <name>` is optional and says nothing about the index.
+            let rest = strip_constraint_name(part);
+            let keyword = bare_tokens(rest).next().unwrap_or_default();
+            if keyword != "UNIQUE" && keyword != "PRIMARY" {
+                continue; // CHECK, FOREIGN KEY — no index.
+            }
+            keys.push(resolve(&key_list(rest)?, &ddl.names)?);
+            continue;
+        }
+        let Some(name) = first_identifier(part) else { continue };
+        let position = keys_position(&name, &ddl.names)?;
+        let tokens: Vec<String> = bare_tokens(part).collect();
+        let declares = |word: &str| tokens.iter().any(|t| t == word);
+        let primary = declares("PRIMARY") && Some(position) != ddl.rowid_alias;
+        // **One index, not two**, where a column declares both: measured, and
+        // the reason `||` is right here rather than two pushes.
+        if primary || declares("UNIQUE") {
+            if tokens.iter().any(|t| t == "COLLATE" || t == "DESC") {
+                return Err(format!(
+                    "column \"{name}\" keys an index with a COLLATE or DESC this crate's \
+                     comparison does not implement"
+                ));
+            }
+            keys.push(vec![position]);
+        }
+    }
+    Ok(keys)
+}
+
+/// The parenthesised key column list of a table constraint, rejecting any
+/// per-column modifier [`compare_values`] cannot honour.
+fn key_list(constraint: &str) -> std::result::Result<Vec<String>, String> {
+    let open = constraint.find('(').ok_or("a key constraint with no column list")?;
+    let close = constraint.rfind(')').ok_or("a key constraint with no column list")?;
+    let mut names = Vec::new();
+    for item in split_top_level(&constraint[open + 1..close]) {
+        let item = item.trim();
+        if item.is_empty() {
+            continue;
+        }
+        let name = first_identifier(item).ok_or("a key column with no name")?;
+        // Two modifiers say nothing and are allowed through: `ASC`, which is
+        // the default direction, and `COLLATE BINARY`, which is the collation
+        // `compare_values` implements and so names the behaviour already in
+        // force. **`DESC` and any other collation change the order this crate
+        // would build**, so they are refused rather than ignored — an index
+        // built in the wrong order is one SQLite reports as corrupt.
+        let mut tokens = bare_tokens(item).skip(1); // past the column name
+        while let Some(token) = tokens.next() {
+            let permitted = token == "ASC"
+                || (token == "COLLATE" && tokens.next().as_deref() == Some("BINARY"));
+            if !permitted {
+                return Err(format!(
+                    "key column \"{name}\" carries \"{token}\", which this crate's \
+                     comparison does not implement"
+                ));
+            }
+        }
+        names.push(name);
+    }
+    Ok(names)
+}
+
+/// Each key column's position, or an error naming the one that is not a column.
+fn resolve(names: &[String], columns: &[String]) -> std::result::Result<Vec<usize>, String> {
+    names.iter().map(|n| keys_position(n, columns)).collect()
+}
+
+fn keys_position(name: &str, columns: &[String]) -> std::result::Result<usize, String> {
+    columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(name))
+        .ok_or_else(|| format!("key column \"{name}\" is not one of the table's columns"))
+}
+
+/// `CONSTRAINT <name>` stripped from the front of a table constraint.
+fn strip_constraint_name(part: &str) -> &str {
+    let trimmed = part.trim_start();
+    let mut words = trimmed.split_whitespace();
+    if !words.next().is_some_and(|w| w.eq_ignore_ascii_case("CONSTRAINT")) {
+        return trimmed;
+    }
+    // Step past the keyword and the name, however the name is quoted.
+    let after_keyword = trimmed[10..].trim_start();
+    match first_identifier(after_keyword) {
+        Some(name) => after_keyword[after_keyword.find(&name).unwrap_or(0) + name.len()..]
+            .trim_start_matches(['"', '\'', '`', ']'])
+            .trim_start(),
+        None => after_keyword,
+    }
+}
+
+/// The upper-cased words of `s` that lie outside any quoted string or
+/// parenthesised group.
+///
+/// **Searching the text instead is the bug this avoids**: `DEFAULT 'UNIQUE'`
+/// and `CHECK (a <> 'UNIQUE')` both contain the word and oblige no index, and
+/// SQLite creates none for either /(measured)/.
+fn bare_tokens(s: &str) -> impl Iterator<Item = String> + '_ {
+    let mut depth = 0i32;
+    let mut quote: Option<char> = None;
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for c in s.chars() {
+        match quote {
+            Some(q) => {
+                if c == q {
+                    quote = None;
+                }
+            }
+            None => match c {
+                '"' | '\'' | '`' => quote = Some(c),
+                '[' => quote = Some(']'),
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ if depth > 0 => {}
+                _ if c.is_whitespace() || c == ',' => {
+                    if !cur.is_empty() {
+                        out.push(std::mem::take(&mut cur).to_ascii_uppercase());
+                    }
+                }
+                _ => cur.push(c),
+            },
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur.to_ascii_uppercase());
+    }
+    out.into_iter()
+}
+
 pub fn autoindex_records(rows: &[(i64, Vec<Value>)], key_cols: &[usize]) -> Vec<Vec<u8>> {
     let mut keyed: Vec<(Vec<Value>, i64)> = rows
         .iter()
@@ -1752,6 +1952,103 @@ mod tests {
     /// b-tree: `UNIQUE`, a `TEXT PRIMARY KEY`, an explicit `CREATE INDEX`, and
     /// a `UNIQUE COLLATE NOCASE`. See `tests/fixtures/HOSTILE.org`.
     const CONSTRAINTS: &[u8] = include_bytes!("../tests/fixtures/sqlite_constraints.gpkg");
+
+    /// ***What SQLite actually does, transcribed from a measurement rather than
+    /// from the documentation.***
+    ///
+    /// Each row was run against **SQLite 3.51.0 on 2026-10-13** and the
+    /// expectation is `PRAGMA index_info`'s answer for every
+    /// `sqlite_autoindex_*` the statement produced, in name order. /The
+    /// numbering matters as much as the keys: attach the right records to the
+    /// wrong index and SQLite reports a corrupt index, not a key mismatch./
+    #[test]
+    fn autoindex_keys_are_what_sqlite_creates() {
+        // (DDL, the autoindexes SQLite created, as key-column positions)
+        let cases: &[(&str, &[&[usize]])] = &[
+            // Declaration order, with no reordering and no primary-key-first
+            // rule — the two halves of this pair are the proof.
+            ("CREATE TABLE t(a,b,c, UNIQUE(c), PRIMARY KEY(a,b))", &[&[2], &[0, 1]]),
+            ("CREATE TABLE t(a,b,c, PRIMARY KEY(a,b), UNIQUE(c))", &[&[0, 1], &[2]]),
+            // Column constraints and table constraints share one sequence.
+            ("CREATE TABLE t(a TEXT PRIMARY KEY, b TEXT UNIQUE, UNIQUE(a,b))",
+             &[&[0], &[1], &[0, 1]]),
+            ("CREATE TABLE t(a UNIQUE, b, UNIQUE(b))", &[&[0], &[1]]),
+            ("CREATE TABLE t(a, b UNIQUE, c, PRIMARY KEY(c))", &[&[1], &[2]]),
+            // An INTEGER PRIMARY KEY is a rowid alias and owns no b-tree.
+            ("CREATE TABLE t(a INTEGER PRIMARY KEY, b UNIQUE)", &[&[1]]),
+            ("CREATE TABLE t(a TEXT PRIMARY KEY, b)", &[&[0]]),
+            // PRIMARY KEY and UNIQUE on one column collapse to ONE index.
+            ("CREATE TABLE t(a TEXT PRIMARY KEY UNIQUE, b)", &[&[0]]),
+            ("CREATE TABLE t(a TEXT UNIQUE PRIMARY KEY, b)", &[&[0]]),
+            // A named constraint still produces sqlite_autoindex_*; the
+            // constraint's name does not name the index.
+            ("CREATE TABLE t(a,b, CONSTRAINT k UNIQUE(a))", &[&[0]]),
+            ("CREATE TABLE t(a,b, CONSTRAINT k PRIMARY KEY(a,b))", &[&[0, 1]]),
+            // Neither of these obliges an index, and the word appearing inside
+            // a string or an expression must not be counted.
+            ("CREATE TABLE t(a,b,c, FOREIGN KEY(a) REFERENCES x(y))", &[]),
+            ("CREATE TABLE t(a,b, CHECK(a <> 'UNIQUE'))", &[]),
+            ("CREATE TABLE t(a TEXT DEFAULT 'UNIQUE', b)", &[]),
+            // ***The case that distinguishes scanning tokens from searching
+            // text***, and the one a mutation survived without: with spaces
+            // inside the literal, a naive split yields a **bare** `UNIQUE`
+            // token and fabricates an index SQLite does not create. /The
+            // neighbouring rows above both leave the quotes attached to the
+            // token, so either implementation happens to get them right./
+            ("CREATE TABLE t(a TEXT DEFAULT ' UNIQUE ', b)", &[]),
+            // And the inverse, so the skipping is not simply "ignore
+            // everything": a real constraint after a quoted literal still
+            // counts, and a `DESC` inside the literal is not a key modifier.
+            ("CREATE TABLE t(a TEXT DEFAULT ' DESC ' UNIQUE, b)", &[&[0]]),
+            ("CREATE TABLE t(a TEXT DEFAULT (1) UNIQUE, b)", &[&[0]]),
+            // ASC is the default and says nothing.
+            ("CREATE TABLE t(a,b, UNIQUE(a ASC, b ASC))", &[&[0, 1]]),
+            ("CREATE TABLE t(a,b, UNIQUE(a COLLATE BINARY))", &[&[0]]),
+            // A real tile pyramid, which is the only caller.
+            ("CREATE TABLE \"imagery\" (id INTEGER PRIMARY KEY AUTOINCREMENT,\
+              zoom_level INTEGER NOT NULL,tile_column INTEGER NOT NULL,\
+              tile_row INTEGER NOT NULL,tile_data BLOB NOT NULL,\
+              UNIQUE (zoom_level, tile_column, tile_row))", &[&[1, 2, 3]]),
+            // A conformant tile table may declare no UNIQUE at all, and then
+            // nothing may fabricate one — `handoff.org` entry 20.
+            ("CREATE TABLE imagery (id INTEGER PRIMARY KEY AUTOINCREMENT,\
+              zoom_level INTEGER NOT NULL, tile_column INTEGER NOT NULL,\
+              tile_row INTEGER NOT NULL, tile_data BLOB NOT NULL)", &[]),
+        ];
+        for (sql, expected) in cases {
+            let got = autoindex_key_columns(sql)
+                .unwrap_or_else(|e| panic!("{sql}\n  refused: {e}"));
+            let expected: Vec<Vec<usize>> =
+                expected.iter().map(|k| k.to_vec()).collect();
+            assert_eq!(got, expected, "{sql}");
+        }
+    }
+
+    /// ***A DDL this crate cannot honour is refused, not approximated.***
+    ///
+    /// Each of these produces an index whose *order* is not the one
+    /// [`autoindex_records`] would build, so constructing it would write a
+    /// b-tree SQLite reports as corrupt. D2 says build the index; it does not
+    /// say guess at one.
+    #[test]
+    fn a_key_this_crate_cannot_order_is_refused() {
+        for sql in [
+            "CREATE TABLE t(a,b, UNIQUE(a COLLATE NOCASE))",
+            "CREATE TABLE t(a,b, UNIQUE(a DESC, b))",
+            "CREATE TABLE t(a TEXT COLLATE NOCASE UNIQUE, b)",
+            // The primary key takes number 1 without owning a b-tree, so the
+            // positional mapping this function returns would be off by one.
+            "CREATE TABLE t(a,b, PRIMARY KEY(a), UNIQUE(b)) WITHOUT ROWID",
+            // A key naming something that is not a column: the DDL is not one
+            // this parse understood, whatever else is true of it.
+            "CREATE TABLE t(a,b, UNIQUE(nosuch))",
+        ] {
+            assert!(
+                autoindex_key_columns(sql).is_err(),
+                "should refuse rather than build an order it cannot reproduce: {sql}"
+            );
+        }
+    }
 
     /// Root page of `name` in `sqlite_master`.
     fn root_of(db: &Database, name: &str) -> u32 {

@@ -302,7 +302,7 @@ fn build(
     // Built *before* `gpkg_extensions` is pushed because it decides what goes
     // in it — Requirement 141 registers the tables that exist — but pushed
     // after, which is the position it has always had.
-    let schema_tables = schema_extension_tables(layers);
+    let schema_tables = schema_extension_tables(layers)?;
     extension_rows.extend(schema_extension_rows(&schema_tables));
     if !extension_rows.is_empty() {
         specs.push(extensions_table(extension_rows));
@@ -422,7 +422,7 @@ fn gpkg_native(fc: &FeatureCollection) -> Option<&GpkgNative> {
 /// also be derived" ruling decision 14 made for `ARROW:schema`, since a
 /// dangling `gpkg_data_columns` row is a description of nothing and GDAL
 /// surfaces it as an alias on a field that is not there.
-fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableSpec> {
+fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Result<Vec<TableSpec>> {
     let mut columns: Vec<(String, GpkgDataColumn)> = Vec::new();
     let mut constraints: Vec<GpkgConstraint> = Vec::new();
     for (name, fc) in layers {
@@ -434,8 +434,31 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
             }
         }
         for constraint in &native.constraints {
-            if !constraints.contains(constraint) {
-                constraints.push(constraint.clone());
+            match constraints.iter().find(|held| same_constraint(held, constraint)) {
+                // The same constraint, already held: one row. Identity is § 6's
+                // rather than the whole row's, which is the entire point — see
+                // `same_constraint`.
+                Some(held) if held == constraint => {}
+                // The same constraint saying something different. No union
+                // exists: a column referring to this name would get bounds
+                // neither source declared, so this is
+                // `plans/container-reconciliation.org` § 5's refusal.
+                //
+                // /`ogr2ogr -update -append` resolves it silently in the
+                // destination's favour (measured 2026-10-13), which leaves the
+                // appended layer's domain quietly replaced. § THE ORACLE RULE:
+                // that is evidence of what a producer does, not of what is
+                // right./
+                Some(_) => {
+                    return Err(Error::Convert(format!(
+                        "gpkg: the output would carry two constraints named \"{}\" of type \
+                         \"{}\" that define different things; refusing to write a \
+                         gpkg_data_column_constraints the declared gdcc_ntv key cannot \
+                         separate (plans/container-reconciliation.org § 5)",
+                        constraint.constraint_name, constraint.constraint_type
+                    )));
+                }
+                None => constraints.push(constraint.clone()),
             }
         }
     }
@@ -447,7 +470,7 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
         })
     });
     if columns.is_empty() && constraints.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let data_column_rows: Vec<(i64, Vec<Value>)> = columns
@@ -513,7 +536,45 @@ fn schema_extension_tables(layers: &[(String, FeatureCollection)]) -> Vec<TableS
         let records = autoindex_records(rows, &[0, 1, 2]);
         specs.last_mut().expect("just pushed").autoindexes = vec![records];
     }
-    specs
+    Ok(specs)
+}
+
+/// Whether two `gpkg_data_column_constraints` rows describe the *same*
+/// constraint, per `plans/container-reconciliation.org` § 6.
+///
+/// ***This is the one table whose identity is type-dependent, and saying so is
+/// the honest resolution of § 3's NULL trap rather than a workaround for it.***
+///
+/// | `constraint_type` | identity |
+/// |---|---|
+/// | `enum`, `glob` | `(constraint_name, constraint_type, value)` |
+/// | `range` | `(constraint_name, constraint_type)` |
+///
+/// A `range` row's `value` is NULL *by definition* — the column is for `enum`
+/// and `glob` — and the standard admits one range row per constraint name, so
+/// it carries no information to key on. The trap and the contract are the same
+/// fact seen twice: `gdcc_ntv UNIQUE (constraint_name, constraint_type, value)`
+/// includes `value` because it must cover `enum`, where the value is the row's
+/// whole point, and a `range` row has none — so **the index cannot separate two
+/// of them and identity must not try to**.
+///
+/// /Measured 2026-10-13, GDAL 3.13.3 and SQLite 3.51.0: two `range` rows with
+/// the same `constraint_name` and different bounds coexist under `gdcc_ntv`,
+/// because SQLite treats NULLs as distinct under `UNIQUE`, and
+/// `PRAGMA integrity_check` reports `ok`. Deduping on the declared key, or
+/// assuming the index makes a set, is wrong./
+///
+/// # Why an unrecognised type gets the three-column key
+///
+/// Requirement 104 defines the three, so a fourth is the source's
+/// non-conformance and this crate does not interpret a constraint. Keying it on
+/// `value` as well is the conservative half of the choice: it can only ever
+/// *fail* to merge two rows, where dropping `value` could merge two rows whose
+/// values mean something to a reader that understands the type.
+fn same_constraint(a: &GpkgConstraint, b: &GpkgConstraint) -> bool {
+    a.constraint_name == b.constraint_name
+        && a.constraint_type == b.constraint_type
+        && (a.constraint_type == "range" || a.value == b.value)
 }
 
 /// An absent optional member is a NULL cell, not an empty string: the reader
@@ -608,6 +669,16 @@ pub(crate) struct DroppedReference {
 /// valid in the output as it was in the source. Where the source itself was
 /// wrong, that is a dangling reference this crate did not create and does not
 /// repair, on the same terms as [`super::carry::Pyramid::srs`].
+///
+/// ***That premise has one exception, and it is handled upstream rather than
+/// here.*** A **merged** pyramid's rowids are not the source's: step 5 keeps
+/// the destination's and reissues the incoming side's
+/// (`plans/container-reconciliation.org`). So
+/// [`super::reconcile::merge_metadata`] remaps every incoming `row_id_value`
+/// through that reissue *before* this function sees it — which is why the rule
+/// below still holds unchanged, and why the remap could not be deferred to
+/// here: by this point there is one merged pyramid and no record of which side
+/// a reference arrived from.
 ///
 /// A written *layer* is the opposite case: its columns come from
 /// [`crate::schema::columns_for`] and its rowids from [`feature_ids`], and
@@ -1252,6 +1323,32 @@ fn gpkg_contents(
         })
         .collect();
     let mut rows = rows;
+    // ***The same Requirement 13 uniqueness the two carried arms below enforce,
+    // and the layers had never been checked against each other.*** Found
+    // 2026-10-13 while measuring `plans/container-reconciliation.org` § 3: a
+    // single source cannot hold two colliding identifiers, because its own
+    // `UNIQUE` forbade it — but an **append composes two sources**, and
+    // `ogr2ogr -nln` copies the identifier verbatim when it renames a layer, so
+    // two files with differently-named layers and the same identifier are what
+    // a real producer hands you. The output was a database `integrity_check`
+    // reports as `non-unique entry in index sqlite_autoindex_gpkg_contents_2`.
+    //
+    // /`ogr2ogr -update -append` refuses the same case outright —
+    // `UNIQUE constraint failed: gpkg_contents.identifier`, and it terminates
+    // the translation — so a refusal here is not merely the conservative
+    // answer, it is the one the only other implementation gives./
+    for (position, (_, values)) in rows.iter().enumerate() {
+        let identifier = values.get(2);
+        if rows[..position].iter().any(|(_, earlier)| earlier.get(2) == identifier) {
+            let Some(Value::Text(identifier)) = identifier else { continue };
+            return Err(Error::Convert(format!(
+                "gpkg: two feature layers in the output would share the gpkg_contents \
+                 identifier \"{identifier}\", which Requirement 13 makes UNIQUE; refusing to \
+                 write a database SQLite reports as malformed — rename one layer's identifier, \
+                 or write to a new file"
+            )));
+        }
+    }
     for (i, (pyramid, &srs_id)) in carried.pyramids.iter().zip(per_pyramid_srs).enumerate() {
         // `identifier` is UNIQUE across the whole table, so a carried pyramid
         // whose identifier a layer already took would build an index with two
@@ -1409,13 +1506,18 @@ fn tile_table(pyramid: &Pyramid) -> TableSpec {
     TableSpec {
         name: pyramid.name.clone(),
         sql: pyramid.sql.clone(),
-        // Re-packed from the source, never built. Requirement 54 says a tile
-        // table's key is `(zoom_level, tile_column, tile_row)`, and until
-        // 2026-08-25 this built an index over whichever of those columns it
-        // found by name — which fabricates an autoindex for a table whose DDL
-        // declares no `UNIQUE`, and that is a malformed database rather than a
-        // harmless extra. The source's own b-tree is the only thing that knows
-        // what the DDL actually declared. See `super::carry::Pyramid`.
+        // Whatever the pyramid carries, and **what that is depends on how it
+        // got here**: re-packed from the source for a carried pyramid (D10),
+        // or *built* from the merged rows for a merged one
+        // (`super::reconcile::merge_tiles`, step 5). Either way this function
+        // does not decide it, which is the point — until 2026-08-25 it built an
+        // index over whichever of Requirement 54's columns it found *by name*,
+        // which fabricates an autoindex for a table whose DDL declares no
+        // `UNIQUE`, and that is a malformed database rather than a harmless
+        // extra (`handoff.org` entry 20). The DDL is the only authority for
+        // whether an index exists at all, and the merge consults it through
+        // `sqlite::autoindex_key_columns` rather than guessing again. See
+        // `super::carry::Pyramid`.
         autoindexes: pyramid.autoindexes.clone(),
         autoincrement: pyramid.autoincrement,
         rows: pyramid.rows.clone(),
@@ -2231,6 +2333,242 @@ mod tests {
             ["gpkg_data_columns"],
             "a registration must not name a table the file does not contain"
         );
+    }
+
+    // --- § 3's NULL trap, and the identity that resolves it ----------------
+
+    /// A one-feature layer whose `price` column refers to `constraint`.
+    fn layer_with_constraint(constraint: GpkgConstraint) -> FeatureCollection {
+        let mut layer = fc(vec![Feature {
+            geometry: point(1.0, 2.0),
+            properties: vec![("price".into(), JsonValue::Float(1.0))],
+            native: None,
+        }]);
+        layer.native = Some(crate::Native::new(
+            Format::Gpkg,
+            crate::NativePayload::Gpkg(crate::GpkgNative {
+                identifier: None,
+                description: None,
+                last_change: None,
+                data_columns: vec![crate::GpkgDataColumn {
+                    column_name: "price".into(),
+                    name: None,
+                    title: None,
+                    description: None,
+                    mime_type: None,
+                    constraint_name: Some(constraint.constraint_name.clone()),
+                }],
+                constraints: vec![constraint],
+            }),
+        ));
+        layer
+    }
+
+    /// A `range` constraint named `price_range`, with `value` NULL as the
+    /// standard defines it for that type.
+    fn range_constraint(max: f64, description: &str) -> GpkgConstraint {
+        GpkgConstraint {
+            constraint_name: "price_range".into(),
+            constraint_type: "range".into(),
+            value: None,
+            min: Some(0.0),
+            min_is_inclusive: Some(true),
+            max: Some(max),
+            max_is_inclusive: Some(true),
+            description: Some(description.into()),
+        }
+    }
+
+    /// Every `gpkg_data_column_constraints` row in the output, as
+    /// `(constraint_name, constraint_type, value)`.
+    fn constraints_in(bytes: &[u8]) -> Vec<(String, String, String)> {
+        let db = crate::sqlite::Database::open(bytes).unwrap();
+        let tables = db.tables().unwrap();
+        let Some(t) = tables.iter().find(|t| t.name == "gpkg_data_column_constraints") else {
+            return Vec::new();
+        };
+        let at = |c: &str| t.columns.iter().position(|n| n == c).unwrap();
+        let (n, ty, v) = (at("constraint_name"), at("constraint_type"), at("value"));
+        db.read_rows(t)
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let cell = |i: usize| match &row[i] {
+                    Value::Text(s) => s.clone(),
+                    Value::Null => "-".to_string(),
+                    other => panic!("unexpected cell {other:?}"),
+                };
+                (cell(n), cell(ty), cell(v))
+            })
+            .collect()
+    }
+
+    /// ***Two `range` rows for one constraint name are refused, and the
+    /// declared key cannot see the problem.***
+    ///
+    /// `plans/container-reconciliation.org` § 3's trap, and before 2026-10-13
+    /// this wrote both rows. `gdcc_ntv UNIQUE (constraint_name,
+    /// constraint_type, value)` does not separate them, because a `range` row's
+    /// `value` is NULL *by definition* and SQLite treats NULLs as distinct
+    /// under `UNIQUE` — so the output held two contradictory definitions of one
+    /// domain and `PRAGMA integrity_check` reported `ok`. /Measured against
+    /// GDAL 3.13.3 and SQLite 3.51.0; `tests/fixtures/sqlite_nullkey.gpkg` is
+    /// the file./
+    ///
+    /// **The refusal is § 5's, and it is what honours the rule**: a column
+    /// referring to this name would otherwise get bounds neither layer
+    /// declared. `ogr2ogr -update -append` resolves the same case silently in
+    /// the destination's favour, which is evidence of what a producer does and
+    /// not of what is right.
+    #[test]
+    fn two_range_constraints_for_one_name_are_refused() {
+        let layers = [
+            ("cities".into(), layer_with_constraint(range_constraint(100.0, "Survey band."))),
+            ("towns".into(), layer_with_constraint(range_constraint(500.0, "Another band."))),
+        ];
+        let error = write_layers(None, &layers, &Carried::default(), false, false)
+            .expect_err("two definitions of one domain have no union");
+        let message = error.to_string();
+        assert!(
+            message.contains("price_range") && message.contains("gdcc_ntv"),
+            "the refusal must name the constraint and the key that cannot separate it: {message}"
+        );
+    }
+
+    /// ***The same `range` constraint on both sides is one row, not a
+    /// refusal.*** The noise bar in `plans/same-format-fidelity.org` § THE RULE
+    /// is what makes this the load-bearing half: a refusal is an acceptable
+    /// answer only while it stays off the ordinary path, and two layers sharing
+    /// a field domain *is* the ordinary path — it is what every `ogr2ogr`
+    /// append produces.
+    #[test]
+    fn one_range_constraint_shared_by_two_layers_is_one_row() {
+        let layers = [
+            ("cities".into(), layer_with_constraint(range_constraint(100.0, "Survey band."))),
+            ("towns".into(), layer_with_constraint(range_constraint(100.0, "Survey band."))),
+        ];
+        let bytes = write_layers(None, &layers, &Carried::default(), false, false).unwrap();
+        assert_eq!(
+            constraints_in(&bytes),
+            [("price_range".to_string(), "range".to_string(), "-".to_string())],
+            "one domain declared twice is one row"
+        );
+    }
+
+    /// ***A `range` row's `value` is not part of its identity, and this is the
+    /// only input that can tell.***
+    ///
+    /// Added after mutation-checking: deleting the `range` arm of
+    /// [`same_constraint`] broke no test, because a *conformant* range row has
+    /// `value` NULL on both sides and `None == None` — so comparing `value`
+    /// or not comparing it gives the same answer on every fixture in the tree.
+    /// **The correlation was satisfied by both implementations**, which this
+    /// tree has now learned to look for before the mutation survives rather
+    /// than after.
+    ///
+    /// The distinguishing input is two `range` rows that disagree on a *non-NULL*
+    /// `value`. Keyed per § 6 they are one constraint saying two things, and so
+    /// a refusal; keyed on the declared `gdcc_ntv` triple they are two
+    /// constraints and both get written, which the standard admits only one of.
+    /// /The input is non-conformant — `value` is for `enum` and `glob` — and
+    /// that is the point: the branch only ever earns its keep here./
+    #[test]
+    fn two_range_constraints_differing_only_in_value_are_still_one_constraint() {
+        let valued = |value: &str| GpkgConstraint {
+            value: Some(value.into()),
+            ..range_constraint(100.0, "Survey band.")
+        };
+        let layers = [
+            ("cities".into(), layer_with_constraint(valued("x"))),
+            ("towns".into(), layer_with_constraint(valued("y"))),
+        ];
+        let error = write_layers(None, &layers, &Carried::default(), false, false)
+            .expect_err("one range domain cannot have two values");
+        assert!(error.to_string().contains("price_range"), "{error}");
+    }
+
+    /// ***Two `enum` rows differing only in `value` are two constraints.***
+    ///
+    /// The negative half of [`same_constraint`], and what stops the rule from
+    /// being written as "drop `value` from the key". For an `enum` the value is
+    /// the row's whole point, so these must both survive — the same identity
+    /// that merges two `range` rows must keep two `enum` rows apart.
+    ///
+    /// /A rule with one branch tested is a rule half tested, which this tree
+    /// has now learned three times./
+    #[test]
+    fn two_enum_constraints_differing_only_in_value_are_two_constraints() {
+        let enum_constraint = |value: &str| GpkgConstraint {
+            constraint_name: "grade".into(),
+            constraint_type: "enum".into(),
+            value: Some(value.into()),
+            min: None,
+            min_is_inclusive: None,
+            max: None,
+            max_is_inclusive: None,
+            description: None,
+        };
+        let layers = [
+            ("cities".into(), layer_with_constraint(enum_constraint("a"))),
+            ("towns".into(), layer_with_constraint(enum_constraint("b"))),
+        ];
+        let bytes = write_layers(None, &layers, &Carried::default(), false, false).unwrap();
+        let mut rows = constraints_in(&bytes);
+        rows.sort();
+        assert_eq!(
+            rows,
+            [
+                ("grade".to_string(), "enum".to_string(), "a".to_string()),
+                ("grade".to_string(), "enum".to_string(), "b".to_string()),
+            ],
+            "an enum's value is its identity, so neither row may be merged away"
+        );
+    }
+
+    /// ***Two layers sharing a `gpkg_contents.identifier` are refused***, which
+    /// Requirement 13 makes `UNIQUE`.
+    ///
+    /// **The carried arms of [`gpkg_contents`] had enforced this since
+    /// 2026-08-24 and the layers had never been checked against each other.**
+    /// A single source cannot hold the collision — its own `UNIQUE` forbade it
+    /// — but an append composes *two* sources, and `ogr2ogr -nln` copies the
+    /// identifier verbatim when it renames a layer, so two files with
+    /// differently-named layers and one identifier is what a real producer
+    /// hands you. The output was a database `integrity_check` reports as
+    /// `non-unique entry in index sqlite_autoindex_gpkg_contents_2`.
+    ///
+    /// /`ogr2ogr -update -append` refuses the same case and terminates the
+    /// translation, so this is not merely the conservative answer./
+    #[test]
+    fn two_layers_sharing_a_gpkg_contents_identifier_are_refused() {
+        let titled = |title: &str| {
+            let mut layer = fc(vec![Feature {
+                geometry: point(1.0, 2.0),
+                properties: Vec::new(),
+                native: None,
+            }]);
+            layer.native = Some(crate::Native::new(
+                Format::Gpkg,
+                crate::NativePayload::Gpkg(crate::GpkgNative {
+                    identifier: Some(title.into()),
+                    ..crate::GpkgNative::default()
+                }),
+            ));
+            layer
+        };
+        let layers = [("cities".into(), titled("Survey")), ("towns".into(), titled("Survey"))];
+        let error = write_layers(None, &layers, &Carried::default(), false, false)
+            .expect_err("a duplicate identifier is a malformed database");
+        assert!(
+            error.to_string().contains("Survey"),
+            "the refusal must name the identifier: {error}"
+        );
+
+        // The same two layers with distinct identifiers are perfectly ordinary,
+        // so the check must not fire on them.
+        let distinct = [("cities".into(), titled("Survey")), ("towns".into(), titled("Other"))];
+        write_layers(None, &distinct, &Carried::default(), false, false)
+            .expect("distinct identifiers are not a collision");
     }
 
     // --- the metadata pair -------------------------------------------------

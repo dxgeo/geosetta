@@ -752,8 +752,10 @@ mod tests {
         assert!(warnings.is_empty(), "an empty registry is not content: {warnings:?}");
 
         // And the other half: populated, with the pyramid they describe not
-        // carried. This is the append path, where the destination's container
-        // is destroyed and nothing is carried at all.
+        // carried. Reached by passing no carried names at all — which since
+        // the § 3 merge landed is no longer what an append does, but is still
+        // exactly the question this warning has to answer: a populated
+        // registry whose pyramid is not coming along is a real loss.
         let populated = container_drop_warnings(TILES, "dest.gpkg", &["cities".into()], &[], true);
         assert!(
             populated[0].contains("gpkg_tile_matrix (14 rows)"),

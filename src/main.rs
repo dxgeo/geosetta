@@ -773,24 +773,26 @@ fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Cr
     // (stdout) is never "existing" — there's nothing to read back from a pipe
     // you're about to write to, so piping to a .gpkg always starts fresh.
     let existing = if out.path == "-" { None } else { std::fs::read(out.path).ok() };
-    // The append is a read-modify-write of the *destination* too, so its own
-    // non-layer content is destroyed on the same terms (its layers survive:
-    // `write_layers` reads and re-emits them). Skipped when the destination is
-    // the source, already reported above rather than reported twice.
+    // The destination's own container content, merged with what the source
+    // carries — `plans/container-reconciliation.org` § 3. Read here rather than
+    // in the writer because the warning below has to be built against the
+    // merged result: what the destination keeps is no longer destroyed, and a
+    // survey that still named it would report surviving content as lost, which
+    // is bug 13's mistake.
+    //
+    // *Not read when the destination is the source.* That run is refused by
+    // `same-format-output.org` D4 before reaching here for a `gpkg` source, and
+    // for any other source there is no second container to merge.
     if let Some(bytes) = existing.as_deref()
         && !(args.from == Format::Gpkg && args.input == out.path)
     {
+        carried = geopackage::reconcile_containers(geopackage::read_container(bytes)?, &carried)?;
         print_warnings(
-            // The *destination's* container content is still destroyed: what
-            // the source carries is carried, but reconciling two containers is
-            // `plans/container-reconciliation.org` and is not built. So this
-            // call passes no carried names — nothing of the destination's own
-            // survives, which is exactly what it has always reported.
             &geopackage::container_drop_warnings(
                 bytes,
                 io_label(out.path, "stdout"),
                 &names_of(&new_layers),
-                &[],
+                &carried.reproduced_names(),
                 args.rtree,
             ),
             args.quiet,

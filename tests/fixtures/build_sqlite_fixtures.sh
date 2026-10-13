@@ -1,5 +1,5 @@
 #!/bin/sh
-# Build the two sqlite_* fixtures added 2026-08-23, from the ogr2ogr base.
+# Build the sqlite_* fixtures added 2026-08-23 and 2026-10-13, from the ogr2ogr base.
 # Recorded in tests/fixtures/HOSTILE.org; re-run from the geosetta/ root.
 set -e
 cd "$(dirname "$0")/../.."
@@ -106,8 +106,59 @@ BEGIN
 END;
 SQL
 
+# --- sqlite_nullkey.gpkg: a UNIQUE key with a nullable member is not a set --
+# Designed in tests/fixtures/PLANNED.org (as gpkg_range_constraints.gpkg) and
+# built 2026-10-13 for container-reconciliation.org § 3. The range rows are the
+# *vehicle*; what this pins is that gdcc_ntv does not make a set, which is why
+# identity has to be stated per constraint_type rather than delegated to the
+# index.
+rm -f tests/fixtures/sqlite_nullkey.gpkg
+cp "$BASE" tests/fixtures/sqlite_nullkey.gpkg
+sqlite3 tests/fixtures/sqlite_nullkey.gpkg <<'SQL'
+-- The base's gpkg_data_column_constraints is ogr2ogr's, which omits gdcc_ntv,
+-- so a plain GDAL base has nothing to pin. Replaced with the Schema annex's
+-- normative DDL -- the same string writer.rs emits, which
+-- the_registry_ddl_is_what_the_standard_says compares against
+-- spec_conformant.gpkg -- so the UNIQUE this fixture is about is actually
+-- declared.
+DROP TABLE gpkg_data_column_constraints;
+CREATE TABLE gpkg_data_column_constraints (
+  constraint_name TEXT NOT NULL, constraint_type TEXT NOT NULL, value TEXT,
+  min NUMERIC, min_is_inclusive BOOLEAN, max NUMERIC, max_is_inclusive BOOLEAN,
+  description TEXT,
+  CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value));
+
+-- THE TRAP. Two range rows for one constraint name, disagreeing on their
+-- bounds. A range row's value is NULL *by definition* -- the column is for
+-- enum and glob -- and SQLite treats NULLs as distinct under UNIQUE, so
+-- gdcc_ntv accepts both and PRAGMA integrity_check reports ok. The standard
+-- admits one range row per constraint name, so this pair says nothing
+-- coherent about the domain, and anything deduping on the declared key keeps
+-- both. A real NULL, not '': the distinction is the whole fixture.
+INSERT INTO gpkg_data_column_constraints
+  VALUES ('price_range','range',NULL,0,1,100,1,'Survey price band.');
+INSERT INTO gpkg_data_column_constraints
+  VALUES ('price_range','range',NULL,50,1,500,1,'A different band entirely.');
+
+-- THE NEGATIVE HALF, and it is what keeps the rule from being written as "drop
+-- value from the key". For an enum the value *is* the row's whole point, so
+-- two rows sharing a name and differing in value are two constraints and both
+-- SHALL survive. Non-NULL values, so gdcc_ntv separates these on its own.
+INSERT INTO gpkg_data_column_constraints
+  VALUES ('grade','enum','a',NULL,NULL,NULL,NULL,'Top grade.');
+INSERT INTO gpkg_data_column_constraints
+  VALUES ('grade','enum','b',NULL,NULL,NULL,NULL,'Second grade.');
+
+-- A column referring to `grade`, or the writer drops the rows as describing
+-- nothing: a constraint whose every referring column was dropped is a row GDAL
+-- reports as an unused domain. `cities.price` already refers to `price_range`.
+INSERT INTO gpkg_data_columns
+  VALUES ('cities','zip','postcode','Postcode',NULL,NULL,'grade');
+SQL
+
 echo "built:"
-for f in tests/fixtures/sqlite_contents.gpkg tests/fixtures/sqlite_constraints.gpkg; do
+for f in tests/fixtures/sqlite_contents.gpkg tests/fixtures/sqlite_constraints.gpkg \
+         tests/fixtures/sqlite_nullkey.gpkg; do
   printf '  %s  ' "$f"
   sqlite3 "$f" "PRAGMA integrity_check;"
 done

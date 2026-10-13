@@ -44,10 +44,14 @@
 //!
 //! # What this module does not do
 //!
-//! It reads *one* container. Merging a carried container into a destination
-//! that already has one is `plans/container-reconciliation.org`, which gates
-//! M3b's completion and is not started here — a destination's own container
-//! content is still destroyed, and still warned about, exactly as before.
+//! It reads *one* container. Merging one into a destination that already has
+//! one is `super::reconcile`, built 2026-10-13 for
+//! `plans/container-reconciliation.org` § 3 — which calls **this** module for
+//! both sides, so the reading stays single-container and the merging stays out
+//! of it. /Until then a destination's own container content was destroyed and
+//! warned about; it is now merged, and the only collisions still refused are a
+//! same-named user table (D5) and a same-named tile pyramid (that plan's step
+//! 5, index construction)./
 //!
 //! And since 2026-08-25 it carries the **metadata pair** — but on different
 //! terms from everything else here, which is why [`Metadata`] is a field of

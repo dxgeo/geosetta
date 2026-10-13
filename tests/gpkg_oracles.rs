@@ -71,6 +71,38 @@ fn gpkg_fixtures() -> Vec<PathBuf> {
     out
 }
 
+
+/// Fixtures whose `gpkg -> gpkg` write is **refused by design**, so these
+/// oracles have no output to check.
+///
+/// /Added 2026-10-13 with `sqlite_nullkey.gpkg`, and the list is asserted
+/// rather than merely subtracted — see [`write_or_designed_refusal`]. A
+/// fixture quietly skipped is a fixture that stops testing anything, which is
+/// the failure mode `gpkg_fixtures`'s automatic sweep exists to prevent./
+const REFUSED_BY_DESIGN: [&str; 1] = ["sqlite_nullkey.gpkg"];
+
+/// A fixture's `gpkg -> gpkg` output, or `None` where the write is refused on
+/// purpose.
+///
+/// ***The exclusion is a third assertion, not a hole.*** A fixture named in
+/// [`REFUSED_BY_DESIGN`] must actually be refused: if it starts writing
+/// successfully the list has rotted and the test says so, rather than skipping
+/// a file that now has an output worth checking. And a fixture *not* named
+/// there must write, which is what it always had to do.
+fn write_or_designed_refusal(name: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    let carried = geosetta::geopackage::read_container(bytes).expect("read container");
+    let layers = geosetta::geopackage::read_layers(bytes).expect("read layers");
+    let written = geosetta::geopackage::write_layers(None, &layers, &carried, false, false);
+    match (written, REFUSED_BY_DESIGN.contains(&name)) {
+        (Ok(bytes), false) => Some(bytes),
+        (Err(_), true) => None,
+        (Ok(_), true) => {
+            panic!("{name} is listed as refused by design and now writes; drop it from the list")
+        }
+        (Err(e), false) => panic!("{name}: write: {e:?}"),
+    }
+}
+
 /// ***Every fixture's `gpkg -> gpkg` output satisfies `sqlite3`'s own two
 /// structural oracles.***
 ///
@@ -93,11 +125,7 @@ fn every_fixtures_geopackage_output_satisfies_sqlite3() {
     for fixture in gpkg_fixtures() {
         let name = fixture.file_name().unwrap().to_string_lossy().to_string();
         let bytes = std::fs::read(&fixture).expect("fixture");
-        let carried = geosetta::geopackage::read_container(&bytes).expect("read container");
-        let layers = geosetta::geopackage::read_layers(&bytes).expect("read layers");
-        let written =
-            geosetta::geopackage::write_layers(None, &layers, &carried, false, false)
-                .expect("write");
+        let Some(written) = write_or_designed_refusal(&name, &bytes) else { continue };
 
         let out = dir.join(&name);
         std::fs::write(&out, &written).expect("write output");
@@ -151,11 +179,7 @@ fn every_fixtures_geopackage_output_can_be_inserted_into() {
     for fixture in gpkg_fixtures() {
         let name = fixture.file_name().unwrap().to_string_lossy().to_string();
         let bytes = std::fs::read(&fixture).expect("fixture");
-        let carried = geosetta::geopackage::read_container(&bytes).expect("read container");
-        let layers = geosetta::geopackage::read_layers(&bytes).expect("read layers");
-        let written =
-            geosetta::geopackage::write_layers(None, &layers, &carried, false, false)
-                .expect("write");
+        let Some(written) = write_or_designed_refusal(&name, &bytes) else { continue };
 
         let out = dir.join(&name);
         std::fs::write(&out, &written).expect("write output");
@@ -197,3 +221,4 @@ fn tempdir() -> PathBuf {
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
+

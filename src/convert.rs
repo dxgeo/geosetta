@@ -78,7 +78,9 @@ pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>>
         // GeoPackage and Shapefile are handled outside this single-buffer path
         // (see read_features above) — GeoPackage via geopackage::write_layers,
         // Shapefile via shapefile::write, both called from main.rs.
-        Format::Gpkg => Err(Error::Usage("writing GeoPackage is not supported yet".into())),
+        Format::Gpkg => Err(Error::Usage(
+            "GeoPackage output is handled per-layer; this path should not be reached".into(),
+        )),
         Format::Shapefile => Err(Error::Usage(
             "Shapefile output is handled via its sibling files; this path should not be reached".into(),
         )),

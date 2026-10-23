@@ -27,6 +27,47 @@ check it off and remove it once the item ships or is shelved.
   are built and documented in =tests/fixtures/HOSTILE.org=. Only the
   =edges=/=epoch= fixture hunt remains, and no available tool emits either. Blocks the warning-scope
   question in =lossy-conversion-warnings.org=.
+
+  /2026-10-21:/ its § QUESTIONS item 1 — *is canonicalisation a loss?*, the
+  oldest open question here — is **answered** (=same-format-fidelity.org= D17,
+  decision 31): a loss exactly where the reader had a choice. ***CSV's share of
+  M3 shipped with it and needed no native at all***: =infer_value= types a cell
+  only when =cell_text= renders the value back to the text that was read, so
+  =007=, =1.50=, =TRUE=, =+7=, =1e2= and a past-=i64= integer all survive a
+  =csv -> csv= run byte-identical. The verdict is *per column* — one refused cell
+  types its column as text, so a ZIP column does not return =12345= as a number
+  beside =007= as a string. =Format::Csv='s two loss entries are
+  replaced by the two that remain (the geometry column's WKT spelling, and a
+  =Double= column that one fractional row widened). =Format::GeoJson='s row was
+  corrected the same day — it had the same number-formatting loss and did not
+  declare it.
+
+  /2026-10-21, second item:/ **D6's fixture registry is built** — one hostile
+  fixture per spoke behind a catch-all-free =match= in =tests/same_format.rs=,
+  so a tenth format cannot compile the suite without supplying one. It found a
+  defect on its first run: the FlatGeobuf writer was Hilbert-sorting every
+  write, silently permuting features on a =fgb -> fgb= run and leaving
+  =--sort-hilbert= a dead flag for that format. Fixed by deletion — the index
+  is packed over input order now, and locality is the caller's request. See
+  =handoff.org= entry 24 and =spatial-index.org= milestone B.
+
+  /2026-10-21, third item:/ **§ QUESTIONS item 3 (Shapefile sidecars) is
+  answered** — and it was not about indexes. A Shapefile write had been
+  adopting whatever sidecars already sat at the output basename, so a stale
+  =.prj= relabelled our coordinates as UTM metres and a stale =.cpg= turned
+  =København= into =KÃ¸benhavn= *through geosetta's own round trip*. Now:
+  =.cpg= is always written (=UTF-8=), surviving sidecars are warned about by
+  name, and nothing is ever deleted. =.qix=/=.sbn= are still not written —
+  D4's rebuild-if-present is triggered nowhere today, GeoPackage included, so
+  it belongs on =spatial-index.org= as one piece of work across both spokes.
+  See =shapefile.org= § THE SIDECAR POLICY and =handoff.org= entry 25.
+
+  /Filed, not fixed:/ an unrecognised =.cpg= is approximated as ISO-8859-1
+  silently — =CP1252= is the common case and differs in exactly the bytes real
+  data uses. The warning is owed under
+  [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]
+  § OPEN CANDIDATES; the decode fix is sized in =shapefile.org= § OPEN
+  QUESTIONS.
 - [ ] [[file:same-format-fidelity.org][same-format-fidelity.org]] — the
   standing invariant that a same-format run loses nothing, and the opaque
   format-tagged =Native= channel that delivers it without the IR becoming a
@@ -90,6 +131,57 @@ check it off and remove it once the item ships or is shelved.
   equality against GDAL's output. And **two defects came out of § 3**,
   =handoff.org= entries 22 and 23, one of them reachable with no merge involved
   at all.
+
+- [ ] [[file:encodings.org][encodings.org]] — text encodings across every
+  spoke, not just Shapefile. *Scoping only*, written 2026-10-21 out of
+  =native-inventory.org= § QUESTIONS item 3. Two of its milestones are
+  *correctness* rather than capability and should go first: E1 warns when an
+  unrecognised =.cpg= is approximated as Latin-1 (silent today, and wrong in
+  exactly the =0x80=--=0x9F= bytes that distinguish =CP1252=), and E3 refuses a
+  multi-byte codepage instead of producing mojibake. E2's single-byte tables
+  and E4's =--encoding= for the four spokes that currently refuse non-UTF-8
+  input are the capability half. /Records why the =.dbf= language-driver byte
+  must **not** be trusted: =ogr2ogr= declares Windows-1252 by default while
+  writing UTF-8./
+
+- [ ] [[file:kml-standard.org][kml-standard.org]] — M3's KML spoke, rescoped
+  2026-10-22 to *the standard*: OGC KML 2.3 as a typed model in the KML native,
+  both OGC versions (2.2, 2.3) read and detected, and =--kml-version= choosing
+  the output, defaulting to the source's version on =kml -> kml= and to 2.3
+  otherwise. Pre-OGC 2.0/2.1 are refused. Starts at K1 (a namespace-aware
+  =xml.rs=). All eight open questions were decided on 2026-10-22 (D-K11 to
+  D-K15). One measurement is left: the plane in which a =GroundOverlay='s
+  =rotation= applies (D-K14).
+
+- [ ] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
+  both of this crate's warning mechanisms are write-side, and **two owed
+  warnings are blocked behind that**: =native-inventory.org= § QUESTIONS item
+  6 (an unrecognised KML geometry yields a geometry-less feature, silently —
+  ruled *warn and emit* on 2026-08-20 and unbuilt since) and =encodings.org=
+  E1 (an unrecognised =.cpg= approximated as Latin-1). Neither can use a
+  pre-write check: the source fact is destroyed at read, and a
+  =geometry: None= left by a =<Model>= is indistinguishable in the IR from a
+  Placemark that legitimately has none. *Scoped 2026-10-22*: a
+  =&mut Vec<String>= sink on =read_features=, counted per cause so a GPS
+  export's thousands of =gx:Track= Placemarks say one line rather than
+  thousands.
+
+  /The KML half is **mostly not a warning at all**, which the GDAL
+  measurement settled: of the four geometry elements that drop silently
+  today, three are geometry the IR can hold -- a bare =<LinearRing>= and a
+  =<gx:Track>=/=<gx:MultiTrack>= are *parsed* (LIBKML reads them as
+  =LINEARRING= and =LINESTRING Z=; GDAL's built-in =KML= driver drops the
+  features outright), and only =<Model>= earns the warning. Ruled in
+  =kml.org= § GEOMETRY ELEMENT COVERAGE, under the preference stated at
+  =lossy-conversion-warnings.org= § THE COMPLEMENT. That section also
+  enumerates the positive geometry list the warning needs, since
+  =parse_geometry='s catch-all is how every *non*-geometry child is passed
+  over too./
+
+  /Remaining loss once the parsers land: a =<gx:Track>='s per-vertex
+  =<when>= series, which belongs in the KML native channel
+  (=same-format-fidelity.org= M3) rather than the =m= ordinate, and owes
+  =Format::Kml= a loss entry of its own in the meantime./
 
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a

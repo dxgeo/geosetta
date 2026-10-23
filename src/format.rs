@@ -44,6 +44,29 @@ pub enum Format {
 }
 
 impl Format {
+    /// Every variant, for tests and callers that must cover the whole set.
+    ///
+    /// # This array cannot go stale, and that is the point
+    ///
+    /// A plain list beside an enum is the staleness D6
+    /// (`plans/same-format-fidelity.org`) exists to prevent: a tenth variant
+    /// would compile, pass, and be silently uncovered. So completeness here is
+    /// *compiler-enforced* — `every_variant_is_listed_in_all` maps each
+    /// variant through a catch-all-free `match`, which a new variant cannot
+    /// compile, and then asserts this array holds it. The build breaks, the
+    /// person fixing it lands here, and the assertion fails until they do.
+    pub const ALL: [Format; 9] = [
+        Format::GeoJson,
+        Format::Parquet,
+        Format::FlatGeobuf,
+        Format::Csv,
+        Format::Wkt,
+        Format::Gpkg,
+        Format::Shapefile,
+        Format::Kml,
+        Format::Kmz,
+    ];
+
     /// Parse an explicit format name (e.g. a `--from`/`--to` value).
     pub fn parse(name: &str) -> Result<Format> {
         match name.to_ascii_lowercase().as_str() {
@@ -177,16 +200,33 @@ impl Format {
             // Measured: `/bbox` and `/features/[]/bbox` vanish, and a foreign
             // member on a *geometry* is dropped where one on the feature or
             // the collection survives. The `id` half was closed by M2.
-            Format::GeoJson => {
-                &["the collection and feature `bbox` members", "foreign members on a geometry"]
-            }
-            // Measured: `007` -> `7`, `1.50` -> `1.5`, `TRUE` -> `true`, and
-            // `12345678901234567890` -> `12345678901234567000`. The last is a
-            // *different number*, not a reformat; the rest are the lexeme the
-            // reader inferred a type from and then discarded.
-            Format::Csv => &[
-                "the exact text of every cell (leading zeros, trailing zeros, letter case)",
+            // The last two were measured on 2026-10-21, while ruling D17, and
+            // had been missing: a `geojson -> geojson` run reformats numbers
+            // exactly as a `csv -> csv` one did, and this table told two
+            // different stories about one loss. Unlike CSV's, these are not
+            // the reader's choice to make — a bare JSON number is a number by
+            // grammar, so there is no un-inferred reading to fall back to.
+            Format::GeoJson => &[
+                "the collection and feature `bbox` members",
+                "foreign members on a geometry",
+                "the exact spelling of every number (`1.50` becomes `1.5`)",
                 "integer precision beyond 64 bits",
+            ],
+            // *Both entries this row used to hold are gone, closed by D17's
+            // reversibility gate* (2026-10-21). `007`, `08001`, `1.50`,
+            // `22.250`, `TRUE`, `+7`, `1e2` and `12345678901234567890` now all
+            // come back byte-identical, because a cell whose text the writer
+            // cannot reproduce is never inferred in the first place.
+            //
+            // What remains is what the gate cannot see, and neither is the
+            // inference's choice. The geometry column is WKT by definition, so
+            // it inherits that row's canonicalisation. And a column type is a
+            // property of the *column*: `[9007199254740993, 1.5]` is typed
+            // `Double` because one row is fractional, so the integer loses its
+            // low bits on the way out even though its own text round-trips.
+            Format::Csv => &[
+                "the geometry column's coordinate spelling, which is WKT's",
+                "exact integers past 2^53 in a column that also holds a decimal",
             ],
             // Measured: `POINT (1.50 2.00)` -> `POINT (1.5 2)` and
             // `MULTIPOINT ((1 2), (3 4))` -> `MULTIPOINT (1 2, 3 4)`. Both
@@ -196,6 +236,16 @@ impl Format {
             // `Point`. Narrowing, not data loss — but a consumer that could
             // have appended a LineString to the source cannot append one to
             // the output.
+            //
+            // *Feature order was briefly a second entry here, on 2026-10-21.*
+            // The D6 fixture registry found the writer Hilbert-sorting on every
+            // run, so a `fgb -> fgb` returned the same features in a different
+            // order — measured on `gdal_hostile.fgb`, whose two came back
+            // swapped. **It was fixed rather than declared**: the sort is now
+            // the caller's request (`--sort-hilbert`) and the index is packed
+            // over input order, so there is no loss left to name. Recorded
+            // because an entry appearing and leaving within a day is worth more
+            // than its absence.
             Format::FlatGeobuf => &["the declared geometry type, which is narrowed to what is present"],
             // Measured: the GeoParquet 1.1 covering-bbox column is read and
             // not written (`plans/spatial-index.org` milestone E), and the
@@ -305,21 +355,72 @@ mod tests {
 
     /// Pins the spellings themselves: these strings are user-visible, and the
     /// whole point of the helper is that a format reads the same everywhere.
+    ///
+    /// # Why this is a `match` and not the array it used to be
+    ///
+    /// It pinned all nine spellings from an array literal, so a tenth variant
+    /// compiled, passed, and was silently uncovered — *the exact staleness D6
+    /// was written to prevent, sitting next to the rule.*
+    /// `plans/same-format-fidelity.org` D6 calls for converting it, on the
+    /// reasoning that leaving a working example of the anti-pattern beside the
+    /// new rule is how the rule gets read as optional. /Converted 2026-10-21,
+    /// with the fixture registry that is D6's real subject./
+    ///
+    /// The arm is the obligation: a new variant cannot compile this function
+    /// without someone stating its user-visible spelling.
     #[test]
     fn display_name_uses_each_format_s_own_spelling() {
-        let expected = [
-            (Format::GeoJson, "GeoJSON"),
-            (Format::Parquet, "GeoParquet"),
-            (Format::FlatGeobuf, "FlatGeobuf"),
-            (Format::Csv, "CSV"),
-            (Format::Wkt, "WKT"),
-            (Format::Gpkg, "GeoPackage"),
-            (Format::Shapefile, "Shapefile"),
-            (Format::Kml, "KML"),
-            (Format::Kmz, "KMZ"),
-        ];
-        for (format, name) in expected {
-            assert_eq!(format.display_name(), name, "{format:?}");
+        fn spelling(format: Format) -> &'static str {
+            match format {
+                Format::GeoJson => "GeoJSON",
+                Format::Parquet => "GeoParquet",
+                Format::FlatGeobuf => "FlatGeobuf",
+                Format::Csv => "CSV",
+                Format::Wkt => "WKT",
+                Format::Gpkg => "GeoPackage",
+                Format::Shapefile => "Shapefile",
+                Format::Kml => "KML",
+                Format::Kmz => "KMZ",
+                // No catch-all arm. See this test's doc comment.
+            }
+        }
+        for format in Format::ALL {
+            assert_eq!(format.display_name(), spelling(format), "{format:?}");
+        }
+    }
+
+    /// [`Format::ALL`] holds every variant, enforced by the compiler rather
+    /// than by counting.
+    ///
+    /// The `match` is what a new variant breaks; the assertion is what it
+    /// fails. Neither alone is enough — an arm returning `true` for a variant
+    /// nobody added to the array would pass the compiler and fail here.
+    #[test]
+    fn every_variant_is_listed_in_all() {
+        fn is_listed(format: Format) -> bool {
+            match format {
+                Format::GeoJson
+                | Format::Parquet
+                | Format::FlatGeobuf
+                | Format::Csv
+                | Format::Wkt
+                | Format::Gpkg
+                | Format::Shapefile
+                | Format::Kml
+                | Format::Kmz => Format::ALL.contains(&format),
+                // No catch-all arm. A new variant must be named here, and
+                // naming it is what makes the assertion below reachable.
+            }
+        }
+        for format in Format::ALL {
+            assert!(is_listed(format), "{format:?} is missing from Format::ALL");
+        }
+        // And the array holds each one once, so iterating it is iterating the
+        // set rather than a multiset.
+        for (i, a) in Format::ALL.iter().enumerate() {
+            for b in &Format::ALL[i + 1..] {
+                assert_ne!(a, b, "{a:?} appears twice in Format::ALL");
+            }
         }
     }
 }

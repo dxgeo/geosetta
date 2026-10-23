@@ -1,7 +1,17 @@
 //! Encode a [`FeatureCollection`] as FlatGeobuf, using the from-scratch
-//! [`crate::flatbuffers::Builder`]. Writes an index-less file
-//! (`index_node_size = 0`); building the packed Hilbert R-tree is a deferred
-//! enhancement. See `plans/flatgeobuf.org`.
+//! [`crate::flatbuffers::Builder`]. See `plans/flatgeobuf.org`.
+//!
+//! **The packed R-tree is built**, not deferred — this doc said otherwise until
+//! 2026-10-21, describing an index-less writer (`index_node_size = 0`) that had
+//! stopped being the implementation. It is written whenever *every* feature has
+//! a geometry, since a leaf needs a bbox; otherwise the file goes out
+//! index-less.
+//!
+//! **Features are written in the order they arrive**, and the index is packed
+//! over that order. Hilbert locality is a *caller's* request — `--sort-hilbert`,
+//! applied to the IR before this writer runs — rather than something the writer
+//! imposes, because imposing it permuted content on a same-format run and made
+//! that flag a no-op for this format. See the comment in [`fn@write`].
 
 use crate::feature::FeatureCollection;
 use crate::flatbuffers::Builder;
@@ -125,24 +135,35 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
         gtype::UNKNOWN
     };
 
-    // A packed Hilbert R-tree needs a bbox per feature, so index only when every
-    // feature has geometry; otherwise write index-less in input order.
+    // A packed R-tree needs a bbox per feature, so index only when every feature
+    // has geometry; otherwise write index-less.
+    //
+    // ***Features go out in the order they arrived.*** This writer used to
+    // Hilbert-sort them here, on the reasoning that a *packed Hilbert* R-tree
+    // is that sort — true of the locality the name describes, and not a
+    // requirement of the structure: the tree is packed bottom-up over whatever
+    // order the leaves are in, and a reader walks it by bbox either way.
+    //
+    // Sorting here cost two things that are not the writer's to spend. It
+    // *silently permuted content* on a same-format run, which
+    // `plans/same-format-fidelity.org` § THE RULE forbids — found 2026-10-21
+    // by the D6 fixture registry on its first run. And it made `--sort-hilbert`
+    // a dead flag for this format, since `main.rs` applies that flag to the IR
+    // *before* calling this writer: the sort was mandatory where the CLI
+    // advertised it as opt-in, and opt-in for GeoPackage's `--rtree` right
+    // beside it. So locality is now the caller's request and the index is
+    // unconditional, which is the combination that spends nothing.
     let feature_bboxes: Vec<Bbox> = fc.features.iter().map(feature_bbox).collect();
     let indexed = !fc.features.is_empty() && fc.features.iter().all(|f| f.geometry.is_some());
-    let order: Vec<usize> = if indexed {
-        crate::spatial::hilbert_order(&feature_bboxes)
-    } else {
-        (0..fc.features.len()).collect()
-    };
     let node_size = if indexed { NODE_SIZE } else { 0 };
 
-    // Encode features in `order`, recording each framed feature's byte offset
-    // within the feature section (for the R-tree leaf pointers).
+    // Encode features in input order, recording each framed feature's byte
+    // offset within the feature section (for the R-tree leaf pointers).
     let mut feature_section = Vec::new();
-    let mut offsets = Vec::with_capacity(order.len());
-    for &idx in &order {
+    let mut offsets = Vec::with_capacity(fc.features.len());
+    for (idx, feature) in fc.features.iter().enumerate() {
         offsets.push(feature_section.len() as u64);
-        let bytes = build_feature(fc.features[idx].geometry.as_ref(), &columns, idx);
+        let bytes = build_feature(feature.geometry.as_ref(), &columns, idx);
         feature_section.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         feature_section.extend_from_slice(&bytes);
     }
@@ -153,8 +174,7 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     out.extend_from_slice(&(header.len() as u32).to_le_bytes());
     out.extend_from_slice(&header);
     if indexed {
-        let ordered: Vec<Bbox> = order.iter().map(|&i| feature_bboxes[i]).collect();
-        out.extend_from_slice(&packed_rtree(&ordered, &offsets, node_size));
+        out.extend_from_slice(&packed_rtree(&feature_bboxes, &offsets, node_size));
     }
     out.extend_from_slice(&feature_section);
     out
@@ -1034,6 +1054,52 @@ mod tests {
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
         assert_eq!(back.features[0].geometry, fc.features[0].geometry);
+    }
+
+    /// **Features go out in the order they arrived, and the file is still
+    /// indexed.** The two halves have to be asserted together: this writer
+    /// sorted for the index's sake until 2026-10-21, so a test proving only
+    /// the order would be satisfied by dropping the index, and one proving
+    /// only the index would be satisfied by sorting again.
+    ///
+    /// The input is deliberately *anti*-sorted — descending by y, so Hilbert
+    /// locality is as wrong as it can be — because an already-ordered input
+    /// cannot tell a writer that preserves order from one that re-sorts. That
+    /// is exactly how the old behaviour stayed invisible: it is idempotent
+    /// after one hop, so it only shows against a *foreign* producer's order,
+    /// which `tests/same_format.rs`'s D6 registry finally supplied.
+    #[test]
+    fn features_keep_their_input_order_and_the_file_is_still_indexed() {
+        let anti_sorted: Vec<Feature> = (0..40)
+            .map(|i| Feature {
+                geometry: Some(Geometry::Point(Position::new(
+                    f64::from(i % 7) * 13.0 - 40.0,
+                    80.0 - f64::from(i) * 3.0,
+                ))),
+                properties: vec![("i".into(), crate::json::JsonValue::Int(i64::from(i)))],
+                native: None,
+            })
+            .collect();
+        let fc = FeatureCollection::new(anti_sorted);
+
+        let bytes = write(&fc);
+        let back = crate::flatgeobuf::read(&bytes).unwrap();
+
+        let ids: Vec<i64> = back
+            .features
+            .iter()
+            .map(|f| f.properties[0].1.as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, (0..40).collect::<Vec<i64>>(), "features were reordered");
+
+        // And the index is there: `index_node_size` is the default 16, which an
+        // index-less file writes as 0.
+        let table = crate::flatbuffers::Table::root(&bytes[8..]).unwrap();
+        assert_eq!(
+            table.read_u16(header::INDEX_NODE_SIZE, 16).unwrap(),
+            NODE_SIZE,
+            "the file came out index-less",
+        );
     }
 
     #[test]

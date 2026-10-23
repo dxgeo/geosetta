@@ -24,7 +24,7 @@ Design priorities for the project, in order. Geosetta aims to be:
 
 ## STATUS
 
-Current version: **0.26.0**.
+Current version: **0.26.1**.
 
 Eight formats are supported, all routed through a shared feature IR
 (`read(from) → FeatureCollection → write(to)`), so every format composes with
@@ -40,7 +40,8 @@ validated against DuckDB / GDAL.
     **deliberate divergence** on mixed 2D/3D input (see below).
 -   **FlatGeobuf** (read + write) on a from-scratch FlatBuffers reader and builder;
     written with a **packed Hilbert R-tree** spatial index (GDAL bbox queries work)
--   **CSV** with a WKT geometry column (read + write), types lightly inferred
+-   **CSV** with a WKT geometry column (read + write), types inferred only
+    where the inference is reversible, so a cell's exact text survives
 -   **WKT** — one geometry per line (read + write)
 -   **GeoPackage** (read + write) on a from-scratch SQLite reader **and** writer. A
     `.gpkg` is multi-layer, so reading fans out over all feature tables and writing
@@ -79,7 +80,11 @@ validated against DuckDB / GDAL.
     each geometry's bounding box in the GPB header (the format's optional
     per-geometry envelope), matching GDAL's own bytes ordinate for ordinate.
 -   **Shapefile** (read + write) — the first multi-file spoke: sibling
-    `.shp`/`.shx`/`.dbf`/`.prj`(/`.cpg`) files sharing a basename. A from-scratch
+    `.shp`/`.shx`/`.dbf`/`.cpg` files sharing a basename, plus a `.prj` when the
+    source carries a CRS. Writing never deletes a sidecar it did not produce
+    (a `.qix`, an `.sbn`, a `.prj` it could not write) — it names them on
+    stderr instead, since those files describe the output beside them. A
+    from-scratch
     mixed-endian `.shp`/`.shx` geometry codec (with real ring classification —
     shoelace winding + appearance-order grouping — for the Polygon/MultiPolygon
     disambiguation) and a dBase III/IV `.dbf` attribute codec. Composes with
@@ -392,9 +397,10 @@ fgb → gpkg` loses what FlatGeobuf cannot carry, twice.
 
 Where a same-format re-encode still loses something, the run says so on stderr
 rather than leaving you to find out. Today Shapefile is the only format that
-round-trips with nothing to report; GeoJSON drops both `bbox` members, CSV
-normalises the text it inferred a type from, GeoParquet drops the covering-bbox
-column, and KML keeps little more than placemarks. Those are measured, not
+round-trips with nothing to report; GeoJSON drops both `bbox` members and
+reformats numbers, CSV re-renders its geometry column's coordinates,
+GeoParquet drops the covering-bbox column, and KML keeps little more than
+placemarks. Those are measured, not
 predicted, and each is a gap being closed rather than a design position.
 
 In-process, none of this applies: a Rust consumer holding a `FeatureCollection`

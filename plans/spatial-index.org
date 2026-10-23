@@ -9,9 +9,13 @@ Spatial ordering and indexing are a cross-cutting capability that several
 outputs benefit from. Rather than one-off code per format, build shared
 primitives once and reuse them:
 
-- *FlatGeobuf* — its spatial index *is* a packed Hilbert R-tree. We currently
-  write index-less files (=index_node_size = 0=) and skip the index on read.
-  Writing it makes our FGB spatially queryable by GDAL / QGIS.
+- *FlatGeobuf* — its spatial index *is* a packed Hilbert R-tree. /This entry
+  said "we currently write index-less files (=index_node_size = 0=) and skip
+  the index on read" until 2026-10-21, and had been stale since milestone B
+  shipped./ **The index is written** (=index_node_size = 16=) whenever every
+  feature has a geometry, which makes our FGB spatially queryable by GDAL and
+  QGIS; the read side still skips it, since a full scan needs no index. Packed
+  over *input order* — see milestone B's amendment.
 - *GeoParquet* — *this entry was written before GeoParquet 1.1 and is no longer
   the whole story* (corrected 2026-08-20). Hilbert row ordering still clusters
   nearby features so row-group bbox stats prune well, and the =geo= metadata
@@ -49,14 +53,48 @@ The common threads: a *per-feature bounding box* and a *Hilbert curve encoding*
 unit-tested as a bijection on a small grid and for clustering locality.
 
 *** B. FlatGeobuf packed Hilbert R-tree (write) — *DONE*
-Implemented in =flatgeobuf/writer.rs=: features are Hilbert-sorted, the packed
-R-tree is built bottom-up (=NodeItem= = 4 f64 bbox + u64 offset, root first down
-to leaves) and written between header and features, with =index_node_size = 16=.
-Indexed only when every feature has geometry (else index-less, input order).
+Implemented in =flatgeobuf/writer.rs=: the packed R-tree is built bottom-up
+(=NodeItem= = 4 f64 bbox + u64 offset, root first down to leaves) and written
+between header and features, with =index_node_size = 16=. Indexed only when
+every feature has geometry (else index-less).
 Validated: GDAL reads our indexed =.fgb= and a bbox-filtered =ST_Read= returns
 the correct subset; our own reader still round-trips (it skips an index whose
-computed size must now match). The original design:
-- Sort features by Hilbert value (A) and write feature data in that order.
+computed size must now match).
+
+***AMENDED 2026-10-21: the writer no longer Hilbert-sorts, and the index is
+packed over input order.*** /Found by =same-format-fidelity.org= D6's fixture
+registry on its first run./ The sort was *not* a requirement of the structure
+-- a packed R-tree is packed bottom-up over whatever order its leaves are in,
+and a reader walks it by bbox either way -- and keeping it cost two things:
+
+1. ***It silently permuted content on a same-format run.*** =gdal_hostile.fgb='s
+   two features came back swapped, both files carrying =index_node_size = 16=.
+   That is a § THE RULE violation, and an undeclared one.
+2. ***It made =--sort-hilbert= a dead flag for this format.*** =main.rs=
+   applies that flag to the IR *before* calling the writer, so the sort was
+   mandatory exactly where the CLI advertised it as opt-in -- and opt-in for
+   GeoPackage's =--rtree= in the same breath. /The flag's own doc comment said
+   it was "a no-op ordering-wise for already-sorted FlatGeobuf", which had the
+   causality backwards./
+
+**So locality is now the caller's request and the index is unconditional**,
+which is the combination that spends nothing: order preserved by default, no
+capability lost, and =--sort-hilbert= means the same thing for every format.
+
+/Verified against the reference implementation, because self-consistency
+cannot establish this:/ =tests/gdal_types.rs='s
+=gdal_filters_correctly_through_an_index_over_unsorted_leaves= builds 500
+features sorted *against* locality -- past =NODE_SIZE= twice over, so the tree
+has interior nodes with genuinely overlapping boxes -- and requires GDAL's
+=-spat= filter through our index to match a *brute-force* count computed in the
+test. /The in-tree half is =features_keep_their_input_order_and_the_file_is_still_indexed=,
+which asserts both properties together: a test proving only the order would be
+satisfied by dropping the index, and one proving only the index by sorting
+again./
+
+*The original design, whose first bullet no longer holds:*
+- ~~Sort features by Hilbert value (A) and write feature data in that order.~~
+  /Superseded above: the caller sorts, or nobody does./
 - Build the *packed R-tree* bottom-up over the sorted features: leaves are one
   =NodeItem= per feature (=minX,minY,maxX,maxY= as 4 f64 + =offset= u64 = 40
   bytes), grouped =node_size= at a time (default 16) into parent nodes whose

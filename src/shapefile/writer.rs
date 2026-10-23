@@ -20,6 +20,34 @@ pub struct Encoded {
     pub shx: Vec<u8>,
     pub dbf: Vec<u8>,
     pub prj: Option<String>,
+    /// `.cpg` — the codepage the `.dbf`'s `C` field bytes are in. Always
+    /// `UTF-8`, because that is always what `dbf::write` emits: text reaches
+    /// it only through `Cell::Str`, which is a Rust `String`, and every other
+    /// field type is ASCII. /Verified that truncation cannot break the claim:
+    /// `truncate_at_char_boundary` backs off to a character boundary, so a
+    /// 400-byte run of `ø` clipped to the 255-byte field limit comes out 254
+    /// bytes of valid UTF-8./
+    ///
+    /// # Why this is written at all, when `ogr2ogr` writes none
+    ///
+    /// `native-inventory.org` § Shapefile ranked this low on exactly that
+    /// comparison, and the comparison was incomplete. Measured 2026-10-21:
+    /// `ogr2ogr`'s default output carries **LDID `0x57`** — ANSI/Windows-1252
+    /// — in the `.dbf` header while writing UTF-8 bytes, and only writes a
+    /// `.cpg` when given an explicit `-lco ENCODING=`. So the reference does
+    /// declare an encoding by default; it declares the wrong one, through the
+    /// other channel. This writer leaves LDID `0x00` ("unknown", and dBase has
+    /// no UTF-8 value to put there — which is why Esri invented `.cpg`) and
+    /// states the truth in the file meant for it.
+    ///
+    /// The deciding reason is not symmetry, though. A `.cpg` already sitting
+    /// at the output basename *governs the `.dbf` this run writes*, and
+    /// geosetta does not delete files it did not write — so writing our own is
+    /// the only thing that stops a foreign one from relabelling our text.
+    /// Measured before the fix: a stale `.cpg` reading `ISO-8859-1` turned
+    /// `København` into `KÃ¸benhavn` for `ogrinfo` *and for geosetta's own
+    /// reader*.
+    pub cpg: &'static str,
     /// Non-fatal warnings from lossy `.dbf` truncation (a property value or
     /// name too long for dBase's fixed-width fields) — see `dbf::write`.
     /// Empty in the overwhelmingly common case where nothing was truncated.
@@ -40,8 +68,12 @@ pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
 
     let prj = fc.crs.as_ref().and_then(prj_wkt);
 
-    Ok(Encoded { shp, shx, dbf: dbf_bytes, prj, warnings })
+    Ok(Encoded { shp, shx, dbf: dbf_bytes, prj, cpg: CPG, warnings })
 }
+
+/// The `.cpg` contents. `UTF-8` is the spelling `encoding_from_cpg` recognises
+/// on the way back in, and the one `ogr2ogr -lco ENCODING=UTF-8` writes.
+const CPG: &str = "UTF-8";
 
 /// The WKT text to write to `.prj` for this CRS, or `None` when it can't be
 /// expressed: prefer the source's own verbatim WKT (including one supplied with

@@ -34,11 +34,60 @@ are bugs, not accepted debt) and prospectively (every new format spoke or
 new IR field must ship its capability gaps' warnings in the same pass as
 the feature itself, not as a follow-up).
 
-** THE TWO EXISTING MECHANISMS -- extend these, don't invent a third
-Two shapes already exist in this codebase; a new gap should fit one of
-them, not grow a bespoke path. As of the *generalization pass* below, both
-funnel through the same two shared =main.rs= functions rather than each
-growing its own wrapper — see § GENERALIZED COLLECTION.
+** THE COMPLEMENT -- a warning is the last resort, not the first
+/Stated 2026-10-22, on a ruling it decided. The rule above says a loss must be
+*loud*; this says what to reach for before the rule applies at all./
+
+#+begin_quote
+*Where a choice exists between reporting a loss and doing the work to avoid
+it, do the work.* A warning is owed when the target genuinely cannot hold what
+the source carries. It is **not** a substitute for a reader or writer that
+could have held it and does not.
+#+end_quote
+
+***The failure mode this guards against is a warning that is perfectly honest
+and still the wrong answer*** -- a message naming a loss the crate was capable
+of avoiding, which reads as diligence and ships as a gap. It is easy to reach
+because a warning is three lines and a parser is not.
+
+*Four rulings already went this way, and naming the pattern is the only new
+part:*
+- =same-format-fidelity.org= *D17* -- a CSV cell's text is kept by gating the
+  inference, rather than declaring the canonicalisation.
+- *M4* -- a =.dbf= field width is carried in =FieldDecl=, rather than warning
+  that an 80-character field came back as 1.
+- *Decision 33* -- a =.cpg= is **written** rather than reported, on the
+  measurement that a warning fires on the write and the corruption happens on
+  a later read. /That entry states the general form: "that asymmetry is the
+  argument for writing whatever can be written rather than warning about it"./
+- =kml.org= § GEOMETRY ELEMENT COVERAGE -- a bare =<LinearRing>= and a
+  =<gx:Track>= are *parsed*, because LIBKML's own reading proves the IR can
+  hold them; only =<Model>=, which has no nearer IR shape than nothing, stays
+  in the warn column.
+
+*And it re-opens two things below rather than leaving them settled.*
+§ OPEN CANDIDATES' =<altitudeMode>= entry was deferred partly on noise
+grounds, and the complement says the question to ask first is whether it can
+be *carried*; the =.cpg= approximation (E1) is owed its warning **and**
+=encodings.org= E2's table is the thing that makes the warning stop firing.
+/Neither is a reason to delay a warning that is owed today: the order is warn
+now, carry when the carry lands -- the warning is what makes the gap visible
+enough to get fixed./
+
+** THE MECHANISMS -- extend these, don't grow a bespoke path
+Two *shapes* exist in this codebase -- a prediction, and a report of what
+actually happened -- across *three sites*: a check run before the write, a
+writer reporting what it did, and (owed, not built) a reader reporting what it
+could not keep. A new gap should fit one of the two shapes, not grow a bespoke
+path. As of the *generalization pass* below, every site funnels through the
+same two shared =main.rs= functions rather than each growing its own wrapper
+— see § GENERALIZED COLLECTION.
+
+/The heading read "THE TWO EXISTING MECHANISMS -- extend these, don't invent a
+third" until 2026-10-22, and the third site is not an invention of one: a
+reader reporting what it dropped is § 2's shape on the other side of the pipe.
+What the old heading was defending is intact -- it forbids a second
+presentation path, not a second place a loss can be observed./
 
 *** 1. Pre-write predictive check (preferred when the answer doesn't depend on the actual encoding)
 A pure function taking the source data and the target =Format=, returning
@@ -144,14 +193,111 @@ reason it states:
   none of their meaning; a relation that called that lossless would define
   defect 5 out of existence.
 
-*** 2. Post-write actual-outcome collection (when the loss is only knowable during real encoding)
-A writer returns its warnings alongside its bytes, collected as the actual
-encoding happens (field-name collisions, fixed-width truncation — things a
-pure pre-check can't predict without redoing the writer's own work).
+*** 2. Actual-outcome collection (when the loss is only knowable while the bytes are processed)
+The step doing the work returns its warnings alongside its product, collected
+as the real encoding or decoding happens — field-name collisions, fixed-width
+truncation, an element with no IR slot: things a pure pre-check cannot predict
+without redoing that step's own work.
+
+**** 2a. The write side -- BUILT
 - =shapefile::writer::Encoded { warnings: Vec<String>, ... }= (=dbf.rs='s
   field-name/value truncation) — =main.rs='s =write_shapefile_to_path=
   prints them via the same shared =print_warnings= the pre-write checks
   use (see below), same =--quiet= gate.
+
+**** 2b. The read side -- OWED, and owed twice
+/Scoped 2026-10-22, unbuilt./ ***A reader that drops a member leaves no trace
+in the IR for a § 1 check to find***, so the predictive shape cannot cover a
+read-time loss however it is written. Two are already owed and both are
+blocked on there being nowhere to put the message:
+
+- [[file:native-inventory.org][=native-inventory.org=]] § QUESTIONS item 6 --
+  an unrecognised KML geometry element. /Measured 2026-10-22:/
+  =hand_hostile.kml='s =<Model>= Placemark, a bare =<LinearRing>= and a
+  =<gx:Track>= all come back =geometry: null= with nothing on stderr.
+- [[file:encodings.org][=encodings.org=]] E1 -- a =.cpg= naming a codepage
+  this build has no table for, approximated as Latin-1. See § OPEN CANDIDATES
+  below, which had already noticed that a pre-write check is the wrong tool
+  for it.
+
+***Why § 1 cannot be stretched to reach them.*** A =geometry: None= left by a
+=<Model>= is indistinguishable in the IR from a Placemark that legitimately
+carries no geometry, and a =.cpg= this build cannot decode is *gone* by the
+time the IR holds the text. The source fact is destroyed at read, so the only
+honest place to observe it is where it happens.
+
+*And it is not what the same-format loss list says.* =Format::same_format_losses='s
+=Format::Kml= row names "folders, overlays and models" and fires on a
+=kml -> kml= hop -- a *static, format-level* string that fires whether or not
+this file holds one, and that does not fire at all on the =kml -> geojson= run
+that is the common case. /Both measured 2026-10-22./ The missing thing is the
+*per-file* fact.
+
+***The shape is a sink parameter:***
+
+#+begin_src rust
+  pub fn read_features(
+      format: Format,
+      input: &[u8],
+      warnings: &mut Vec<String>,
+  ) -> Result<FeatureCollection>
+#+end_src
+
+Additive rather than breaking, and most arms simply never touch it. Message
+*bodies* only, as everywhere else here: =print_warnings= keeps the
+=warning: = prefix.
+
+***There are three read entry points, not one***, and the second owed warning
+is behind one of the other two -- worth knowing before this is sized as "a
+parameter on =read_features=":
+- =convert::read_features(format, input)= -- the single-buffer spokes, where
+  item 6's KML case lives (both the =Kml= and =Kmz= arms).
+- =shapefile::read(shp, dbf_bytes, prj, cpg)= -- called from =main.rs=, which
+  locates the sibling files; =read_features='s =Format::Shapefile= arm is an
+  =Err=. ***This is where E1's =.cpg= warning has to go***, so the sink
+  cannot be a =read_features= detail.
+- =geopackage::read_layers(bytes)= -- same reason, per-layer. Nothing owes a
+  read warning here yet, and it should take the sink anyway rather than be the
+  one path that cannot report.
+
+*Two alternatives, both rejected.*
+1. *Return =Result<(FeatureCollection, Vec<String>)>=.* Uniform and
+   impossible to forget -- and it breaks the crate's one public read entry
+   point, rewriting all nine arms and every call site for a warning two spokes
+   will ever produce. /A sink costs the silent readers a parameter, not a
+   change./
+2. *A =read_warnings= field on =FeatureCollection=.* The cheapest plumbing,
+   and a fairer precedent than it first looks: § 2a's =Encoded.warnings= is
+   itself warnings-on-the-product-struct. ***Rejected because the IR crosses
+   the pipe and a diagnostic does not travel with it*** -- a reproject, an
+   external edit, GeoPackage's layer fan-out and
+   [[file:container-reconciliation.org][=container-reconciliation.org=]]'s
+   destination merge would each need an answer for a field that means nothing
+   to them, and D5's "the natives channel does not cross the pipe" binds a
+   diagnostic harder than it binds data. /It would *not* have broken D6's
+   fixture registry, which compares named fields rather than whole structs --
+   the obvious objection, and not the real one./
+
+***Aggregation is part of this mechanism, not a nicety.*** A real GPS-export
+KML is thousands of =gx:Track= Placemarks; one line per feature is unreadable
+and buries every other warning in the run. A read-side warning is counted per
+cause and said once:
+
+#+begin_src text
+  warning: kml: 3 features hold <Model>, which this reader does not support; kept with no geometry
+#+end_src
+
+/=collect_layer_warnings='s =BTreeSet= is the de-duplication precedent, but it
+collapses identical messages rather than *counting* them -- so the first
+read-side instance owes the counting helper, and the second one should find it
+already there./
+
+*What a reader cannot say, and it is not this mechanism's fault.* =xml.rs='s
+=local_name= strips namespace prefixes at parse, so =gx:Track= reaches the
+warning as =Track= and a user grepping the file for =<Track>= finds nothing.
+Ship the local name with a test pinning the wart: the fix is the verbatim-replay
+ruling =same-format-fidelity.org= M3's KML spoke is gated on, and a one-off
+=raw_name= added here would pre-empt that ruling to buy a cosmetic gain.
 
 ** GENERALIZED COLLECTION -- one place to add a check, one place to print
 Adding the M-ordinate warning alongside the existing CRS one meant
@@ -175,7 +321,8 @@ undeniable and a third was explicitly expected.
   =warn_crs_loss_layers= used to do alone, now built once on top of
   =collect_conversion_warnings= and shared by every check.
 - =print_warnings(warnings: &[String], quiet: bool)= — the =--quiet= gate
-  and =eprintln!= loop, shared by *both* mechanisms (§1 and §2): the
+  and =eprintln!= loop, shared by *every* site (§1, §2a and, when it is
+  built, §2b -- which adds a collection point, not a presentation one): the
   three =main.rs= call sites use =print_warnings(&collect_conversion_warnings(...),
   ...)=/=print_warnings(&collect_layer_warnings(...), ...)=, and
   =write_shapefile_to_path= calls =print_warnings(&encoded.warnings, quiet)=
@@ -233,6 +380,18 @@ next pass through this area doesn't have to rediscover them:
   out of scope for *this* rule specifically, since it's dropped uniformly
   on *read*, not conversion-target-dependent the way every case above is;
   a pre-write predictive check has nothing to compare against for it.
+
+  /2026-10-22: **the second half of that reasoning no longer holds, and the
+  first half is what the entry actually rests on.** § 2b gives a read-time
+  drop somewhere to be reported from, so "a pre-write check cannot see it" has
+  stopped being a reason not to warn -- for this, for =.cpg= below, and for
+  item 6's KML geometry. What is left of the objection is the honest one: an
+  =<altitudeMode>= is dropped on **every** KML read, so warning about it says
+  the same sentence on every file this spoke ever reads, which is § THE RULE's
+  noise bar rather than its scope. (A per-file count does not rescue it: the
+  count is "all of them".) Decide it with the spoke's unmodelled-member carry
+  (=same-format-fidelity.org= M3), not before -- if the element is *carried*
+  there is nothing left to warn about./
 - GeoParquet's full 3D covering-bbox (6-element =[xmin,ymin,zmin,xmax,ymax,zmax]=
   vs. the 4-element 2D form this crate writes) is a *tightness* loss
   (spatial pruning is less effective), not a data loss — real DuckDB/GDAL
@@ -243,6 +402,33 @@ next pass through this area doesn't have to rediscover them:
   per =zm-geometry.org='s M7 follow-up) and =MultiPatch=(31) (never
   modeled, no =Geometry= variant exists to decode into) — not conversion
   losses in the sense this rule covers.
+- ***A =.cpg= naming a codepage this build has no table for is approximated as
+  ISO-8859-1, silently.*** /Filed 2026-10-21 while answering
+  =native-inventory.org= § QUESTIONS item 3; **this one is squarely inside the
+  rule**, unlike the three above./ =dbf::encoding_from_cpg= maps every
+  unrecognised codepage to =Encoding::Latin1=, documented in =dbf.rs:42= as "an
+  approximation documented as a known gap" — and the gap is documented in the
+  *source*, where no user reads it.
+
+  The common real case is =CP1252=, which differs from ISO-8859-1 in exactly
+  the 32 bytes =0x80=--=0x9F= — the curly quotes, en/em dashes, =€= and =…=
+  that real attribute data is full of, decoded as C1 control characters
+  instead. ***It is also the encoding =ogr2ogr= declares by default*** (LDID
+  =0x57=, measured), so this is not an exotic input.
+
+  *Unlike the candidates above, a pre-write predictive check is not what this
+  needs* /(and as of 2026-10-22 it has somewhere else to go -- § 2b, whose
+  sink this is the second owed instance of)/ — the loss happens on **read**, and the source states the codepage
+  itself, so the warning has something concrete to compare against: what the
+  =.cpg= declared against what this build can decode. That makes it a cheap,
+  well-formed instance of the rule rather than a hard one.
+
+  /Fixing the decode is separate and now has its own plan:
+  [[file:encodings.org][encodings.org]], where this warning is **E1** and the
+  refusal for a multi-byte codepage is **E3** -- a single-byte codepage is a
+  128-entry table and no dependency, multi-byte ones (Shift-JIS, GBK, Big5) are
+  where the answer should be a refusal rather than an approximation.
+  **The warning is owed either way**, and owed first./
 
 ** AN OPEN CALL -- the mixed-number column, and whether it earns a warning
 /Raised 2026-08-21, deliberately not decided./

@@ -144,6 +144,13 @@ why, not to implement the spec's table from symmetry.
   LIBKML =.kmz= fixture that required flattening every internal =*.kml= entry
   rather than trusting just the first (its root =doc.kml= is only a
   =<NetworkLink>=). No dependency on the other plans.
+- [[file:kml-standard.org][kml-standard.org]] :: Rescope the KML spoke to the
+  standard — OGC KML 2.3 as a typed document model in the KML native, with the
+  IR as its projection; both OGC versions (2.2, 2.3) read and detected; output
+  in the version asked for (=--kml-version=), defaulting to the source's own.
+  It is =same-format-fidelity.org='s M3 KML spoke (D18) and supersedes parts of
+  =kml.org=. Depends on =lossy-conversion-warnings.org= § 2b and
+  =encodings.org=. *Scoping only.*
 - [[file:projjson-to-wkt.org][projjson-to-wkt.org]] :: The reverse of
   =crs.org= milestone C — translate a PROJJSON CRS with no authority code
   into WKT1, so a GeoParquet source can still express its CRS when converted
@@ -269,7 +276,7 @@ why, not to implement the spec's table from symmetry.
   from it), and with no dependency edges between the three crates it could not
   have called a sibling's version anyway. Carries that plan's empirically
   confirmed GPB layout forward. Excludes envelopes *under reprojection*, which
-  is a different problem and belongs to =nazca/plans/transform-bounds.org=.
+  is a different problem and belongs to =geoscribe/plans/transform-bounds.org= (=nazca='s until 2026-10-22).
   *DONE (V1--V4, 0.25.0)* -- =Bbox= folds Z/M, and an opt-in =--envelope= flag writes
   the GPB envelope, matching GDAL's bytes ordinate for ordinate. The design
   question it settled: the envelope *stops at Z*. An envelope is a spatial
@@ -334,7 +341,9 @@ why, not to implement the spec's table from symmetry.
   /code/ or /unverified/, because the confidence differs. First pass covers
   all nine; Shapefile's write side and some KML elements remain unconfirmed.
   Notable findings: CSV and WKT lose the *lexeme* rather than any member
-  (=007= → =7=, =1.50= → =1.5=, and a 20-digit integer through an =f64=),
+  (=007= → =7=, =1.50= → =1.5=, and a 20-digit integer through an =f64= --
+  *CSV's half fixed 2026-10-21 under D17*, WKT's declared because its
+  coordinates are numbers by grammar),
   FlatGeobuf's =Column= table drops *nine* fields of per-column schema, and
   *KMZ is a second container spoke* -- a =.kmz= is a zip and geosetta writes
   =doc.kml= alone, so icons and overlays are dropped and the surviving KML
@@ -423,3 +432,40 @@ why, not to implement the spec's table from symmetry.
   construction from the same-file guard
   [[file:same-format-output.org][same-format-output.org]] proposes.
   *Scoping only.*
+- *WebAssembly* (cross-crate; lives at the repo root) :: Both wasm targets
+  already build from this crate's library with zero source changes, and the
+  =wasm32-wasip1= CLI emits output byte-identical to native across all seven
+  single-buffer formats *and* Shapefile's four sibling files; 569 of 569 library
+  tests pass under =wasmtime=. The portability property this rests on is that
+  every =std::fs=/=std::process=/=std::env= call in this crate sits in a
+  =#[cfg(test)]= module or a doc comment -- all host I/O is in =main.rs=.
+  *Scoped, not built*: what is missing is a browser binding (a separate consumer
+  crate, no =wasm-bindgen=) and an answer for how the stderr warnings of
+  [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] reach a
+  caller that has no stderr. Also records why =convert::write_features= errors
+  on =Gpkg=/=Shapefile= despite both being fully implemented -- those arms are
+  routing redirects to =geopackage::writer::write_layers= and
+  =shapefile::writer::write=. The =Gpkg= arm's "not supported yet" wording,
+  which invited exactly that misreading, is *fixed in 0.26.1*.
+  See [[file:../../wasm-plan.org][wasm-plan.org]].
+- *Text encodings* (cross-spoke) :: Every spoke that reads or writes text, and
+  the picture is uneven in a way no single flag fixes: *four spokes refuse
+  non-UTF-8 input outright* (GeoJSON, CSV, WKT, KML -- with no remedy to offer,
+  which is what makes the refusal awkward rather than wrong), *one guesses*
+  (Shapefile's =.dbf= maps any unrecognised =.cpg= to Latin-1 **silently**, and
+  =CP1252= -- the common case -- differs from Latin-1 in exactly the bytes real
+  data uses), and *one throws away the declaration it needs* (=xml.rs= skips
+  KML's =<?xml encoding=…?>= prolog unread, then refuses the file for being
+  what it said it was). The write side is settled and UTF-8 everywhere,
+  declared in a =.cpg= since 2026-10-21.
+
+  Two measurements shape it. =ogr2ogr='s default output declares LDID =0x57=
+  (Windows-1252) while writing UTF-8 bytes, so **honouring the in-band
+  declaration would mis-decode the reference tool's own files** -- the existing
+  UTF-8-probe is better than the declaration. And the dependency-free
+  constraint puts a sharp boundary between single-byte codepages (a 128-entry
+  table each, cheap, reversible for the write side) and multi-byte ones
+  (thousands of entries -- where the answer is *refusal*, not approximation).
+  Correctness first (E1 warn, E3 refuse), capability after (E2 tables, E4
+  =--encoding=). *Scoping only.*
+  See [[file:encodings.org][encodings.org]].

@@ -54,7 +54,7 @@ premise is gone twice over:
    the stage at *both ends* of every pipeline, with a sibling tool in the
    middle. The endpoint format is chosen by the user's data and the transit
    format by what the middle tool speaks, so the two colliding is ordinary,
-   not exotic. =nazca='s own documented pipeline (=nazca/project.org:129=)
+   not exotic. =nazca='s own documented pipeline (=nazca/project.org:129= then; =geoscribe/project.org= § ROADMAP since reprojection moved there, 2026-10-22)
    pipes WKT: =geosetta in.geojson - --to wkt | nazca --to ... | geosetta -
    out.fgb --from wkt=. Give that same pipeline a WKT-native user, and stage
    one is =geosetta in.wkt - --to wkt= -- refused.
@@ -185,6 +185,13 @@ format could have recorded it.* Both halves matter:
   does not model" as including the byte-level form of what it does model, and
   both CSV and WKT fall out correctly. **Shapefile** is the format that
   actually warns about nothing.
+
+  /2026-10-21: and the two formats part company here, under
+  =same-format-fidelity.org= D17. **CSV's lexeme loss is fixed** -- its cells
+  are untyped text, so typing them was the reader's choice and it is now gated
+  on being reversible. **WKT's is declared**, because a WKT coordinate is a
+  number by grammar and there is no un-inferred reading to keep. So this entry's
+  conclusion survives with one format in it rather than two./
 - The second half keeps the existing capability logic intact, so a cross-format
   run to a target that genuinely cannot hold the member stays silent-or-warned
   by the same reasoning it uses now.
@@ -414,5 +421,5 @@ each one predicted is worth comparing against what it cost./
 - [[file:../../architecture.org][../../architecture.org]] § THE COMPOSITION
   MODEL -- why geosetta stands at both ends of every pipeline, which is what
   makes transit and endpoint formats collide routinely.
-- =nazca/project.org:129= -- the WKT-transit pipeline whose WKT-native case is
+- =nazca/project.org:129= (now =geoscribe/project.org= § ROADMAP, 2026-10-22) -- the WKT-transit pipeline whose WKT-native case is
   blocked today.

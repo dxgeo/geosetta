@@ -1,2473 +1,400 @@
-#+TITLE: Handoff: Same-Format Fidelity Work
+#+TITLE: Handoff -- D17, The D6 Registry, And The Sidecar Policy
 #+AUTHOR: Daniel Okuniewicz Jr.
-#+DATE: {{{time(%Y-%m-%d)}}}
+#+DATE: 2026-10-21
 
-* Handoff -- Round-Trip Fidelity and Edit Composability
+* Handoff -- 2026-10-21
+This file was **rewritten on 2026-10-21 to cover this session's changes only**.
+It had accumulated the whole round-trip-fidelity and edit-composability arc --
+157,379 bytes, decisions 1--30, BUGS FOUND 1--23, the sequencing diagram, the
+oracle rule, the domain of the rule -- and that arc is now largely closed.
 
-Orientation doc for an agent picking up the fidelity work started 2026-08-20.
-Same role =geoscribe/handoff.org= plays for the CRS work: read this, then the
-plans it points at.
+** WHERE THE PREVIOUS HANDOFF WENT -- read this before following a citation
+***The earlier content is intact at =9768a87:geosetta/handoff.org=.***
 
-*M1, M2 and M4 are done. M3 is half done: four spokes carry natives, four
-still pass =native: None=.*
+#+begin_src sh
+  git show 9768a87:geosetta/handoff.org > /tmp/handoff-pre-2026-10-21.org
+#+end_src
 
-- *The mechanism* -- =src/native.rs=, the opaque format-tagged =Native=
-  channel, and D1's two modelled fields (=FeatureCollection::name=, the column
-  schema on =FeatureCollection::schema=).
-- *Spokes with natives:* GeoJSON, FlatGeobuf, GeoParquet, GeoPackage.
-  *Still to do:* CSV, WKT, KML, Shapefile -- their readers pass
-  =native: None=.
-- *M4, declared column types* -- =crate::DeclType= on =FieldDecl=, closing
-  defects 1, 2 and 5. *All four declaring spokes* carry a declaration
-  (FlatGeobuf, Shapefile, GeoPackage, GeoParquet); a declaration dropped to a
-  format with no slot still *warns*.
-- *=edit-composability.org='s live bug 1* -- the GeoPackage edit loop that
-  duplicated layers -- is fixed.
-- *Defect 3 is the only defect left, and as of 2026-08-25 it is **mostly
-  fixed**.* Its *warning* shipped 2026-08-21 -- a =gpkg= write says what the
-  rewrite destroys instead of exiting 0 in silence -- and the *fix* arrived in
-  three pieces: a **tile pyramid** survives a =gpkg -> gpkg= write as of
-  2026-08-24, and **a user's own tables**, **the =gpkg_metadata= pair** and
-  **an =attributes= dataset** as of 2026-08-25, all carried by
-  =geopackage/carry.rs=, and **a =WITHOUT ROWID= table** as of 2026-08-26.
-  ***Eleven of the thirteen =.gpkg= fixtures now round-trip with the warning
-  silent*** /(recounted 2026-10-13: =sqlite_nullkey.gpkg= made it thirteen and
-  is **refused by design**)./ /What is left is one thing this crate cannot yet
-  model rather than a class it has not carried: the CRS-WKT extension's
-  **column**./ ***And the merge path is no longer the exception*** --
-  =container-reconciliation.org= is **complete** as of 2026-10-13, so a
-  destination's own container survives an append too, a same-named tile pyramid
-  included. The only merge still refused is one with no union: two tables of a
-  name, two pyramids that are not the same pyramid, or two images at one tile
-  coordinate. /Entry 13
-  closed with it: the warning had misclassified =gpkg_ogr_contents=, and ten
-  triggers besides./
-- ***Defect 6 was found and fixed on 2026-08-23**, twice over, and it is the
-  one to read first if you are new to this work.* /The first fix was checked
-  against =ogr2ogr= and inherited two of that tool's own deviations from the
-  standard; reading the specification found them, and
-  =tests/fixtures/spec_conformant.gpkg= -- built from that specification with
-  no GDAL in its provenance -- is what now checks it without anyone having to
-  read anything. See § THE ORACLE RULE in the fidelity plan./ Five of the six registry tables were
-  written with *no table constraints at all* -- no =PRIMARY KEY=, no =UNIQUE=,
-  no =FOREIGN KEY= -- so this crate's output did not state the schema the
-  GeoPackage specification defines. **It was never a decision**: =sqlite.rs=
-  could not write an index b-tree, so the DDL that would have needed one was
-  never written, and what was left read like a house style. Fixed by building
-  the index b-tree, which was the actual missing capability; the DDL then
-  followed in one line per table. /Verified with =PRAGMA integrity_check=,
-  =foreign_key_check=, a duplicate =INSERT= against every restored constraint,
-  =EXPLAIN QUERY PLAN= showing the planner using the index, and =ogr2ogr=
-  rewriting the output./
-- *Two things changed on 2026-08-22 that a returning reader should not
-  discover by accident.* The format-check deletion's only gating argument
-  *expired*, so its position at the end of the chain is an open call rather
-  than a settled one (§ THE SEQUENCING). And the original ask -- a middle
-  package modifying the collection mid-flight -- was restated as a *constraint
-  on this work* rather than a consumer of it, which adds a third content class
-  M3b has to honour and rules out dirty-flag invalidation on structural
-  grounds (§ THE EDIT LOOP).
+*This matters because that content is cited by name from roughly sixty places
+that this file no longer satisfies.* Nothing was lost, but nothing was
+rewritten to point at the new location either:
 
-585 tests pass (=cargo test -p geosetta=: 528 lib, 56 integration, 1 doc),
-clippy clean, *and =cargo doc= is green* -- add that third command to your
-verification ritual, because =Cargo.toml= denies two rustdoc lints and nothing
-else runs them (see § WHAT CHANGED IN EXISTING DOCS, 2026-08-22). The
-=#[ignore]=d cross-checks against =sqlite3=, GDAL and the PROJ oracle run with
-=cargo test -p geosetta -- --ignored= and all pass; that command also runs the
-two =perf.rs= benchmarks, which take about ninety seconds and are not
-cross-checks. **The one to run when you touch the GeoPackage writer is
-=tests/gpkg_oracles.rs=** /(new 2026-08-25)/: it puts every fixture's output in
-front of =sqlite3= rather than one, which is the gap entry 20 fell through.
-/It asks **three** questions as of the same day -- =integrity_check=,
-=foreign_key_check=, and whether an =INSERT= still *compiles* against every
-table, which is the one the first two cannot express: a trigger naming a table
-the output does not hold satisfies both pragmas and then fails every write./ /Stated without a number on 2026-08-23: it had said "six", which
-counted the lib tests only and had been wrong since =tests/gdal_types.rs=
-added two more on 2026-08-20 -- § THE THREE LESSONS, lesson 1, in this
-document's own change log./ The newest of them is
-=sqlite_itself_validates_the_index_this_writer_builds=, which hands this
-crate's b-tree to the =sqlite3= binary and asks *it* whether the file is well
-formed -- the same second opinion the fixture sweep now takes for the whole
-corpus. See
-[[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
-§ STATUS for the precise line between done and not.
+- *Source comments* cite =§ BUGS FOUND entry 15= (=sqlite.rs=,
+  =geopackage/carry.rs=, =geopackage/writer.rs=), =entry 19= (=native.rs=,
+  =carry.rs=), =entry 20= (=sqlite.rs=, =carry.rs=, =reconcile.rs=,
+  =writer.rs=), =entry 21= (=carry.rs=), =§ THE SEQUENCING= (=format.rs=) and
+  =§ M3B NEEDS A THIRD CLASS= (=writer.rs=).
+- *Plan files* cite it ~40 times, including =§ BUGS FOUND= entries 11, 14 and
+  15, =§ THE EDIT LOOP=, =§ OPEN QUESTIONS= and =§ WHAT CHANGED IN EXISTING
+  DOCS=.
 
-** WHAT THIS WORK IS
-It began as a request to make =geosetta= read a file, let *another program*
-modify the feature collection, and write it back. That turned out to be
-possible already, and the interesting question was why it is not *faithful*.
-Chasing that produced a standing rule:
+**So a citation to an entry below 24 means the file at that git ref**, not this
+one. /If those citations are to be rewritten, that is its own pass and should
+be done deliberately -- they are load-bearing explanations in module docs, not
+decoration./
 
-#+begin_quote
-*Reading a format and writing the same format loses nothing.* A capability gap
-in the target is a defence for dropping data; the target being the source's own
-format is not.
-#+end_quote
-
-Everything else is consequence.
+The decision *table* rows 1--30 are the cheapest thing to recover if only one
+part is wanted; they are an index of what was settled, one line each, under
+=§ THE DECISIONS= in that revision.
 
 ** WHERE TO START
-In this order. The first two are the load-bearing ones:
+If you are picking up the remaining work rather than reviewing this session:
 
-1. [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]] --
-   the rule, the mechanism (an opaque, format-tagged =Native= channel), and all
-   *seven* design decisions. *Read § THE MECHANISM and § DECISIONS before
-   anything else.*
-2. [[file:plans/native-inventory.org][plans/native-inventory.org]] -- what each
-   of the nine readers actually discards, measured. This is the reference the
-   other three plans are written against.
-3. [[file:plans/same-format-output.org][plans/same-format-output.org]] --
-   deleting the =args.from == out.format= check. ***SHIPPED 2026-08-23***, out
-   of the order the diagram draws, on the composability reading of the call in
-   § THE SEQUENCING. Read it for what measuring the result overturned: the
-   prediction that the warning would cover four spokes (it covers seven), and
-   the plan's own example of a format with nothing to lose (WKT, which loses
-   the lexeme).
-4. [[file:plans/edit-composability.org][plans/edit-composability.org]] -- the
-   original ask, now the consumer of the above.
-5. [[file:tests/fixtures/HOSTILE.org][tests/fixtures/HOSTILE.org]] -- what each
-   fixture carries and why. Read before touching any of them, and
-   [[file:tests/fixtures/PLANNED.org][PLANNED.org]] beside it for the ones
-   designed on 2026-08-23 and not yet built. /Its first entry,
-   =spec_conformant.gpkg=, was built the same day and has moved to
-   =HOSTILE.org= under a new =spec_= prefix; =gdal_tiles.gpkg= followed on
-   2026-08-24 -- designed there as =gpkg_tiles.gpkg=, renamed to the =gdal_=
-   prefix because provenance is what these names carry -- and it is the fixture
-   M3b § 1 needs. =sqlite_fid_gap.gpkg= followed on 2026-08-25, and unlike the
-   others was not designed in advance at all: it exists because a bug turned out
-   to be invisible to every fixture in the tree at once. =sqlite_nullkey.gpkg=
-   followed on 2026-10-13 -- designed 2026-08-23 and built when § 3 needed it --
-   and it is the **only fixture in the tree whose =gpkg -> gpkg= write is
-   refused by design**, which =tests/gpkg_oracles.rs= asserts through
-   =REFUSED_BY_DESIGN= rather than skipping./
-6. [[file:plans/container-reconciliation.org][plans/container-reconciliation.org]]
-   -- /new 2026-08-23; **COMPLETE 2026-10-13**/. What happens to container
-   content when the destination =.gpkg= already has some. ***Read its § STATUS
-   first*** -- the destination's container is merged rather than destroyed, a
-   same-named tile pyramid included, and **all six requirements are built**.
-   The rest of this entry is the state before that landed and is kept for the
-   reasoning. It no longer gates M3b; it did, and this is why:
-   M3b can carry a source container into a fresh file without any of it, and
-   cannot claim to carry a container in general until it is settled. Its § 1 is
-   due regardless of the rest. *Its D2 was decided the same day it was filed,
-   on § THE MEASUREMENT* -- **merge, and build the index** -- and that section
-   is the one to read first, because both options moved when the command was
-   run: refusing turned out to fire on every ordinary append, and building
-   turned out not to need the collation machinery it was feared for. It also
-   overturned an entry in the plan's own § 3: =ge_tce= does not make a set
-   either, so three of the four registry keys cannot be leaned on to dedupe.
-7. =same-format-fidelity.org= § THE ORACLE RULE -- one page, and it is the
-   thing this project got wrong most recently: *=ogr2ogr= is evidence of what a
-   producer emits and what a consumer accepts, never of what the standard
-   requires.* Read it before writing another differential test.
+1. [[file:summary.org][summary.org]] -- this session's narrative, with the
+   measurements and what was learned. Read it first; this file is the
+   structured form of the same three items.
+2. [[file:plans/todo.org][plans/todo.org]] -- the live list of what is open.
+3. [[file:plans/same-format-fidelity.org][plans/same-format-fidelity.org]]
+   § STATUS and § MILESTONES -- M3's remainder, which is where the next work
+   is. **Three spokes, not four**: CSV closed this session without needing a
+   native at all.
+4. =9768a87:geosetta/handoff.org= § THE RULE / § THE MECHANISM / § THE
+   DECISIONS -- the accumulated reasoning, if you need why any of this is
+   shaped the way it is.
 
-=plans/lossy-conversion-warnings.org= and =plans/spatial-index.org= were also
-edited; see § WHAT CHANGED IN EXISTING DOCS.
+** WHAT THIS SESSION CHANGED
+Three questions answered, two defects found and fixed, one plan written.
 
-** THE SEQUENCING -- MOSTLY FORCED, WITH ONE LINK NOW LOOSE
-/Titled "WHICH IS FORCED" until 2026-08-22, when the last link stopped being
-forced: the format-check deletion's position rests on an argument that has
-since expired (below). Everything above it in the diagram is still a real
-dependency./ This is the one thing spread across two plans and worth having in
-one place:
+*** 1. Q1 -- canonicalisation -- ANSWERED, and the CSV half shipped
+=native-inventory.org= § QUESTIONS item 1, filed 2026-08-20 and **the oldest
+open question in this body of work**.
 
-*Free-standing, not in the chain:* =spatial-index.org= milestone E --
-GeoParquet's covering bbox column, handed over from M3's GeoParquet spoke
-because it is a D4 rebuild-if-present index rather than a native. Ship it any
-time. *Not started.*
+***Decision 31 / =same-format-fidelity.org= D17: a reader may replace text with
+a parsed value only when its own writer renders that value back to the exact
+text read.*** Where it cannot, the text stands.
 
-#+begin_src text
-  M4  FieldDecl gains a declared type         [DONE]
-      defect 1 (fgb nulls)                    [DONE]
-      defect 2 (gpkg booleans)                [DONE]
-      defect 5 (type narrowed to IR's 4)      [DONE -- but it was a
-                                               class, not a list: three more
-                                               instances shipped after M4
-                                               closed it. See the recast
-                                               matrix.]
-            |
-  M1 inventory + fixtures  [DONE]
-            |
-  M2  Native channel in the IR + GeoJSON spoke        [DONE]
-      + D1 modelled: collection name                  [DONE]
-      + D1 modelled: column schema (shp + fgb)        [DONE]
-            |
-  M3  remaining single-collection spokes
-      FlatGeobuf                                  [DONE]
-      GeoParquet                                  [DONE]
-      GeoPackage                                  [DONE]
-      csv / wkt / kml / shp                       [not started]
-            |
-  container-reconciliation.org  [COMPLETE 2026-10-13 -- all six
-                                 requirements. The merge runs, a same-named
-                                 tile pyramid included, and M3b's gate is
-                                 clear. D10's reversal is spent here]
-            |
-  M3b GeoPackage container   M3c KMZ container
-            |
-  same-format-output.org M1: delete the format check   [DONE 2026-08-23 --
-            |                                           taken *out* of this
-  atomic write-and-rename                               order and shipped
-                                                        first; see below]
-#+end_src
+The question had been holding *three different problems as one*, which is why
+it sat: a *spelling* change (=1.50= → =1.5=), a lost *value identity* (=007= →
+=7=, where the text was the data) and *a different number* (past =i64=, through
+an =f64=). Only the first was ever the canonicalisation argument.
 
-*Why the deletion came last -- and why that reason has now expired.* Decided
-deliberately in 2026-08-20: M2's =Format::unmodelled_members= inventory is the
-same pass the natives need, so shipping the deletion first produces nine
-constants that are dead code the moment natives replace them. An earlier draft
-also argued the warning "could not be phrased honestly" -- *that argument was
-withdrawn* and should not be resurrected; a statement of current fact is
-perfectly sayable. The decision rested on the duplicated inventory pass alone.
+**What draws the line is who decides the type, not which format it is.** A CSV
+cell and a KML =ExtendedData= value are untyped text, so typing them is the
+reader's decision and D17 binds it. A JSON number and a WKT coordinate are
+numbers *by grammar*, so those spokes declare the loss instead.
 
-*That single argument is spent, as of 2026-08-22.* M1's inventory is complete,
-the natives mechanism exists, and four spokes carry natives. **Nobody would
-write those nine constants today** -- you would use the natives that exist and
-warn for the four spokes that do not, which is a smaller change than the one
-the decision was protecting against. The diagram above is therefore *no longer
-forced below M3*; it is drawn as it was decided, and the position of the
-deletion is now an open call rather than a settled one.
+*Built*: =csv.rs='s =refuses_typing= gate, rendering through =cell_text= so the
+reference is this spoke's own writer -- which makes its reader and writer a
+*fixed point* on cell text. **The verdict is per column**: one refused cell
+types the whole column as text, because =[007, 08001, 12345]= read per cell
+returns two strings and a *number*. Only a *refusal* gates a column; a plain
+=hello= beside a =7= has no typed reading to refuse and leaves its column
+alone.
 
-*** SHIPPED 2026-08-23, and the prediction in the paragraph above was wrong
-/The deletion landed first, ahead of M3b, on the composability reading of the
-call below./ The conclusion -- that the deletion was small and worth doing --
-held. **The sentence "warn for the four spokes that do not" did not.**
+*Measured on =hand_hostile.csv=*: =007=, =08001=, =12345678901234567890=,
+=1.50=, =22.250=, =TRUE=, =" spaced "=, =København= and ="Zürich, CH"= all
+survive byte-identical, plus =+7=, =1e2= and =1.0= -- three spellings nobody
+had enumerated, which is the argument for a rule over the named-exception list
+this nearly became.
 
-Once the check was gone, every format could be run against itself and measured
-rather than reasoned about. *Three of the four spokes that carry natives still
-lose something:* GeoJSON drops both =bbox= members and any foreign member on a
-*geometry*, GeoParquet drops the covering-bbox column and renames the primary
-geometry column, and FlatGeobuf narrows the source's declared geometry type
-from =Unknown (any)= to what is present. Add CSV, WKT and KML/KMZ and the
-warning covers *seven* of nine formats, not four. Shapefile is the only one
-that round-trips clean; =gpkg= belongs to =container_drop_warnings=.
+*Also corrected*: =Format::GeoJson='s loss list. A =geojson -> geojson= run
+reformats numbers exactly as =csv -> csv= did, and the table had named only
+=bbox= and geometry foreign members -- one loss, two stories, in a warning a
+user reads.
 
-So the per-format table survived, in =Format::same_format_losses=, with
-contents that are measured. **The natives channel made three spokes less lossy
-and none of them lossless**, which is the fact the prediction was missing --
-and it is a useful correction to carry into M3b, whose job is exactly the
-remaining half for GeoPackage.
+*Ruled and deliberately not fixed*: GeoParquet's parsed =JSON=-annotated column
+(={"a": 1}= re-serializes without the space). Gating =push_json_embedded= the
+way =infer_value= is gated looks like the same change and is not -- the parse
+is also what gives =DeclType::Json= its meaning, and =Format::recast='s pinned
+table is written against the parsed reading. It stays with the GeoParquet spoke.
 
-*What makes it worth actually reopening* is § THE EDIT LOOP below: per
-=edit-composability.org= § THE TRANSIT COROLLARY, an edit loop is lossless only
-when the transit format *is* the endpoint format -- so until the deletion
-lands, **no format has a lossless edit loop at all**, including FlatGeobuf,
-which has carried natives and a column schema since 2026-08-20 and still cannot
-be used as its own transit. The deletion converts work already shipped into a
-capability a user can reach.
+*** 2. D6's fixture registry -- BUILT, and it found defect 24 immediately
+Decided 2026-08-20, unbuilt until now. =tests/same_format.rs= holds
+=hostile_fixture(Format) -> Fixture= -- one arm per spoke, no catch-all -- plus
+=round_trip=, which is *also* catch-all-free because its three arms are the
+three on-disk shapes this crate has (one buffer, a container of layers, a set
+of sibling files) and a fourth cannot be assumed.
+=every_format_puts_back_what_its_reader_recovered= drives both.
 
-/The call is genuinely yours and turns on which goal is primary:/ if defect 3's
-data destruction is the priority, M3b still leads; if *composability* is, the
-deletion does, and M3b improves a path (=gpkg -> gpkg= in one invocation) that
-an edit loop does not even use.
+=Format::ALL= landed with it, its completeness compiler-enforced the same way
+rather than by counting. Both array literals D6 named are converted:
+=display_name_uses_each_format_s_own_spelling= and the loss-table test's
+neighbour.
 
-*** What 2026-08-23 did to the order, and it is not what the diagram says
-/The three decisions M3b was blocked on were taken this day (rows 24--26), and
-taking them turned up defect 6 -- the registry DDL this crate emits does not
-match the GeoPackage specification. That reorders the work, because conformance
-to the published spec is not one feature among others: it is the property that
-decides whether anyone can rely on the output at all. A file that reads fine in
-GDAL and fails a conformance check is a file a user is right to distrust./
+***An earlier draft compared two generations of output bytes and passed all
+nine formats immediately -- which was the tell.*** A writer that drops a member
+uniformly, or settles on a permutation, is **idempotent**: generation 2 agrees
+with generation 1 about the loss.
 
-*The dependency runs the other way from how it was drawn.* The diagram has M3b
-carrying container content, with index b-trees filed as a gap M3b might or might
-not need. In fact:
-
-#+begin_src text
-  index b-tree write  --+--> defect 6: spec-exact registry DDL   (constructed keys)
-                        |
-                        +--> M3b: carrying any table that is not
-                             INTEGER PRIMARY KEY shaped            (re-packed keys)
-#+end_src
-
-**One capability unblocks both**, and the *conformance* half is the one with a
-user-visible payoff that does not wait for the rest of M3b. It is also the
-smaller half: constructing the registry tables' autoindexes needs the type-class
-ordering and =memcmp= over keys this writer produced, with no =COLLATE= clause
-anywhere in the specified DDL -- not the general comparison-and-collation
-machinery that the "carrying is cheaper than building" note was warning about.
-
-*So the order to work in is:* index b-trees first (both halves of D10), then
-defect 6, then the carrying that M3b's classification work sits on. The three
-things queued on 2026-08-23 -- entry 14's fix, the missing fixtures, and index
-b-trees -- are all upstream of that and unchanged.
-
-** THE EDIT LOOP, AND WHAT IT REQUIRES OF EVERYTHING ELSE
-/Added 2026-08-22, from the question "a middle package should be able to modify
-the contents mid-flight -- reprojection, vector math, metadata rewrite; how
-does that affect us going forward?" It is the original ask
-(=edit-composability.org=), restated as a constraint on the fidelity work
-rather than as a consumer of it, and it changes three things./
-
-*** The frame is already settled -- =edit-composability.org= § THE TRANSIT COROLLARY
 #+begin_quote
-An edit loop is lossless end to end only when the transit format *is* the
-endpoint format.
+*Byte equality across a hop measures the writer against itself. IR equality
+measures it against the reader.*
 #+end_quote
 
-Everything below follows from it. Any other recipe is *two cross-format
-conversions* wearing a round trip's clothing, and each hop is independently
-entitled to drop what its target cannot hold.
+**Worth knowing before anyone "strengthens" this test into a byte comparison.**
+What it cannot see is a member dropped at *read* -- a KML =<Style>= never
+reaches the IR, so both sides agree about a file that already lost it. That
+half stays =Format::same_format_losses='s and the inventory's, which is why the
+registry records what each fixture carries.
 
-*** In-process and piped are opposite cases, and natives behave oppositely
-The "middle package" is two different things, and conflating them is the
-easiest mistake to make here.
+*** 3. Q3 -- Shapefile sidecars -- ANSWERED, and it was not about indexes
+=native-inventory.org= § QUESTIONS item 3 asked whether derived-capability
+index sidecars should be rebuilt. ***Decision 33: a Shapefile write writes the
+sidecars it can, deletes none, and warns about the rest.*** Policy lives at
+=plans/shapefile.org= § THE SIDECAR POLICY, which the warnings themselves cite.
 
-- *In-process* -- a Rust consumer holding a =FeatureCollection= (reprojection
-  via =for_each_position_mut=, vector math). **Natives survive**, because
-  nothing is serialized, and D7 made the modelled types nameable so this
-  consumer can read *and construct* declarations. This path works today;
-  =tests/reproject_pipe.rs= exercises it against a real third-party
-  reprojection crate.
-- *Piped* -- an external process. **Natives die at the transit boundary by
-  construction**; that is D5. A =GpkgNative= cannot cross a FlatGeobuf pipe.
+- ***=.cpg= is written, always, saying =UTF-8=*** -- the one member of the set
+  whose right answer this writer always knows, and under no-deletion the only
+  thing that stops a foreign one from relabelling our text. /Also closes
+  =native-inventory.org='s one-sided =.cpg= gap./
+- ***A surviving sidecar is warned about by name***, saying what it will be
+  read as. Twelve extensions covered.
+- ***=.qix=/=.sbn= are still not written.*** D4's "rebuilt when the source
+  carried one" is triggered **nowhere today**, GeoPackage included --
+  =main.rs= passes only =args.rtree= -- so extending an unimplemented rule to a
+  second spoke before the first would be backwards. It belongs on
+  =spatial-index.org= as one piece of work across both spokes.
 
-*M3b widens that gap rather than closing it*, which is worth knowing before
-starting it: afterwards =gpkg -> gpkg= in one invocation carries the whole
-container, while =gpkg -> fgb -> tool -> fgb -> gpkg= still carries only the
-layers. Not an argument against M3b -- an argument for why the deletion's
-position is now worth reopening (§ THE SEQUENCING).
+*Deletion was rejected on principle.* =ogr2ogr -overwrite= removes the entire
+prior file set /(measured)/; a conversion must not remove files nobody asked it
+to touch.
 
-*** M3b needs a third class, because D4's two are not enough
-D4 splits derived content two ways -- information *recomputed*, capability
-*rebuilt if present*. Editing forces a third distinction, because container
-content divides by *what it depends on*:
+*** 4. plans/encodings.org -- written, scoping only
+Crate-wide and deliberately not a Shapefile plan. Per-spoke, **half the spokes
+refuse non-UTF-8 input outright and half guess** -- opposite failure modes
+needing opposite fixes, and nobody chose the split. A Shapefile carrying
+Latin-1 text reads fine; *the same bytes* in a CSV are refused.
 
-| class | example | rule |
-|-------+---------+------|
-| *independent* | =side_notes=, a user's own table | carry unconditionally; survives any edit |
-| *layer-coupled* | =gpkg_metadata_reference= (keyed by =table_name=/=column_name=), triggers on feature tables, =gpkg_data_columns= | **validate against what is actually being written**, never replay blindly |
-| *derived* | R*Tree, =gpkg_ogr_contents=, =gpkg_contents='s bbox | recompute, *never* carry |
-
-The precedent for the middle row already exists and should be followed rather
-than reinvented: decision 14 replays =ARROW:schema= only while the column names
-still match, and decision 16 regenerates a member equal to what the writer
-would emit anyway.
-
-*** Invalidation has to be *computed at write*, not tracked
-The obvious design is a dirty flag -- mark the collection modified, drop the
-natives. **It cannot work, and the reason is structural rather than effort:**
-=Feature::properties= and =FeatureCollection::schema= are *public fields*,
-deliberately, because D7 needed a caller able to name and build them. A
-consumer mutates them directly. There is no method call to intercept and no
-setter to hook.
-
-So validity must be derived at write time, by comparing each native against
-what is actually being written. That is already what the crate does -- the
-format tag in =payload_for=, the column-name gate on =ARROW:schema=, decision
-16's "is this what the writer would emit anyway" -- but it has grown one member
-at a time. *M3b is where it should become one explicit contract*, because
-container content multiplies the number of members that need it.
-
-*** Reprojection is the case that invalidates the most
-Every bbox, every spatial index, and the CRS rows in
-=gpkg_contents=/=gpkg_geometry_columns=/=gpkg_spatial_ref_sys=. A carried
-R*Tree after a reprojection would be *wrong*, not stale -- **worse than
-absent**, because a reader trusts it. D4 already says an index is rebuilt
-rather than carried; editing is what makes that rule load-bearing instead of
-merely tidy.
+Correctness before capability: E1 warns when an unrecognised =.cpg= is
+approximated as Latin-1 (silent today), E3 refuses a multi-byte codepage rather
+than producing mojibake, then E2's single-byte tables and E4's =--encoding=.
 
 ** THE DECISIONS
-Each is recorded in full, with rejected alternatives, in the plan that owns it.
-One line each so you know what has already been settled.
-
-/This was "THE NINE DECISIONS" and stopped being nine on 2026-08-20. Rows
-10--15 are M4's and the GeoParquet spoke's; 16--22 are 2026-08-21's -- the
-GeoPackage spoke, the recast matrix, the value-model work and D7. Row 23 is
-2026-08-22's, from the edit-loop question. Rows 24--26 are 2026-08-23's and
-row 27 is 2026-08-25's -- the first decision in this table taken because a
-*measurement* of shipped behaviour contradicted a document, rather than to
-unblock work. The section is an index of what is
-settled, so it grows rather than freezing at the count it happened to start
-with. /Row 23 is the only one whose "where" is not a plan file -- it was forced
-by a property of the public API rather than argued in a design document, and it
-should move to =edit-composability.org= when that plan is next opened./
+Three this session, continuing the numbering of the table in
+=9768a87:geosetta/handoff.org= § THE DECISIONS, which holds rows 1--30.
 
 | # | decision | where |
 |---+----------+-------|
-| 1 | Natives channel lands *before* the format-check deletion -- *REOPENED 2026-08-22*, its one supporting argument is spent | =same-format-fidelity.org= § SEQUENCING; § THE SEQUENCING here |
-| 2a | The invariant binds *the whole container*, not just the layer | § THE DOMAIN OF THE RULE |
-| 2b | It covers *any file the crate reads without rejecting* | § THE DOMAIN OF THE RULE |
-| 3 | CRS dialect is information; the GeoParquet hop owes a warning | =lossy-conversion-warnings.org= § OWED WARNING |
-| 4 | Derived splits by risk: information *recomputed*, capability *rebuilt if present* | =same-format-fidelity.org= D4 |
-| 5 | New-spoke obligation enforced by a catch-all-free fixture =match= | D6 |
-| 6 | Warning-scope question consolidated and *blocked on M1* | =lossy-conversion-warnings.org= § OPEN QUESTION |
-| 7 | In-place: fix identity loss first, atomic writes second; gpkg append stays | =edit-composability.org= D4 |
-| 8/9 | =--print-crs= one-pass and multi-layer piping both *closed* | =edit-composability.org= § OPEN QUESTIONS |
-| 10 | =FieldDecl= gains a *declared type*, in each spoke's vocabulary rather than the hub's four | =same-format-fidelity.org= D1 / M4 |
-| 11 | Precedence: the declaration wins where the data is *silent*, the data wins where it *contradicts* | § THE DEFECTS, defect 2; =FieldDecl::type_for= |
-| 12 | A FlatGeobuf omitted cell reads back as *null* -- the unset-vs-null "fork" was measured away | § THE DEFECTS, defect 1 |
-| 13 | =created_by= is *not* a native: it names the writer, and geosetta is the writer | § MILESTONES, M3 GeoParquet |
-| 14 | An opaque member can also be *derived*: =ARROW:schema= is replayed only while the columns match | § MILESTONES, M3 GeoParquet |
-| 15 | GeoParquet's =covering= is an *index*, not a native -- rebuilt if present, and handed over | =spatial-index.org= milestone E |
-| 16 | A member equal to *what the writer would emit anyway* is derived, not opaque -- so a =gpkg= =identifier= that repeats the table name is regenerated, not carried | =same-format-fidelity.org= § MILESTONES, M3 GeoPackage |
-| 17 | =FgbNative='s "absent and empty are different" rule *does not generalize*: it holds only where the writer omits an absent field | § MILESTONES, M3 GeoPackage |
-| 18 | =gpkg_data_columns= is *layer* content in a container-scoped table, so it travels with M3, not M3b | § MILESTONES, M3 GeoPackage |
-| 19 | A member equal to what the writer emits anyway is *derived*; =String= admits nothing, so a type becoming text always warns | =same-format-fidelity.org= § Defect 5 was a class |
-| 20 | The IR gets a *byte-level value*: a declaration whose values are destroyed is a promise the value side cannot keep | § The blob the schema check could not see |
-| 21 | =JsonValue= and =DeclType= are *exported*, =#[non_exhaustive]= -- a modelled field a caller cannot name is a native with extra steps | D7 |
-| 22 | Numbers are =Int(i64)= / =Float(f64)=, not an =f64= plus a flag; a whole float keeps its =.0=, as =ogr2ogr= writes it | § The number model |
-| 23 | Native validity is *computed at write* by comparing against what is being written, never *tracked* by a dirty flag -- =Feature::properties= and =FeatureCollection::schema= are public fields, so a consumer's mutation cannot be intercepted | =handoff.org= § THE EDIT LOOP; migrate to =edit-composability.org= when that plan is next edited |
-| 24 | A tile pyramid is *carried*, and no file is rejected for holding one -- the refusal had been drawn at the reader, where nothing is lost | =same-format-fidelity.org= D8; § The collision |
-| 25 | =run_geopackage_write= keeps *rewriting*, and the question is closed -- in-place would make preservation the default, which is backwards for editing | =same-format-fidelity.org= D9 |
-| 26 | An index's fate follows the *content class of the table it indexes*, not a cost comparison -- so the R*Tree is always rebuilt, a verbatim-carried table's index is carried, and index b-trees turn out to be *mandatory* rather than optional | =same-format-fidelity.org= D10 |
-| 27 | The GeoPackage **feature id is carried**, on a *feature-level* native -- Requirement 29's note makes it the target of =gpkg_metadata_reference='s row links, so renumbering breaks a reference the standard defines. D16 contains the cost: a dense =1..n= is what the writer emits anyway, so it is derived and the common case pays nothing | =same-format-fidelity.org= § MILESTONES, M3 GeoPackage; =native-inventory.org= § A second discard |
-| 28 | The metadata pair's **DDL is constructed, its rows are carried** -- Requirement 93 makes the definition normative, so a source's own spelling is not this crate's to reproduce, and the constructed =crmr_mfi_fk= gives =foreign_key_check= a dangling reference to catch that five of the eight metadata-bearing fixtures could not | =same-format-fidelity.org= § MILESTONES, The metadata pair, D11 |
-| 29 | A dropped reference **never cascades into the =gpkg_metadata= row it named** -- an unreferenced record is conformant (=spec_conformant.gpkg= is the proof), both foreign keys run reference → metadata, and =md_parent_id= would make collection a graph walk | =same-format-fidelity.org= D12 |
-| 30 | Content carried in *part* is **reported**, which the container survey's carried-or-destroyed vocabulary could not say -- a dropped reference has no remedy and does lose information, which is the combination =gpkg_ogr_contents= (silent, derived) and the R*Tree (a message, because =--rtree= is a remedy) do not cover | =same-format-fidelity.org= D13 |
+| 31 | **An inference must be reversible**: a reader may type text only when its own writer renders the value back to the exact text read. So canonicalisation is a loss *exactly where the reader had a choice* -- a CSV cell is untyped text and is now gated, a JSON number and a WKT coordinate are numbers by grammar and declare the loss instead. The verdict is per *column*: one refused cell types its column as text, because a ZIP column read per cell returns =12345= as a number beside =007= as a string | =same-format-fidelity.org= D17; =native-inventory.org= § QUESTIONS item 1, § CSV → FIXED |
+| 32 | **FlatGeobuf's index is packed over input order**; Hilbert locality is the *caller's* request via =--sort-hilbert=, not the writer's imposition. The sort is no requirement of a packed R-tree -- it buys locality, not correctness -- and imposing it permuted content on a same-format run while making that flag dead for the one format where it was mandatory | =spatial-index.org= milestone B's amendment; § BUGS FOUND entry 24 |
+| 33 | **A Shapefile write writes the sidecars it can, deletes none, and warns about the rest.** The output basename is a namespace a dozen files can share; =.cpg= is now always written (=UTF-8=, which is always what the =.dbf= holds) because that is the one answer the writer always knows, while a =.prj= with no CRS to state and the index sidecars are *reported*. Deleting them -- =ogr2ogr -overwrite='s answer -- was rejected: a conversion must not remove files nobody asked it to touch | =shapefile.org= § THE SIDECAR POLICY; =native-inventory.org= § QUESTIONS item 3; § BUGS FOUND entry 25 |
 
-*Three later rulings extended D1*, all worth knowing before you design
-anything, and *all three now implemented*. The third is =FieldDecl='s
-*declared type* (M4) -- what lets an all-null FlatGeobuf column keep its type,
-a GeoPackage =BOOLEAN= survive its reader, and a =DateTime= stop returning as
-=String= (defect 5). Its vocabulary was the open question M4 opened by
-settling: the IR's own four column types are measurably too narrow, so
-=crate::DeclType= names sixteen, every one drawn from some spoke's own on-disk
-vocabulary rather than invented for symmetry. The first two: collection =name=
-and the *column schema* (=width=/=precision=/=scale=/
-=nullable=/=unique=/=primary_key=) are **modelled in the IR**, not carried as
-opaque natives. The reason is D5 -- a native does not cross a pipe, so only a
-modelled field lets an external tool widen a declaration mid-flight alongside
-the value that outgrew it. *Both are implemented*; the schema half lives in
-=crate::FieldDecl= and =FeatureCollection::schema=.
-
-** WHAT IS BUILT
-- ***A =WITHOUT ROWID= table*** (/2026-08-26/) -- =kv= survives a
-  =gpkg -> gpkg= run, and **no new writer capability was needed to do it**.
-  Such a table is stored as an *index b-tree* keyed by the declared primary
-  key, and =write_database= has built index b-trees from
-  =MasterEntry::records= since D10's work landed on 2026-08-23 -- with **no
-  test on the entry's kind**, so handing it =kind: "table"= writes a valid
-  file. =UserTable.rows= became =UserTable.storage=, an enum of =Rows= and
-  =Records=, because the two shapes need different writers and getting it wrong
-  writes a malformed database rather than failing.
-
-  ***The estimate this crate carried about itself was wrong, in three
-  documents.*** All of them said the writer "has never emitted one" and called
-  it real file-format work; that half was never tested, only inferred from the
-  absence of code saying =WITHOUT ROWID=. /Second time in two days that a
-  blocker turned out to be a **reason** falsified by other work recorded in the
-  same plan -- the =attributes= dataset was the first. A reason reads like a
-  measurement and is not one./
-
-  *Bounded where the writer really is limited*: a =WITHOUT ROWID= table owning
-  a =sqlite_autoindex_*= is skipped and still reported, because
-  =MasterEntry::sql= cannot be NULL and =TableSpec::autoindexes= would renumber
-  it. Only an additional =UNIQUE= creates one -- measured; a single-column and a
-  composite primary key each own no separate b-tree.
-- ***An =attributes= dataset*** (/2026-08-25/, D14) -- an aspatial table
-  carried **with the =gpkg_contents= row Requirement 118 obliges**, which is
-  what makes it a dataset rather than a table nothing enumerates.
-  =carry::Registration= holds the row; its =srs_id= goes through the same
-  =reconcile_carried_srs= a pyramid's does (Requirement 16), and its
-  =identifier= is modelled =Option<String>= because two NULLs do not collide
-  under a SQL =UNIQUE= and two empty strings do. /The exclusion that had
-  blocked this gave as its reason that the registry row could not come along.
-  That was true on 2026-08-23 and **false on 2026-08-24**, when the pyramid
-  started carrying its own -- drift in a *reason*, which is what a reader
-  consults instead of looking./
-
-  ***It also turned up a file shape both structural oracles are blind to.***
-  =ogr2ogr= attaches two =gpkg_ogr_contents= maintenance triggers to every
-  table it registers, and this writer never emits that table. Carried verbatim
-  they produce a file that reads perfectly, answers =ok= to =integrity_check=,
-  says nothing to =foreign_key_check=, and **fails every =INSERT=** with
-  =no such table: main.gpkg_ogr_contents=. /Note the shape against entry 21:
-  that was a file that worked and was wrong about what it is; this is a file
-  that is right about what it is and does not work. Neither pragma asks a
-  question about behaviour./ =carry::triggers_of= drops them, and
-  =tests/gpkg_oracles.rs= gained a **third oracle** that catches the class
-  without knowing the rule: every table in every fixture's output must still
-  compile an =INSERT= against it, checked with =EXPLAIN= so it mutates nothing.
-- ***The =gpkg_metadata= pair*** (/2026-08-25/, decisions 28--30) -- the last
-  *layer-coupled* member of defect 3, and the first content carried as **rows
-  into constructed DDL**: the documents are a producer's and opaque, the table
-  definition is the standard's (Requirement 93). Each
-  =gpkg_metadata_reference= is *validated against what the write actually
-  produces* -- Requirement 97 against the output's =gpkg_contents=, 98 against
-  the written columns, 99 against the written feature ids -- and one that does
-  not survive is dropped while the document it named is **kept**. /The
-  authority is =gpkg_contents=, not the layer set, which is why a reference to
-  a carried tile pyramid survives; the plan's first draft had it narrower than
-  the standard and would have destroyed one./
-- ***The two extensions this crate implements now register themselves***
-  (/2026-08-25/) -- =gpkg_extensions= rows per Requirements 140 and 141. The
-  Schema half was a **shipped conformance defect** dating to 2026-08-21, not
-  new work: § BUGS FOUND entry 21. /Requirement 59 makes registration
-  constitutive -- an unregistered file declares itself a plain GeoPackage --
-  so the output had been asserting the wrong thing about itself while passing
-  every oracle in this tree./
-- ***The feature id*** (/2026-08-25/, decision 27) -- a =gpkg -> gpkg= run
-  preserves each feature's =INTEGER PRIMARY KEY= instead of renumbering it,
-  carried on =NativePayload::GpkgFeature= and *only* where it differs from the
-  dense =1..n= the writer emits anyway. Validated at write rather than replayed:
-  ids that no longer strictly ascend are discarded and the layer is renumbered,
-  because a duplicate is a malformed database. The R*Tree is built against the
-  same ids. /Byte-invisible to all eleven pre-existing =.gpkg= fixtures, which
-  is D16's containment measured rather than claimed./
-- ***A user's own tables*** (/2026-08-25/) -- =side_notes=, =events=,
-  =registry=, =tags=, =people= and their kind survive a =gpkg -> gpkg= run
-  with their DDL verbatim, their rows, **their rowids**, their triggers and
-  their indexes. The plainest member of the independent class, and the one
-  M3b's survey predicted would need no new file-format work -- correctly.
-  /Its indexes are re-packed from the source rather than rebuilt, which is why
-  a =UNIQUE ... COLLATE NOCASE= key survives a crate that implements no
-  collation: an index read in index order is already sorted./
-- ***The container carrying channel*** (M3b's first half, /2026-08-24/) --
-  =geopackage/carry.rs=. Independent container content is read out of a source
-  =.gpkg= and re-emitted, which is the first part of *defect 3's fix* rather
-  than another warning about it. Today it reaches the **tile pyramid**: the
-  tile table verbatim with its rows, its autoindex, its =sqlite_sequence= mark
-  and its six triggers, plus =gpkg_tile_matrix= whole and
-  =gpkg_tile_matrix_set=. /Measured on =gdal_tiles.gpkg=: 80 tiles
-  blob-for-blob, =gdalinfo -checksum= identical through the output, a second
-  pass byte-identical to the first, and =integrity_check= + =foreign_key_check=
-  clean./ **Nothing in it decodes a tile** -- D8's argument that carrying a
-  pyramid needs no raster-specific code, held.
-  - *With it, M3b requirement 1* -- =srs_id= reconciliation.
-    =writer::reconcile_carried_srs= maps a carried reference into the numbering
-    =resolve_srs= has just rebuilt: /reuse/, /renumber/ on a collision with a
-    different CRS, or /register/. It could not ship separately, which is the
-    thing worth knowing: until something carried an =srs_id= there was nothing
-    to dangle.
-  - *And the two tile registry tables' DDL*, transcribed from Annex C at the
-    pinned commit and checked by =the_registry_ddl_is_what_the_standard_says=,
-    which now compares **eight** tables rather than six. =spec_conformant.gpkg=
-    grew the two tables so it could. /GDAL emits both identically -- the one
-    place so far where reading the standard confirmed the producer instead of
-    correcting it./
-- *The inventory*, all nine spokes, every entry marked /measured/ or /code/.
-- *The natives mechanism and four spokes* -- GeoJSON (=id=, foreign members
-  at three levels), FlatGeobuf (header/=Crs=/per-column descriptive members
-  plus the header name), GeoParquet (every =key_value_metadata= entry
-  beside =geo=, plus =geo.orientation=) and GeoPackage (the layer's
-  =gpkg_contents= title/description and its =gpkg_data_columns= rows plus the
-  constraints they name). See § STATUS in the fidelity plan.
-- *The modelled column schema*, end to end for three spokes: a =.dbf= field's
-  declared width survives =shp -> fgb -> shp= intact, and a middle stage can
-  widen it. Losing a declaration to a target that does not carry one now warns.
-- *Declared column types* (M4) -- =crate::DeclType= on =FieldDecl=, carried by
-  *all four* declaring spokes: FlatGeobuf, GeoPackage, Shapefile and
-  GeoParquet. An =Int16= stays an =Int16=, a =DateTime= stops becoming text, a
-  GeoPackage =BOOLEAN= comes back a boolean, and an all-null column keeps both
-  its existence and its type. GeoParquet needed no =ARROW:schema=: its own
-  =converted_type= annotations carry every width and both temporal types.
-- *Nine hostile fixtures* in =tests/fixtures/= (=gdal_hostile.*= produced by
-  =ogr2ogr=, =hand_hostile.*= authored), each confirmed *readable by geosetta*
-  before being committed. They fail the invariant by design -- they are the
-  target, not a regression suite.
-
-  *Two more joined them on 2026-08-21 and neither is hostile*, which is why
-  =HOSTILE.org= now says so per entry: =gdal_types.gpkg= is a *specimen sheet*
-  (one column per GeoPackage declared type, for the GDAL cross-check), and
-  =hand_mixed_number.geojson= documents a single open case rather than testing
-  anything. =gdal_hostile.gpkg= also *grew* -- the GeoPackage spoke needed
-  layer-level members it did not carry.
-
-*Everything below landed on 2026-08-21, after M3's GeoPackage spoke, and none
-of it was planned work* -- each item was found by measuring the one above it:
-- *Defect 3's warning* -- =geopackage/container.rs= surveys the container a
-  =gpkg= write is about to rewrite and reports what will not survive. The
-  destruction is still M3b's to fix; the silence is not. /Since 2026-08-24 the
-  survey subtracts what =carry.rs= reproduces, so the warning names the tile
-  pyramid no longer -- and its trigger count fell from 18 schema objects to 12
-  on =gdal_tiles.gpkg=, because the six a carried table owns are carried with
-  it./
-
-  ***Three corrections on 2026-08-25, and two of them were the warning being
-  wrong rather than the write.*** It counted =gpkg_extensions= rows that are
-  now reproduced; it reported =gpkg_tile_matrix= / =_set= as destroyed when
-  they were **empty**, which is furniture on every ordinary file /(and a test
-  was pinning that, asserting =contains("2 empty tables")= with a comment
-  naming them)/; and the new metadata warning reasoned from the *caller's*
-  layer set rather than the output's, so an append claimed losses the same run
-  did not incur. /The last was caught in review before it left the working
-  tree. All three share a shape: **the report and the write derived their
-  answers separately.**/ =gdal_tiles.gpkg= now round-trips saying nothing at
-  all, and eleven of the thirteen =.gpkg= fixtures do /(recounted
-  2026-10-13)/.
-- *The recast matrix* -- =DeclType::admits= (the widening relation),
-  =Format::recast= (what each format does to each type),
-  =decl_recast_warning=, =DeclType::ALL=, two sweeps, four *inbound* tables
-  asserting what each on-disk spelling means, and =tests/gdal_types.rs= for a
-  second opinion. It closed defect 5's *class* after M4 had closed its
-  instances.
-- *A byte-level value type* -- =JsonValue::Binary=. A =gpkg= run had been
-  destroying every blob it read while the =BLOB= declaration survived.
-- *An exact integer model* -- =JsonValue::Int= / =Float=, after a same-format
-  run was found turning =9007199254740993= into =...992=.
-- *D7, the public API* -- =JsonValue= and =DeclType= exported
-  =#[non_exhaustive]=, so the caller D1 and D5 argue for can finally *name* the
-  types those decisions are about. =tests/public_api.rs= runs the argument.
-
-** WHAT IS NOT BUILT
-- The remaining spokes' *natives* (M3 -- CSV, WKT, KML, Shapefile) and both
-  containers (M3c =kmz=, and *the rest of* M3b). /M3b is no longer wholly
-  unbuilt: its carrying channel and requirement 1 shipped 2026-08-24, and the
-  independent class was **finished** on 2026-08-25 with a user's own tables.
-  The *layer-coupled* class closed the same day -- the =gpkg_metadata= pair
-  and the =gpkg_extensions= registrations for both extensions this crate
-  implements. What is left of M3b is =container-reconciliation.org=, for a
-  destination that already has a container./
-
-  ***The metadata pair is BUILT, 2026-08-25***, which closes the last of
-  defect 3's classes on the one-container path -- written up in
-  =same-format-fidelity.org= § MILESTONES, /The metadata pair/, with three
-  decisions filed and all three taken (D11 construct the DDL rather than carry
-  it, D12 drop the reference and never the metadata record, D13 report a
-  partial carry; decisions 28--30 in the table above).
-  Requirement 95 makes =gpkg_metadata= and =gpkg_metadata_reference= a pair:
-  a GeoPackage containing the first SHALL contain the second, so neither can
-  be carried alone. Requirement 99 makes a =row=-scoped reference point at a
-  *rowid* -- which **decision 27 stopped renumbering**, so the blocker this
-  paragraph recorded is gone. /Requirement 97
-  is the easy half and needs no decision: a reference whose =table_name= names
-  something the write does not produce must be dropped, which is the
-  layer-coupled class's "validate against what is written" rule arriving as a
-  conformance obligation rather than a design choice./
-
-  ***Three things the work found that were not in anyone's plan, and each was
-  fixed.*** First, **the corpus could not test this at all**: measured
-  2026-08-25, every =gpkg_metadata_reference= row in the tree was =table=-scoped
-  with a NULL =row_id_value=, so not one =row=, =column= or =row/col= reference
-  existed to exercise -- the same structural blindness that hid entry 19.
-  =sqlite_fid_gap.gpkg= now carries all three scopes. Second, **decision 27 did
-  not fully close the =row_id_value= hazard**: =writer::feature_ids= still
-  reissues ids for a whole layer when the carried sequence does not strictly
-  ascend, which a consumer triggers by deleting from the middle, and that is a
-  renumbering with live row-scoped references pointing into it. /That is the
-  guard =container-reconciliation.org= D5 says belongs wherever a rowid
-  changes, and it is now built and tested rather than only stated./ Third,
-  **Requirement 97's authority is =gpkg_contents=, not the layer set** -- read
-  at the pin, after the plan's first draft cited it from memory. Carried tile
-  pyramids are registered there, so =gdal_tiles.gpkg='s reference to =imagery=
-  is valid and must survive; the first draft's rule would have destroyed it
-  from a file that still contains =imagery=. *Column declarations are done everywhere they can be*: all four
-  declaring spokes carry one as of M4, so =Format::carries_column_schema= has
-  stopped shrinking and the four remaining =false= answers (GeoJSON, CSV, WKT,
-  KML) are permanent -- those formats have no slot.
-- *GeoParquet's =covering= bbox column*, the one member the GeoParquet spoke
-  left unhandled -- a file with a spatial index goes in and one without comes
-  out, silently. Now owned by =plans/spatial-index.org= *milestone E*, which
-  already owns the same D4 "rebuild it when the source had one" pattern for
-  FlatGeobuf's and GeoPackage's indexes. Blocked on the writer's flat schema:
-  it has never emitted a nested struct column.
-- *Defect 3* -- and now **mostly fixed** rather than wholly open: a tile
-  pyramid survives a =gpkg -> gpkg= write as of 2026-08-24, and a user's own
-  tables, the =gpkg_metadata= pair, the =gpkg_extensions= registrations for
-  both of this crate's extensions and an =attributes= dataset as of 2026-08-25.
-  =kv=, a =WITHOUT ROWID= table, followed on 2026-08-26.
-  ***=gdal_tiles.gpkg= now round-trips with the drop warning saying nothing at
-  all***, the first fixture with a non-trivial container to do so, and
-  =sqlite_contents.gpkg= -- which holds every class this crate models at once
-  -- followed. /What is left across the whole corpus: =gpkg_crs_wkt_1_1= alone
-  (a **column** on =gpkg_spatial_ref_sys=, so a capability rather than a
-  carry). *The "2 empty tables" report was **false** and is
-  fixed*: an empty =gpkg_tile_matrix= / =_set= is not destroyed content, since
-  this writer builds both on demand -- but only when **empty**, because a
-  populated pair whose pyramid is not carried is a real loss and the append
-  path depends on it still being named./ ***Eleven of the thirteen =.gpkg=
-  fixtures now round-trip with the drop warning silent*** -- /counted, not
-  estimated: the one that still speaks is =gpkg_crs_wkt_1_1=, and the
-  thirteenth, =sqlite_nullkey.gpkg=, is refused by design. Recounted
-  2026-10-13./ Note that
-  section's numbering is *not* the plan's defect numbering; see its own note.
-- The exhaustive-match fixture registry (D6).
-- The format-check deletion. *Drawn last in the diagram, no longer forced
-  there*: its only gating argument (the duplicated inventory pass) is spent as
-  of 2026-08-22, and § THE EDIT LOOP argues it is the prerequisite for any
-  lossless edit loop -- until it lands, *no format has one*, not even
-  FlatGeobuf. Position is an open call; see § THE SEQUENCING.
-- *One open call, deliberately not decided*: a column mixing an integer past
-  2^53 with a fractional value infers =Double= and the integer loses its low
-  bits. The loss is *inherent* -- inference has decided the column is
-  fractional, and GDAL's =OFTReal= does the same -- so what is missing is a
-  warning, not exactness. Whether it earns one against the noise bar is argued
-  both ways in =lossy-conversion-warnings.org= § AN OPEN CALL. Fixture and an
-  =#[ignore]=d test that *passes* and exists to be rewritten:
-  =hand_mixed_number.geojson= and
-  =convert.rs='s =a_mixed_number_column_loses_precision_above_2_53=.
-
-/Warning work is no longer on this list./ It said "and any warning work" until
-2026-08-21, when two shipped: defect 3's container warning and
-=decl_recast_warning=.
-
-*Two =sqlite.rs= gaps remain of the four found while scoping M3b on
-2026-08-22*, both recorded in =plans/same-format-fidelity.org= § MILESTONES,
-M3b. Neither is a silent data loss today; each is work M3b needs: *page size*
-(read faithfully, written as a hardcoded 4096) and *reserved per-page space*
-(read as =usable_size=, written as zero).
-
-/=sqlite_sequence= was the third and closed on 2026-08-23, ahead of the
-carrying that needs it, because "reasoned, not measured" had understated it:
-the cost is not a reused id but a **malformed database**, and one that passes
-=integrity_check= while failing every =INSERT=. Every ritual in this tree would
-have called it green./ A fifth is out of scope by construction:
-*WAL* is invisible to a reader that takes bytes rather than a path, so an
-un-checkpointed GeoPackage reads as its last checkpoint, silently.
-
-***The first gap -- index b-trees -- closed on 2026-08-23.*** Both directions:
-=Database::read_index= walks =0x0a=/=0x02= in index order, and the writer packs
-records into fresh index pages, with =MasterEntry='s =rootpage= now a per-entry
-choice exactly as the plan predicted it would have to be. *Scoped by D10 to
-re-packing and one bounded construction case*, so it carries no collation
-logic. Three things came with it that were not the point of it: defect 6's fix,
-a =WITHOUT ROWID= table now reporting a real row count instead of
-=(rows not counted)=, and the reason the fourth =sqlite.rs= gap was never
-merely M3b's.
-
-/A **fourth**, and nobody noticed it for three days: this also made the writer
-able to emit a =WITHOUT ROWID= table, because such a table **is** an index
-b-tree and =write_database='s rootpage assignment never asks what kind of
-=MasterEntry= it is holding. Three documents went on describing that as
-unbuilt file-format work until it was measured on 2026-08-26. **Work that
-closes something it was not aimed at does not announce itself**, which is the
-transferable half./
+/Also taken, and recorded in its own plan rather than here: **the =.dbf=
+language-driver byte is never trusted** (=encodings.org= D-E2), on the
+measurement that =ogr2ogr= declares LDID =0x57= -- Windows-1252 -- while
+writing UTF-8 bytes. Honouring it would mis-decode the reference
+implementation's own default output./
 
 ** BUGS FOUND
-/This heading has been renamed four times and the count in it is the reason --
-"LIVE BUGS FOUND, NOT FIXED", then "ONE STILL LIVE", "TWO STILL LIVE", and now
-this. **Read the entries, not the heading.** The open ones are marked *LIVE* in
-their own text, which is the only place that cannot drift./
-
-**Open at the end of 2026-08-23:** entry 3 (defect 3, the GeoPackage
-container) and entry 13 (=gpkg_ogr_contents= misclassified). /Entry 3 became
-*partly fixed* on 2026-08-24 and **mostly fixed** on 2026-08-25: a tile
-pyramid, a user's own tables, the =gpkg_metadata= pair and both extensions'
-registrations are all carried. It stays LIVE, because the entry is about the
-container rather than any one member of it -- three things the crate cannot
-*model* are still lost, and the merge path reconciles nothing. See the entry
-for which is which. **Entry 13 is
-fixed** the same day -- and it turned out to be the smaller half of its own
-class; see the doc-change entry on the ten triggers./ Entry 15 is not a
-bug in shipped behaviour but a constraint on M3b, and its missing capability
-shipped. Entry 16 (*defect 6*) was found and fixed the same day, once the
-index-writing work it was gated on existed. The fixed entries stay because each
-records how it was measured and what the fix turned on.
-
-**Found and fixed 2026-08-25:** entries 19 (feature ids renumbered silently),
-20 (a carried tile table written as a malformed database) and 21 (an
-extension's tables written without registering the extension, live since
-2026-08-21). /19 and 21 were both found by *reading what a document or a
-warning still said* rather than by any test failing -- 19 from a decision's
-stated scope, 21 from the two rows the drop warning had left over./ /19 is the
-second entry in this list found by pulling on a =gpkg_metadata_reference=
-question rather than by testing anything, after =last_change=; 20 came from
-running an oracle over every fixture instead of one./
-
-/Four more were found on 2026-08-21 and all four are fixed. Three on
-2026-08-22, two fixed and one open. Three on 2026-08-23, one fixed and two
-open. One on 2026-08-25, live. Each group is in its own subsection at the end,
-because in each case what *found* them is the useful part./
-
-*Note the two countings, since they have collided before.* "Defect /n/" is
-=same-format-fidelity.org= § THE DEFECTS and is canonical; the numbered
-entries here are reading order. By the *defect* counting there are *two* left
-(3 and 6) -- entries 13 and 15 are neither of them. /That section stopped
-naming a total on 2026-08-23, when a sixth defect arrived; a heading that
-states a count is a heading that expires, and this one had already been
-renamed once./
-
-Ordered by how likely they were to bite a real user.
-
-*The list positions below are reading order, not defect numbers.* The canonical
-numbering is =same-format-fidelity.org= § THE DEFECTS, and each entry names
-its own identity in bold; entries with no such name are not one of the five at
-all. This is worth stating because an earlier draft numbered these entries
-1--5 and then referred to them as though they *were* the plan's numbers, which
-made § THE SEQUENCING above -- where "defects 1--2" correctly means the
-FlatGeobuf null cell and the GeoPackage boolean -- read as a contradiction of
-this section. It never was one; the two lists were simply counting different
-things. /Reconciled 2026-08-20./
-
-1. ~~*A GeoPackage edit loop silently duplicates layers.*~~ *FIXED
-   2026-08-20.* Not one of the five -- it belongs to =edit-composability.org=
-   D4, which calls it *live bug 1*. The second cause was the one left: the
-   GeoPackage reader did not set =fc.name= from the table name, so the FGB on
-   the wire had no name to carry and the write-back landed in a new table
-   called =layer=. One line in =geopackage/reader.rs='s =read_layers=, because
-   =write_layers= already *replaces* a same-named layer rather than appending
-   rows. /Verified on the original reproduction, both the pure-FGB and
-   FGB-via-GeoJSON forms:/ one =bug1= table, and a middle stage that deletes a
-   feature now has its deletion stick -- which was the real damage, since a
-   delete silently became a no-op. Pinned by
-   =an_edit_loop_that_deletes_a_feature_does_not_duplicate_the_layer=, which
-   asserts on the surviving rows rather than the table name.
-2. ~~*Shapefile narrows the schema.*~~ Also not one of the five -- it is the
-   inventory's own finding, M1 § 3. *FIXED 2026-08-20* by D1's column
-   schema. An 80-character =.dbf= field used to return sized to today's longest
-   value; it now returns 80. Verified through a FlatGeobuf transit, which is
-   the only route that carries it -- =shp -> geojson -> shp= and
-   =shp -> gpkg -> shp= still narrow, and now warn.
-3. *A =gpkg= → =gpkg= run destroys the container* around the layers: user
-   tables, =gpkg_metadata=, =gpkg_extensions=, every R*Tree. This is
-   *defect 3*, and after M4 it is *the only defect left* -- the destruction
-   travels with the GeoPackage container (M3b).
-
-   ***Still LIVE, and every member the list above names now survives.*** A
-   tile pyramid as of 2026-08-24; **user tables**, the =gpkg_metadata= pair
-   and both extensions' =gpkg_extensions= registrations as of 2026-08-25,
-   which closes the *independent* and *layer-coupled* classes alike. The
-   R*Tree is *derived* and was never part of this entry's loss.
-
-   *So why it stays LIVE, stated so nobody has to re-derive it.* **This entry
-   is about the container, not about a list of members**, and two things keep
-   it open. The corpus still loses one thing this crate cannot model -- the
-   CRS-WKT extension's *column* -- and that is not carrying work. ~~And on the
-   **merge** path nothing is reconciled at all: a destination's own container
-   is still destroyed wholesale, which is =container-reconciliation.org=
-   §§ 3--5 and unbuilt.~~ **That half closed 2026-10-13**: the plan is
-   complete, and a destination's container is merged rather than destroyed --
-   a same-named tile pyramid included. /Eleven of the thirteen =.gpkg= fixtures
-   round-trip with the warning silent; that is the honest measure of how far it
-   has come./
-
-   *No longer silent, as of 2026-08-21.* "Exit 0, no warning" was the original
-   finding; the exit code is unchanged (§ THE RULE is loud, not blocking) but
-   =geopackage/container.rs= now surveys the container being rewritten and
-   reports what will not survive -- destroyed content in one message, and an
-   R*Tree that will not be rebuilt in a second, since that one is *derived* and
-   =--rtree= fixes it. Silent on any GeoPackage this crate wrote itself. The
-   two things worth knowing before touching it: =REPRODUCED= is a statement
-   about what =writer::build= emits and has to move when the writer does, and
-   an R*Tree's =gpkg_extensions= rows are counted as part of the index rather
-   than as a loss of their own. Both are written up in
-   =same-format-fidelity.org= § THE DEFECTS, defect 3.
-4. ~~*FlatGeobuf drops null cells*~~ -- *defect 1*, *FIXED 2026-08-20 (M4)*.
-   It was *two* losses, not one, and the second was nearly missed: fixing the
-   cell is necessary and not sufficient, because an all-null column then
-   returns as =String= -- =infer_columns= has no values to infer from, and
-   =FieldDecl= carried no *type*. Both halves landed together.
-
-   *The unset-vs-null worry recorded here on 2026-08-20 was wrong and has been
-   retracted.* It read =ogrinfo='s display convention as GDAL's data model.
-   =ogr2ogr= itself writes an explicit =null= for every declared column in
-   every feature on GeoJSON output, and -- decisively -- *GeoParquet,
-   GeoPackage and CSV already do exactly that in this crate today*, with
-   Shapefile rectangular too. FlatGeobuf is the lone outlier, being the only
-   format rectangular in its header and sparse in its rows. There is no fork
-   to settle. See =same-format-fidelity.org= § THE DEFECTS for the
-   spoke-by-spoke measurement.
-5. ~~*GeoPackage loses booleans*~~ -- *defect 2*, *FIXED 2026-08-20 (M4)*.
-   The reader now parses the declared SQL type out of the table DDL, so a
-   =BOOLEAN= storing =0=/=1= comes back a boolean. *It was defect 1's second
-   half in another format* -- both were a declared column type on disk that
-   the IR could not hold -- which is why M4 shipped them as one piece.
-6. ~~*Every spoke narrows a declared column type to the IR's four*~~ --
-   *defect 5*, /found 2026-08-20 while reviewing defect 1/, *FIXED the same
-   day (M4) across all four declaring spokes* -- FlatGeobuf, GeoPackage,
-   Shapefile and GeoParquet. It was the largest of the five:
-   unlike defect 1 it needed no null to show itself, so it fired on most real
-   =ogr2ogr= output. /Measured before/: =Integer(Int16)= returned
-   =Integer64=, =Real(Float32)= returned float64, and *=DateTime= returned
-   =String=* -- a temporal column silently becoming text. /Measured after,
-   through GDAL:/ all three arrive intact across =parquet -> gpkg=,
-   =parquet -> fgb=, =fgb -> gpkg= and =fgb -> parquet=. This is what
-   re-scoped M4 around a vocabulary investigation -- the declared type has to
-   carry the *source's* vocabulary, not the hub's.
-
-*Defects 1, 2 and 5* -- entries (4), (5) and (6) -- were the free-standing
-group in the sequencing diagram, and *all three shipped together as M4* on
-2026-08-20, which is what their shared fix required. What remains in this
-section is *defect 3* alone (entry 3), and it travels with the GeoPackage
-container (M3b). *Defect 4* is not in this list because it is done: it was the FlatGeobuf
-header's hardcoded =geosetta= name, retired with the FlatGeobuf spoke.
-
-*** Four more, all found and fixed 2026-08-21 -- and none of them by reading
-None was in the list above, none was hard, and every one broke the *same-format*
-invariant. They are grouped because what found them matters more than what they
-were: each fell out of measuring the fix for the one before it.
-
-7. *A GeoPackage =REAL= column read back 32-bit.* =decl_type= grouped =REAL=
-   with =FLOAT=; the spec and SQLite both make it 8 bytes. /Measured through
-   GDAL:/ =Real (0.0)= in, =Real(Float32) (0.0)= out. Found while measuring the
-   GeoPackage spoke's round trip. Fixed -- and note the fix *normalizes the
-   spelling* rather than preserving it: a =REAL= column comes back =DOUBLE=,
-   which GDAL reads identically. See the GeoPackage spoke's entry in § WHAT
-   CHANGED IN EXISTING DOCS.
-8. *Every unsigned width written as its same-width signed spelling.* =UInt32=
-   was written =MEDIUMINT=. The value survived SQLite's dynamic typing and the
-   *declaration* was a lie: **GDAL read =3000000000= back as =-1294967296=**.
-   Found by the recast matrix, which (7) is what motivated building.
-9. *Every blob destroyed on read.* =Value::Blob(_) => JsonValue::Null=, so a
-   =gpkg -> gpkg= run replaced =X'0102'= with =NULL= while the =BLOB=
-   declaration survived. Found by adding *value* assertions to a suite that
-   had only ever compared declarations.
-10. *64-bit integers routed through an =f64=.* =9007199254740993= came back
-    =...992= on a same-format run; past =i64::MAX= the serializer saturated, so
-    =12345678901234567890= became =9223372036854775807=. Found by pulling on
-    what looked like a JSON canonicalisation question.
-
-*The pattern worth carrying forward*, because it caught three of these four and
-is not obvious: **the obvious test shape has a blind spot exactly where the
-bugs are.** A self-round-trip misses a spelling the writer never emits (7). A
-sweep over every *type* misses a class if its *values* are unadventurous (10).
-And a check that compares declarations can be perfectly green while the values
-are being destroyed (8, 9).
-
-*** Three more, 2026-08-22 -- by asking what =sqlite.rs= cannot do
-/Two fixed, one live./ The first two were found while scoping *M3b*, by reading
-=src/sqlite.rs= for the gaps M3b would have to close rather than by testing
-anything. Both turned out to be live in shipped code, and *neither is reachable
-from any existing fixture* -- =ogr2ogr= writes neither construct, so every
-fixture in the tree is built out of the subset of SQLite that GDAL happens to
-emit. The third (13) came from the edit-loop question and is *still open*.
-
-11. *One =WITHOUT ROWID= table silenced every defect 3 warning in the file.*
-    Such a table is stored as an *index* b-tree; =walk_table= handles only
-    table b-trees (=0x0d=/=0x05=) and errors on the page type. That =Err=
-    propagated out of =survey=, and =container_drop_warnings= swallowed it on
-    the documented reasoning that "every caller has already read this
-    container" -- true of feature layers, false of a user table nothing else
-    ever reads. /Measured on =gdal_hostile.gpkg= with one table added and
-    nothing else changed:/ both warnings present with a rowid, *both absent*
-    with =WITHOUT ROWID=, exit 0 either way. Defect 3 was returned to exactly
-    the silence its warning shipped to end, one day after it shipped.
-
-    Fixed by classifying rather than aborting: a table whose rows cannot be
-    decoded is reported by name, without a count (=kv (rows not counted)=).
-    Naming it without a number is the honest form -- the rows are real and this
-    cannot count them.
-12. *A column added by =ALTER TABLE= read back NULL instead of its default.*
-    SQLite does not rewrite existing rows on =ADD COLUMN=; their records stay
-    *short*, and the added column's value for those rows lives only as the
-    =DEFAULT= in the DDL. =read_rows= padded short records with
-    =Value::Null= and =parse_columns= discarded =DEFAULT= as a constraint
-    keyword. /Measured:/ =sqlite3= and =ogrinfo= both report =B=; geosetta
-    reported an empty cell -- **on every output format**, needing no
-    same-format run to fire. Fixed by decoding the literal (text with =''=
-    escapes, integers, reals, blobs, =TRUE=/=FALSE=) and padding with it.
-
-    *Only literals are decoded, and that is sufficient rather than partial:*
-    the sole path by which a default reaches a stored row is
-    =ALTER TABLE ADD COLUMN=, and SQLite rejects a non-constant default there.
-    An expression default can never apply to a short record.
-
-13. *=gpkg_ogr_contents= is reported as destroyed content, and it is derived.*
-    ***FIXED 2026-08-24*** (found 2026-08-22). Defect 3's warning named it in
-    the loss list -- =gpkg_ogr_contents (2 rows)= -- but the table is
-    =(table_name TEXT PRIMARY KEY, feature_count INTEGER)=, GDAL's *row-count
-    cache*, recomputable from the feature table by definition. Under D4 it
-    belongs in the second message beside the R*Tree ("derived, not rebuilt"),
-    not in the first.
-
-    ***Reported silently instead, and the reason matters more than the entry
-    did.*** The second message exists because =--rtree= is a **remedy**; a
-    cache with no remedy and no information lost would be furniture on every
-    =ogr2ogr= file. The =gpkg_extensions= precedent this entry cites went the
-    same way -- wholly derived rows are not reported at all -- so "beside the
-    R*Tree" meant *in the same class*, not *in the same sentence*.
-
-    ***And it was the smaller half of its own class.*** The pass that fixed it
-    found that **every** trigger attached to a table the write rebuilds is
-    derived too, including the *ten* =ogr2ogr= puts on =gpkg_tile_matrix= --
-    which the standard does not mandate. On a file holding a pyramid those ten
-    were the dominant term in the warning, and =gpkg_ogr_contents= was two
-    rows beside them.
-
-    *This is the =gpkg_extensions= mistake in another table*, which the entry
-    below in § WHAT CHANGED already records as caught once: counting derived
-    content as a loss names one loss twice and inflates the message. The
-    warning is not *false* -- the table genuinely is not carried -- so this is
-    a misclassification rather than a wrong statement, and the severity is
-    correspondingly modest. Fix it with M3b, which has to classify the table
-    anyway.
-
-    *Why it is worth the entry rather than a footnote:* under editing it is the
-    sharpest illustration in the whole container. Carry that table verbatim
-    after a middle stage deletes a feature and you have written a **count that
-    is a lie** -- strictly worse than the loss it was meant to repair. See
-    § THE EDIT LOOP. =gpkg_contents='s =min_x/min_y/max_x/max_y= is the same
-    shape and is already handled: the writer recomputes it.
-
-*The lesson these two add*, which is the type-vs-value one turned outward:
-**the fixture set is only as wide as the tools that built it.** Every fixture
-in the tree came from =ogr2ogr=, DuckDB, pyarrow or hand-authoring, so the
-whole crate had been tested against the subset of SQLite that GDAL emits --
-and a GeoPackage is a general SQLite database that anything may touch after
-GDAL is done. Both bugs sat in the gap between "what our fixtures contain" and
-"what the format permits", which is a gap no amount of testing the fixtures
-can close. The new =sqlite_altered.gpkg= is the first fixture built by
-reading the *format* for what it allows instead of the *tool* for what it
-writes.
-
-*** 2026-08-23 -- by taking the three decisions M3b was blocked on, then by reading the standard
-/Five entries, 14--18. The first three came from taking the decisions M3b was
-blocked on -- **by measuring the case instead of re-reading the argument**;
-two of the three recommendations on file had been carried for days and neither
-survived first contact with a measurement. The last two came from reading the
-*specification itself*, after the work above was already believed finished, and
-both are failures of the checking method rather than of the code: 17 is a
-differential test inheriting the reference tool's own deviations, 18 is a test
-that never produced a value large enough to reach the branch it was written
-for./
-
-14. ~~*Defect 3's warning excluded any dataset that was not a feature layer,
-    and so destroyed it in silence.*~~ *FIXED 2026-08-23.* =container.rs='s =feature_layers= collects
-    *every* =gpkg_contents.table_name= regardless of =data_type=, where the
-    reader (=reader.rs=, =feature_layer_names=) filters on
-    =data_type = 'features'=. So a tile pyramid or a GDAL =attributes= table
-    was treated as "a layer, out of scope" by the survey -- and then not
-    written, because it is not a feature layer either. /Measured on
-    =gdal_hostile.gpkg= with one =gpkg_contents= row added and nothing else
-    changed:/
-
-    #+begin_src text
-      side_notes unregistered   -> "... side_notes (1 row), gpkg_metadata (1 row) ..."   destroyed, named
-      side_notes as attributes  -> "... gpkg_metadata (1 row) ..."                        destroyed, unnamed
-    #+end_src
-
-    *=ogr2ogr= writes =data_type='attributes'= for an aspatial table*, so this
-    was reachable from ordinary GDAL output -- just not from any fixture in the
-    tree. **The third scope bug in a warning, after the R*Tree message naming
-    unwritten layers and entry 11's =WITHOUT ROWID= silence.** A round-trip
-    assertion cannot see any of the three: they are all about what the warning
-    *covers*, and a test that checks a warning's text has already assumed its
-    scope.
-
-15. *A table carried with its DDL verbatim would produce a malformed database.*
-    **The capability it was missing shipped 2026-08-23**; the classification
-    work that consumes it is still M3b's, so this stays here as a constraint
-    rather than a bug. **Found by asking what carrying a user table actually
-    costs**, which is D10's question. SQLite creates a =sqlite_autoindex_*= b-tree for every
-    =UNIQUE= and every non-INTEGER =PRIMARY KEY=; =write_database= cannot write
-    an index b-tree and hardcodes =rootpage: 0= for every =MasterEntry=.
-    /Measured on a file whose DDL was rewritten to declare =UNIQUE= with no
-    autoindex present:/ =SELECT= works, =PRAGMA integrity_check= reports
-    *database disk image is malformed*, and every =INSERT= fails.
-
-    Not a bug in shipped behaviour -- nothing carries a table yet -- but a
-    *live constraint on M3b* that the plan had recorded as optional. Two things
-    hid it, and both are the fixture lesson: this writer strips constraints
-    from its own DDL, and =side_notes(id INTEGER PRIMARY KEY, note TEXT)= --
-    the only user table in the fixture set -- is the one shape that needs no
-    autoindex.
-
-16. ~~*Every GeoPackage this crate writes states a schema the specification
-    does not.*~~ *FIXED 2026-08-23, the same day it was found.* This is
-    *defect 6*, and it is the one entry in this section
-    that is a defect in the canonical numbering -- see
-    =same-format-fidelity.org= § THE DEFECTS for the table-by-table
-    measurement. Five of the six registry tables are emitted with no table
-    constraints at all: no =PRIMARY KEY=, no =UNIQUE=, no =FOREIGN KEY=, no
-    =DEFAULT=. A =gpkg -> gpkg= run reads a conformant container and returns
-    one whose registry DDL has lost every constraint it arrived with.
-
-    ***The exception explains the rule.*** =gpkg_spatial_ref_sys= is the only
-    one emitted exactly right, and the only one whose specified constraints
-    need no index b-tree -- =srs_id INTEGER NOT NULL PRIMARY KEY= is a rowid
-    alias. **The deviation was never a decision; it is entry 15's missing
-    capability showing through as a schema.**
-
-    *Nothing observable was broken*, which is why it survived: GDAL read the
-    output, =integrity_check= was =ok=, every value and declared type
-    round-tripped. The constraint text was the only casualty and no test in the
-    tree looked at it. That is precisely the class of thing a conformance
-    checker looks at first.
-
-    /What the fix produced, measured:/ =PRAGMA integrity_check= =ok= and
-    =foreign_key_check= clean on both a plain and an =--rtree= write; a
-    duplicate =INSERT= now *rejected* by each restored constraint
-    (=gpkg_contents.table_name=, =gpkg_contents.identifier=,
-    =gpkg_geometry_columns='s composite key, =gpkg_extensions.ge_tce=);
-    =EXPLAIN QUERY PLAN= showing =SEARCH gpkg_contents USING INDEX
-    sqlite_autoindex_gpkg_contents_1=; and =ogr2ogr= rewriting the output with
-    the non-ASCII identifier intact. **The DDL was the one-line part.** The
-    work was the index b-tree underneath it, which is why this entry sits
-    beside 15 rather than being filed as a formatting change.
-
-    *One table is deliberately left alone:* =gpkg_data_column_constraints=.
-    The Schema extension specifies =CONSTRAINT gdcc_ntv UNIQUE
-    (constraint_name, constraint_type, value)=, but *=ogr2ogr= does not emit
-    it* -- so the reference implementation and the specification disagree here,
-    where they agreed on all four tables that were changed. **It is not changed
-    on a recollection of the spec text**, and the code says so at the site. Read
-    the specification and finish it; it is one line plus one
-    =autoindex_records= call.
-
-17. *=gpkg_data_columns= was missing =gdc_tn=, and defect 6's first fix
-    reproduced GDAL's omission rather than the standard.* **Found 2026-08-23 by
-    reading the specification**, after defect 6 had already been "fixed" the
-    same day. The Schema extension specifies *two* constraints on that table --
-    =CONSTRAINT pk_gdc PRIMARY KEY (table_name, column_name)= **and**
-    =CONSTRAINT gdc_tn UNIQUE (table_name, name)=. =ogr2ogr= writes only the
-    first. The fix had been cross-checked against GDAL's own file, so it
-    inherited exactly the gap it was checking against.
-
-    *The same reading settled the table that had been left open on purpose*:
-    =gpkg_data_column_constraints= does specify
-    =CONSTRAINT gdcc_ntv UNIQUE (constraint_name, constraint_type, value)=,
-    and =ogr2ogr= omits that too. Both now emitted.
-
-    *And one deviation ran the other way:* the standard says
-    =srs_id INTEGER PRIMARY KEY= on =gpkg_spatial_ref_sys=, while =ogr2ogr=
-    writes =INTEGER NOT NULL PRIMARY KEY= -- a =NOT NULL= the spec does not ask
-    for, which this crate had copied. Now matched to the standard.
-
-    ***The lesson is not "check the spec".*** It is that **a differential test
-    against a reference implementation measures agreement, not correctness**,
-    and this crate had been treating =ogr2ogr= as though those were the same
-    thing. Four measured deviations in the reference tool, three of which we
-    had inherited. /The fixture set has the same shape as the bug: everything
-    in it came from GDAL, so nothing in it could have caught this./
-    =tests/fixtures/PLANNED.org= designs the fixture that can.
-
-18. *The index writer's overflow path was shipped untested.* **Found
-    2026-08-23**, in code written the same day. =build_index_btree= handles a
-    record too large for an index cell by spilling to an overflow chain, and
-    both new tests built their records out of ~40-byte keys, so *neither ever
-    reached =write_overflow=*. Fixed by widening every fourth key past the
-    ~1002-byte ceiling in the round-trip test and every fifth in the =sqlite3=
-    cross-check, so =PRAGMA integrity_check= is now asked about the chains and
-    an overflowing key is looked up through the index.
-
-    **The third time the same blind spot has been recorded here** -- after the
-    =Int64= sweep whose representative value was small enough to survive a
-    double, and the type sweep that never looked at a value. /A test can be
-    exhaustive over structure and still never reach a branch, because the
-    branch is chosen by a *size* the test never produces./
-
-*What entries 15 and 16 add to the lesson list*, and it is the sharpest form of
-it yet: **a missing capability does not always announce itself as a failure --
-sometimes it announces itself as a design.** Nobody chose to write
-constraint-free DDL. The writer could not write an index, so the DDL that
-needed one never got written, and what was left read like a house style. The
-way it was found was not a test; it was asking what a *different* feature would
-cost.
-
-*** 2026-08-25 -- by asking what a decision already taken was really about
-/Two entries, both fixed the same day they were found. 19 came out of D5 in
-=container-reconciliation.org=, which refuses a user-table merge because
-renumbering rowids silently invalidates =gpkg_metadata_reference=. The question
-was whether that hazard is confined to merging, as the decision assumes. It is
-not. **20 came from running an oracle over every fixture instead of one**, and
-it is a database the previous day's work could write that SQLite refuses to
-open./
-
-19. ~~***A =gpkg -> gpkg= run renumbers every feature, silently.***~~ **Found
-    2026-08-25 and FIXED the same day**, by decision 27. =reader.rs:148= filters the =rowid= alias out of the
-    properties it builds and =writer.rs:900= assigns =(i + 1)= on the way out,
-    so feature ids are reissued dense from 1 on every write. Measured on a
-    =cities= layer holding fids =1, 9, 40=:
-
-    #+begin_src text
-      geosetta gap.gpkg out.gpkg   ->  1, 2, 3
-      ogr2ogr  -f GPKG ogr.gpkg    ->  1, 9, 40
-    #+end_src
-
-    No warning fires, because nothing classifies the id at all -- it is not
-    modelled, not carried, and was not listed in =native-inventory.org=, the
-    document whose whole job is enumerating what each reader discards.
-
-    **The standard gives the column a stated purpose**, which is what makes
-    this a loss rather than an allocation detail. Requirement 29 mandates the
-    INTEGER primary key as a =rowid= alias, and the note under it says what it
-    is for: linking features to row-level records in =gpkg_metadata= *by rowid
-    value* through =gpkg_metadata_reference=. /Nothing requires a **writer** to
-    preserve those values, so renumbered output is conformant -- the same
-    posture as =last_change=, which was conformant either way and was still
-    real information being destroyed./
-
-    ***Why it reaches a decision already taken.***
-    =container-reconciliation.org= D5 refuses a user-table merge specifically
-    on the =row_id_value= hazard: a reference the DDL declares no foreign key
-    on, so =foreign_key_check= cannot see it and =integrity_check= cannot
-    either, because the file is not malformed -- merely lying. D5 attributes
-    that hazard to merging. **It is already live on the plain one-container
-    path**, which D5 treats as safe. The decision is not wrong; its stated
-    scope is too narrow.
-
-    /It has not bitten because an ordinary =ogr2ogr= file's metadata reference
-    is =table=-scoped, not =row=-scoped -- measured on the same file. That is
-    luck about producer practice, not a property of the code./
-
-    **Nothing in the tree could have caught it.** All eleven =.gpkg= fixtures
-    hold dense =1..n= ids, so every one round-trips through the renumbering
-    unchanged. /The same fact is the containment result: carrying the id would
-    be byte-invisible to the entire existing corpus./
-
-    *The channel exists already.* =Feature::native='s doc names /"a GeoJSON
-    =id="/ as its example, and the GeoJSON spoke carries that member today,
-    classed *identity*. What is missing is that =NativePayload::Gpkg= is
-    collection-level only by construction, so a per-feature form is the one
-    structural addition -- with D16 containing the cost, since a dense =1..n=
-    sequence is what the writer emits anyway and is therefore derived.
-
-    ***FIXED by carrying it*** -- decision 27, taken by the project owner on
-    the recommendation filed here. =NativePayload::GpkgFeature= is the
-    feature-level variant the enum's =#[non_exhaustive]= was written for, and
-    the shape above survived contact with the code exactly: the reader attaches
-    an id only when it differs from the position, so `second` in the new
-    fixture carries nothing while `cities` carries two of three.
-
-    *One thing the filing did not anticipate.* A carried id is **layer-coupled**
-    rather than independent, and had to be validated at write per decision 23 --
-    delete a feature from the middle and the survivors' ids no longer describe
-    them, which can duplicate an =INTEGER PRIMARY KEY= (a malformed database) or
-    run backwards (unpackable into a b-tree). The whole layer falls back to a
-    dense sequence when the carried ids do not strictly ascend. /Falling back
-    per feature would hand back a set that is neither the source's numbering nor
-    a fresh one./
-
-    *And the R\*Tree had to be told.* =rtree::build= numbered its leaf entries
-    by position too, so an index built beside a carried numbering would have
-    pointed at rows that do not exist -- **which =integrity_check= does not
-    object to**, because the shadow tables are well-formed and merely wrong.
-    The ids are now computed once per layer and passed to both.
-
-20. ~~***A carried tile table could be written as a malformed database.***~~
-    **Found and FIXED 2026-08-25**, in code shipped the day before.
-    =carry::tile_key_columns= located the pyramid's key by looking for columns
-    *named* =zoom_level=, =tile_column= and =tile_row=, and the writer built a
-    =sqlite_autoindex_<name>_1= over whichever it found. **A table's DDL is
-    what decides whether it owns an autoindex, and column names are not that.**
-    =sqlite_contents.gpkg='s =imagery= has all three columns and declares no
-    =UNIQUE=, so the write fabricated an index SQLite cannot attribute to any
-    constraint:
-
-    #+begin_src text
-      $ sqlite3 out.gpkg "SELECT count(*) FROM cities;"
-      Error: malformed database schema (sqlite_autoindex_imagery_1)
-             - orphan index (11)
-    #+end_src
-
-    Not a degraded file -- one that **will not open at all**, for any query.
-
-    ***This is entry 15 exactly inverted***, and that is the part worth
-    keeping. Entry 15 was a DDL declaring =UNIQUE= with no index behind it;
-    this is an index with no constraint in front of it. Both are malformed,
-    both were reasoned about correctly in the *same doc comment* -- the
-    original said /"Empty when the table does not have all three, which leaves
-    the spec with no autoindex -- correct for a table whose DDL then declares
-    no =UNIQUE="/ -- and the code then tested the wrong condition, because
-    *having the three columns* and *declaring a constraint over them* are not
-    the same fact. **The author saw the case and checked its proxy.**
-
-    *Fixed by re-packing instead of building.* =Pyramid= now carries the
-    source's own autoindex records, exactly as the user-table carrying does:
-    the source's b-tree is the only thing that knows what its DDL declared, and
-    an index read in index order needs no comparison at all. /D10's
-    construction case is gone; re-packing covers both./
-
-    ***How it got through, and this is the fourth time for this class.*** The
-    tile carry shipped with 562 passing tests, clean clippy, green =cargo doc=,
-    and =integrity_check=/=foreign_key_check=/=gdalinfo -checksum= all clean --
-    *on =gdal_tiles.gpkg=*, which is GDAL-produced and therefore conformant and
-    therefore **does** declare the =UNIQUE=. The one fixture in the tree that
-    would have caught it is hand-built, and nothing ran an oracle over its
-    output. It was found by running =PRAGMA integrity_check= across *every*
-    =.gpkg= fixture's output while measuring something else entirely.
-
-    /The regression test is
-    =no_autoindex_is_written_for_a_carried_ddl_that_declares_no_unique=, and
-    restoring the construction fails it and nothing else in 567 tests -- which
-    is the measurement of how invisible this was./
-
-21. ~~***Every file this crate wrote with column declarations claimed to be a
-    plain GeoPackage while carrying an extension's tables.***~~ **Found and
-    FIXED 2026-08-25**, live since 2026-08-21.
-
-    =writer::schema_extension_tables= has emitted =gpkg_data_columns= and
-    =gpkg_data_column_constraints= since the GeoPackage spoke learned to carry
-    column declarations. It never wrote the =gpkg_extensions= rows that
-    register them, and =grep -rn 'gpkg_schema' src/= returned **nothing**.
-
-    ***Requirement 59 is what makes this a defect and not an omission.***
-    /"In an Extended GeoPackage, every extension SHALL be registered in a
-    corresponding row in the =gpkg_extensions= table … the absence of rows in
-    the =gpkg_extensions= table SHALL indicate that the file is a GeoPackage
-    (as opposed to an Extended GeoPackage)."/ So the output did not merely omit
-    bookkeeping -- it **positively asserted the wrong thing about itself**.
-    Requirement 141 fixes the two rows' values exactly, in the same
-    /Extension Table Records/ shape as the Metadata extension's Requirement 140.
-
-    #+begin_src text
-      geosetta gdal_hostile.gpkg out.gpkg   ->  gpkg_data_columns written
-                                                gpkg_extensions   absent
-      ogr2ogr  -f GPKG          ogr.gpkg   ->  both
-    #+end_src
-
-    ***This is defect 6 one level up, and the reason it survived defect 6 is
-    worth keeping.*** That pass asked whether each table this crate writes is
-    *defined* as the standard defines it, and fixed five that were not --
-    comparing whole DDL against =spec_conformant.gpkg=, per table. It never
-    asked whether writing the table obliged a **row in another table**. A
-    conformance check shaped as "is this table's definition right" cannot see a
-    requirement of the form "if you have this table you must also have that
-    row", and both of this crate's extensions have exactly that requirement.
-
-    *No oracle in this tree objected, and none could.* The file is well-formed
-    SQLite: =integrity_check= ok, =foreign_key_check= clean, =ogrinfo= reads
-    the declarations back and =ogr2ogr= rewrites the result -- all measured on
-    2026-08-21 and all true. **A missing =gpkg_extensions= row is invisible to
-    every oracle that asks whether the file works**, because the file does
-    work; it is only wrong about what it is.
-
-    /Found by asking what was left in the drop warning after the metadata pair
-    landed. =gpkg_extensions (2 rows)= was still reported against most
-    fixtures, and reading which rows those were is what surfaced it -- the
-    warning whose job is to name destroyed content naming, correctly, content
-    this crate should have been writing all along./
-
-    *Fixed by* =writer::schema_extension_rows=, which registers **the tables
-    actually written** rather than the annex's two: Requirements 103 and 107
-    each say a GeoPackage MAY contain their table *independently*, so unlike
-    the Metadata pair (Requirement 95) one may exist without the other, and
-    registering an absent table would name nothing. /Tests
-    =writing_the_schema_extension_registers_it= and
-    =an_unwritten_schema_table_is_not_registered=; both halves
-    mutation-checked./
-
-*What entry 20 adds to the lesson list*, beyond its own class: **the oracle you
-did not run is the one that would have caught you.** Yesterday's write-up said
-=integrity_check= was clean on the carried output, and it was -- on the file it
-was run against. Running it on *one* file is a statement about that file.
-/The fix is not more discipline; it is running the oracle over every fixture,
-which is a loop, and now is one./
-
-*What entry 19 adds to the lesson list.* **A decision can be right and still be
-scoped wrong**, and the way to find out is to ask what the hazard it names
-actually depends on rather than where it was noticed. D5's hazard depends on
-*renumbering*, not on *merging*; merging is merely where someone happened to be
-standing when they saw it. /Nothing about D5's conclusion changes -- the refusal
-still holds -- but a reader would have finished that section believing the
-one-container path was safe./
-
-*** 2026-10-13 -- by building the merge the destination had never been given
-/Two entries, both found by implementing =container-reconciliation.org= § 3 and
-both fixed the same day. **Neither was in that plan**, and 23 is not about
-merging at all -- it is a defect an append *exposed* in a check the writer had
-been making correctly for carried content and had never made for layers./
-
-22. ~~***Two =range= constraints for one name both reached the output, and the
-    declared key could not see it.***~~ **Found and FIXED 2026-10-13**, live
-    since the Schema extension's tables shipped on 2026-08-21.
-
-    =writer::schema_extension_tables= deduped constraints by **whole-row
-    equality**: =if !constraints.contains(constraint)=. § 6's contract makes a
-    =range= row's identity =(constraint_name, constraint_type)= -- its =value=
-    is NULL *by definition*, the column being for =enum= and =glob= -- so two
-    rows disagreeing on their bounds are one constraint saying two things, and
-    whole-row equality kept both.
-
-    ***The output is conformant-looking and wrong, which is why nothing
-    caught it.*** The writer emits =CONSTRAINT gdcc_ntv UNIQUE (constraint_name,
-    constraint_type, value)=, and SQLite treats NULLs as distinct under
-    =UNIQUE= -- so the declared key accepts the pair and the file passes every
-    structural oracle:
-
-    #+begin_src text
-      two 'range' rows, same name, min 0/100 and 50/500, value NULL
-        PRAGMA integrity_check    ->  ok
-        PRAGMA foreign_key_check  ->  (silent)
-        SELECT count(*)           ->  2        -- the standard admits one
-    #+end_src
-
-    /Measured against GDAL 3.13.3 and SQLite 3.51.0, and **GDAL's own DDL does
-    declare =gdcc_ntv=** -- =PLANNED.org= said =ogr2ogr= omits it, which was
-    true of the hand-built =gdal_hostile.gpkg= table and not of =ogr2ogr=./
-
-    ***It was reachable without a merge, which is wider than the plan that
-    found it.*** A single source file can hold the pair, for exactly the reason
-    above, so the refusal fires on a one-container =gpkg -> gpkg= run too.
-    =plans/container-reconciliation.org= § 5 scopes its refusals to merges; this
-    one is not scoped to them, and should not be. **Writing rows the key you
-    declared cannot separate is output that does not state what the file says
-    about itself** -- entry 21's class, one table over.
-
-    *Fixed by* =writer::same_constraint=, which keys per =constraint_type=, and
-    a § 5 refusal where two rows share an identity and differ. /Fixture
-    =tests/fixtures/sqlite_nullkey.gpkg=, designed 2026-08-23 and built for
-    this. The =enum= half had to be built beside the =range= half: a test
-    asserting only the range case is satisfied by an implementation that drops
-    =value= from the key entirely, which **the first mutation survived** until
-    =two_range_constraints_differing_only_in_value_are_still_one_constraint=
-    gave it an input where the two rules disagree./
-
-    /=ogr2ogr -update -append= resolves the same collision silently in the
-    destination's favour, leaving the appended layer's domain quietly replaced.
-    § THE ORACLE RULE: evidence of what a producer does, not of what is right./
-
-23. ~~***An append could write a database SQLite reports as malformed, through
-    a check the writer was already making everywhere else.***~~ **Found and
-    FIXED 2026-10-13.**
-
-    =gpkg_contents.identifier= is =UNIQUE= (Requirement 13).
-    =writer::gpkg_contents= has refused a carried *pyramid* or carried
-    *dataset* whose identifier a layer already took since 2026-08-24 -- two
-    arms, two refusals, both correct. **The layers were never checked against
-    each other**, and the output was:
-
-    #+begin_src text
-      PRAGMA integrity_check  ->  non-unique entry in index
-                                  sqlite_autoindex_gpkg_contents_2
-    #+end_src
-
-    ***The reason it was invisible is the reason it is real.*** A single source
-    cannot hold the collision -- its own =UNIQUE= forbade it -- so no fixture
-    could exhibit it and no one-container test could reach it. **An append
-    composes two sources**, and =ogr2ogr -nln= copies the identifier verbatim
-    when it renames a layer, so two files with differently-named layers and one
-    identifier is what a real producer hands you rather than a constructed
-    case.
-
-    /The oracle agrees, and unusually it agrees with the *refusal*:
-    =ogr2ogr -update -append= fails the same input with
-    =UNIQUE constraint failed: gpkg_contents.identifier= and terminates the
-    translation./
-
-    *Fixed by* a uniqueness pass over the layer rows in =gpkg_contents=, with
-    the two carried arms' refusal reasoning and their NULL exemption -- two
-    NULLs do not collide under a SQL =UNIQUE=, which is why
-    =Registration::identifier= is an =Option= and why a layer's, always
-    non-NULL, needs no exemption. /Test
-    =two_layers_sharing_a_gpkg_contents_identifier_are_refused=, which asserts
-    both branches: the collision refuses and two distinct identifiers do not./
-
-*Step 5 found no defect, and one **property** worth recording.* A *built*
-index is not byte-equal to a *carried* one over identical rows:
-=encode_record= writes every integer as an 8-byte serial type where SQLite
-picks the narrowest that fits, so the records come out wider. Valid -- every
-index this crate has ever built is encoded that way and =integrity_check= has
-always passed -- but it means a merged pyramid's index bytes are *this crate's*
-rather than SQLite's, which is the thing to know before anyone asserts byte
-equality against a GDAL-produced file. /Found by writing an idempotence test
-that compared a self-merge's index against the source's records and watching it
-fail on encoding rather than on order./
-
-*What entries 22 and 23 add to the lesson list.* **A check made in two places
-out of three is a check whose third place nobody looked for.** Entry 23's two
-carried arms were written together, in one function, on one requirement, and
-the third caller of that requirement -- the layer rows, built forty lines
-above -- was never considered, because the requirement arrived while thinking
-about *carried* content. /The transferable question is not "did I handle this
-case" but "how many places does this rule have to hold, and have I enumerated
-them". Entry 21 is the same shape at the level of tables; this is it at the
-level of rows./
-
-*And entry 22 adds a sharper form of something already on the list.* /A test
-that asserts a correlation is satisfied by both sides of it/ -- learned
-2026-08-26 and **not transferred**: the first version of the range test was
-satisfied by the rule and by its plausible neighbour alike, because every
-conformant input makes the two agree. The distinguishing input had to be a
-*non-conformant* one. **When a rule's branch exists only to handle malformed
-input, only malformed input can test it**, and a corpus of well-formed files
-will never produce the case.
+Two, continuing from entry 23 in =9768a87:geosetta/handoff.org=.
+
+*** 24 -- a =fgb -> fgb= run silently permuted the user's features
+**Found by D6's fixture registry on its first run; FIXED 2026-10-21.** Live
+since the packed R-tree shipped (=spatial-index.org= milestone B).
+
+=flatgeobuf/writer.rs= called =hilbert_order= on every write where each feature
+had a geometry, so =gdal_hostile.fgb='s two features came back *swapped*. Both
+the source and our output carry =index_node_size = 16=, so this was not a
+producer that had skipped the index -- GDAL simply does not order its leaves
+the way we did.
+
+***The sort was never a requirement of the structure.*** A packed R-tree is
+packed bottom-up over whatever order its leaves are in, and a reader walks it by
+bbox either way; the Hilbert part of the name describes the *locality* a sorted
+build buys, not a correctness condition. So the sort was spending content for a
+performance property, on every run, with no way to decline.
+
+***And there was already a flag for it, which this made meaningless.***
+=main.rs= applies =--sort-hilbert= to the IR *before* calling the writer, so for
+FlatGeobuf the sort was **mandatory where the CLI advertised it as opt-in** --
+and opt-in for GeoPackage's =--rtree= in the same breath, on the stated
+reasoning that an index is "a size/query optimization, not a correctness
+requirement". /The flag's doc comment read "a no-op ordering-wise for
+already-sorted FlatGeobuf", which has the causality backwards: it was a no-op
+because the writer sorted regardless./
+
+The fix is a *deletion* -- the writer packs the index over input order -- so
+order is preserved by default, no capability is lost, and the flag means one
+thing everywhere.
+
+**Three things worth keeping.**
+
+*It was invisible to every test in the tree, and to the obvious test.* The sort
+is **idempotent**: generation 2 of our own output agrees with generation 1 about
+the permutation. It also needed a *foreign producer's* order to show at all,
+which is precisely what a hostile fixture is for.
+
+*Self-consistency could not have validated the fix either*, so the oracle is
+GDAL against a **brute-force** expectation:
+=gdal_filters_correctly_through_an_index_over_unsorted_leaves= builds 500
+features sorted against locality, past =NODE_SIZE= twice over so interior node
+boxes genuinely overlap, and requires =ogrinfo -spat= to match a count computed
+in the test. /Our reader walking our own tree would have agreed about a broken
+one./
+
+*A test for one half of a correlated pair is satisfied by breaking the other.*
+=features_keep_their_input_order_and_the_file_is_still_indexed= asserts both
+together on purpose: order alone is satisfied by dropping the index, the index
+alone by sorting again.
+
+*** 25 -- a Shapefile write adopted whatever sidecars were already there
+**Found while answering Q3; PARTLY FIXED 2026-10-21.** Live since the Shapefile
+spoke shipped.
+
+=write_shapefile_to_path= writes =.shp=/=.shx=/=.dbf= and a =.prj= *when the
+collection has a CRS*. Everything else at that basename survived the write and
+then described the output beside it. Measured:
+
+| left behind | effect |
+|-------------+--------|
+| =.prj= | a CRS-less CSV's degrees came back =NAD83 / UTM zone 18N= in *metres* -- from =ogrinfo= and from =geosetta --print-crs= alike |
+| =.cpg= | one reading =ISO-8859-1= turned =København= into =KÃ¸benhavn= for GDAL **and for geosetta's own reader** |
+| =.qix=/=.sbn= | an index describing different geometry; could not be made to give GDAL a wrong answer in any configuration tried |
+
+***The =.cpg= case is the one that should sting***: geosetta wrote correct bytes
+and then read them back wrong. A round trip through one tool, corrupted by a
+file neither end of it wrote.
+
+*Fixed by writing =.cpg= (always =UTF-8=) and warning about the rest*, per
+decision 33.
+
+**Four things worth keeping.**
+
+*A question's own framing can hide the defect.* Q3 asked about *rebuilding
+derived capabilities* -- a performance concern -- and the same gap was leaking
+*information*: a CRS and a text encoding. The index, the thing actually asked
+about, turned out to be the harmless member of the set. /Answering the question
+as asked would have ruled "no" and moved on./
+
+*"The reference does the same thing" bounds how unusual a gap is, never how
+much it costs.* =native-inventory.org='s own priority note had deferred =.cpg=
+on exactly that argument. Both halves failed on re-measurement: the cost had
+nothing to do with symmetry, and ***=ogr2ogr='s default declares LDID =0x57= --
+ANSI/Windows-1252 -- while writing UTF-8 bytes***, so the reference is not
+silent about encoding, it is wrong about it through a different channel.
+
+*Whether two filenames are two files is a property of the filesystem.* The
+first version of the check probed =Path::exists= for the upper-cased spelling
+*before* writing and reported every sidecar twice on this machine. It now runs
+*after* the write and compares bytes, which is the only test honest on both
+case-sensitive and case-insensitive filesystems.
+
+*A warning that fires on the write cannot cover the read.* A later
+=geosetta out.shp …= reads a stale =.prj= as simply the file's CRS and says
+nothing -- by then no evidence remains. That asymmetry is the argument for
+writing whatever can be written rather than warning about it, and it is why
+=.cpg= is written rather than reported.
+
+** WHAT IS NOT BUILT
+- *M3's remaining spokes' natives:* **WKT, KML, Shapefile**. /CSV came off this
+  list and never needed a native -- D17's gate keeps every cell's text with no
+  payload and no IR change, so =csv.rs= still passes =native: None= and is
+  nonetheless faithful./
+- ***KML is the large one, and it is gated on a mechanism decision rather than
+  on effort.*** =xml.rs= strips namespace prefixes at parse (=local_name=),
+  discards comments and PIs (=skip_misc=), and concatenates mixed content -- so
+  the symmetric =parse=/=write= pair *looks* like it offers verbatim replay and
+  does not: a carried =gx:Track= would re-emit as =Track=. Either =XmlElement=
+  keeps raw names, or unmodelled subtrees carry a source byte range, which has
+  precedent in =json::raw_at= slicing PROJJSON out of =geo=. **Decide this
+  before writing any of the spoke.** Three levels of loss to carry: Placemark
+  children, whole features above the Placemark (=<GroundOverlay>=,
+  =<ScreenOverlay>=, =<NetworkLink>=), and the document's own name/description.
+  /Q6's ruling -- warn and emit on an unrecognised geometry -- is decided and
+  unbuilt, and is independently shippable today./
+  /2026-10-22: **decided, as neither option alone** -- the spoke is rescoped to
+  the KML standard, with a typed 2.3 model in the native.
+  =same-format-fidelity.org= D18; [[file:plans/kml-standard.org][plans/kml-standard.org]]./
+- *M3c*, the KMZ container. =hand_hostile.kmz= already exists and carries the
+  dangling =files/overlay.png= reference.
+- *=gpkg_crs_wkt_1_1=*, the last of defect 3 -- a capability, not a carry.
+- *=spatial-index.org= § E*, GeoParquet's covering-bbox write, blocked on the
+  Parquet writer never having emitted a nested struct column.
+- *=native-inventory.org='s =edges=/=epoch= fixture hunt*, where no available
+  tool emits either.
+- *=encodings.org= E1--E7.* E1 (warn on an approximated codepage) is the
+  smallest unit of work in that plan and the only one owed by a rule that
+  already exists.
+- *D4's "rebuild a derived capability if the source had one" is triggered
+  nowhere*, GeoPackage included. One piece of work on =spatial-index.org=
+  across both spokes; Q3 declined to half-do it for Shapefile.
 
 ** WHAT CHANGED IN EXISTING DOCS
-Listed explicitly because each entry was written before its work was committed.
-/=git log= is the better source wherever the two disagree -- see § THE ONE REAL
-GAP, whose "no commits" claim was itself an error and is retracted there, and
-which explains why this section must never be read as a statement about what is
-committed./
-
-*Everything below had landed as of 2026-08-22, through =c789447=; the
-2026-08-23 and 2026-08-24 entries were uncommitted when written.* That sentence
-is exactly the kind that expires -- it has now been extended twice, which is
-the point of the rule above: check =git log= rather than trusting it.
-
-/Newest first./
-
-*The metadata pair, the Schema registration and three wrong reports, 2026-08-25
--- code, a fixture and four documents.* /Uncommitted when written. The pair was
-planned in =same-format-fidelity.org= before any code; the other two came out of
-reading what the drop warning still said afterwards./
-- =src/geopackage/carry.rs= -- =Metadata=, =MetadataRecord=,
-  =MetadataReference= and the =metadata= reader; =Carried::metadata=, and
-  =is_empty= / =reproduced_names= extended to it. **Reads verbatim and validates
-  nothing**: a reference's validity depends on the write, which is decision 23.
-- =src/geopackage/writer.rs= -- =METADATA_DDL= and =METADATA_REFERENCE_DDL=
-  (transcribed from the annex at =fe83fdd=), =retained_references= (the
-  layer-coupled rule, per =reference_scope=), =metadata_tables=,
-  =metadata_extension_rows=, =schema_extension_rows=, =metadata_drop_warnings=,
-  and =compose_layers= extracted out of =write_layers= so the warning and the
-  write reason about the same layer set.
-- =src/geopackage/container.rs= -- =SCHEMA_EXTENSION= and =METADATA_EXTENSION=;
-  =foreign_extension_rows= takes =carried=; and the =Ok(0)= arm that stops
-  reporting an **empty** =CONSTRUCTED= registry table as destroyed content.
-- =src/geopackage/rtree.rs=, =src/geopackage/mod.rs= --
-  =ExtensionRow::column_name= became =Option<String>= /(a table-scoped
-  registration names no column, and the empty string is a different value under
-  =ge_tce=)/; =metadata_drop_warnings= exported.
-- =src/main.rs= -- the metadata warning, printed *after* =existing= is in hand.
-- =tests/fixtures/build_fid_fixture.sh= and =sqlite_fid_gap.gpkg= -- =row= and
-  =column= scoped references added, the =row= one at fid **9**.
-- =tests/fixtures/HOSTILE.org= -- the =sqlite_fid_gap= entry extended, and
-  ***a factual correction***: the =spec_conformant= table said the two
-  =crmr_*_fk= foreign keys are ones "GDAL omits", which is measurably false --
-  GDAL 3.13.2 declares both, and the FK-less shape is =gdal_hostile.gpkg='s
-  hand-built container content propagating through the =sqlite_*= family.
-- =tests/fixtures/PLANNED.org= -- the fixture designed and built the same day;
-  the corpus-wide blindness it pins is kept there rather than moved.
-- =plans/same-format-fidelity.org= -- three new =***= sections in § MILESTONES
-  (the metadata pair with D11--D13, the Schema registration, the empty tables),
-  and the test count corrected 571 → 585.
-- =plans/native-inventory.org= -- the =gpkg_metadata= and =gpkg_extensions=
-  container rows; the latter is **not opaque after all**, being derived from
-  what the write produces.
-- =handoff.org= -- decisions 28--30, § BUGS FOUND entry 21, § WHAT IS BUILT,
-  defect 3's status in two places, and this entry.
-
-*Ten triggers nobody had classified, 2026-08-24 -- the warning stops
-overstating what it destroys.* Carrying the tile pyramid made this visible
-rather than causing it: with =imagery= surviving, **ten of the twelve** "other
-schema objects" the drop warning still reported on =gdal_tiles.gpkg= were
-=ogr2ogr='s validation triggers on =gpkg_tile_matrix= -- a registry table this
-writer *constructs*.
-
-***The standard settles it, and settles it against GDAL's practice.***
-Requirements 46--52 constrain the **values** in =gpkg_tile_matrix= -- zoom
-level not negative, widths and pixel sizes greater than zero -- and the tiles
-clause (§ 2.2, pinned =fe83fdd=) does not mention a trigger anywhere. GDAL's
-ten are *one implementation* of enforcing a value requirement, so output
-without them is conformant as long as the values are, and this writer carries
-those values verbatim. /Another instance of § THE ORACLE RULE, and the second
-one this week where the standard and =ogr2ogr= had to be told apart./
-
-So they are **derived** under the three-class contract, along with every other
-trigger attached to something the write rebuilds -- and =gpkg_ogr_contents=,
-which is *entry 13*, filed 2026-08-22 as "found, live, fix it here" and fixed
-now: a =(table_name, feature_count)= row-count cache reported as destroyed
-content. Both silently, not in the index message: the R*Tree earns a message
-because =--rtree= is a remedy, and a cache with no remedy and nothing lost
-would be furniture on every =ogr2ogr= file. /On =gdal_hostile.gpkg= the
-message's schema clause disappears entirely, from "14 other schema objects" to
-none./
-
-***And the test written for the new rule was wrong, found by mutating it.***
-=is_derived_trigger= has a negative half -- a trigger on a table that really is
-destroyed must still be reported -- and **no fixture in the tree had one**:
-every trigger anywhere was attached to a layer or a registry table. So
-=sqlite_constraints.gpkg= gained =events_stamp=. The first test asserted the
-message contained /"other schema objects"/, which passed under a mutation
-classifying **every** trigger as derived -- because =idx_events_kind=, an
-explicit =CREATE INDEX= in the same fixture, satisfies that phrase by itself.
-/Assert the count, not the phrase./ Same lesson as the =LAST_CHANGE= fixture
-mistake two days earlier, in a different disguise.
-
-*Defect 3 stops being wholly a warning, 2026-08-24 -- code, a fixture and four
-plans.* =geopackage/carry.rs= is new: the container **carrying** channel, which
-reads independent content out of a source =.gpkg= so the write puts it back.
-Today it reaches the tile pyramid, which is D8's case, and with it *M3b
-requirement 1* -- =srs_id= reconciliation, in =writer::reconcile_carried_srs=.
-
-***The two shipped together because neither was shippable alone***, and that is
-the finding rather than a scheduling note. Requirement 1 was filed in
-=container-reconciliation.org=, moved to M3b by D3 on the argument that it is
-needed on the *one-container* path too -- and it is, but it is not *observable*
-until something carries an =srs_id=. Before the carrying, =foreign_key_check=
-on =gdal_tiles.gpkg='s output was clean because the row was gone. **A
-requirement whose oracle says nothing until its consumer exists cannot be
-verified on its own**, whatever the sequencing diagram says.
-
-*What it cost was less than the milestone predicted, and the reason is dated.*
-No new file-format work: =TableSpec='s =autoindexes= and =autoincrement=, both
-closed 2026-08-23 ahead of the carrying that needed them, are exactly the two
-capabilities a tile table obliges -- it is the only mergeable table that both
-declares AUTOINCREMENT and owns an index. /The prediction that they would be
-needed "the first thing M3b carries" was right to the table./
-
-*Measured, not argued:* 80 tiles blob-for-blob out of =gdal_tiles.gpkg=;
-=gdalinfo -checksum= reporting the same four band checksums through the output
-as through the source, so GDAL reads the same *pixels* and not merely the same
-row count; =integrity_check= and =foreign_key_check= clean **with the pyramid
-present**; a second pass byte-identical to the first; and a GeoPackage with no
-pyramid byte-identical to what the previous binary wrote, so the channel is
-contained the way =0e33a40='s payload was.
-
-*The conformance oracle grew with it.* The two tile registry tables' DDL is
-transcribed from Annex C at pinned =fe83fdd=, =spec_conformant.gpkg= gained both
-so it could be checked, and =the_registry_ddl_is_what_the_standard_says= now
-compares **eight** tables rather than six. /GDAL emits both identically: the
-first table so far where reading the standard confirmed the producer rather
-than correcting it, which is worth recording precisely because the four core
-tables went the other way./
-
-*Two refusals rather than two guesses*, both on D5's reasoning: a carried table
-whose name a layer already has, and a carried =gpkg_contents.identifier= a
-layer already has. Both would build an index with two equal keys -- a malformed
-database -- so they are made impossible instead of guarded against.
-
-/All four new tests were mutation-tested./ Dropping the srs registration, never
-renumbering on a collision, dropping the carried triggers and dropping the
-=sqlite_sequence= mark each fail exactly one test and no others.
-
-*A raster fixture, and the naming rule that turned out to be unwritten,
-2026-08-24 -- fixture and docs.* =tests/fixtures/gdal_tiles.gpkg= is the first
-*tile pyramid* in this tree: 80 tiles over two zoom levels with real JPEG
-payloads, built by =build_tile_fixture.sh= from a generated raster. It is the
-fixture =same-format-fidelity.org= M3b § 1 needs, and =PLANNED.org= had
-designed it as =gpkg_tiles.gpkg=.
-
-**Three things it forced.** /First:/ a *tiles-only* GeoPackage is **rejected by
-this reader** -- =GeoPackage has no feature layers= -- against =HOSTILE.org='s
-standing rule that every fixture reads without error, so =cities= from
-=gdal_hostile.gpkg= sits beside the pyramid. That accident is what makes the
-fixture bite: the layer is EPSG:4326 and the pyramid EPSG:3857, so the file
-holds an =srs_id= **no feature layer accounts for**, which is exactly what
-=resolve_srs= will not write and =fk_gc_r_srs_id= will catch.
-
-/Second:/ *the naming rule was a pattern, not a rule.* Four prefixes that all
-happened to encode provenance is not the same as a written rule, and the
-fixture nearly landed under a content-named =gpkg_= prefix with a paragraph
-arguing why the rule should bend. =HOSTILE.org= § NAMING now *states* it --
-**prefix is provenance, stem is purpose** -- and the two remaining =gpkg_*=
-names in =PLANNED.org= were changed to match: =sqlite_sequence.gpkg= and
-=sqlite_nullkey.gpkg=. /The second changed stem as well as prefix: it was named
-after its vehicle (=range= constraints) rather than its finding (a =UNIQUE= key
-with a nullable member does not make a set), which is the half that
-generalises./
-
-/Third:/ **the baseline is on record before any carrying exists.** geosetta
-writes that fixture today as =cities= alone, warning correctly that =imagery=
-(80 rows), =gpkg_tile_matrix= (14 rows) and 18 other schema objects are not
-carried -- defect 3. =foreign_key_check= on the output is *clean only because
-the row is gone*, so the oracle says nothing until § 1 is built. /Two facts the
-design did not have: the tile table carries **six triggers**, and
-=gpkg_tile_matrix= has 14 rows for 2 populated levels, so anything recomputing
-it from the tiles present writes a different file./
-
-*And rebuilding it is not byte-reproducible*, at exactly four sites: both
-=gpkg_contents.last_change= values and both
-=gpkg_metadata_reference.timestamp= values -- the two DATETIME columns of the
-same day's reading. /Which also means its =last_change= is a real producer
-stamp rather than the epoch sentinel, so the fixture exercises the carry that
-shipped in =0e33a40=./
-
-*A conformance oracle with no GDAL in it, 2026-08-23 -- code and a fixture.*
-Defect 6's fix was verified against the standard by *reading* it, and the thing
-that had just gone wrong was a fix verified the wrong way -- so reading was not
-a good enough place to stop. =tests/fixtures/spec_conformant.gpkg= is a
-GeoPackage built by =sqlite3= from the annexes' normative SQL with **no GDAL at
-any point in its provenance**, not even as a base file, and
-=build_spec_fixtures.sh= transcribes that DDL *mechanically* from the =.adoc=
-sources at a pinned commit so the independence can be audited rather than
-taken on trust.
-
-- =src/sqlite.rs= -- =MasterObject= gains =sql=, the undecoded
-  =sqlite_master.sql= text. The data was already being read; the struct
-  dropped it, which is part of why the existing test was written out of
-  substrings. Deliberately unparsed: normalising it first would erase the
-  differences the comparison exists to find.
-- =src/geopackage/writer.rs= -- =the_registry_ddl_is_what_the_standard_says=,
-  which compares *whole normalised DDL* per table against the fixture. The
-  normaliser collapses layout but steps over string literals, because
-  =DEFAULT ''= and =strftime('%Y-%m-%dT%H:%M:%fZ','now')= both appear in the
-  registry DDL and blind whitespace collapsing would rewrite them.
-
-***Result: all six registry tables match the standard exactly*** -- the spec
-pass earlier the same day holds up. The value is not the green run, it is that
-the check no longer depends on anyone remembering what to assert: the SHALL is
-/"only the specified columns and table constraints"/, and a substring assertion
-is structurally incapable of seeing an *added* column. **Confirmed by mutation,
-not by reasoning:** dropping =gdc_tn=, adding a spurious column and restoring
-=ogr2ogr='s =NOT NULL= on =srs_id= are each caught by the new test, and the
-extra column is *not* caught by the old one -- which is now documented in the
-old one's own doc comment.
-
-*The three M3b decisions, index b-trees, and defect 6, 2026-08-23 -- code.*
-The three decisions M3b was blocked on (D8, D9, D10) were taken by *measuring
-each case rather than re-reading the argument for it*, and two of the three
-recommendations on file did not survive that. Taking them turned up three bugs
-(§ BUGS FOUND, entries 14--16) and one missing capability that turned out to be
-underneath all of it.
-
-- =src/sqlite.rs= -- *index b-trees, both directions.* =Database::read_index=
-  and =walk_index=/=index_cell= (page types =0x0a=/=0x02=); =local_payload=
-  factored out of =leaf_cell= because index cells use a different on-page
-  ceiling; =Writer::build_index_btree=, =pack_index_interior=,
-  =index_leaf_cell=, =index_interior_cell=, =render_index_leaf=,
-  =write_index_interior=, =index_cell_size=; =autoindex_records= and
-  =compare_values=; =MasterEntry::records= and =TableSpec::autoindexes=, which
-  make =rootpage= the per-entry choice the plan said it would have to become.
-  Four new tests, one of them =#[ignore]=d.
-- =src/geopackage/writer.rs= -- *defect 6.* Four registry tables now emit the
-  specification's DDL, constraints included, each with the index its
-  constraints oblige. One new test.
-- =src/geopackage/container.rs= -- *entry 14's fix*: =feature_layers= filters
-  on =data_type = 'features'=, as the reader always has. And a
-  =WITHOUT ROWID= table now reports a real row count, because the index walk
-  can read one. One new test; one existing test updated to the better
-  behaviour.
-- =tests/fixtures/sqlite_contents.gpkg=, =tests/fixtures/sqlite_constraints.gpkg=
-  and =tests/fixtures/build_sqlite_fixtures.sh= -- *new*, with =HOSTILE.org=
-  entries. The script is checked in because these two exist to pin the gap
-  between what our fixtures contain and what the format permits, and a recipe
-  nobody can re-run reopens it.
-- =plans/same-format-fidelity.org= -- D8, D9, D10; defect 6 in § THE DEFECTS;
-  M3b's gap 1 and gap 2 corrected; § The collision's overturned
-  recommendation left standing with the reason.
-- =plans/spatial-index.org= -- D4's "rebuilt when the source had one" recorded
-  as an *unimplemented decision* rather than an open question, with M3b named
-  as its owner.
-
-*Three things worth carrying forward, and the third is the one to remember.*
-
-1. **A count in a heading is a heading that expires.** § THE DEFECTS stopped
-   being "Five defects" and § BUGS FOUND stopped naming a number, both on the
-   precedent of "THE NINE DECISIONS". Between them these two headings had been
-   renamed five times for no reason but arithmetic.
-2. **Two of three recorded recommendations were wrong, and both in the same
-   way** -- they were reasoned rather than measured, and each had been carried
-   forward long enough to read as settled. The raster refusal was drawn at the
-   reader, where nothing is lost; "carrying tiles is much less cheap" was false
-   under a classification written *after* it. /Re-derive a recommendation
-   before implementing it, especially one that has been sitting still./
-3. ***A missing capability does not always announce itself as a failure.
-   Sometimes it announces itself as a design.*** Nobody chose to write
-   constraint-free DDL. =sqlite.rs= could not write an index b-tree, so the DDL
-   that needed one was never written, and what was left looked like a house
-   style -- with the one table that needed no index standing as the apparent
-   exception that proved the rule. It was found by asking what a *different*
-   feature would cost, not by testing anything.
-
-*Two =sqlite.rs= bugs and the M3b survey, 2026-08-22 -- code.* Scoping M3b
-meant reading =src/sqlite.rs= for what it cannot do; the reading turned up two
-live bugs before any of the scoping was written down. Both are in
-§ BUGS FOUND, entries 11--12, with what measured them.
-
-- =src/sqlite.rs= -- =Table::defaults=, =ColumnDdl= (=parse_columns= now
-  returns a struct rather than a widening tuple), =default_literal=,
-  =parse_literal=, =text_literal=, =starts_word=; =read_rows= pads a short
-  record with the declared default instead of NULL. Four new tests, including
-  the full literal matrix and the two cases that must *not* be read as a
-  default (=CURRENT_TIMESTAMP=, =DEFAULT (1 + 1)=).
-- =src/geopackage/container.rs= -- =Survey::populated= holds
-  =Option<usize>=, so a table whose rows cannot be decoded is *classified*
-  rather than aborting the survey. One new test, and it asserts on
-  =warnings.len() == 2= deliberately: the bug's damage was *scope*, not
-  wording, and the R*Tree message disappearing alongside the loss message is
-  what shows that.
-- =tests/fixtures/sqlite_altered.gpkg= -- *new*, and it introduces a third
-  fixture prefix (=sqlite_*=) documented in =HOSTILE.org= § NAMING. Neither
-  construct it carries is something =ogr2ogr= will emit, which is the whole
-  point: see the lesson under entries 11--12.
-- =plans/same-format-fidelity.org= -- M3b gained the =sqlite.rs= gap survey:
-  what the writer can already do, the four gaps, the two decisions to take
-  first, and the note that =container.rs= should *invert* rather than keep
-  maintaining =REPRODUCED= by hand.
-
-/Worth carrying forward from the survey itself:/ =write_database= is already a
-general SQLite writer, so *carrying an arbitrary user table is an operation the
-crate can already express*. M3b is mostly classification work, not
-file-format work -- with one real exception (index b-trees), and even that is
-far cheaper for *carrying* an index than for *building* one, because a b-tree
-on disk is already sorted. Both are argued in the plan.
-
-*=cargo doc= had been failing for four commits, 2026-08-22 -- docs only.* Found
-while verifying the two fixes above. =Cargo.toml= denies
-=broken_intra_doc_links= and =private_intra_doc_links=, with a stated reason:
-"a link that silently stops resolving ... is the same class of drift as prose
-going stale, so it fails the build rather than scrolling past as a warning."
-Six links had stopped resolving. /Bisected:/
-
-#+begin_src text
-  2a12bab  0 errors   <- last green
-  4e29eea  3 errors   the column-schema pass (FieldDecl lands)
-  e27163c  5 errors   M4
-  16bd5dd  5 errors
-  c9d4932  6 errors   <- HEAD before this fix
-#+end_src
-
-Five were =private_intra_doc_links= -- a *public* item documenting itself in
-terms of something the reader of those docs cannot see (=columns_for=,
-=ColumnType=, =Column::name=, =FieldDecl::type_for= twice). All are now plain
-code spans, which is what the lint's own note recommends. The sixth, the
-=DeclType::admits= link in =feature.rs=, simply lacked a path and is now
-=crate::DeclType::admits=; =DeclType= is exported, so that one stays a link.
-
-*Two things worth knowing, and the second is the actual finding:*
-1. *This is not D7's doing*, despite landing in the same area. Comparing the
-   error *sets* across commits, D7 *fixed* one (=ty= → =DeclType=, by
-   exporting =DeclType=) while its =pub(crate)= demotions broke others -- net
-   zero at =c9d4932=. It broke at *=4e29eea=*, the first commit where a public
-   type in =feature.rs=/=schema.rs= documented itself by pointing into the
-   private =schema= module.
-2. **A deny-level lint that nothing runs is not a tripwire.** These lints were
-   configured precisely to catch "a module demoted to =pub(crate)=" -- which is
-   exactly what happened -- and they caught nothing for four commits, because
-   the verification ritual recorded everywhere in these documents is
-   =cargo test= plus =cargo clippy=, and neither runs rustdoc. There is no CI
-   in this repo. The header's verification line now names =cargo doc= as the
-   third command; that is the whole fix, and it is a process fix rather than a
-   code one.
-
-*A review pass over the uncommitted work, 2026-08-21 -- code.* Everything since
-=16bd5dd= re-read and re-measured rather than taken on trust. The test count,
-clippy, and both =#[ignore]=d GDAL cross-checks all held; the value-level claims
-(2^53+1 exact, blobs surviving, =REAL= 64-bit, unsigned widths, =.dbf= fifteen
-decimals) were re-run against the release binary and hold too. Five things did
-not, and all five are fixed:
-
-1. *The R*Tree warning named layers that were not being written.*
-   =indexed_layers= filtered against every layer in =gpkg_contents= rather than
-   against =written=, so =--layer cities= reported an index on =second= -- a
-   layer absent from the output -- and offered =--rtree= as a remedy that
-   cannot apply, since the writer only indexes what it writes. That also
-   contradicted the module's own rule that a deliberate selection is not a
-   loss, which the row survey had followed and this had not. Now filtered by
-   =written=, pinned by
-   =an_index_on_a_layer_that_is_not_being_written_is_not_reported=.
-2. *=decl_recast_warning= said the opposite of its own doc.* The doc explains
-   that the message shows both types "rather than claiming which is worse,
-   because =Date -> DateTime= is not narrower and is still not what went in" --
-   and the message then ended "which is narrower than what went in", which is
-   the one claim a lateral recast does not support. Now "which is not the type
-   that went in", the claim both cases carry.
-3. *=NativePayload= was public and exhaustive.* D7 marked =JsonValue= and
-   =DeclType= =#[non_exhaustive]= and left the one enum that grows *by
-   construction* -- a variant per spoke, with four spokes and two containers
-   still to come, each of which would have broken every downstream =match=.
-   Now marked, and =tests/public_api.rs= gained the arm that *enforces* it:
-   every known variant named beside a wildcard, under a crate-level
-   =deny(unreachable_patterns)=, so removing the attribute fails the build.
-   /Verified by removing it and watching the build fail./ The two existing
-   arms in that test are demonstrations rather than enforcement -- they do not
-   list every variant -- and now say so.
-4. *Two doc comments orphaned by insertion.* New code was placed between an
-   existing doc comment and the item it documented, in =geopackage/reader.rs=
-   (=feature_layer_names='s doc absorbed by =ContentsMeta=) and
-   =json/value.rs= (=write_json_string='s absorbed by =write_json_f64=). Both
-   restored.
-5. =sqlite.rs= pointed at =container_drop_warning=; the function is
-   =container_drop_warnings=.
-
-/Worth noting about (1) and (2): both are warnings, and both were wrong in the
-direction the tests could not see -- a warning's *text* and its *scope* are not
-what a round-trip assertion looks at. That is the same blind-spot lesson as the
-type-vs-value one, one layer further out./
-
-*Two claims below were also measured and corrected in place* rather than
-restated here, since a correction filed at the top of a change log is a
-correction nobody reading the original will see: what the =REAL= fix actually
-produces (it normalizes the spelling to =DOUBLE=; it does not preserve
-=REAL=), and what "byte-identical to GDAL's" covers in the =.dbf= entry (the
-number's digits, not the field width). Both are in the entries that made them.
-
-*The number model and Shapefile's decimals, 2026-08-21 -- code.* Two findings
-that had been recorded rather than fixed. The first turned out to be a symptom.
-
-=JsonValue::Number= was an =f64= plus an =is_int= flag, and an =f64= carries
-integers exactly only to 2^53 -- so a *same-format* =gpkg -> gpkg= run turned
-=9007199254740993= into =...992=, on a plain 64-bit =INTEGER= column. Past
-=i64::MAX= the serializer's =as i64= saturated: =12345678901234567890= came
-back =9223372036854775807=, a specific wrong number. **The flag was the tell**
--- it existed to remember what the representation had already thrown away.
-
-Now =Int(i64)= and =Float(f64)=, so an integer never touches a double. One too
-wide for an =i64= becomes =Float=: lossy, but honestly lossy, never a different
-integer. Whole floats keep their =.0= (=1.0= stays =1.0=), which matches
-=ogr2ogr= -- verified, including its coordinates, which it writes =[1.0,2.0]=.
-That change immediately caught =geojson/mod.rs='s *two writers disagreeing*:
-the direct writer formatted its own coordinates while the tree serializer went
-through =JsonValue=. Both now call one =write_json_f64=.
-
-*The sweep now uses values past 2^53*, because it did not before -- =Int64='s
-representative value was small enough to survive a double. A sweep can be
-exhaustive over *types* and still miss a whole class by being unadventurous
-about *values*. That is the third variation on the same lesson in two days,
-after the undeclared-column path and the type-vs-value blind spot.
-
-=dbf.rs='s =DECIMALS= fallback went 6 → 15, matching the =15= in =ogr2ogr='s
-=Real (24.15)= for an undeclared double. *The number's text is now
-byte-identical to GDAL's; the field around it is not, and deliberately.*
-/Measured on =1.23456789012345=:/ both write the digits =1.234567890123450=,
-and geosetta writes them into an =N(17,15)= field where =ogr2ogr= writes
-=N(24,15)= -- the difference is trailing pad, because this writer sizes a field
-from the values it actually holds while GDAL uses a fixed default. That is the
-same policy that makes an integer column =N(2)= here and =N(9)= there, it is
-not part of this change, and the =24= was never the thing being matched.
-*Whether that policy is the right one is now an open question* --
-=same-format-fidelity.org= § OPEN QUESTIONS' first entry, and § OPEN QUESTIONS
-WORTH KNOWING below.
-Fifteen decimals push the fixed-point text past the 255-byte =.dbf= limit at
-lower magnitudes, so the *fallback* is trimmed to fit (at =1e240= those
-decimals are padding an =f64= never carried); a *declared* scale is left to
-fail loudly, since that is the source stating a fact.
-
-*The JSON half of the original finding stands unfixed and is fine*: a =Json=
-column round-trips through GeoParquet as a parsed object, so its text is not
-byte-preserved. That is the open canonicalisation question, not a defect.
-
-*D7, the public API, 2026-08-21 -- code.* D1 models the column schema in the IR
-rather than carrying it as a native, and D5 says why: only a modelled field lets
-an external tool widen a declaration mid-flight. Both are arguments about a
-*caller*, and neither had ever been run from where a caller stands.
-
-=Feature::properties= is a public field of type =JsonValue=; =FieldDecl::ty= is
-a public field of type =DeclType=; both types lived in =pub(crate)= modules, so
-**neither could be named outside this crate**. A consumer could read a
-declaration and not construct one, read a feature's properties and not build a
-feature that had any. The library was a read-and-convert API whose docs
-described an edit-in-the-middle API.
-
-The tell was found by accident: adding =JsonValue::Binary= earlier the same day
-was a new variant on a public enum -- normally breaking for every downstream
-=match= -- and it broke nothing, because no downstream match was possible.
-
-Both are now exported =#[non_exhaustive]=; =DeclType::hub= and
-=FieldDecl::type_for= are demoted to =pub(crate)= (both name types that stay
-internal); =ColumnType=/=Cell=/=Column= stay internal and are now reachable
-from nothing public. *The enforcement is =tests/public_api.rs=, and it has to
-live in =tests/=* -- an integration test compiles as a separate crate, so it
-sees what a real dependent sees. A unit test in =src/= cannot check this
-property at all, because inside the crate everything is nameable, which is
-exactly why the gap survived this long.
-
-*The binary cell type, 2026-08-21 -- code.* The recast matrix asserted
-*declarations*, and it was green while a =gpkg -> gpkg= run **destroyed every
-blob in the file**: the =BLOB= declaration survived, so the types matched, and
-=X'0102'= came back =NULL=. The GDAL cross-check missed it for the same reason
--- it diffed =ogrinfo -so=, which prints the schema and no values.
-
-The cause was structural rather than careless. The IR's property type is
-=JsonValue=, so bytes had nowhere to live; =geopackage/reader.rs= returned
-=Null=, FlatGeobuf skipped the payload, GeoParquet rendered hex text, and all
-three then *declined to declare* =Binary= -- correctly, since declaring a type
-whose values are destroyed is a promise the value side cannot keep. So the fix
-was the IR: =JsonValue::Binary(Vec<u8>)=, whose doc admits it makes the type's
-name a slight lie and cites the precedent (=Number { is_int }= is not a JSON
-distinction either). The compiler then enumerated the blast radius exactly as
-D3 intends -- eight sites, each a writer that had to decide.
-
-Two spokes gained a capability they already had on disk: FlatGeobuf's
-=ctype::BINARY= was in the reader's table and unreachable from the writer,
-which kept *its own duplicate of all fourteen constants* -- collapsed to one
-shared table in the same pass. GeoParquet's unannotated =BYTE_ARRAY= is binary
-in Parquet's own model and was being decoded as UTF-8.
-
-=Date= also stopped degrading to text: FlatGeobuf has no =DATE= but has
-=DATETIME=, which is what =ogr2ogr= writes for the same hop. And once the type
-survived the transit, the *value* turned out not to -- =format_timestamp=
-emitted no =Z=, so =gpkg -> parquet -> gpkg= turned =12:00:00+00= into an
-unzoned =12:00:00=. =TIMESTAMP_MILLIS= is UTC by definition, so it emits the
-designator now.
-
-*The rule this bought*, and it belongs beside the undeclared-column one below:
-**a type-fidelity test that never looks at a value can be perfectly green while
-the values are being destroyed.** Three of those four bugs fell out of one
-change -- adding a value comparison beside the type comparison, in both the
-in-tree sweep and the GDAL check.
-
-*Two findings recorded, not fixed*, both policy calls rather than defects: a
-=Json= column round-trips through GeoParquet as a *parsed object* rather than
-its text (not byte-preserving -- ={"a": 1}= loses the space -- and an instance
-of the open canonicalisation question), and Shapefile rounds an undeclared
-double to =dbf.rs='s =DECIMALS= fallback of 6, silently, where GDAL uses 15.
-
-*The recast matrix, 2026-08-21 -- code.* Defect 5 was closed by M4 across all
-four declaring spokes, and then three more instances of it shipped anyway.
-=REAL= read back 32-bit; GeoPackage wrote every unsigned width as the
-same-width *signed* spelling (=UInt32= as =MEDIUMINT=, so GDAL read 3000000000
-back as -1294967296); and an ISO 8601 =DateTime= carrying the standard =Z=
-degraded to text on the GeoParquet writer's parse side, which is what a
-=gpkg -> parquet= hop always produces. All three were shallow. All three
-survived because *every test that touched the type surface was an example
-test*, while the surface is eight =match= tables over sixteen variants and some
-forty on-disk spellings.
-
-What went in instead of a fourth example: =DeclType::admits= (the widening
-relation, derived from =int_range=, in which *=String= admits nothing* --
-see the plan for why that matters), =Format::recast= (what each format does to
-each type), =FeatureCollection::decl_recast_warning= (the fourth entry in
-=collect_conversion_warnings=, firing only where =admits= fails),
-=DeclType::ALL= with a catch-all-free completeness test, two sweeps in
-=convert.rs=, four *inbound* tables asserting what each on-disk spelling
-*means*, and =tests/gdal_types.rs= + =tests/fixtures/gdal_types.gpkg= for the
-differential check against the reference tool. 522 tests (from 513), plus 2
-=#[ignore]=d.
-
-*The one lesson worth carrying forward*, because it is not obvious and it cost
-a day: **a self-round-trip over declared values is not sufficient.** The =REAL=
-bug lived on the *undeclared* path -- the writer emits =REAL= for a plain
-double and the reader read =REAL= as =Float32=, so an undeclared column
-acquired a narrower declaration out of nowhere. The declared path
-(=Float32= → =FLOAT= → =Float32=) was closed the entire time. A writer never
-emits the spelling it cannot read, so closure under *our own output* can hide
-an inbound bug indefinitely; only a table of what each spelling *means*, or a
-second implementation, will say.
-
-*Also worth knowing:* =DeclType= is *not publicly exported* -- =FieldDecl.ty= is
-a public field of a type an external consumer cannot name, so a pipeline stage
-can read a declaration but not construct one. That partly undercuts D5's
-argument for modelling the schema rather than carrying it as a native. Left
-alone deliberately: it is an API decision, not a bug fix.
-
-*The GeoPackage spoke, 2026-08-21 -- code, extended 2026-08-24.* =GpkgNative=
-carries a layer's =gpkg_contents.identifier=/=description=/=last_change= and its
-=gpkg_data_columns= rows plus
-the =gpkg_data_column_constraints= they name; verified on real =ogr2ogr= output
-and *read back by GDAL* (=ogrinfo= reports the same alternative names, comments
-and domain off our output; =ogr2ogr= rewrites it). 513 tests (from 509). The
-identifier was defect 4's shape in another format -- =gpkg_contents(identifier)=
-was hardcoded to the table name, =description= to ='' =, exactly as FlatGeobuf's
-=NAME= slot had been hardcoded to =geosetta=.
-
-***=last_change= was added on 2026-08-24, and it had been missed rather than
-deferred.*** The =gpkg_contents= row was surveyed for what it says *about* a
-layer, and a timestamp reads as bookkeeping -- so it was never listed as a
-member in =native-inventory.org= at all. It is not bookkeeping: the standard
-defines it as /"timestamp of last change to content"/, the one column in that
-row with a stated meaning about the data. So a =gpkg -> gpkg= run had been
-overwriting a real value with a constant for three days, inside the spoke whose
-whole job is that this does not happen. /Found while reading the normative text
-for an unrelated question -- the =gpkg_metadata_reference= timestamp, which the
-standard leaves undefined, and the contrast is what made this one visible./
-
-*The new payload is contained, measured against the parent commit:* over
-=gdal_hostile.gpkg=, =geojson=, =fgb=, =csv= and =wkt= output is byte-identical
-and so is stderr; only =gpkg= differs, which is the intended change. A
-=Gpkg=-tagged payload is invisible to other spokes because =payload_for= is
-format-tagged, and no warning path reads =fc.native=. **The risk that remains
-is the proxy one:** =is_empty()= is now always false for a foreign GeoPackage,
-so =native.is_some()= no longer means "this file has unusual content" -- one
-existing test used it that way and broke on this change.
-
-*Only the carry half shipped.* The rule is that the stamp follows whoever last
-changed the content and that is never geosetta, so a passthrough carries and a
-cross-format source -- having nothing to carry -- still gets the writer's epoch
-sentinel. Writing a fresh timestamp there is the other half and is deliberately
-unbuilt: it would cost byte-reproducible output on nearly every run this tool
-does, and fixes nothing the carry does not. That property is now pinned by
-=two_writes_of_the_same_input_are_byte_identical=, which exists so the trade
-cannot be made by accident.
-
-Three things came out of it, all in the plan's M3 entry:
-1. *A member equal to what the writer would emit anyway is derived, not
-   opaque.* =identifier= is carried only when it differs from the table name,
-   =description= only when non-empty -- otherwise every GeoPackage in existence
-   gets a payload, =is_empty= is never true, and a renamed layer gets a *stale*
-   title replayed into it.
-2. *=FgbNative='s "absent and empty are different" rule does not generalize*,
-   and this is worth knowing before the next spoke: it holds there because the
-   FlatGeobuf writer *omits* an absent field. =gpkg_contents= is a row always
-   written, so NULL and ='' = are the same bytes.
-3. *The Schema extension's tables are layer content in container-scoped
-   tables*, keyed by =(table_name, column_name)= -- so they travel with the
-   layer, not with M3b, and had to come out of defect 3's warning. That is
-   =container.rs='s =REPRODUCED= coupling moving for the first time, one day
-   after it was flagged.
-
-*And a pre-existing bug that measuring found and reading would not have.*
-=decl_type= grouped =REAL= with =FLOAT= as =Float32=, but =REAL= is 64-bit in
-both the GeoPackage spec's table 1 and SQLite's storage classes -- so a
-=price REAL= column came back declared =FLOAT=: =Real (0.0)= in,
-=Real(Float32) (0.0)= out, on a *same-format* run, per GDAL. *Defect 5's shape
-in one more spelling*, sitting inside work M4 had declared complete across all
-four declaring spokes. /Fixed the same day./
-
-*What the fix produces, since the width was only half the question:* the round
-trip is 64-bit in both directions now, and the *spelling is normalized*. All
-five of GeoPackage's 64-bit float names collapse to =DeclType::Float64=, and
-the writer has one spelling per variant -- so =REAL=, =NUMERIC=, =DECIMAL= and
-=DOUBLE PRECISION= all come back declared =DOUBLE=. /Measured:/ GDAL reports
-=Real (0.0)= for every one of them before *and* after, so nothing a reader can
-act on is lost; the file is simply not byte-identical in its DDL. Left alone on
-decision 16's grounds -- =DOUBLE= is what this writer emits for a 64-bit float
-anyway, and carrying the source's spelling would mean a =DeclType= variant per
-synonym for a distinction no format, and no tool, draws. *Worth knowing before
-the next reader assumes a same-format =gpkg= run is byte-preserving: it is
-value- and type-preserving, which is what the rule asks for.* /A related
-measurement, recorded because it cuts the other way:/ =ogrinfo= does not list a
-=DECIMAL= or =DOUBLE PRECISION= column at all -- GDAL skips spellings outside
-its own table -- and reads them fine off our output, where they have become
-=DOUBLE=.
-
-The step that caught it was
-diffing =ogrinfo= on the input against =ogrinfo= on the output, which is the
-argument for the reference-tool check being part of a spoke rather than a
-nicety.
-
-*Defect 3's warning, 2026-08-21 -- code.* =src/geopackage/container.rs= (new,
-the survey and both messages), =src/sqlite.rs= (=MasterObject= and
-=Database::master_objects=, which enumerates *every* =sqlite_master= entry --
-=tables()= returns only the readable subset, and what a file *contains* is a
-different question from what it can *read*), =src/geopackage/mod.rs=
-(re-export), =src/main.rs= (two call sites in =run_geopackage_write= -- the
-source container and the destination being appended to -- plus =names_of=).
-Six new tests, 509 from 503. =plans/lossy-conversion-warnings.org= gained it as
-the *fourth* pre-write instance, with the reason it is the only one not wired
-into =collect_conversion_warnings=: the other three answer "can the target hold
-this", and this one's target is GeoPackage, which holds all of it perfectly
-well -- the loss is in *this writer*, so only the bytes can answer.
-
-*One thing the first draft got wrong, kept because it is the useful part:* it
-reported =gpkg_extensions= as destroyed content. Feeding this crate's own
-=--rtree= output back in showed it warning about the very table it had just
-written -- the registration rows are *derived*, travelling with the index that
-=indexed= already reports separately, so counting them named one loss twice.
-The check that caught it was the cheap one available from the start: run the
-tool on its own output and see whether it stays quiet.
-
-*The GeoParquet spoke, 2026-08-20 -- code.* =ParquetNative= carries every
-=key_value_metadata= entry beside =geo= (=ARROW:schema=, =gdal:metadata=,
-anything else a producer wrote) plus =geo.orientation=; verified on real
-=ogr2ogr= output and read back by *both GDAL and DuckDB*. 503 tests (from
-500). Two rulings came out of it, both in the plan's M3 entry: *=created_by=
-is not a native* (it names the application that wrote the file, and geosetta
-did -- the mirror image of defect 4, where FlatGeobuf's =name= was the
-*layer's* identity and had to be carried), and *an opaque member can also be
-derived*, which is why =ARROW:schema= is replayed only while the column names
-still match.
-
-*The =covering= handover, same day -- documentation only.* The one GeoParquet
-member the spoke left unhandled turned out to have *no owner*: =envelope.org=
-pointed at =arbitrary-geoparquet.org= milestone 6, but that milestone is
-geometry variation and its covering work (3c) is the *read* side, already
-done. Writing one is now =spatial-index.org= *milestone E*, beside the
-FlatGeobuf and GeoPackage indexes it shares a D4 rule with. Two stale claims
-fell out: that plan said "GeoParquet -- no index structure" (written before
-GeoParquet 1.1) and =plans/README.org= marked it *DONE*. Both corrected, and
-it is now in =plans/todo.org= where remaining work is actually looked for.
-
-*The FlatGeobuf review pass, 2026-08-20 -- documentation only, no code.* The
-spoke was re-verified rather than taken on trust (487 tests, clippy clean, 27
-FlatGeobuf tests, =ogrinfo= re-confirmed on our own output). Recorded: the
-stale =482= test count here and in the fidelity plan, replaced by a figure
-that says which suites it counts; and the *two conflicting defect numberings*
-reconciled in § LIVE BUGS.
-
-*M4 and live bug 1, 2026-08-20 -- code.* Everything above this entry was
-documentation; this one shipped. =FieldDecl::ty= + =DeclType= + the
-=type_for= precedence rule; FlatGeobuf null cells and =Column.type=;
-GeoPackage DDL type parsing, boolean recovery and type emission; Shapefile
-=.dbf= =L=/=D= field types; GeoParquet's =converted_type= annotations and
-=TIMESTAMP=/=DATE= columns in both directions, which also fixed a *latent
-pre-existing bug* -- an unsigned column above =i32::MAX= was being read back
-negative, because Parquet has no unsigned physical type and the annotation was
-never applied; the GeoPackage reader setting =fc.name=. 500 tests (from 487),
-clippy clean, and =tests/perf.rs= gained the sparse =wide_table= counterpart
-/before/ the change that needed it. Three surprises are recorded in the plan's M4 entry -- the one
-worth repeating here is that *an absent FlatGeobuf properties vector is not
-"no properties"*: an all-null row encodes as an empty blob the writer omits,
-so the reader has to decode against the header columns even when there is no
-vector at all.
-
-*The defect 5 discovery, same day -- documentation only.* Advising on whether
-to finish M3 before M4 turned up a *fifth defect*: =schema::ColumnType='s four
-values are narrower than every real format's, so =Int16=, =Float32= and
-=DateTime= columns all widen or degrade on a round trip -- with no null
-involved. Written up in =same-format-fidelity.org= (§ THE DEFECTS, which is
-what that section is now called), and it re-scoped M4 to open with a
-*vocabulary investigation* instead of a field addition.
-
-*The defect 1 review, same day -- also documentation only.* Three findings,
-each measured against real =ogr2ogr= output rather than argued:
-1. *Defect 1 is two losses, not one.* Restoring the cell leaves the column's
-   *declared type* behind, because =FieldDecl= has none and =infer_columns=
-   defaults an all-null column to =String=. The plan's "one-sided fix in
-   =flatgeobuf/reader.rs=" named the right file and understated the size.
-2. *Defects 1 and 2 share a fix* -- a declared type on =FieldDecl= -- so M4 is
-   now scoped as one piece with that step sequenced first.
-   =native-inventory.org= gained the =Column.type(1)= entry it was missing and
-   reclassified GeoPackage's declared type opaque -> modelled.
-3. *An earlier note of mine was retracted.* The GDAL /unset/-vs-/null/
-   "decision to settle", added to defect 1 hours earlier in this same pass,
-   mistook =ogrinfo='s display convention for GDAL's data model. Measuring
-   one input through every spoke showed GeoParquet, GeoPackage and CSV
-   already materialize nulls exactly as GDAL does. There was never a fork.
-   /Left in the record deliberately, since the mistake is the useful part: a
-   reference implementation's *display* output is not its model, and the
-   cheaper check -- what does this crate already do? -- was available the
-   whole time and would have answered it in one command./
-- =plans/same-format-output.org= -- gained a backlink recording that it is
-  *gated*, its M1 resequenced, its atomic-writes scope item updated, and one
-  OPEN QUESTION moved out. /That backlink is stale as of 2026-08-22: the gate's
-  supporting argument expired -- see § THE SEQUENCING. The plan file has not
-  been edited to say so, so believe this note over the backlink./
-- =plans/lossy-conversion-warnings.org= -- gained § OWED WARNING (decision 3)
-  and § OPEN QUESTION (the consolidated warning-scope question).
-- =plans/spatial-index.org= -- its =--rtree=-by-default question *narrowed*,
-  not answered: D4 decided only that an index is rebuilt when the source had
-  one. Whether a file that never had one should get one is still that plan's
-  call. *Later (2026-08-20) it also gained milestone E*, GeoParquet's covering
-  column, handed over from M3's GeoParquet spoke -- see the change-log entry
-  above.
-- =plans/README.org=, =plans/todo.org= -- indexed the new documents; README
-  entries placed in dependency order (fidelity → inventory → output →
-  edit-composability).
-
-*Source changes, for the same reason:*
-- =src/native.rs= -- *new*. The whole mechanism.
-- =src/lib.rs= -- =pub mod native= and the =Native=/=NativePayload= re-export.
-- =src/feature.rs= -- =Feature::native=; =FeatureCollection::name= and
-  =::native=; =Default= derived on both (which is what kept the migration to 14
-  sites in =src/= instead of 68).
-- =src/geojson/mod.rs= -- reader stashes and models =name=; both writer paths
-  replay. Four new tests.
-- =src/{convert,csv,schema}.rs=, =src/{flatgeobuf,geopackage,kml,shapefile}/*=
-  -- *mechanical only*: =native: None= at each construction site. No behaviour
-  change in any of them.
-- =tests/crs_external.rs= -- one construction site, mechanical.
-
-*M4, the declared column type* (2026-08-20) -- the widest of these passes,
-touching every declaring spoke:
-- =src/schema.rs= -- =DeclType= (sixteen variants), =FieldDecl::ty=,
-  =FieldDecl::type_for= (the precedence rule), =Column::declared_type=.
-- =src/flatgeobuf/{reader,writer}.rs= -- null cells materialized,
-  =Column.type= kept, and =encode_properties= switched to the *on-disk* type
-  (a column written =SHORT= stores two bytes; writing eight would
-  desynchronise every value after it in the row).
-- =src/sqlite.rs= -- =parse_columns= now returns each column's declared DDL
-  type; =Table::column_types=.
-- =src/geopackage/{reader,writer}.rs= -- declared type read and emitted,
-  booleans recovered.
-- =src/shapefile/dbf.rs= -- =L=/=D= field types, and the =D= write arm they
-  needed.
-- =src/parquet/{reader,writer,types,geo}.rs= -- =converted_type= annotations
-  both ways, =INT32=/=FLOAT= physical encoding the writer had never emitted,
-  ISO-to-epoch parsing to invert the reader's =format_timestamp=, and the
-  unsigned-mask fix.
-- =src/format.rs= -- =carries_column_schema= gained =Gpkg= and =Parquet=.
-- =src/convert.rs=, =tests/perf.rs= -- tests, and the sparse benchmark.
-
-*The GeoPackage spoke, sixth* (2026-08-21): =src/native.rs= (=GpkgNative=,
-=GpkgDataColumn=, =GpkgConstraint=), =src/lib.rs= (re-exports),
-=src/geopackage/reader.rs= (=layer_native= and the three table readers; also
-the =REAL= → =Float64= fix), =src/geopackage/writer.rs= (=gpkg_contents=
-replays identifier/description, =schema_extension_tables= rebuilds the Schema
-extension), =src/geopackage/container.rs= (=LAYER_SCOPED=, so defect 3's
-warning stops reporting what the spoke now carries), =src/convert.rs= (five new
-tests), =tests/fixtures/gdal_hostile.gpkg= + =HOSTILE.org= (the layer-level
-members the fixture did not previously carry). *Left to M3b deliberately:*
-everything at container level -- user tables, =gpkg_metadata=, extension
-registrations.
-
-*The GeoParquet spoke, fifth* (2026-08-20): =src/native.rs=
-(=ParquetNative=), =src/lib.rs= (re-export), =src/parquet/reader.rs= (collect
-every =key_value_metadata= entry beside =geo=, plus =geo_orientation=),
-=src/parquet/geo.rs= (=metadata= takes an orientation), =src/parquet/writer.rs=
-(=replayable_metadata= and its =ARROW:schema= gate), =src/convert.rs= (attach
-and replay). Three new tests. *Left undone deliberately:* =covering=, which
-needs nested-struct writing the writer cannot do -- see the plan's M3 entry.
-
-*The FlatGeobuf spoke, third* (see § STATUS in the fidelity plan):
-=src/native.rs= (=FgbNative=/=FgbColumnNative=), =src/lib.rs= (re-exports),
-=src/flatgeobuf/{reader,writer}.rs= (header/`Crs`/`Column` descriptive members,
-=fc.name=; =build_header= now takes the collection rather than eight
-positional arguments), =src/main.rs= (the name fallback chain). Six new tests.
-
-*The column-schema pass, second:*
-- =src/schema.rs= -- =FieldDecl=, =Column::decl=, =columns_for=,
-  =declared_or=. Six new tests.
-- =src/feature.rs= -- =FeatureCollection::schema= and
-  =schema_drop_warning=. Two new tests.
-- =src/format.rs= -- =Format::carries_column_schema=. *Read its doc comment
-  before editing it*: unlike =supports_m= beside it, it describes this crate's
-  implementation rather than the formats' specs, and it shrinks as spokes land.
-- =src/lib.rs= -- =pub use schema::FieldDecl= (the module stays =pub(crate)=).
-- =src/shapefile/dbf.rs= -- =read_schema=; =dbf_field= widens to a declaration
-  instead of re-deriving. Seven new tests.
-- =src/shapefile/{reader,writer}.rs= -- fill =fc.schema=; use =columns_for=.
-- =src/flatgeobuf/{reader,writer}.rs= -- =read_decl= / =write_decl= over
-  =Column= slots 4--9; use =columns_for=. Two new tests.
-- =src/main.rs= -- one line in =collect_conversion_warnings=.
-- =src/convert.rs= -- two end-to-end tests (the transit, and the mid-flight
-  widen).
+- =plans/encodings.org= -- **new**, and indexed in =plans/README.org= and
+  =plans/todo.org=.
+- =plans/native-inventory.org= -- Q1 and Q3 answered; § CSV gains a FIXED
+  subsection and a pointer so its present tense cannot mislead; the =.cpg=
+  prose rewritten with the =ogr2ogr= LDID measurement and the wrong priority
+  note kept as a lesson.
+- =plans/same-format-fidelity.org= -- D17 added with its per-column
+  sub-decision; D6 → BUILT; STATUS; M1 finding 2; the compiler-enforcement
+  open question marked built.
+- =plans/shapefile.org= -- new § THE SIDECAR POLICY (cited by the warnings
+  themselves); § OPEN QUESTIONS hands the encoding question to
+  =encodings.org=.
+- =plans/spatial-index.org= -- milestone B amended for the sort removal, with
+  the GDAL oracle; the intro bullet's "we currently write index-less files"
+  corrected /(stale since milestone B shipped)/.
+- =plans/flatgeobuf.org=, =plans/same-format-output.org=,
+  =plans/lossy-conversion-warnings.org= (the approximated-codepage candidate),
+  =plans/README.org=, =plans/todo.org=.
+- =tests/fixtures/HOSTILE.org= -- the =hand_hostile.csv= entry described
+  behaviour that no longer happens.
+- =README.md=, =project.org= -- the CSV inference wording, the Shapefile file
+  set, and the same-format loss list.
+- *Source docs*: =csv.rs='s module doc, =flatgeobuf/writer.rs='s module doc
+  (which still called the R-tree "a deferred enhancement"), =cli.rs='s
+  =sort_hilbert= comment (whose causality was backwards),
+  =shapefile/writer.rs='s =Encoded::cpg=, =main.rs='s
+  =write_shapefile_to_path=.
+
+*Two of the four stale sites found in the audit predated this session*, which is
+the part worth keeping: a doc goes stale at the moment a *different* file
+changes, and nothing in the workflow notices.
 
 ** REPRODUCING THE MEASUREMENTS
-Every claim marked /measured/ was run against the release binary
-(=target/release/geosetta=, workspace target dir -- note =geosetta/target/= is
-a stale leftover and its binary predates =--crs=) and GDAL 3.13.2. The fixtures
-are in the tree, so most re-run directly, e.g.:
-
-#+begin_src text
-geosetta tests/fixtures/gdal_hostile.gpkg - --to geojson --layer cities
-geosetta tests/fixtures/hand_hostile.csv - --to fgb | geosetta - - --from fgb --to csv
-#+end_src
-
-*The D2 measurement (2026-08-23) needs files that are not in the tree*, because
-it is about what a *producer* emits rather than about a fixture. It rebuilds in
-four commands, and the last one is the oracle:
+Every claim above was run, not inferred. The non-obvious ones:
 
 #+begin_src sh
-  ogr2ogr -f GPKG a.gpkg roads.geojson   -nln roads
-  ogr2ogr -f GPKG b.gpkg rivers.geojson  -nln rivers
-  # every index in either file, with the collation of its first key column
-  sqlite3 a.gpkg "SELECT tbl_name, name, sql IS NULL AS autoindex FROM sqlite_master WHERE type='index';"
-  sqlite3 a.gpkg "SELECT name, coll, desc FROM pragma_index_xinfo('sqlite_autoindex_gpkg_extensions_1') WHERE key=1;"
-  # the naive set-union, which dedupes nothing: 3 + 3 -> 6
-  cp a.gpkg m.gpkg && sqlite3 m.gpkg "ATTACH 'b.gpkg' AS s; INSERT OR IGNORE INTO gpkg_extensions SELECT * FROM s.gpkg_extensions; SELECT count(*) FROM gpkg_extensions;"
-  # what the answer should have been: 4, renumbered, foreign keys rewritten
-  cp a.gpkg o.gpkg && ogr2ogr -f GPKG -update -append o.gpkg rivers.geojson -nln rivers
+  # D17: every cell's text survives, and the geometry column's does not.
+  geosetta tests/fixtures/hand_hostile.csv - --to csv
+
+  # The per-column verdict, which per-cell gets wrong.
+  printf 'zip,geometry\n007,"POINT (1 2)"\n08001,"POINT (3 4)"\n12345,"POINT (5 6)"\n' > /tmp/z.csv
+  geosetta /tmp/z.csv - --to geojson      # all three strings; per cell, 12345 was a number
+
+  # Defect 24: the source's order, and ours.
+  geosetta tests/fixtures/gdal_hostile.fgb /tmp/out.fgb
+  ogrinfo -al -q /tmp/out.fgb | grep name  # København first, as in the source
+
+  # Defect 25: a stale .cpg, before the fix. (Now overwritten; use git to retry.)
+  printf 'ISO-8859-1' > /tmp/s.cpg
+  printf 'name,geometry\nKøbenhavn,"POINT (12.5683 55.6761)"\n' > /tmp/uni.csv
+  geosetta /tmp/uni.csv /tmp/s.shp && ogrinfo -al -q /tmp/s.shp | grep name
+
+  # The LDID measurement behind encodings.org D-E2.
+  ogr2ogr -f 'ESRI Shapefile' /tmp/g2.shp tests/fixtures/gdal_hostile.shp
+  xxd -s 29 -l 1 -p /tmp/g2.dbf           # 57 — Windows-1252, over UTF-8 bytes
+  xxd -s 29 -l 1 -p /tmp/s.dbf            # 00 — ours, with .cpg carrying the truth
+
+  # The oracles.
+  cargo test -p geosetta
+  cargo test -p geosetta --lib -- --ignored
+  cargo test -p geosetta --test gdal_types -- --ignored
+  cargo test -p geosetta --test gpkg_oracles -- --ignored
 #+end_src
 
-/The =pragma_index_xinfo= line is the one to keep: it is the only way to read an
-autoindex's collation, since an autoindex has no =sql= text to grep./
+*Verified state at the end of this session*: 641 tests pass (576 lib, 64
+integration, 1 doc), 13 =#[ignore]=d cross-checks against GDAL, =sqlite3= and
+the PROJ oracle all pass, clippy clean on =--all-targets=, =cargo doc= green.
+Five mutations, each caught by the test aimed at it.
 
-*A trap in the append leg, which cost one wrong sentence in a commit message.*
-The interesting row is the destination's *pre-existing*
-=gpkg_metadata_reference= row, not the count of rows afterwards -- the new
-layer's row is newly created, so its =timestamp= being the append time is
-evidence of nothing. Read the destination before and after, and discriminate
-the mechanism before generalising:
+***Not committed.*** 24 files modified, one new.
 
-#+begin_src sh
-  ogr2ogr -f GPKG -update -append d.gpkg b.geojson -nln rivers  # NEW layer: rewrites the old row's ts
-  ogr2ogr -f GPKG -update -append d.gpkg a.geojson -nln roads   # EXISTING layer: leaves it alone
-  ogrinfo d.gpkg roads -so                                      # read-only: leaves it alone
-#+end_src
-
-/It is a new metadata *record* that makes GDAL rewrite the whole table, not a
-write to the file. Two of those three commands are what stop "GDAL refreshes
-metadata on every write" from being written down as measured./
-
-Three traps that already cost time once each:
-- *Do not write fixtures through a shell heredoc.* It silently mangled
-  =København= to =Ke\xe2\x88\x9a\xe2\x88\x8f...=. Write with explicit encoding
-  and check the raw bytes.
-- *=strings= defaults to a 4-character minimum*, which hid a 3-character
-  column name and produced a wrong conclusion about FlatGeobuf's header. Use
-  =strings -n 1= when decoding fixtures by hand.
-- *=tests/fixtures/gdal_hostile.fgb= does not exercise column widths*, despite
-  being the fixture the inventory cites for FlatGeobuf's =Column= table. It was
-  written *from the GeoPackage*, which has no widths, so every column reads
-  =String (0.0)=. To exercise them, write a fresh FGB from
-  =gdal_hostile.shp=. The =0.0= is itself a useful case -- it is what proved
-  that GDAL writes =width: 0= for "undeclared".
-
-*The carrying measurement (2026-08-24)* runs entirely on fixtures in the tree,
-and the third command is the one that matters -- a row count survives a carry
-that mangles every payload, so the check has to be on the *pixels*:
-
-#+begin_src sh
-  geosetta tests/fixtures/gdal_tiles.gpkg /tmp/out.gpkg --to gpkg
-  sqlite3 /tmp/out.gpkg 'PRAGMA integrity_check; PRAGMA foreign_key_check;'
-  # the reference implementation reading our output, band by band
-  gdalinfo -checksum tests/fixtures/gdal_tiles.gpkg | grep -i checksum
-  gdalinfo -checksum /tmp/out.gpkg                  | grep -i checksum
-  # a fixed point: writing our own output again changes nothing
-  geosetta /tmp/out.gpkg /tmp/out2.gpkg --to gpkg && cmp /tmp/out.gpkg /tmp/out2.gpkg
-#+end_src
-
-/And the containment check, on the =0e33a40= precedent:/ a GeoPackage with **no
-pyramid** must come out byte-identical to what the previous binary wrote, which
-is what says the new channel costs nothing where it does not apply. Build the
-parent commit's binary into a *separate* target directory before comparing --
-see the second false start below.
-
-*Two false starts on the payload-containment comparison (2026-08-24), both of
-which read as findings.* Neither was a bug in the code. Both were bugs in the
-measurement, and each was believed for a while before it was caught.
-- *The first compared files that were never written.* =zsh= does not
-  word-split unquoted expansions, so a list of format names held in a variable
-  stayed a single word, every output collapsed onto one path, and the
-  per-format files did not exist -- yet the comparison still reported a
-  difference in every spoke. **The mechanism is worth knowing exactly:**
-  =cmp= exits *2* for a missing file and *1* for a real difference, but the
-  usual test is =if ! cmp -s a b=, which sees only /non-zero/ -- and =-s=
-  suppresses the =No such file or directory= that would have given it away.
-  /Loop over an array, not over an unquoted string; the =bash= idiom is
-  silently wrong here./
-- *The second used a stale release binary*, built before the change, and so
-  showed the carry silently not working -- a clean, plausible negative result
-  about code that was never run. See the note at the head of this section:
-  =geosetta/target/= is a leftover, and even the workspace binary is only as
-  new as the last =cargo build --release=.
-
-/Both produce the shape of a finding rather than the shape of an error, which
-is why they cost time: nothing in either run looks like a failed measurement./
-***Check that the thing you measured exists and was built from the code you
-think it was.***
-
-** THE ONE REAL GAP -- *RETRACTED 2026-08-20, it was a measurement error*
-This section claimed *"this repository has no commits at all"* and recommended
-an initial commit. Both were wrong, and the way they were wrong is worth
-keeping.
-
-=geosetta= has full history -- =git log= shows =2a12bab=, =a1c9bc1=,
-=028314a= and back through the 0.2x releases. What actually happened is that
-=git= was run from =geocore/=, which is *not* a repository: the search walked
-up to =~/Projects=, which *is* one, has no commits, and holds every unrelated
-project the user owns. So the "no commits" reading was true of a repo nobody
-meant to look at.
-
-*The trap, for whoever runs =git= here next:* =geocore/= is a bare workspace
-directory containing two independent repos, =geosetta/= and =geoscribe/=,
-inside an outer =~/Projects= repo that should almost certainly never be
-committed to. *Always run =git= from =geosetta/= itself*, and check
-=git rev-parse --show-toplevel= before staging anything -- a =git add -A= one
-level up would sweep in =basin/=, =hen/=, =sphere2/= and a =.venv=.
-
-The fidelity work described in this handoff /was/ uncommitted while it was
-being done, which is what made the error plausible.
-
-*The durable rule, since naming which commits exist is a claim that expires:*
-**prefer =git log= / =git show= over this document wherever the two disagree.**
-§ WHAT CHANGED IN EXISTING DOCS exists for work that has not reached a commit
-yet, and which work that is changes every time someone commits -- so treat it
-as a record of *what was done*, never as a statement about *what is committed*.
-
-/An earlier version of this paragraph listed the commits and then asserted that
-the GeoParquet spoke and the =covering= handover were "not yet committed". They
-had landed in =16bd5dd= by the time anyone read it. Corrected 2026-08-21, and
-rewritten as a rule rather than a snapshot so it cannot go stale the same way
-again./
-
-** OPEN QUESTIONS WORTH KNOWING
-Not blockers, but they will come up:
-- *Where does the format-check deletion go now?* /Added 2026-08-22./ It is
-  drawn last and is no longer forced there -- the duplicated-inventory-pass
-  argument that put it there is spent. Argued in full in § THE SEQUENCING; the
-  call turns on whether defect 3's destruction or *composability* is the
-  priority, because per § THE EDIT LOOP no format has a lossless edit loop
-  until the deletion lands.
-- ~~*Does M3b carry an index, or rebuild it?*~~ **CLOSED 2026-08-23**, in two
-  steps, and the question named more than two things. /Added 2026-08-22:/
-  Carrying is far cheaper than it looks -- an index b-tree on disk is *already
-  sorted*, so an in-order read re-packs without any comparison or collation
-  logic, which is the expensive part of building one. But § THE EDIT LOOP says
-  a carried index is *wrong* rather than stale once a middle stage has touched
-  the geometry. The two pull opposite ways and the plan's M3b entry records
-  both.
-
-  *=same-format-fidelity.org= D10 dissolved the fork* by splitting it: an
-  index's fate follows the *content class of the table it indexes*. An R*Tree
-  over a feature layer is derived -- always rebuilt, and =rtree::build= already
-  does it. An ordinary index over a table carried verbatim is carried verbatim.
-
-  *=container-reconciliation.org= D2 answered the third case D10 exposed* -- a
-  *merged* table, whose rows are in neither source's order and whose index
-  therefore cannot be re-packed at all. **Build it.** Both sides of that fork
-  moved once measured: refusing the merge fires on every ordinary append
-  (every table that would need merging carries an index), and building needs no
-  collation logic (no real producer emits a non-=BINARY= index). So the answer
-  is *all three*, by content class: rebuild derived, carry carried, build
-  merged.
-- *Is canonicalisation a loss?* =MULTIPOINT ((1 2))= → =MULTIPOINT (1 2)=,
-  =linestring= → =LINESTRING=. Decides whether the CSV/WKT lexeme problem is
-  two bugs or a whole class. (=native-inventory.org= § QUESTIONS, item 1.)
-
-  *A third instance arrived 2026-08-21 and it is not CSV/WKT*: GeoParquet
-  *parses* a =Json= column, so ={"a": 1}= comes back as an object and
-  re-serializes without the space. GeoPackage and FlatGeobuf keep the text --
-  so this is also a *spoke inconsistency*, and settling the question settles
-  which of the three is right. Measured; the values are otherwise unharmed
-  (key order holds, and numbers are exact now that the number model is split).
-- *Does the mixed-number column earn a warning?* A column holding an integer
-  past 2^53 *and* a fractional value infers =Double=, and the integer loses its
-  low bits. The loss is inherent -- do not try to make the value survive -- so
-  the question is only whether it should be *said*. Argued both ways in
-  =lossy-conversion-warnings.org= § AN OPEN CALL; fixture and an =#[ignore]=d
-  test are in place, written to be rewritten around the warning.
-- *=edges= / =epoch= in GeoParquet* -- no available tool emits either, so no
-  fixture exists. *Do not close this as a null result* the way =envelope.org=
-  closed the GPKG XYM indicators: =edges: "spherical"= would restate what the
-  coordinates *mean*, which is a semantic corruption, not a dropped member.
-- *Should a =.dbf= field be sized to the data or fixed per type?* This writer
-  sizes from the values; =ogr2ogr= uses a fixed default per type (=String
-  (80.0)=, =Integer (9.0)=, =Real (24.15)=) and ignores the data. *Not a rule
-  violation either way* -- on a route that carries the declaration the source's
-  width wins and no default is consulted -- so it is only about what to invent
-  on a carrier-less hop. Both sides measured, and each has one hard number:
-  fixed widths cost *6.5x the file* (9.7 MB against 1.5 MB on 50,000 rows of
-  four ordinary columns, because dBase records are fixed-width), and GDAL's
-  fixed =Real (24.15)= **silently writes a different number** for =1e240= --
-  =1.00000000000000008388608e23=, off by ~10^217, at warning severity -- where
-  this writer widens to =Real (255.13)= and keeps it. Argued in full, with the
-  =max(fitted, gdal_default)= floor that is the likely shape of a decision, in
-  =same-format-fidelity.org= § OPEN QUESTIONS. /Do not decide this from the
-  ratchet complaint alone: =schema_drop_warning= already tells the user the
-  declaration did not survive that hop./
-- *Raster GeoPackages* -- container scope puts tile pyramids in the domain
-  while geosetta is vector-only. Recommendation on file is to *reject* a
-  populated tile container rather than silently drop the imagery.
+** WHAT WAS LEARNED
+1. ***A question's framing can hide its own answer.*** Three for three this
+   session -- Q1 was three questions, D6's answer was a defect, Q3 was not
+   about indexes. Measure before answering a question that has been sitting.
+2. ***Byte equality across a hop measures a writer against itself.*** A uniform
+   drop or a settled permutation is idempotent and invisible to it.
+3. ***A rule catches what a list does not.*** D17's gate caught =+7=, =1e2= and
+   =1.0=; the named-exception alternative would have missed all three.
+4. ***"The reference does the same thing" bounds how unusual a gap is, never
+   how much it costs.***
+5. ***A test for one half of a correlated pair is satisfied by breaking the
+   other.***
+6. ***Whether two filenames are two files is a filesystem property*** -- a
+   check comparing spellings must write first and compare bytes.
+7. ***A decision stated in a plan and triggered nowhere is not a decision the
+   code honours.*** D4's "rebuild if present" reads as settled and fires for no
+   spoke.

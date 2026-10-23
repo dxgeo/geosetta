@@ -585,7 +585,11 @@ fn refuse_same_file(input: &str, from: Format, out: &Output) -> Result<()> {
 
 /// Write a Shapefile's sibling files under `output_path`'s stem (a trailing
 /// `.shp`/`.SHP`, if present, is stripped so `roads.shp` and `roads` both name
-/// the same `roads.{shp,shx,dbf,prj}` set).
+/// the same `roads.{shp,shx,dbf,cpg,prj}` set).
+///
+/// Writes every file it can and deletes none, then reports the sidecars it left
+/// behind — see [`stale_sidecar_warnings`] and `plans/shapefile.org`
+/// § THE SIDECAR POLICY.
 fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection, quiet: bool) -> Result<()> {
     let encoded = shapefile::write(fc)?;
     print_warnings(&encoded.warnings, quiet);
@@ -593,15 +597,150 @@ fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection, quiet: boo
     std::fs::write(format!("{stem}.shp"), &encoded.shp)?;
     std::fs::write(format!("{stem}.shx"), &encoded.shx)?;
     std::fs::write(format!("{stem}.dbf"), &encoded.dbf)?;
+    std::fs::write(format!("{stem}.cpg"), encoded.cpg)?;
     if let Some(prj) = &encoded.prj {
         std::fs::write(format!("{stem}.prj"), prj)?;
     }
+    // After writing: say what of the destination's existing file set this run
+    // left behind, because those files now describe the output beside them.
+    // See `stale_sidecar_warnings` on why this cannot be checked beforehand.
+    print_warnings(&stale_sidecar_warnings(&stem, &encoded), quiet);
     eprintln!(
-        "wrote {stem}.shp + .shx + .dbf{} ({} features)",
+        "wrote {stem}.shp + .shx + .dbf + .cpg{} ({} features)",
         if encoded.prj.is_some() { " + .prj" } else { "" },
         fc.features.len(),
     );
     Ok(())
+}
+
+/// Sidecar files a Shapefile can have that this writer does not produce, with
+/// what each one would misdescribe if left beside our output.
+///
+/// `.shp`/`.shx`/`.dbf`/`.cpg` are absent because this writer always writes
+/// them, so a pre-existing one is overwritten rather than left to disagree.
+/// `.prj` is handled separately: it is written only when the collection *has* a
+/// CRS, and the case where it does not is the sharpest one on the list.
+const UNWRITTEN_SIDECARS: &[(&str, &str)] = &[
+    ("qix", "a quadtree spatial index describing different geometry"),
+    ("sbn", "an Esri spatial index describing different geometry"),
+    ("sbx", "an Esri spatial index describing different geometry"),
+    ("fbn", "a read-only Esri spatial index describing different geometry"),
+    ("fbx", "a read-only Esri spatial index describing different geometry"),
+    ("ain", "an attribute index describing different attributes"),
+    ("aih", "an attribute index describing different attributes"),
+    ("atx", "an attribute index describing different attributes"),
+    ("ixs", "a geocoding index describing different features"),
+    ("mxs", "a geocoding index describing different features"),
+    ("qpj", "a CRS, in QGIS's sidecar, that this run did not write"),
+    ("shp.xml", "metadata describing a different dataset"),
+];
+
+/// Warn about files at the output basename that this run did not overwrite.
+///
+/// **Geosetta writes the files it can and deletes nothing** — so when a
+/// Shapefile is written where one already exists, part of the resulting file
+/// set can be somebody else's, and those files *describe* the part we wrote. A
+/// stale `.prj` is read as the output's CRS; a stale index is read as its
+/// geometry's layout. The user is told which files that applies to and left to
+/// decide, rather than having data removed as a side effect of a conversion.
+///
+/// # Why warning is the whole answer here and not half of one
+///
+/// Two cases cannot be fixed by writing more. `.sbn`/`.sbx` are Esri's
+/// proprietary format, which GDAL itself declines to write. And `.prj` has
+/// nothing to say when the source carries no CRS — OGC WKT has no spelling for
+/// "unknown", so inventing one would be the guess that `shapefile::writer`'s
+/// `.prj` doc already refuses to make. /`ogr2ogr -overwrite` removes the prior
+/// file set instead (measured), which is the other coherent answer and not
+/// this project's: a conversion must not delete files nobody asked it to
+/// touch./
+///
+/// # Called *after* the write, which is not an accident
+///
+/// A case-differing spelling cannot be judged before writing, because whether
+/// `out.PRJ` and `out.prj` are two files or one is a property of the
+/// filesystem rather than of the names — on macOS and Windows the write lands
+/// in the existing file and there is nothing to report, while on a
+/// case-sensitive filesystem both survive and readers disagree about which
+/// wins. So the only honest test is to write first and then compare bytes: a
+/// differently-spelled file that still differs from what we just wrote is a
+/// real second file. /A first version probed `Path::exists` for the
+/// upper-cased spelling before writing and reported every sidecar twice on
+/// this machine, which is how the distinction was noticed./
+///
+/// # The blind spot, stated because it is not obvious
+///
+/// This fires on the *write*. A later `geosetta out.shp …` reads a stale
+/// `.prj` as simply the file's CRS and says nothing, because by then there is
+/// no evidence anything is wrong. That asymmetry is why `.cpg` is written
+/// rather than warned about — encoding is the one member of the set whose
+/// right answer this writer always knows.
+fn stale_sidecar_warnings(stem: &str, encoded: &shapefile::Encoded) -> Vec<String> {
+    let stem_path = std::path::Path::new(stem);
+    let dir = match stem_path.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => std::path::PathBuf::from("."),
+    };
+    let Some(base) = stem_path.file_name().and_then(|n| n.to_str()) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut warnings = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        // Only this output's own basename, and only a sidecar of it.
+        let Some(ext) = name.strip_prefix(base).and_then(|rest| rest.strip_prefix('.')) else {
+            continue;
+        };
+        let lower = ext.to_ascii_lowercase();
+        let path = dir.join(name);
+
+        // An extension we wrote. Ours landed at the lower-case spelling, so
+        // anything else is only a second file if its bytes still differ.
+        let written = match lower.as_str() {
+            "shp" => Some(encoded.shp.clone()),
+            "shx" => Some(encoded.shx.clone()),
+            "dbf" => Some(encoded.dbf.clone()),
+            "cpg" => Some(encoded.cpg.as_bytes().to_vec()),
+            "prj" => encoded.prj.as_ref().map(|p| p.as_bytes().to_vec()),
+            _ => None,
+        };
+        if let Some(ours) = written {
+            if ext != lower && std::fs::read(&path).is_ok_and(|on_disk| on_disk != ours) {
+                warnings.push(format!(
+                    "shapefile: {} already exists and this run wrote {stem}.{lower}, so both \
+                     spellings are present and readers disagree about which one wins \
+                     (plans/shapefile.org)",
+                    path.display(),
+                ));
+            }
+            continue;
+        }
+
+        // A `.prj` we could not write at all: the source had no CRS to state.
+        if lower == "prj" {
+            warnings.push(format!(
+                "shapefile: {} already exists and this run wrote no .prj, so that file will be \
+                 read as this output's CRS (plans/shapefile.org)",
+                path.display(),
+            ));
+            continue;
+        }
+
+        if let Some((_, what)) = UNWRITTEN_SIDECARS.iter().find(|(e, _)| *e == lower) {
+            warnings.push(format!(
+                "shapefile: {} already exists and this run does not write it, so it will be read \
+                 as {what} (plans/shapefile.org)",
+                path.display(),
+            ));
+        }
+    }
+    warnings.sort();
+    warnings
 }
 
 fn strip_shp_extension(path: &str) -> String {

@@ -87,10 +87,72 @@ layer split across several sibling files sharing a basename*:
 - =.dbf= — attribute table (required for properties).
 - =.prj= — CRS as WKT1 text (optional; absent means no CRS).
 - =.cpg= — DBF text-encoding declaration (optional; absent means guess).
+  /Written as of 2026-10-21, always =UTF-8=; see § THE SIDECAR POLICY, which
+  also covers the dozen sidecars this writer does *not* produce./
 This breaks =main.rs='s current =std::fs::read(&args.input)= single-file model
 the same way GeoPackage did, but inverted: GPKG special-cased main.rs because
 *one file* holds *many layers*; Shapefile special-cases it because *one layer*
 is *many files*.
+
+** THE SIDECAR POLICY — write what we can, delete nothing, say the rest
+/Added 2026-10-21, answering =native-inventory.org= § QUESTIONS item 3. The
+warnings in =main.rs= cite this section, so it is the one place that has to
+state the whole rule./
+
+A shapefile's basename is a *namespace*, not a file, and a dozen different
+sidecars can live in it. **Geosetta writes the ones it can, never deletes any,
+and warns about what it leaves** — which means an output file set can
+legitimately be part ours and part somebody else's, and the user is told
+exactly which part.
+
+| sidecar | this writer |
+|---------+-------------|
+| =.shp= =.shx= =.dbf= | always written |
+| =.cpg= | always written, =UTF-8= |
+| =.prj= | written when the collection has a CRS; otherwise *nothing to say* |
+| =.qix= =.sbn= =.sbx= =.fbn= =.fbx= =.ain= =.aih= =.atx= =.ixs= =.mxs= =.qpj= =.shp.xml= | never written; warned about when present |
+
+*Why those three rules and not the obvious fourth.* The obvious fix for a file
+that misdescribes our output is to delete it, which is what
+=ogr2ogr -overwrite= does /(measured: it removes the entire prior set, =.qix=
+and =.prj= included)/. **Rejected on principle**: a format conversion must not
+remove files nobody asked it to touch, because an unexpected side effect on a
+user's directory is worse than an output they can inspect. So the remedies left
+are *write it* or *say so*, and each sidecar gets whichever is available.
+
+*=.cpg= is written because we always know the answer.* The =.dbf= is always
+UTF-8 by construction, and a =.cpg= already at the basename would otherwise
+relabel it — measured, a stale one reading =ISO-8859-1= turned =København= into
+=KÃ¸benhavn= for =ogrinfo= *and for geosetta's own reader*.
+
+*=.prj= is the irreducible case.* It is written whenever there is a CRS, but a
+source carrying none leaves nothing to write: OGC WKT has no spelling for
+"unknown", and inventing one is the guess =shapefile::writer='s =.prj= handling
+already refuses to make. Measured, a CRS-less CSV written where an old =.prj=
+sat came back as =NAD83 / UTM zone 18N= in *metres*, from both tools. **A
+warning is the whole answer there, not half of one.**
+
+*The index sidecars are not rebuilt*, and that is the narrow answer to the
+question as filed. =.sbn=/=.sbx= are Esri's proprietary format, which GDAL
+declines to write too. =.qix= is writable in principle, but D4's "rebuilt when
+the source carried one" is triggered **nowhere today** — GeoPackage included,
+where =main.rs= passes only =args.rtree= — so it belongs on
+=spatial-index.org= as one piece of work across both spokes rather than
+half-done here. /A stale =.qix= also could not be made to produce a wrong
+answer from GDAL in any configuration tried, which is evidence about one
+consumer and not a guarantee./
+
+*The warning fires after the write, deliberately.* Whether =out.PRJ= and
+=out.prj= are two files or one is a property of the *filesystem*, not of the
+names, so the only honest test is to write first and compare bytes. /A first
+version probed =Path::exists= on the upper-cased spelling beforehand and
+reported every sidecar twice on a case-insensitive filesystem./
+
+*And it has a blind spot worth knowing:* it fires on the **write**. A later
+=geosetta out.shp …= reads a stale =.prj= as simply the file's CRS and says
+nothing, because by then no evidence remains that anything is wrong. That
+asymmetry is the strongest argument for writing whatever we can rather than
+warning about it.
 
 ** THE FORMAT
 
@@ -329,6 +391,40 @@ throughout, which was always the bar that mattered.
   hand-built Windows-1252 table (a common real-world shapefile encoding,
   distinct from Latin-1 in the =0x80-0x9F= range) worth adding, or an
   documented gap?
+
+  /Still open 2026-10-21, and sharpened while answering
+  =native-inventory.org= § QUESTIONS item 3. Three things now known:/
+
+  1. ***The write side is settled*** -- output is always UTF-8 and now says so
+     in a =.cpg=. This question is read-side only, plus a possible
+     =--encoding= flag later.
+  2. ***The silent part is the defect, not the approximation.***
+     =encoding_from_cpg= maps *any* unrecognised =.cpg= to Latin-1 with no
+     warning, so a file declaring =CP1252= is decoded wrongly in exactly the
+     32 bytes =0x80=--=0x9F= -- the curly quotes, dashes, =€= and =…= real
+     attribute data is full of -- and nothing says so.
+     =lossy-conversion-warnings.org='s rule covers this: *the warning is owed
+     whether or not the table ever gets written.*
+  3. ***The cost boundary is single-byte vs multi-byte.*** A single-byte
+     codepage is a 128-entry =char= table (=0x00=--=0x7F= is ASCII in all of
+     them): Windows-1252, CP437 and CP850 cover nearly all real dBase files,
+     for a few hundred lines and no dependency. Shift-JIS, GBK, Big5 and
+     EUC-KR need thousands of entries each, which is where "support more
+     encodings" stops being free for a dependency-free crate -- and there the
+     defensible answer is to **refuse rather than approximate**, since a
+     silent mojibake answer is worse than no answer.
+
+  /A write-side =--encoding= flag (GDAL spells it =-lco ENCODING==) would also
+  need a lossiness story: a character the target codepage cannot hold must warn
+  or refuse. The =.cpg= this writer now emits is where such a flag would
+  declare itself, so that work is unblocked rather than competing./
+
+  ***This question now has its own plan and is no longer answered here:***
+  [[file:encodings.org][encodings.org]], written 2026-10-21 and deliberately
+  crate-wide -- the same gap runs through CSV, WKT, KML and GeoJSON, which
+  refuse non-UTF-8 input outright, and the two correctness items (warn on
+  approximation, refuse a multi-byte codepage) are not Shapefile's alone. The
+  sizing above stands and is restated there as E2/E3.
 - *Bare-stem input* (=roads= with no extension, a convention some Shapefile
   tooling accepts) vs. requiring the explicit =.shp= extension — affects
   =Format::from_path='s contract, which currently assumes every input has one.

@@ -118,11 +118,23 @@ Authored; no tool emits unmodelled members by definition.
 | =K\u00f8benhavn= escaped *and* =Zürich= raw | both JSON unicode forms, so the unescape path and the raw-UTF-8 path are each exercised |
 
 *** =hand_hostile.csv=
-Authored. Every cell is a lexeme the reader's type inference changes.
+Authored. Every cell is a lexeme the reader's type inference *used to* change:
 =007= → =7=, =08001= → =8001= (*a different number, not a reformat*),
 =12345678901234567890= → =12345678901234567000= (past =i64=, through an =f64=),
 =1.50= → =1.5=, =22.250= → =22.25=, =TRUE= → =true=, and =" spaced "= plus
 ="Zürich, CH"= to pin quoting and embedded-comma handling.
+
+***As of 2026-10-21 none of them change***, and this fixture is the one that
+measures it: =same-format-fidelity.org= D17 gates every inference on the
+writer being able to render the text back, so a =csv -> csv= run returns all
+seven cells byte-identical. Asserted through the real binary by
+=tests/same_format.rs='s =the_hostile_csv_keeps_every_cell_s_text=.
+
+/So this is now a fixture that **passes** rather than one that documents a
+loss, and it is worth knowing which: it is still hostile input, but the
+hostility is handled. Do not "simplify" any cell -- each one pins a distinct
+branch of the gate (leading zero, past-=i64=, trailing zero, letter case,
+padding, non-ASCII, embedded comma)./
 
 *** =hand_hostile.wkt=
 Authored. =POINT (1.50 2.00)= (trailing zeros), =point (1e2 3E-1)= (lowercase

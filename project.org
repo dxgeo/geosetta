@@ -31,7 +31,7 @@ boundary wherever the format is externally specified, and no shared internal
 structs across a repo boundary.
 
 ** STATUS
-Current version: *0.26.0*.
+Current version: *0.26.1*.
 
 Eight formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -47,7 +47,8 @@ validated against DuckDB / GDAL.
   divergence* on mixed 2D/3D input (see below).
 - *FlatGeobuf* (read + write) on a from-scratch FlatBuffers reader and builder;
   written with a *packed Hilbert R-tree* spatial index (GDAL bbox queries work)
-- *CSV* with a WKT geometry column (read + write), types lightly inferred
+- *CSV* with a WKT geometry column (read + write), types inferred only where
+  the inference is reversible, so a cell's exact text survives
 - *WKT* — one geometry per line (read + write)
 - *GeoPackage* (read + write) on a from-scratch SQLite reader *and* writer. A
   =.gpkg= is multi-layer, so reading fans out over all feature tables and writing
@@ -61,7 +62,11 @@ validated against DuckDB / GDAL.
   per-geometry envelope), matching GDAL's own bytes ordinate for ordinate —
   see [[file:plans/envelope.org][plans/envelope.org]].
 - *Shapefile* (read + write) — the first multi-file spoke: sibling
-  =.shp=/=.shx=/=.dbf=/=.prj=(/=.cpg=) files sharing a basename. A from-scratch
+  =.shp=/=.shx=/=.dbf=/=.cpg= files sharing a basename, plus a =.prj= when the
+  source carries a CRS. Writing never deletes a sidecar it did not produce —
+  it names them on stderr instead, since those files describe the output beside
+  them; see [[file:plans/shapefile.org][plans/shapefile.org]] § THE SIDECAR
+  POLICY. A from-scratch
   mixed-endian =.shp=/=.shx= geometry codec (with real ring classification —
   shoelace winding + appearance-order grouping — for the Polygon/MultiPolygon
   disambiguation) and a dBase III/IV =.dbf= attribute codec. Composes with

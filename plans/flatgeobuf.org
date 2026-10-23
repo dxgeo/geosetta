@@ -105,10 +105,16 @@ Point / LineString / Polygon-with-hole / MultiPolygon / MultiLineString /
 MultiPoint decode from and encode to files GDAL reads correctly. Fixtures:
 =tests/fixtures/duckdb_geoms.fgb=, =duckdb_props.fgb=.
 
-*Also DONE:* the packed Hilbert R-tree spatial index on write — see
-=spatial-index.org= milestone B (=index_node_size = 16= by default, built via
-=src/spatial.rs='s Hilbert ordering, checked in
+*Also DONE:* the packed R-tree spatial index on write — see
+=spatial-index.org= milestone B (=index_node_size = 16= by default, built in
 =src/flatgeobuf/writer.rs=). GDAL bbox queries against our output work.
+
+/2026-10-21: the writer **no longer Hilbert-sorts** on its own. It packs the
+index over *input order*, because sorting permuted a user's features on a
+=fgb -> fgb= run and made =--sort-hilbert= a no-op for the one format where
+the sort was mandatory. Locality is now requested with that flag, for every
+format alike. See =spatial-index.org= milestone B's amendment for the
+reasoning and the GDAL oracle behind it./
 
 ** TESTING
 - Fixtures written by DuckDB (=DRIVER 'FlatGeobuf'=), committed small under
@@ -120,5 +126,7 @@ MultiPoint decode from and encode to files GDAL reads correctly. Fixtures:
 
 ** OPEN QUESTIONS
 Both resolved — see Status above:
-- The packed Hilbert R-tree is built on write (default =index_node_size = 16=).
+- The packed R-tree is built on write (default =index_node_size = 16=), over
+  *input order*; Hilbert locality is =--sort-hilbert='s to request /(amended
+  2026-10-21)/.
 - =infer_columns= was hoisted to =src/schema.rs= and is shared by both writers.

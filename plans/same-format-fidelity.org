@@ -43,8 +43,19 @@ fixture came out as a database =sqlite3= refuses to open (=handoff.org= entry
 
 *M3 in progress:* the *FlatGeobuf*, *GeoParquet* and *GeoPackage* spokes are
 done. Still to do: CSV, WKT, KML, and Shapefile's remaining *natives*, then
-M3c, the *rest* of M3b, and the exhaustive-match fixture registry (M5/D6). Four
-readers still pass =native: None=.
+M3c and the *rest* of M3b. Four readers still pass =native: None=.
+***The exhaustive-match fixture registry (M5/D6) is built as of 2026-10-21***
+-- see D6 → BUILT.
+
+/2026-10-21: **CSV is closed and it never needed a native** -- D17's
+reversibility gate keeps every cell's text with no payload and no IR change, so
+=csv.rs= still passes =native: None= and is nonetheless faithful. That leaves
+three of the four: WKT (whose remaining loss is grammar-forced and declared,
+plus a MULTIPOINT dialect flag), KML (the real one -- structural, and it needs
+a ruling on carrying XML verbatim through =xml.rs=, which strips namespace
+prefixes today -- *ruled 2026-10-22, D18*: rescoped to the KML standard in
+=kml-standard.org=) and Shapefile (=.cpg=, and a ruling on the =.sbn=/=.qix=
+sidecars)./
 
 ***M3b is begun rather than pending, as of 2026-08-24, and its first content
 class is closed as of 2026-08-25.*** Its carrying channel exists --
@@ -1175,6 +1186,42 @@ shape and should, in this plan rather than filed separately: leaving a working
 example of the anti-pattern beside the new rule is how the rule gets read as
 optional.
 
+**** BUILT 2026-10-21, and it paid for itself on the first run
+=tests/same_format.rs= holds =hostile_fixture(Format) -> Fixture=, one arm per
+spoke and no catch-all, plus =round_trip=, which is *also* catch-all-free: its
+three arms are the three on-disk shapes this crate has -- one buffer, a
+container of layers, a set of sibling files -- so a new spoke must state which
+it is rather than have one assumed. =every_format_puts_back_what_its_reader_recovered=
+drives both. =Format::ALL= landed with it, and its own completeness is
+compiler-enforced the same way rather than by counting.
+
+The =display_name= conversion above is done, and so is the array literal in
+=the_loss_table_says_what_was_measured='s neighbour.
+
+***What it asserts, and the one thing it cannot.*** Read the fixture, write the
+same format, read again, assert the IR is equal /including natives/ --
+=FeatureCollection='s =PartialEq= covers geometry, properties, CRS, name,
+schema and the =Native= payload, so *a member the reader recovered and the
+writer dropped fails*. It **cannot** see a member dropped at *read*: a KML
+=<Style>= never reaches the IR, so both sides agree about a file that already
+lost it. That half stays =Format::same_format_losses='s and the inventory's,
+which is why the registry records what each fixture carries.
+
+***An earlier draft compared two generations of output bytes instead, and
+passing all nine immediately was the tell.*** A writer that drops a member
+uniformly -- or settles on a permutation -- is **idempotent**, so generation 2
+agrees with generation 1 about the loss. *Byte equality across a hop measures
+the writer against itself; IR equality measures it against the reader.* Worth
+knowing before anyone "strengthens" this test into a byte comparison.
+
+***It found a defect immediately*** (=handoff.org= entry 24, decision 32): the
+FlatGeobuf writer was Hilbert-sorting on every run, so a =fgb -> fgb= silently
+permuted the user's features -- and =--sort-hilbert=, which =main.rs= applies
+before the writer, was consequently a dead flag for that format. Fixed by
+deletion. /It needed a **foreign producer's** order to show at all, which is
+exactly what a hostile fixture is for, and no test in the tree had one on this
+axis./
+
 *** D8 -- a tile pyramid is carried, and no file is rejected for holding one
 /One consequence, found 2026-08-23 while scoping the carrying channel: a tile
 pyramid carries =srs_id= *references* -- in its =gpkg_contents= row and its
@@ -1354,6 +1401,110 @@ produced itself. What is actually needed is the type-class ordering
 this path*, because its index is carried rather than constructed -- which is
 the rule at the top of this decision doing its job.
 
+*** D17 -- an inference must be reversible, and that is what "canonicalisation" turns on
+/Decided 2026-10-21, answering =native-inventory.org= § QUESTIONS item 1 -- the
+oldest open question in this body of work. The CSV half shipped the same day./
+
+**The rule: a reader may replace text with a parsed value only when its own
+writer renders that value back to the exact text that was read.** Where it
+cannot, the text stands -- an un-inferred cell is still a correct reading.
+
+***The question this answers had been holding three different things as one***,
+and that is why it sat open: =007= → =7=, =1.50= → =1.5= and
+=12345678901234567890= → =12345678901234567000= read as one family and are not.
+The first loses the *value's identity* (the text was the data -- ZIP, FIPS,
+census tract). The second changes only the *spelling*. The third is *a
+different number*. Only the second is the canonicalisation argument; the other
+two are losses under any reading of § THE RULE. /The full split is tabled in
+=native-inventory.org= § QUESTIONS item 1./
+
+**What draws the line is who decides the type, not which format it is.** A CSV
+cell and a KML =ExtendedData= value are untyped text, so typing them is the
+*reader's* decision and D17 binds it. A JSON number and a WKT coordinate are
+numbers *by grammar* -- there is no un-inferred reading to fall back to, and
+preserving the spelling would mean a lexeme carrier in the IR beside every
+value. That was considered and rejected: it makes =JsonValue= carry two
+representations of one value, and a middle stage editing the value and not the
+text becomes a new failure mode -- which is D5's objection to natives crossing
+a pipe, arriving in a second place. **So those spokes declare the loss instead
+of fixing it**, and =Format::GeoJson='s row was corrected the same day to
+actually do so.
+
+*Three properties are worth stating because they are why this is cheap.*
+
+1. **It is defined against the spoke's own writer**, not against a canonical
+   renderer. =infer_value= renders through =cell_text=, so the reader and
+   writer of one spoke are a *fixed point* on cell text: whatever survives one
+   hop survives every later one. A second opinion about spelling would drift
+   from the writer the first time either changed.
+2. **It fails safe.** An un-inferred cell is a correct string property rather
+   than a wrong number, so the worst case of being wrong about a cell is
+   carrying its text.
+3. **A rule catches what a list does not.** The named-exception form of this
+   fix -- special-case leading zeros and past-=i64= integers -- was the
+   cheaper-looking option and would have missed =+7=, =1e2= and =1.0=, all
+   three measured normalising silently. /Nobody had enumerated them, which is
+   the point./
+
+**The verdict is per *column*, not per cell** -- /decided 2026-10-21, the same
+day, after measuring the per-cell form./ One refused cell types the whole
+column as text.
+
+*A ZIP column is what forced it*, and it is not a contrived case: =[007,
+08001, 12345]= read per cell returns two strings and a *number*, because the
+third ZIP happens to have no leading zero. Nothing in the data supports typing
+it differently from its column, and =12345= is a ZIP in exactly the way =007=
+is. /The same-format run cannot tell the two readings apart -- both keep every
+cell's text -- so this is visible only in a target with per-feature property
+types (GeoJSON, KML) and in the IR a library consumer holds. Which is why it
+was nearly missed./
+
+*It also stops one loss being settled twice with different answers.* For a
+tabular target =schema::infer_columns= would have unified that column to text
+anyway, so the per-cell reading disagreed with the column lattice downstream of
+it; now the question is answered once, at the read.
+
+***Only a refusal gates a column, not any untyped cell.*** A plain =hello=
+beside a =7= has no typed reading to refuse, so it gates nothing and that
+column still returns =Int(7)= and =String("hello")= -- an ordinary mixed
+column, which is the lattice's business and always was. Widening D17 to cover
+it would be a *different* decision, and a much larger one: every column with
+one text cell would lose its type.
+
+*What it does not reach, deliberately:* a =Double= column that one fractional
+row widened (a column type is the column's property, not the cell's), the
+geometry column of a CSV (WKT by definition), and GeoParquet's parsed
+=JSON=-annotated column -- that last one is *ruled* by D17 but is not the same
+fix, because the parse is also what gives =DeclType::Json= its meaning and
+=Format::recast='s table is written against the parsed reading. It stays with
+the GeoParquet spoke. /See =native-inventory.org= § QUESTIONS item 1./
+
+*** D18 -- KML's spoke is the standard: every version in, the version asked for out
+/Decided 2026-10-22. The detail, and its own decisions D-K1--D-K10, are in
+[[file:kml-standard.org][kml-standard.org]]./
+
+M3's KML spoke had been gated on a mechanism question -- raw names in
+=XmlElement=, or carried byte ranges. The target changed underneath it: the goal
+is now *fidelity to the KML standard*. OGC KML 2.3 is the model, both OGC
+versions (2.2 and 2.3) are read and detected, and output is written in the
+version the user asks for (=--kml-version=), defaulting to the source's own
+version on a =kml -> kml= run and to 2.3 from any other format. Google's
+pre-OGC 2.0 and 2.1 are refused.
+
+What that settles here:
+- *The invariant needs no KML clause.* The default is same-version, so
+  =kml -> kml= stays the identity this plan requires. A version change happens
+  only on request, and warns.
+- *The mechanism is neither option.* A typed 2.3 document model sits in the KML
+  native, the IR is its projection, and the writer reconciles the two. Verbatim
+  bytes carry only content outside every KML namespace. D1 holds: the model is
+  the spoke's payload, opaque to the hub.
+- *D5 applies to the version too*: a pipe or a cross-format transit loses it,
+  and the run comes back as 2.3.
+- *D6's registry grows a second axis*: one hostile fixture per KML version.
+- *D1's column-schema exception gains a fifth spoke*: =<Schema>='s typed
+  =SimpleField=s are declarations.
+
 ** SEQUENCING -- this inverts part of =same-format-output.org=
 That plan currently scopes closing the fidelity gap *out*, and ships a warning
 describing it instead ("This one warns about the gap; it does not close it",
@@ -1455,7 +1606,12 @@ travels with D1's =name= modelling.
   2. *CSV, WKT and Shapefile lose the lexeme, not a member*, which is a class
      the natives channel does not obviously fit -- see that file's proposed
      "infer only when re-rendering reproduces the input" rule, which costs no
-     payload at all.
+     payload at all. ***That rule is D17 as of 2026-10-21, and CSV's half is
+     implemented***: every cell's text survives a =csv -> csv= run, and the
+     natives channel was indeed the wrong tool -- the fix carries no payload
+     and changes no IR. /Shapefile's share of this finding was the schema
+     narrowing, closed by M4; WKT's is grammar-forced and declared rather than
+     fixed./
   3. *Shapefile silently narrows the schema*: an 80-character =.dbf= field
      comes back 1 character wide, holding today's rows and unable to hold
      tomorrow's. Likeliest entry in the whole inventory to break a real
@@ -2784,6 +2940,26 @@ sharing one is to build the reference file with the tool you are checking
 against. Every GeoPackage fixture in this tree came from =ogr2ogr=, so the
 whole fixture set was blind to exactly this class.
 
+*** A second datum: two GDAL drivers disagree about whether a feature exists -- /2026-10-22/
+/Measured while ruling =kml.org= § GEOMETRY ELEMENT COVERAGE, on one file
+holding a bare =<LinearRing>=, a =<Model>= and a =<gx:Track>=./
+
+GDAL 3.13.3 reads that file **two different ways out of the same install**:
+=LIBKML= returns all five Placemarks -- the ring as =LINEARRING=, the track as
+=LINESTRING Z=, the =<Model>= as a feature with no geometry -- while the
+built-in =KML= driver returns ***one of the five***, silently discarding every
+Placemark whose geometry it could not parse, attributes included.
+
+***So "GDAL does X" is under-specified in a way this rule did not previously
+have an example of.*** Defect 6's lesson was that the reference can deviate
+from the standard; this is the weaker and more common case -- /the reference
+has no single behaviour to deviate with./ A differential check against "GDAL"
+must name its driver, and a measurement that does not is evidence about
+whichever one happened to win the extension.
+
+*The practical form of the rule is unchanged*: cite what was run. The addition
+is that for KML, =-if LIBKML= / =-if KML= is part of what was run.
+
 *** The rule now has a fixture behind it -- /2026-08-23/
 =tests/fixtures/spec_conformant.gpkg= is a GeoPackage built by =sqlite3= from
 the annexes' normative SQL, with **no GDAL at any point in its provenance**,
@@ -3008,7 +3184,9 @@ is gated on the index-writing work in D10./
   2026-08-20: yes, but not where it was being looked for.* Not a
   =native_members()= constant -- see D6. The enforcement is a catch-all-free
   =match= in the test harness's fixture registry, which makes the compiler
-  demand a fixture and the assertion demand the property.
+  demand a fixture and the assertion demand the property. ***Built 2026-10-21***
+  -- and it found a defect on its first run, which is the answer this entry was
+  really asking for. See D6 → BUILT.
 - ~~*Does the invariant apply to a multi-layer GeoPackage, or only to a
   layer?*~~ *DECIDED 2026-08-20: the container too* -- see § THE DOMAIN OF THE
   RULE.

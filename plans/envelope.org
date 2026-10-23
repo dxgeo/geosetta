@@ -233,7 +233,8 @@ out of this path. What *would* be lossy is emitting a *wrong* envelope, which
 - *Envelopes under reprojection.* Transforming a bbox is not folding one --
   the reprojection of the corners is not the bbox of the reprojection, because
   projections curve. That belongs to the reprojection crate and is planned at
-  =nazca/plans/transform-bounds.org=. Nothing here should grow a =transform=
+  =geoscribe/plans/transform-bounds.org= (it was =nazca='s until 2026-10-22).
+  Nothing here should grow a =transform=
   parameter.
 - *FlatGeobuf's =NodeItem= bbox* (=src/spatial.rs=) -- XY-only by the format's
   own definition, feeding the packed Hilbert R-tree. Nothing here requires
@@ -347,7 +348,7 @@ does not by itself argue for spending bytes on it by default.
   makes V1 an eight-line change rather than a signature change.
 - =zm-geometry.org= M5 (GeoPackage) -- where the envelope-drop finding
   originated.
-- =nazca/plans/transform-bounds.org= -- the reprojection-side envelope problem
+- =geoscribe/plans/transform-bounds.org= (=nazca='s until 2026-10-22) -- the reprojection-side envelope problem
   deliberately excluded from § SCOPE above.
 - =geoscribe/plans/envelope-computation.org= -- retired predecessor; kept for
   its reasoning trail, not to be implemented there.

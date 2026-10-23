@@ -76,6 +76,10 @@ that is not =geometry= or =properties= is skipped. The same catch-all exists in
 dropped too -- rarer, and not previously listed anywhere.
 
 *** CSV -- /measured/
+***Read § FIXED below before this entry's present tense misleads you: every
+loss measured here was closed on 2026-10-21.*** The finding is kept as written
+because the reasoning is what earned D17.
+
 CSV has no metadata to lose, which is why =same-format-output.org= reasoned it
 had nothing unmodelled. That reasoning was about *members*. The loss is the
 *lexeme*: the reader infers a type per cell and discards the text it inferred
@@ -107,6 +111,46 @@ exactly* (=render(parse(s)) == s=), and keep the cell as a string otherwise.
 That resolves all four cases with no payload, no per-cell allocation, and no
 IR change -- and it fails safe, since an un-inferred cell is still a correct
 string property.
+
+**** FIXED 2026-10-21 -- the cheap fix was the right one, and it caught two more
+=infer_value= now gates every inference on that check, rendering through
+=cell_text= so the reference is *this spoke's own writer* rather than a second
+opinion about how a value is spelled. /Measured on =hand_hostile.csv=: all four
+rows above come back byte-identical, and so do =" spaced "=, =København= and
+="Zürich, CH"=./
+
+*It caught two spellings this section never listed*, which is the argument for
+a rule over the named-exception list this nearly became: =+7= → =7= and
+=1e2= → =100= were both normalising silently, and neither is a leading zero or
+a trailing one. /A third, =1.0= → =1=, is this spoke's alone: =Cell::Double='s
+rendering drops the =.0= where the JSON serializer keeps it, so the gate
+declines it here and the number model's "whole floats keep their =.0=" still
+holds everywhere else./
+
+*The gate decides per **column**, and a ZIP column is what forced that.* Read
+per cell, =[007, 08001, 12345]= returns two strings and a *number* -- the third
+ZIP typed differently from its own column because it happens to have no leading
+zero. One refused cell now types the whole column as text. /The =csv -> csv=
+run cannot tell the two readings apart, since both keep every cell's text; the
+difference shows only in a per-feature-property target like GeoJSON, and in the
+IR a library consumer holds./
+
+*But only a **refusal** gates a column.* A plain =hello= beside a =7= has no
+typed reading to refuse, so that column still returns =Int(7)= and
+=String("hello")= -- an ordinary mixed column, settled downstream by
+=schema::infer_columns= as it always was.
+
+***Two losses remain and neither is the inference's choice.*** The *geometry*
+column is WKT by definition, so it inherits that spoke's canonicalisation
+(=POINT (1.50 2.00)= → =POINT (1.5 2)=, /measured/). And a column type is a
+property of the column: =[9007199254740993, 1.5]= is typed =Double= because one
+row is fractional, so the integer loses its low bits on the way out even though
+its own text round-trips /(measured)/. Both are what
+=Format::Csv.same_format_losses()= now says, in place of the two entries it
+used to carry.
+
+See [[file:same-format-fidelity.org][same-format-fidelity.org]] D17 for the
+rule and for which spokes it does *not* reach.
 
 *** WKT -- /measured/
 Same lexeme story, plus one hard gap.
@@ -564,6 +608,14 @@ no warning. That is a *silent* drop rather than a refusal, so unlike WKT's
 =POINT EMPTY= it does not get the carve-out's protection. /Unverified/ whether
 =gx:Track= is common enough to matter; =<Model>= is rare.
 
+***And one element in that hole is not an unsupported geometry but a missing
+one*** /(2026-10-22)/: =LinearRing= is a concrete member of KML's =Geometry=
+substitution group, so a =Placemark= may hold one directly, and this reader
+recognises it *only* inside a =<Polygon>= boundary. A bare one comes back
+geometry-less exactly as a =<Model>= does /(measured)/ -- but the IR can
+represent it, so it is a capability gap to close rather than a loss to report.
+See § QUESTIONS item 6 and =kml.org= § GEOMETRY ELEMENT COVERAGE.
+
 Plus the type coercion: every property becomes a string /(measured)/ -- =7= →
 ="7"=, =true= → ="true"=, =null= → ="="=. The CSV lexeme problem from the other
 direction.
@@ -642,25 +694,53 @@ slot for one, GeoPackage does (=TEXT(80)=) and gets one with M3b. Until then a
 |-------------------------------+----------+------|
 | =.dbf= field =width=          | *modelled* | *done 2026-08-20*: read into =FeatureCollection::schema=, honoured on write |
 | =.dbf= field =decimals=       | *modelled* | *done 2026-08-20*: a declared =scale= replaces the hardcoded 6 |
-| =.cpg= declared codepage      | identity | *not written at all* -- see below |
+| =.cpg= declared codepage      | identity | ***written as of 2026-10-21*** -- always =UTF-8=, which is always what the =.dbf= holds; see § QUESTIONS item 3 |
 | =.shx= index                  | derived-capability | regenerated correctly |
 | header M/Z ranges             | derived-information | |
 | =.sbn= / =.sbx= / =.qix=      | derived-capability | not read or written |
 | deleted-record flag           | --       | =dbf.rs:32=; records dropped, correct |
 
-*=.cpg= is not emitted -- but the reference tool does not emit one either.*
-The =Encoded= struct (=shapefile/writer.rs:20--22=) produces =.shp=, =.shx=,
-=.dbf= and an optional =.prj=; there is no =.cpg= field, and a source carrying
-=src.cpg= = =UTF-8= produced =out.shp out.shx out.dbf= and nothing else
-/(measured)/. The reader *does* honour a =.cpg= (=encoding_from_cpg=,
-=dbf.rs:52=), so it is a one-sided gap, and without one a reader falls back to
+*=.cpg= was not emitted -- and the reference-tool comparison that excused it
+was incomplete.* ***FIXED 2026-10-21: it is written, always, saying =UTF-8=.***
+=Encoded= gained a =cpg= field and =main.rs= writes it beside the other three.
+
+/The original finding, which stands as history:/ =Encoded= produced =.shp=,
+=.shx=, =.dbf= and an optional =.prj=; there was no =.cpg= field, and a source
+carrying =src.cpg= = =UTF-8= produced =out.shp out.shx out.dbf= and nothing
+else /(measured)/. The reader *does* honour a =.cpg= (=encoding_from_cpg=,
+=dbf.rs:52=), so it was a one-sided gap, and without one a reader falls back to
 the DBF language-driver byte =dbf.rs:4= calls "unreliable in practice".
 
-*Priority note, added after checking:* =ogr2ogr= behaves identically -- it read
-the same =src.cpg= and wrote =og.shp og.shx og.dbf= /(measured)/. So this is a
-real loss under the invariant but *not* geosetta being unusually careless, and
-it should rank below the width narrowing above, which the reference tool does
-not share.
+*The priority note that followed it was wrong, and worth reading as a lesson
+rather than deleted.* It said =ogr2ogr= "behaves identically" and so this
+should "rank below the width narrowing, which the reference tool does not
+share". Re-measured 2026-10-21 and both halves fail:
+
+1. ***=ogr2ogr='s default output declares LDID =0x57= -- ANSI/Windows-1252 --
+   in the =.dbf= header while writing UTF-8 bytes.*** It writes no =.cpg=, so
+   the *file* comparison held, but the reference is not silent about encoding;
+   it declares the wrong one through the other channel. /It writes a =.cpg=
+   when given =-lco ENCODING==, and then leaves LDID =0x00=./
+2. ***The real cost had nothing to do with symmetry.*** A =.cpg= already at the
+   output basename governs the =.dbf= this run writes, and geosetta deletes
+   nothing -- so a stale one reading =ISO-8859-1= turned =København= into
+   =KÃ¸benhavn= for GDAL *and for geosetta's own reader*. Writing our own is
+   the only remedy available under no-deletion. See § QUESTIONS item 3.
+
+*Which is the general lesson:* "the reference does the same thing" bounds how
+*unusual* a gap is, never how much it *costs*. The cost here was silent text
+corruption through our own round trip, and the comparison that deferred it had
+looked only at which files appeared.
+
+*What this writer declares now:* a =.cpg= reading =UTF-8=, and LDID left at
+=0x00=. dBase has no UTF-8 language-driver value to put there -- which is
+precisely why Esri invented the =.cpg= -- so =0x00= ("unknown") is the honest
+byte, and the sidecar carries the fact. /Always =UTF-8= is a claim worth
+checking rather than asserting, and it holds by construction: text reaches the
+=.dbf= only through =Cell::Str=, a Rust =String=; every other field type is
+ASCII; and =truncate_at_char_boundary= means a clip never splits a sequence --
+verified by truncating a 400-byte run of =ø= to the 255-byte field limit and
+getting 254 bytes of valid UTF-8 back./
 
 *Not all bad news:* =dbf::write= already emits warnings for over-long values
 and names (=writer.rs:23--24=), so the truncation half of Shapefile's lossiness
@@ -782,17 +862,106 @@ belongs on the fixture hunt, not in the closed pile.
 Not decisions -- things the inventory surfaced that the plans do not currently
 answer.
 
-1. *Is canonicalisation a loss?* =MULTIPOINT ((1 2))= → =MULTIPOINT (1 2)=,
-   =linestring= → =LINESTRING=, KML property order. Both forms are valid and
-   mean the same thing. A strict reading of the invariant forbids it; a
-   reasonable one does not. The answer decides whether the lexeme problem is
-   two bugs (CSV, WKT numbers) or a whole class.
+1. ~~*Is canonicalisation a loss?*~~ ***ANSWERED 2026-10-21: it is a loss
+   exactly where the reader had a choice*** -- =same-format-fidelity.org= D17,
+   and the CSV half is implemented the same day (§ CSV → FIXED).
+
+   *Measuring the question first split it into three things it had been
+   holding as one*, and only the first is the canonicalisation argument the
+   entry was filed about:
+
+   | what changed | example | ruling |
+   |--------------+---------+--------|
+   | *spelling only* -- the output denotes what the input did | =1.50= → =1.5=, =TRUE= → =true=, =point= → =POINT=, the MULTIPOINT dialect, CSV's optional quoting | a loss *where the reader chose to type an untyped cell*; accepted where the grammar forces a number |
+   | *the value's identity* -- the text /was/ the data | =007= → =7=, =08001= → =8001= | always a loss, and a type-inference error rather than canonicalisation |
+   | *a different value* | =12345678901234567890= → =12345678901234567000= | always a loss; never was a canonicalisation question |
+
+   *So "two bugs or a whole class" was the wrong fork.* It is a class, and the
+   class is drawn by **who decides the type** rather than by the format: a CSV
+   cell and a KML =ExtendedData= value are untyped text, so typing them is the
+   reader's decision and must be reversible; a JSON number and a WKT
+   coordinate are numbers *by grammar*, so there is no un-inferred reading to
+   fall back to and the spelling loss is declared instead of fixed.
+
+   *A fourth instance was found while ruling it, and it had been declared
+   inconsistently*: =geojson -> geojson= reformats numbers exactly as
+   =csv -> csv= did (=1.50= → =1.5=, =[1.50,2.00]= → =[1.5,2.0]=, and the same
+   past-=i64= precision), while =Format::GeoJson='s loss list named only =bbox=
+   and geometry foreign members. One loss, two stories, in a warning a user
+   reads. /The list now names it./
+
+   ***The =Json=-column instance is ruled but deliberately not fixed here, and
+   it is not the same fix.*** GeoParquet *parses* a =JSON=-annotated column
+   (=push_json_embedded=), so ={"a": 1}= re-serializes without the space where
+   GeoPackage and FlatGeobuf keep the text. Gating the parse the way
+   =infer_value= is gated looks obvious and is not: the parse is also what
+   makes the column's =DeclType::Json= declaration meaningful, and
+   =Format::recast='s pinned table is written against the parsed reading. It
+   wants its own measurement and belongs to the GeoParquet spoke. /It is the
+   one place the three spokes still disagree about the same column./
 2. *Does the T dimension exist?* FlatGeobuf has =has_t=/=has_tm=; the IR has
    =x, y, z, m=. If a real producer emits T, the invariant says geosetta must
    refuse the file rather than drop the dimension. /Unverified/ that any does.
-3. *Should derived-capability sidecars be rebuilt for Shapefile too?* D4's rule
-   was written for GeoPackage's R*Tree. =.sbn=/=.qix= are the same shape, and
-   geosetta does not read or write them at all today.
+3. ~~*Should derived-capability sidecars be rebuilt for Shapefile too?*~~
+   ***ANSWERED 2026-10-21: no -- and investigating it found that the index
+   sidecars were the least of it.***
+
+   *The question as filed asked about a capability, and the same gap was
+   leaking information.* Geosetta writes =.shp=/=.shx=/=.dbf= and a =.prj= when
+   it has a CRS; **every other file already at the output basename survives the
+   write and then describes the output.** Measured, all three:
+
+   | sidecar left behind | what it does to our output |
+   |---------------------+----------------------------|
+   | =.prj= | a CRS-less CSV's degree coordinates came back as =NAD83 / UTM zone 18N= in *metres*, from =ogrinfo= and from =geosetta --print-crs= alike |
+   | =.cpg= | one reading =ISO-8859-1= turned =København= into =KÃ¸benhavn= -- for GDAL **and for geosetta's own reader**, so correct bytes were written and corrupt text read back |
+   | =.qix=/=.sbn= | an index describing different geometry. /Could not be made to produce a wrong answer from GDAL in any configuration tried -- including a 500-feature file whose stale index knew nothing of the new extent, and with the =.qix= touched newer than the =.shp=. Per § THE ORACLE RULE that is evidence about one consumer, not a guarantee./ |
+
+   /=ogr2ogr -overwrite= has none of this: measured, it deletes the entire
+   prior file set, =.qix= and =.prj= included. **That is the other coherent
+   answer and not this project's** -- a conversion must not delete files nobody
+   asked it to touch, so the output file set can legitimately be part ours and
+   part somebody else's, and the user is *told* which./
+
+   **So the ruling is three parts:**
+
+   1. ***=.cpg= is written, always, saying =UTF-8=.*** It is the one member of
+      the set whose right answer this writer always knows, and under
+      no-deletion it is the only thing that stops a foreign =.cpg= from
+      relabelling our text. /This also closes this section's own one-sided
+      =.cpg= gap, where the reader honoured one and the writer emitted none./
+   2. ***A surviving sidecar is warned about, naming what it will be read
+      as.*** =.sbn=/=.sbx= cannot be written at all (proprietary; GDAL declines
+      too) and =.prj= has nothing to say when the source carries no CRS -- OGC
+      WKT has no spelling for "unknown" -- so the warning is the whole answer
+      for those, not half of one.
+   3. ***=.qix= and =.sbn= are still not written.*** D4's
+      "rebuilt when the source carried one" is triggered **nowhere today**,
+      GeoPackage included -- =main.rs= passes only =args.rtree= -- so extending
+      an unimplemented rule to a second spoke before the first would be
+      backwards. It belongs on =spatial-index.org= as one piece of work
+      covering both spokes.
+
+   *Two things the ranking in this section got wrong, both because the
+   comparison with the reference was incomplete.* =.cpg= was ranked "below the
+   width narrowing" on the grounds that =ogr2ogr= emits none either. True, and
+   beside the point twice over: the stale-=.cpg= corruption above has nothing to
+   do with symmetry, and **=ogr2ogr='s default output declares LDID =0x57= --
+   ANSI/Windows-1252 -- while writing UTF-8 bytes** /(measured)/. So the
+   reference *does* declare an encoding by default; it declares the wrong one
+   through the other channel, and only writes a =.cpg= when given an explicit
+   =-lco ENCODING==.
+
+   *And one adjacent defect, filed not fixed:* =encoding_from_cpg= maps any
+   unrecognised =.cpg= to Latin-1 **silently**. The common real case is
+   =CP1252=, which differs from ISO-8859-1 in exactly the 32 bytes =0x80=--=0x9F=
+   -- where Windows-1252 keeps the curly quotes, dashes, =€= and =…= that real
+   attribute data is full of, and Latin-1 has C1 control characters. Under
+   =lossy-conversion-warnings.org='s rule that approximation owes a warning,
+   and the cheap fix is a 128-entry table per single-byte codepage (no
+   dependency, no architecture change). /Multi-byte codepages -- Shift-JIS,
+   GBK, Big5 -- are where this stops being cheap, and the defensible answer
+   there is to refuse rather than approximate./
 4. *Does =edges: "spherical"= need a refusal rather than a warning?* If a
    producer is found, geosetta reading spherical geometry and writing its
    planar default does not drop a member -- it *restates what the coordinates
@@ -819,6 +988,74 @@ answer.
    and one =<Model>= should not kill a 10,000-feature file. Note GDAL is
    *silent* here /(measured)/, so this is geosetta being deliberately stricter
    than the reference -- as it already is on M-drop and CRS relabel.
+
+   /Re-measured 2026-10-22 and "the reference" is two behaviours: **LIBKML**
+   keeps the Placemark with no geometry and says nothing, exactly as this crate
+   does, while GDAL's **built-in =KML= driver drops the feature outright**,
+   attributes and all. So the warning is stricter than one driver and the
+   feature's survival is kinder than the other./
+
+   /2026-10-22: **scoped, still unbuilt -- and the ruling turned out to be
+   three pieces of work, one of them not a warning at all.** Re-measured
+   first: =hand_hostile.kml='s =<Model>= Placemark comes back
+   =geometry: null= with nothing on stderr, and so do a bare =<LinearRing>=
+   and a =<gx:Track>= authored for the re-measurement./
+
+   1. ***There is no arm to warn in.*** =parse_geometry= (=kml/reader.rs:115=)
+      is driven by =find_map= over *every* child, so its =_ => None= is also
+      how =<name>=, =<description>=, =<styleUrl>=, =<visibility>=,
+      =<TimeStamp>= and =<ExtendedData>= are passed over -- a warning there
+      warns about all of them. What it needs is a *positive list* of KML's
+      geometry element names, split recognised/unsupported, which is D6's
+      catch-all-free shape one level down. Ruled in
+      [[file:kml.org][=kml.org=]] § GEOMETRY ELEMENT COVERAGE.
+   2. ***A capability gap was hiding inside the warning question*** -- which
+      is item 3's lesson in a second instance, found the same way. KML 2.2's
+      =Geometry= substitution group is =Point=, =LineString=, =LinearRing=,
+      =Polygon=, =MultiGeometry= and =Model=; this reader handles four, and
+      reads =LinearRing= *only* inside a =<Polygon>= boundary
+      (=kml/reader.rs:147=). So a =Placemark= holding a bare =<LinearRing>=
+      is legal KML and comes back geometry-less /(measured)/ -- but unlike a
+      =<Model>=, **the IR can hold it**, so the answer for that one is to
+      parse it rather than to warn about it. /Answering the question as asked
+      would have put a warning on geometry this crate can represent exactly,
+      which § THE CLASSES would call a silent loss dressed as a report./
+
+      ***And measured 2026-10-22 it is two of the four, not one***: GDAL's
+      LIBKML driver reads a =<gx:Track>= as =LINESTRING Z=, so ***that is
+      ruled the same way -- parse it*** (=<gx:MultiTrack>= to a
+      =MultiLineString=), under the preference now stated crate-wide at
+      =lossy-conversion-warnings.org= § THE COMPLEMENT: where a loss can be
+      avoided by doing the work, the work wins over the report.
+
+      So ***three of the four members of the silent hole are capability gap
+      rather than loss***, and only =<Model>= earns the warning Q6 was filed
+      about. /The measurement is tabulated in =kml.org= § What GDAL does./
+      **What a track still loses is its per-vertex =<when>= series** -- one
+      instant per vertex, which is not the same thing as a Placemark's own
+      =<TimeStamp>= and needs its own loss-list entry. Its home is the KML
+      native channel when =same-format-fidelity.org= M3 lands, *not* the =m=
+      ordinate: writing times into =m= would relabel what the coordinates
+      mean, which is the failure mode item 4 refuses for =edges=.
+
+      /Also worth noting against item 2: a =gx:Track= is the first real
+      producer of **per-vertex time** either question has turned up. Item 2
+      asks whether anything emits FlatGeobuf's =has_t=; this is adjacent to
+      it and not the same question./
+   3. ***There is nowhere to put the message.*** Both of this crate's warning
+      mechanisms are write-side, and =geometry: None= left by a =<Model>= is
+      indistinguishable in the IR from a Placemark that legitimately has
+      none, so no pre-write check can recover the fact. The read-time channel
+      this needs is scoped at
+      [[file:lossy-conversion-warnings.org][=lossy-conversion-warnings.org=]]
+      § 2b, where **item 3's own =.cpg= warning is the second owed instance**
+      -- so the channel serves two, which is the argument for building it
+      rather than special-casing this spoke.
+
+   /Also worth knowing before it ships: =xml.rs= strips namespace prefixes at
+   parse, so a =gx:Track= reaches the warning as =Track=. Ship the local name
+   with a test pinning the wart -- the fix is the verbatim-replay ruling the
+   KML spoke is already gated on, not a one-off here./
 7. *KMZ's sidecars have no obvious owner.* They are not the KML spoke's (that
    is a document) and not =zip.rs='s (that is a codec). § A FINDING argues for
    their own milestone; nothing in the plans currently holds them.

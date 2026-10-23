@@ -10,8 +10,17 @@ read and write through the Feature IR and compose through the hub in every
 direction (KML↔GeoParquet, KMZ↔GeoJSON, GeoJSON→KML→GeoParquet, etc.). See §
 IMPLEMENTED below for what exists; § OPEN QUESTIONS still has a few
 deliberately-deferred items (a real DEFLATE encoder for compressed =.kmz=
-writes, =<gx:*>= extensions) that don't block calling this spoke done. This
-plan originally laid out the shape of the work before any code was written,
+writes, =<gx:*>= extensions) that don't block calling this spoke done.
+/2026-10-22: "done" covers the four geometry elements this reader dispatches
+on. The other four members of KML's =Geometry= substitution group drop
+**silently**, which is a defect rather than a deferral — scoped in
+§ GEOMETRY ELEMENT COVERAGE below, and one of the four is geometry the IR can
+hold./
+/2026-10-22, later: the spoke is rescoped to the standard -- OGC KML 2.3 as the
+model, every version read, any supported version written back. See
+[[file:kml-standard.org][kml-standard.org]], whose § WHAT THIS OVERTURNS names
+each place this plan is superseded. § GEOMETRY ELEMENT COVERAGE's rulings stand./
+This plan originally laid out the shape of the work before any code was written,
 matching how [[file:shapefile.org][shapefile.org]] and
 [[file:flatgeobuf.org][flatgeobuf.org]] were scoped ahead of their spokes; the
 design below is unchanged from that scoping except where noted.
@@ -346,6 +355,187 @@ spoke so far.
 - Round trips: geojson→kml→geojson (properties + geometry), kml→kmz→kml
   (container only, content should be byte-identical after XML re-parse).
 
+** GEOMETRY ELEMENT COVERAGE — the positive list, and which gaps close rather than warn
+/Added 2026-10-22, scoping =native-inventory.org= § QUESTIONS item 6's "warn
+and emit" ruling into something buildable. Unbuilt./
+
+KML's =Geometry= is an abstract element with a substitution group, so a
+=<Placemark>= may hold any one of six concrete members — plus Google's two
+=gx= extensions. =parse_geometry= (=reader.rs:115=) dispatches on four, and
+everything else falls into one silent hole: the feature is kept, its
+=geometry= is =None=, and nothing is said.
+
+*The rulings below follow one rule*, stated crate-wide at
+[[file:lossy-conversion-warnings.org::*THE COMPLEMENT -- a warning is the last resort, not the first][=lossy-conversion-warnings.org= § THE COMPLEMENT]]:
+**where a choice exists between reporting a loss and doing the work to avoid
+it, do the work.** Three of the four elements in the hole turn out to be
+geometry the IR can hold, so only one of them earns a warning.
+
+| element                      | today                                            | ruling |
+|------------------------------+--------------------------------------------------+--------|
+| =<Point>=                    | parsed                                           | unchanged |
+| =<LineString>=               | parsed                                           | unchanged |
+| =<Polygon>=                  | parsed                                           | unchanged |
+| =<MultiGeometry>=            | parsed                                           | unchanged |
+| =<LinearRing>=               | parsed *only* inside a boundary (=reader.rs:147=); a bare one drops silently /(measured)/ | ***close the gap*** — read it as a =LineString= |
+| =<Model>=                    | drops silently /(measured)/                      | warn and emit |
+| =<gx:Track>= / =<gx:MultiTrack>= | drops silently /(measured)/                  | ***close the gap*** — =LineString= / =MultiLineString=; the per-vertex =<when>= series is the remaining loss |
+
+***The list has to be positive, not a catch-all.*** =parse_geometry= is driven
+by =find_map= over *every* child of the Placemark, so its =_ => None= arm is
+also how =<name>=, =<styleUrl>=, =<visibility>=, =<TimeStamp>= and
+=<ExtendedData>= are passed over. A warning in that arm warns about all of
+them. So the unsupported names are enumerated beside the supported ones —
+=same-format-fidelity.org= D6's catch-all-free =match= one level down, and for
+the same reason: a seventh concrete geometry element should not be able to
+arrive and be silently classified as "not a geometry".
+
+*** Why =LinearRing= is parsed rather than reported
+A ring is a coordinate list and nothing more, and the IR holds a coordinate
+list exactly. Warning about it would file a *report* against geometry this
+crate can represent losslessly — which is
+=lossy-conversion-warnings.org='s definition of a loss, served as a notice
+instead of fixed. /This is the half of item 6 that was not a warning question
+at all: the question asked what to say about geometry we cannot support, and
+one of the four elements in the hole turned out to be geometry we can./
+
+***The reading is a =LineString=, not a =Polygon=.*** A Polygon would invent an
+interior the source never stated; a ring is a boundary, and KML says so itself
+by wrapping one in =<outerBoundaryIs>= when it means an area.
+
+*** What GDAL does, measured 2026-10-22 — and the two drivers disagree
+/Measured against GDAL 3.13.3 on a five-Placemark file, reproducible as
+written: the =-if= flag is load-bearing, since which driver claims =.kml=
+decides the answer./
+
+#+begin_src sh
+cat > /tmp/ring.kml <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2"><Document>
+ <Placemark><name>bare closed ring</name><LinearRing><coordinates>0,0 4,0 4,4 0,4 0,0</coordinates></LinearRing></Placemark>
+ <Placemark><name>bare open ring</name><LinearRing><coordinates>10,0 14,0 14,4 10,4</coordinates></LinearRing></Placemark>
+ <Placemark><name>a real polygon</name><Polygon><outerBoundaryIs><LinearRing><coordinates>20,0 24,0 24,4 20,4 20,0</coordinates></LinearRing></outerBoundaryIs></Polygon></Placemark>
+ <Placemark><name>a model</name><Model><Location><longitude>8.5417</longitude><latitude>47.3769</latitude></Location></Model></Placemark>
+ <Placemark><name>a track</name><gx:Track><gx:coord>1 2 0</gx:coord><gx:coord>3 4 0</gx:coord></gx:Track></Placemark>
+</Document></kml>
+EOF
+
+ogrinfo -if LIBKML -al -q /tmp/ring.kml   # five features
+ogrinfo -if KML    -al -q /tmp/ring.kml   # one
+ogr2ogr -f LIBKML /tmp/rt.kml /tmp/ring.kml && grep -o '<LinearRing>\|<LineString>' /tmp/rt.kml
+geosetta /tmp/ring.kml - --to geojson     # one geometry, four nulls, no warning
+#+end_src
+
+| Placemark holds        | geosetta         | LIBKML                | KML (built-in)        | =ogr2ogr -f LIBKML= round trip |
+|------------------------+------------------+-----------------------+-----------------------+--------------------------------|
+| bare closed =LinearRing= | =null=, silent | =LINEARRING (...)=    | ***feature dropped*** | =<LineString>=                 |
+| bare *open* =LinearRing= | =null=, silent | =LINEARRING=, left open | ***feature dropped*** | =<LineString>=               |
+| =<Polygon>=            | =Polygon=        | =POLYGON=             | =POLYGON=             | =<Polygon><LinearRing>=        |
+| =<Model>=              | =null=, silent   | feature kept, no geometry, attributes kept | ***feature dropped*** | Placemark, no geometry |
+| =<gx:Track>=           | =null=, silent   | =LINESTRING Z (...)=  | ***feature dropped*** | =<LineString>=                 |
+
+***Three things it settled, one of them against this section's own table.***
+
+1. *The =LinearRing= ruling holds, and the dialect entry is the reference's
+   behaviour too.* LIBKML reads a bare ring as geometry rather than discarding
+   it, and ***its own writer emits =<LineString>= on the way back out*** —
+   =<LinearRing>= appears only inside a =<Polygon>=. So the same-format loss
+   entry above is not this crate being careless with a spelling; it is what
+   the reference implementation does with the same file.
+2. *An open ring is **not** closed on read.* LIBKML returns
+   =LINEARRING (10 0,14 0,14 4,10 4)= — four vertices, unclosed. So this
+   reader must not close one either: a ring the source left open is the
+   source's statement, and closing it would add a vertex nobody wrote.
+3. ***=<gx:Track>= is representable too, and it moves columns.***
+   ***RULED 2026-10-22: parse it.*** LIBKML returns =LINESTRING Z= for one,
+   which is the =LinearRing= finding a *second* time — another member of the
+   silent hole turning out to be geometry the IR can hold — so "warn and
+   emit" would again be *reporting* a loss this crate could simply not have.
+   =<gx:Track>= becomes a =LineString= and =<gx:MultiTrack>= a
+   =MultiLineString=.
+
+   /The ruling is the standing preference stated plainly: **where a choice
+   exists between reporting a loss and doing the work to avoid it, do the
+   work** -- the closest fidelity reachable, not the most honest excuse. It
+   is the same call D17 made for a CSV cell and M4 made for a =.dbf= width,
+   and it is why only =<Model>= is left in the warn column: a =<Model>= is a
+   textured mesh with a =<Link>= to a =.dae=, and there is no geometry in the
+   IR that is a nearer thing to it than nothing./
+
+   *Two details the parser needs, both measured.* =<gx:coord>= is
+   ***space***-separated (=1 2 0=), not comma-separated the way
+   =<coordinates>= is -- the same element spelling the =gx= namespace
+   deliberately did not reuse. And the =Z= is real: LIBKML returned
+   =LINESTRING Z=, so a track's third ordinate is an altitude and reaches the
+   IR as one.
+
+   **What a track still loses, and it is now the only thing:** a
+   =<gx:Track>= interleaves =<when>= with =<gx:coord>=, so each vertex
+   carries an instant, and this reading drops that *time series*. /LIBKML
+   does the same -- it keeps the third coordinate as =Z= and discards the
+   times./ Under the preference above that is a loss to *close*, not to
+   accept, so it is recorded here as the next question rather than settled:
+
+   - ***Not the =m= ordinate.*** =m= is a measure, and writing epoch seconds
+     into it would relabel what the coordinates mean to whatever reads the
+     output next -- the GeoJSON-relabel failure mode
+     =native-inventory.org= § QUESTIONS item 4 refuses for =edges=. /It would
+     also silently become a =Double= in every spoke that writes =m=./
+   - ***The KML native channel is the right home***, with the Placemark's
+     other unmodelled children, which is =same-format-fidelity.org= M3's
+     gated work for this spoke. Until that lands the time series is a
+     *declared* loss, and =Format::Kml='s =same_format_losses= row needs it
+     named separately: the existing "timestamps and altitude modes" entry is
+     about a Placemark's own =<TimeStamp>=/=<TimeSpan>=, which is one instant
+     per feature, not one per vertex.
+   - /Item 2's "does the T dimension exist?" is adjacent and is **not** this
+     question. That asks whether a producer emits FlatGeobuf's =has_t=; this
+     asks where a KML track's own times go. A =gx:Track= is the first real
+     producer of per-vertex time either question has turned up, which is
+     worth noting there./
+
+*And the reference is not one behaviour.* GDAL's built-in =KML= driver returned
+***one of the five features*** — every Placemark whose geometry it could not
+parse vanished, attributes included, which is worse than both this crate and
+LIBKML. /A clean datum for =same-format-fidelity.org= § THE ORACLE RULE: two
+drivers in the same install, on the same file, disagreeing about whether a
+feature exists at all./ Where geosetta stands today is between them: it keeps
+every feature (better than =KML=) and drops two geometries it could have held
+(worse than LIBKML).
+
+*And it costs an entry in the same-format loss list.* The writer emits
+=LinearRing= only inside a boundary (=writer.rs:113=), so a bare ring read as a
+=LineString= comes back spelled =<LineString>= on a =kml -> kml= hop. Both
+spellings denote the same closed coordinate list and the IR has no standalone
+ring type, so this is WKT's =MULTIPOINT= dialect problem in a second spoke:
+**declared, not fixed** — =Format::Kml='s =same_format_losses= row owes the
+entry the way =Format::Wkt='s already names its own. /The alternative is a
+native carrying "this was spelled =LinearRing=", which is a payload for a
+spelling; D1's modelling exception does not stretch that far./
+
+*** What the warning says, and that it says it once
+A real GPS-export KML is thousands of =gx:Track= Placemarks, so the message is
+counted per element name and emitted once:
+
+#+begin_src text
+  warning: kml: 3 features hold <Model>, which this reader does not support; kept with no geometry
+#+end_src
+
+It needs the read-time warning channel scoped at
+=lossy-conversion-warnings.org= § 2b, which does not exist yet — both of this
+crate's warning mechanisms are write-side, and a =geometry: None= left by a
+=<Model>= is indistinguishable in the IR from a Placemark that legitimately has
+none. /=.kmz= reads every =.kml= entry in the archive through the same
+=collect_features=, so one sink shared across entries aggregates the whole
+archive rather than per-document./
+
+*The element cannot be named as the file spelled it*, because =xml.rs= strips
+namespace prefixes at parse: a =gx:Track= reaches the warning as =Track=, and a
+user grepping their file for =<Track>= finds nothing. Ship the local name with
+a test pinning it. The fix is the verbatim-replay ruling =same-format-fidelity.org=
+M3's KML spoke is already gated on — adding a =raw_name= to =XmlElement= here
+would pre-empt that ruling to buy a cosmetic gain.
+
 ** OPEN QUESTIONS
 - *How much of =<name>=/=<description>= to keep* — treating them as ordinary
   properties (as scoped above) is cheap and matches how GeoJSON's
@@ -366,6 +556,12 @@ spoke so far.
   =<gx:Track>= in particular is common enough in real GPS-export KML that it
   may be worth a follow-up once the core spoke lands; note it here so it
   isn't forgotten rather than silently dropped.
+
+  /2026-10-22: "silently dropped" is exactly what happens today (measured),
+  and § GEOMETRY ELEMENT COVERAGE above now rules it — =<gx:Track>= warns and
+  emits rather than supporting or refusing. Whether to *support* it is still
+  this bullet's question and still deferred; what is no longer deferred is
+  being quiet about it./
 - *CRC-32 implementation* — RESOLVED: =zip.rs= owns it directly (a 256-entry
   table built at compile time via a =const fn=, not generalized into
   =compress/=), used both to compute entries on write and verify them on

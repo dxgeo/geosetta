@@ -203,3 +203,87 @@ fn a_transit_recasts_only_what_it_warned_about() {
         }
     }
 }
+
+/// **GDAL's spatial filter through an index packed over *unsorted* leaves
+/// returns exactly the right features.**
+///
+/// This is the oracle the 2026-10-21 FlatGeobuf change rests on. That change
+/// stopped the writer Hilbert-sorting features of its own accord — it was
+/// permuting content on a same-format run, and making `--sort-hilbert` a dead
+/// flag for the one format where the sort was mandatory. The claim it needs is
+/// that a *packed Hilbert* R-tree is packed bottom-up over whatever order its
+/// leaves are in, and that only the locality the name describes suffers, not
+/// the correctness of a query.
+///
+/// Self-consistency cannot establish that: our own reader walks the same tree
+/// our own writer packed, so the two would agree about a broken one. Hence
+/// GDAL, and hence a *brute-force* expectation computed in this file rather
+/// than read off either implementation.
+///
+/// The input is deliberately anti-sorted (descending by latitude), and 500
+/// features is past `NODE_SIZE` twice over, so the tree has interior nodes
+/// whose bounding boxes genuinely overlap — the case a sorted build is
+/// supposed to avoid and the one a filter could get wrong.
+#[test]
+#[ignore = "requires GDAL; run with --ignored"]
+fn gdal_filters_correctly_through_an_index_over_unsorted_leaves() {
+    if !gdal_present() {
+        eprintln!("skipping: ogrinfo not found");
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("geosetta-fgb-index-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    // A deterministic spread, then sorted *against* spatial locality.
+    let mut points: Vec<(f64, f64)> = (0..500)
+        .map(|i| {
+            let x = f64::from((i * 149) % 359) - 179.0;
+            let y = f64::from((i * 71) % 169) - 84.0;
+            (x, y)
+        })
+        .collect();
+    points.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
+    let mut csv = String::from("id,geometry\n");
+    for (i, (x, y)) in points.iter().enumerate() {
+        csv.push_str(&format!("{i},\"POINT ({x} {y})\"\n"));
+    }
+    let src = dir.join("anti.csv");
+    std::fs::write(&src, &csv).unwrap();
+
+    let fgb = dir.join("anti.fgb");
+    let out = Command::new(env!("CARGO_BIN_EXE_geosetta"))
+        .args([src.to_str().unwrap(), fgb.to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // The box, and the answer computed here rather than asked of anyone.
+    let (x0, y0, x1, y1) = (-20.0, 10.0, 40.0, 50.0);
+    let expected = points
+        .iter()
+        .filter(|(x, y)| *x >= x0 && *x <= x1 && *y >= y0 && *y <= y1)
+        .count();
+    assert!(expected > 0 && expected < points.len(), "the box must be a real filter");
+
+    let count_with = |args: &[&str]| -> usize {
+        let out = Command::new("ogrinfo")
+            .args(["-al", "-q"])
+            .args(args)
+            .arg(fgb.to_str().unwrap())
+            .output()
+            .expect("ogrinfo failed to run");
+        assert!(out.status.success(), "ogrinfo: {}", String::from_utf8_lossy(&out.stderr));
+        String::from_utf8_lossy(&out.stdout).matches("POINT").count()
+    };
+
+    assert_eq!(count_with(&[]), points.len(), "GDAL could not read the whole file");
+    assert_eq!(
+        count_with(&["-spat", "-20", "10", "40", "50"]),
+        expected,
+        "GDAL's filter through our index disagreed with a brute-force count",
+    );
+    // A box containing nothing must return nothing rather than everything,
+    // which is how a tree walked wrongly tends to fail.
+    assert_eq!(count_with(&["-spat", "200", "10", "201", "11"]), 0);
+}

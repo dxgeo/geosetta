@@ -55,8 +55,17 @@ pub struct Args {
     pub mode: Mode,
     /// A specific GeoPackage layer to read (or the layer name when writing one).
     pub layer: Option<String>,
-    /// Reorder features by Hilbert-curve locality before writing (clusters rows
-    /// for GeoParquet; a no-op ordering-wise for already-sorted FlatGeobuf).
+    /// Reorder features by Hilbert-curve locality before writing, clustering
+    /// rows for GeoParquet row groups and giving a FlatGeobuf index its
+    /// locality.
+    ///
+    /// *This said it was "a no-op ordering-wise for already-sorted
+    /// FlatGeobuf" until 2026-10-21, and had it backwards*: the FlatGeobuf
+    /// writer sorted on every run of its own accord, so the flag was a no-op
+    /// because the sort was *mandatory*, not because the input was already
+    /// ordered — and a same-format run permuted the user's features either
+    /// way. The writer now packs its index over input order, so this flag is
+    /// the only thing that reorders anything, for every format alike.
     pub sort_hilbert: bool,
     /// Write a spatial index into GeoPackage output (the opt-in GeoPackage
     /// RTree extension). Ignored for other output formats.

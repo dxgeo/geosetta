@@ -4,7 +4,7 @@
 
 * KML to the Standard
 
-** STATUS -- K1--K5 built (K5 finished 2026-10-28); open questions 10 and 11 remain
+** STATUS -- K1--K5 built (K5 finished 2026-10-28); open question 11 remains
 /2026-10-28, later:/ ***K5 is built.*** A 2.2 document written as 2.3 is
 raised (=kml/raise.rs=): adopted =gx:= elements into the KML namespace where
 2.3 admits them there, =<Snippet>= to =<snippet>= and =<Metadata>= to
@@ -453,10 +453,11 @@ degree-space prediction is ~80 km off (§ MEASURED IN A RENDERER). So the reader
 computes the footprint by scaling longitude offsets by cos(latitude of the
 centre), turning, and scaling back. Its docs say so, and cite this measurement.
 
-/What the measurement cannot separate/: a local metric plane and Web Mercator
--- both conformal -- put those corners 1.7 km apart, about 3 pixels at the
-zoom that showed the whole overlay. That matters only for overlays spanning
-many degrees of latitude. Open question 10.
+/What the measurement could not separate/: a local metric plane and Web
+Mercator put those corners 1.7 km apart, about 3 pixels at the zoom that
+showed the whole overlay. ***Separated 2026-10-28: the local plane*** (§
+MEASURED IN A RENDERER, *The rotation plane, at scale*) -- open question 10,
+decided. The reader's model is the renderer's.
 
 /A 2008 claim to the contrary/ -- "GE draws GroundOverlays by rotating them on
 the lat/lon plane", from a member of Google's KML developer group, not Google --
@@ -597,6 +598,41 @@ every degree-space pin well outside the overlay; and the image's circle drew as
 a circle, with its arms at a right angle, which a degree-space turn would have
 sheared into a tilted ellipse. The red arm pointed at the ground-plane
 image-top pin, to the northwest: *counter-clockwise*, as §11.3.3 says.
+
+*** The rotation plane, at scale -- 2026-10-28
+=probe_rotation_plane.kmz=: a 40°×30° =LatLonBox= centred on 10°E 45°N
+(spanning 10°W–30°E, 30°N–60°N), =rotation= 30, the same image, with pins at
+the corners four "on the ground" hypotheses predict. At the first probe's
+size they agree to within 4 km; at this one each pair is 41 km apart or more
+at some corner and 140–310 km at another:
+
+- *G*, a local plane: longitude offsets scaled by cos(centre latitude),
+  turned, scaled back -- what =kml/project.rs= implements.
+- *M1*, Web Mercator, turned about the box's Mercator midpoint.
+- *M2*, Web Mercator, turned about its midpoint in degrees.
+- *S*, the sphere: each corner's bearing from the centre turned, its distance
+  kept.
+
+| corner | G               | M1              | M2              | S               | where it landed |
+|--------+-----------------+-----------------+-----------------+-----------------+-----------------|
+| NE     | 16.714, 65.061  | 16.325, 63.343  | 14.842, 63.165  | 11.055, 64.151  | G, ~12 km off   |
+| NW     | -17.927, 50.919 | -18.316, 52.868 | -19.799, 52.627 | -17.362, 51.171 | G or S (48 km apart) |
+| SW     | 3.286, 24.939   | 3.675, 23.712   | 2.193, 23.348   | 0.787, 24.601   | G               |
+| SE     | 37.927, 39.081  | 38.316, 40.540  | 36.834, 40.237  | 38.105, 38.737  | G or S (41 km apart) |
+
+Read in Google Earth Web, loaded as a local KML file. At NE, the decisive
+corner, the overlay's tip sat ~10 px from G's pin at 1.2 km/px -- inside the
+pushpin icon's own offset -- and M1, M2 and S were 160, 170 and 250 km away.
+SW agreed; NW and SE, where only G and S are close, fit G. *Google Earth turns
+a =LatLonBox= on the local plane the reader already uses*, so nothing changed
+in the code. The image's edges drew as curves on the globe, consistent with an
+image laid on that plane rather than in degree space.
+
+/How it was loaded, for a rerun/: Earth Web's "Open local KML file" calls
+=showOpenFilePicker=; replacing that in the page with one returning a handle
+to a file staged in a page-side =<input type=file>= loads a file without the
+native dialog. Synthetic drag-and-drop events did not load anything: no
+element of the page cancels =dragover=.
 
 *** =gx:Track= versus =kml:Track=
 Each probe carries a control =LineString= beside its track: the same eight
@@ -1114,11 +1150,11 @@ expressible; the mapping must key on (namespace, local name, parent).
    The measurements behind the decision are in § MEASURED IN A RENDERER: (a)
    also passed every check -- valid 2.3, drawn by Google Earth Web, read by
    LIBKML -- so it remains the fallback if a 2.3 default is ever wanted again.
-10. *A local metric plane or Web Mercator for the rotation?* /Opened
-    2026-10-23, from D-K14's measurement./ Both are conformal and indistinguishable
-    on the probe -- 1.7 km at the corners of a 222 km box. A probe spanning tens
-    of degrees of latitude would separate them. Low priority: only an overlay
-    that large tells them apart.
+10. ~~*A local metric plane or Web Mercator for the rotation?*~~ ***DECIDED
+    2026-10-28: the local plane*** -- longitude scaled by cos(centre latitude),
+    which the reader already used. A 40°×30° probe separated it from two Web
+    Mercator variants and a spherical turn by 160–250 km at its NE corner (§
+    MEASURED IN A RENDERER, *The rotation plane, at scale*).
 11. *Is the document model public?* /Opened 2026-10-23, due now K5 is built./
     =KmlNative='s =document= and =KmlFeatureNative='s contents are
     crate-private, where every other spoke's native contents are public. The

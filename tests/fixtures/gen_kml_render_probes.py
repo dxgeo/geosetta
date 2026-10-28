@@ -13,6 +13,9 @@ Writes, into OUT_DIR:
       plus a control LineString.
   probe_kml23_gxtrack.kml     -- a gx:Track in a version="2.3" document,
       plus a control LineString: open question 9's option (a).
+  probe_rotation_plane.kmz    -- open question 10: a GroundOverlay 40x30
+      degrees across, rotated 30 degrees, with pins at the corners each of
+      four "on the ground" hypotheses predicts (2026-10-28).
 
 These are not test fixtures: nothing in the suite reads them. They are the
 input to a manual measurement in a renderer (Google Earth Web), kept so the
@@ -38,6 +41,16 @@ Why this shape, so nobody simplifies it back:
   not to draw in Google Earth Pro); 2.3 declares kml:Track's as xs:all, which
   allows either. The probe uses the order both accept so that only the
   namespace differs between the two tracks.
+- *The rotation-plane probe is 40x30 degrees, centred on 10E 45N.* The first
+  probe settled degree space against the ground, but at its size every way of
+  turning "on the ground" agrees to within 4 km. Turned 30 degrees, this box
+  puts each pair of the four ground hypotheses at least 41 km apart at some
+  corner and 140-310 km apart at another -- ten or more pixels with the whole
+  box in view. The hypotheses: G, a local plane with longitude scaled by
+  cos(centre latitude), which kml/project.rs implements; M1, Web Mercator
+  turned about the box's Mercator midpoint; M2, Web Mercator turned about its
+  midpoint in degrees; S, the sphere, each corner's bearing from the centre
+  turned and its distance kept.
 - *Three track files, one variable each.* 2.2 + gx:Track against 2.3 +
   gx:Track differs only in the version stamp; 2.3 + gx:Track against 2.3 +
   kml:Track differs only in the namespace.
@@ -202,6 +215,97 @@ def main(out):
     for k, (ox, oy) in corners.items():
         d, g = degree_space(ox, oy), ground_plane(ox, oy)
         print(f"{k}: degree-space {d[0]:.3f},{d[1]:.3f}  ground-plane {g[0]:.3f},{g[1]:.3f}")
+
+    plane = rotation_plane_probe()
+    with zipfile.ZipFile(os.path.join(out, "probe_rotation_plane.kmz"), "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("doc.kml", plane)
+        z.writestr("overlay.png", overlay_png())
+    for name, corners in PLANE_HYPOTHESES.items():
+        print(f"{name}: " + "  ".join(f"{k} {x:.3f},{y:.3f}" for k, (x, y) in corners.items()))
+
+
+# --- open question 10: the rotation plane -------------------------------
+
+P_LON0, P_LAT0 = 10.0, 45.0  # centre
+P_DLON, P_DLAT = 20.0, 15.0  # half-extents: the box spans -10..30E, 30..60N
+P_ROT = 30.0
+
+
+def _merc_y(lat):
+    return math.degrees(math.log(math.tan(math.pi / 4 + math.radians(lat) / 2)))
+
+
+def _merc_lat(y):
+    return math.degrees(2 * math.atan(math.exp(math.radians(y))) - math.pi / 2)
+
+
+def _turn(x, y, t):
+    return x * math.cos(t) - y * math.sin(t), x * math.sin(t) + y * math.cos(t)
+
+
+def plane_hypotheses():
+    """Each hypothesis's corners, {name: {corner: (lon, lat)}}."""
+    t = math.radians(P_ROT)
+    n, s, e, w = P_LAT0 + P_DLAT, P_LAT0 - P_DLAT, P_LON0 + P_DLON, P_LON0 - P_DLON
+    corners = {"NE": (e, n), "NW": (w, n), "SW": (w, s), "SE": (e, s)}
+    out = {}
+
+    c = math.cos(math.radians(P_LAT0))
+    g = {}
+    for k, (x, y) in corners.items():
+        rx, ry = _turn((x - P_LON0) * c, y - P_LAT0, t)
+        g[k] = (P_LON0 + rx / c, P_LAT0 + ry)
+    out["G"] = g
+
+    for name, cy in [("M1", (_merc_y(n) + _merc_y(s)) / 2), ("M2", _merc_y(P_LAT0))]:
+        m = {}
+        for k, (x, y) in corners.items():
+            rx, ry = _turn(x - P_LON0, _merc_y(y) - cy, t)
+            m[k] = (P_LON0 + rx, _merc_lat(cy + ry))
+        out[name] = m
+
+    p1 = math.radians(P_LAT0)
+    sph = {}
+    for k, (x, y) in corners.items():
+        p2, dl = math.radians(y), math.radians(x - P_LON0)
+        d = math.acos(math.sin(p1) * math.sin(p2) + math.cos(p1) * math.cos(p2) * math.cos(dl))
+        b = math.atan2(math.sin(dl) * math.cos(p2), math.cos(p1) * math.sin(p2) - math.sin(p1) * math.cos(p2) * math.cos(dl))
+        b -= t  # a bearing runs clockwise; the turn is counter-clockwise
+        q = math.asin(math.sin(p1) * math.cos(d) + math.cos(p1) * math.sin(d) * math.cos(b))
+        lon = math.radians(P_LON0) + math.atan2(math.sin(b) * math.sin(d) * math.cos(p1), math.cos(d) - math.sin(p1) * math.sin(q))
+        sph[k] = (math.degrees(lon), math.degrees(q))
+    out["S"] = sph
+    return out
+
+
+PLANE_HYPOTHESES = plane_hypotheses()
+
+# One colour per hypothesis, as KML's aabbggrr.
+PLANE_COLOURS = {"G": "ff00ff00", "M1": "ffff0000", "M2": "ffffff00", "S": "ff00a5ff"}
+
+
+def rotation_plane_probe():
+    styles = "".join(
+        f'<Style id="{h}"><IconStyle><color>{c}</color><scale>0.9</scale></IconStyle>'
+        f"<LabelStyle><color>{c}</color></LabelStyle></Style>"
+        for h, c in PLANE_COLOURS.items()
+    )
+    pins = "".join(
+        pin(f"{h}-{k}", x, y, h) for h, corners in PLANE_HYPOTHESES.items() for k, (x, y) in corners.items()
+    )
+    overlay = (
+        f"<GroundOverlay><name>rotated overlay {P_ROT:g}deg, 40x30deg @{P_LAT0:g}N</name>"
+        "<Icon><href>overlay.png</href></Icon>"
+        f"<LatLonBox><north>{P_LAT0 + P_DLAT}</north><south>{P_LAT0 - P_DLAT}</south>"
+        f"<east>{P_LON0 + P_DLON}</east><west>{P_LON0 - P_DLON}</west>"
+        f"<rotation>{P_ROT}</rotation></LatLonBox></GroundOverlay>"
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<kml xmlns="http://www.opengis.net/kml/2.2">'
+        f"<Document><name>geosetta probe: rotation plane (G green, M1 blue, M2 cyan, S orange)</name>"
+        f"{styles}\n{overlay}\n{pins}\n</Document></kml>"
+    )
 
 
 if __name__ == "__main__":

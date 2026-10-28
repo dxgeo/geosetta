@@ -31,7 +31,7 @@ boundary wherever the format is externally specified, and no shared internal
 structs across a repo boundary.
 
 ** STATUS
-Current version: *0.26.1*.
+Current version: *0.27.0*.
 
 Eight formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -90,7 +90,9 @@ validated against DuckDB / GDAL.
   =doc.kml= entry. Entries are stored (uncompressed) — no DEFLATE encoder in
   the crate yet, so =.kmz= output is bigger than a compressed one but
   universally readable. A =.kmz= made from another format declares a Unix
-  file of mode 0644.
+  file of mode 0644. An archive that needs zip64 — past 65,535 entries or
+  4 GiB — is refused by name on read and on write, never read or written in
+  part.
   Validated against real GDAL (=ogrinfo=, =ogr2ogr -f LIBKML=), DuckDB
   fixtures, and a real Info-ZIP archive for the deflate read path.
   A feature's time (=timestamp=, =begin=/=end=), its geometry's altitude

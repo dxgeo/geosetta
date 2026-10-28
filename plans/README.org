@@ -82,7 +82,13 @@ why, not to implement the spec's table from symmetry.
   reader-internal column fusion; bulk-copy string writing instead of
   char-by-char; =Rc<str>= property-key sharing/interning to cut per-row key
   allocation; a Parquet all-present level-decoding fast path and WKB =Vec=
-  pre-sizing to avoid reallocs. *Remaining:* a hand-rolled float formatter
+  pre-sizing to avoid reallocs. *Memory* (2026-10-28, measured by peak RSS in
+  =compare.py= and a phase-splitting allocator probe): =Feature::native= boxed
+  and GeoJSON properties sized exactly (Mem1--2), property columns borrowing
+  the features' cells (Mem3, which also removed a quadratic FlatGeobuf write),
+  Parquet decoded a column at a time (Mem4), and KML written straight into its
+  text with no element tree (Mem5: 600 → 85 MB on 100 000 points). What is
+  left is KML's read, and KML carried back to KML. *Remaining:* a hand-rolled float formatter
   (dtoa/Ryū) is parked — correctness-risk and effort not worth it yet against
   =std='s formatter; the compression codecs are untuned but unlikely to be the
   bottleneck; full streaming (vs. whole-file-in-RAM) is tracked separately in
@@ -477,14 +483,16 @@ why, not to implement the spec's table from symmetry.
   committed as oracles. /Rescoped 2026-10-28/ from "single-byte, refuse
   multi-byte": the old refusal was a warning standing in for a parser. Today
   four spokes refuse non-UTF-8 input with no remedy, a =.dbf= approximates an
-  unrecognised =.cpg= as Latin-1 (warned since E1), and zip entry names are
-  refused on read and mis-declared on write.
+  unrecognised =.cpg= as Latin-1 (warned since E1), and a non-UTF-8 zip entry
+  name is refused on read (E8's write side, declaring a non-ASCII name UTF-8,
+  is built).
 
   One measurement shapes it: =ogr2ogr='s default output declares LDID =0x57=
   (Windows-1252) while writing UTF-8 bytes, so **honouring the in-band
   declaration would mis-decode the reference tool's own files** (D-E2). A
   same-format run writes the source's encoding back (D-E7), which is the
-  non-UTF-8 item of KML's XML-layer losses. E1 built; E5 partly. Next: E2
+  non-UTF-8 item of KML's XML-layer losses. E1 built; E5 partly; E8's write
+  side built. Next: E2
   (shared module, single-byte tables), E3 (multi-byte), E4
   (=--from-encoding=), E6 (writing).
   See [[file:encodings.org][encodings.org]].

@@ -3,9 +3,8 @@
 #+DATE: {{{time(%Y-%m-%d)}}}
 
 * Current Working Items
-/Picking up the fidelity work? Read [[file:../handoff.org][handoff.org]] first
--- it carries the sequencing, the nine settled decisions, and the live bugs
-found but not fixed./
+/A citation of =handoff.org= by entry or section means one of the two
+revisions [[file:../handoff.org][handoff.org]] names./
 
 Live list of what's open right now — not the full historical plan index (see
 [[file:README.org][README.org]] for that, ordered by dependency, everything
@@ -253,6 +252,15 @@ check it off and remove it once the item ships or is shelved.
   GeoPackage read loss exists, and its library caller (the destination merge)
   has no channel to pass one to.
 
+- [ ] [[file:performance.org::*KML's read, and KML carried back to KML][performance.org — KML's read, and KML carried back to KML]] —
+  what remains of geosetta's memory cost after Mem1--Mem5. Step 2: a reader
+  that keeps a feature's element only when the target is KML or KMZ, set by
+  the CLI as a read option (=kml -> geojson= peaks at 586 MB on 100 000
+  points; ~80 MB expected). Step 3, undecided: carry a KML feature back as a
+  byte span re-parsed at write time, or accept GeoJSON's weaker promise.
+- [ ] [[file:columnar.org][columnar.org]] — the hub as a table rather than
+  rows, keeping every same-format guarantee the row IR gives. Milestones
+  C0--C6. Scoping only.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

@@ -578,8 +578,11 @@ K4): the reader now raises the whole document into the KML model, and a
 =kml -> kml= run in the source's version gives the document back with the IR's
 edits applied. Everything the trace below lists as dropped is carried. What
 remains lost is in =Format::same_format_losses='s KML row -- CDATA, a non-UTF-8
-encoding, a DOCTYPE, whitespace layout -- plus, for =.kmz=, the archive's
-other entries (M3c). The trace stands as the record of the reader before./
+encoding, a DOCTYPE, whitespace layout -- plus, for =.kmz=, what the zip
+writer does not reproduce: each entry's compression, extra fields and
+attributes, and the archive comment. /The archive's other entries, listed
+here until 2026-10-28, are carried (M3c), and so is a layered archive's every
+document./ The trace stands as the record of the reader before./
 
 Upgraded from /unverified/ to /code/ by tracing the reader rather than listing
 the spec. The trace found more than the spec list had, because the loss is

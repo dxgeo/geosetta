@@ -200,6 +200,37 @@ check it off and remove it once the item ships or is shelved.
   and carried as of 2026-10-28: its entries, and a layered archive's every
   document.
 
+- [ ] *KML's XML-layer losses* — =Format::Kml='s =same_format_losses= row, and
+  =native-inventory.org= § KML / KMZ: what a =kml -> kml= run still warns it
+  loses, now that the document itself is carried. Each is a carry in
+  =xml.rs= and the model, not a KML question.
+  - *Whitespace between elements*, the most visible: a node's text runs are
+    joined into one string written before its children, so an indented file
+    comes back with its line breaks bunched at the start of each element.
+    Keeping the runs by position, as comments already are, fixes the read;
+    the reconcile then needs a rule for indenting an element it inserts.
+  - *CDATA sections*, written back as escaped text.
+  - *A non-UTF-8 encoding*, written as UTF-8 — decoding is
+    [[file:encodings.org][encodings.org]]'s; writing back in the declared
+    encoding is what is owed.
+  - *A DOCTYPE*, dropped.
+- [ ] *Write a =<Region>='s =<LatLonBox>= as the =<LatLonAltBox>= it equals* —
+  [[file:kml-standard.org][kml-standard.org]] K5. Lowering 2.3 to 2.2 drops a
+  =<LatLonBox>= or =<LatLonQuad>= in a =<Region>= (and a =<LatLonAltBox>= on a
+  ground overlay), with a warning, because 2.2 has no place for it. An
+  unturned =<LatLonBox>= in a =<Region>= is a =<LatLonAltBox>= with the same
+  edges and no altitudes, so it can be written as one instead of dropped —
+  fidelity over warning. A turned box or a quad has no 2.2 equivalent and
+  stays a reported drop.
+- [ ] *Carry the rest of a =.kmz= entry* —
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] M3c,
+  =Format::Kmz='s =same_format_losses= row. =zip.rs= carries each entry's name,
+  bytes and modification time; it reads past, and writes none of, each
+  entry's extra fields (Info-ZIP's extended timestamps and Unix ids, say) and
+  external attributes (Unix permissions), and the archive comment. All three
+  are bytes the central directory already holds. Compression is the other
+  item in that row, and is [[file:compression-encoders.org][compression-encoders.org]]'s.
+
 - [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
   *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a
   =&mut Vec<String>= sink, counted per cause (=crate::tally::Tally=) so a GPS

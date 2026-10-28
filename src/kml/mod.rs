@@ -148,7 +148,8 @@ pub(crate) fn version_change_warnings(fc: &FeatureCollection, target: Format, ve
 /// the actual per-layer data in `layers/*.kml`; reading only the first entry
 /// would silently produce zero features for archives shaped that way.
 pub(crate) fn read_kmz(bytes: &[u8], _warnings: &mut Vec<String>) -> Result<FeatureCollection> {
-    let entries = crate::zip::read(bytes)?;
+    let archive = crate::zip::read_archive(bytes)?;
+    let entries = &archive.entries;
     let kml_entries: Vec<_> = entries.iter().enumerate().filter(|(_, e)| is_kml_entry(&e.name)).collect();
     if kml_entries.is_empty() {
         return Err(Error::Convert("kmz: no .kml entry found in the archive".into()));
@@ -187,7 +188,7 @@ pub(crate) fn read_kmz(bytes: &[u8], _warnings: &mut Vec<String>) -> Result<Feat
     let facts = facts.expect("at least one .kml entry was read");
     drop(kml_entries);
     native.layers = layers;
-    native.archive = Some(Rc::new(archive_of(entries)));
+    native.archive = Some(Rc::new(archive_of(archive)));
     Ok(reader::finish(features, native, Some(skeleton), facts, Format::Kmz))
 }
 
@@ -199,16 +200,28 @@ fn is_kml_entry(name: &str) -> bool {
 /// each `.kml` one with no bytes of its own, since its document is written
 /// from the model — the first is the collection's document, the rest its
 /// layers.
-fn archive_of(entries: Vec<crate::zip::ZipEntry>) -> KmzArchive {
+fn archive_of(archive: crate::zip::Archive) -> KmzArchive {
+    let entries = archive.entries;
     let document = entries.iter().position(|e| is_kml_entry(&e.name)).expect("the archive has a .kml entry");
     let entries = entries
         .into_iter()
         .map(|e| {
             let data = if is_kml_entry(&e.name) { Vec::new() } else { e.data };
-            KmzEntry { name: e.name, data, modified: e.modified }
+            let m = e.meta;
+            KmzEntry {
+                name: e.name,
+                data,
+                modified: m.modified,
+                made_by: m.made_by,
+                internal_attrs: m.internal_attrs,
+                external_attrs: m.external_attrs,
+                local_extra: m.local_extra,
+                central_extra: m.central_extra,
+                comment: m.comment,
+            }
         })
         .collect();
-    KmzArchive { entries, document }
+    KmzArchive { entries, document, comment: archive.comment }
 }
 
 /// Feature IR -> `.kmz` bytes: the archive a `.kmz` read came from, every
@@ -233,13 +246,27 @@ pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>, com
             Some(writer::write_document(fc, index, version, compact))
         })
         .collect();
-    let entries: Vec<(&str, &[u8], crate::zip::DosTime)> = archive
+    let metas: Vec<crate::zip::EntryMeta> = archive
+        .entries
+        .iter()
+        .map(|e| crate::zip::EntryMeta {
+            modified: e.modified,
+            made_by: e.made_by,
+            internal_attrs: e.internal_attrs,
+            external_attrs: e.external_attrs,
+            local_extra: e.local_extra.clone(),
+            central_extra: e.central_extra.clone(),
+            comment: e.comment.clone(),
+        })
+        .collect();
+    let entries: Vec<(&str, &[u8], &crate::zip::EntryMeta)> = archive
         .entries
         .iter()
         .zip(&written)
-        .map(|(e, w)| (e.name.as_str(), w.as_deref().unwrap_or(&e.data), e.modified))
+        .zip(&metas)
+        .map(|((e, w), meta)| (e.name.as_str(), w.as_deref().unwrap_or(&e.data), meta))
         .collect();
-    crate::zip::write_timed(&entries)
+    crate::zip::write_archive(&entries, &archive.comment)
 }
 
 #[cfg(test)]
@@ -276,19 +303,37 @@ mod tests {
     /// before and after the document, the document not named `doc.kml`, and
     /// times recorded.
     fn archive() -> Vec<u8> {
-        crate::zip::write_timed(&[
+        let entries: [(&str, &[u8], u32); 4] = [
             ("files/", b"", 0x5B5C_0000),
             ("files/overlay.png", b"\x89PNG\r\n", 0x5B5C_6421),
             ("places.kml", DOC, 0x5B5C_6422),
             ("files/notes.txt", b"notes", 0x5B5C_6423),
-        ]).unwrap()
+        ];
+        let metas: Vec<_> = entries.iter().map(|&(n, _, t)| crate::zip::EntryMeta { modified: t, ..crate::zip::EntryMeta::created(n) }).collect();
+        let entries: Vec<_> = entries.iter().zip(&metas).map(|(&(n, d, _), m)| (n, d, m)).collect();
+        crate::zip::write_archive(&entries, b"").unwrap()
+    }
+
+    #[test]
+    fn a_kmz_written_back_keeps_every_entrys_headers_and_the_archive_comment() {
+        let source = include_bytes!("../../tests/fixtures/info_zip_carried.kmz");
+        let fc = read_kmz(source, &mut Vec::new()).unwrap();
+        let (before, after) = (crate::zip::read_archive(source).unwrap(), crate::zip::read_archive(&write_kmz(&fc, None, false).unwrap()).unwrap());
+        assert_eq!(after.comment, before.comment);
+        assert_eq!(after.entries.len(), before.entries.len());
+        for (a, b) in before.entries.iter().zip(&after.entries) {
+            assert_eq!((&a.name, &a.meta), (&b.name, &b.meta));
+            if !is_kml_entry(&a.name) {
+                assert_eq!(a.data, b.data);
+            }
+        }
     }
 
     #[test]
     fn a_kmz_written_back_keeps_every_entry_in_its_place() {
         let fc = read_kmz(&archive(), &mut Vec::new()).unwrap();
         let back = crate::zip::read(&write_kmz(&fc, None, false).unwrap()).unwrap();
-        let shape: Vec<_> = back.iter().map(|e| (e.name.as_str(), e.modified)).collect();
+        let shape: Vec<_> = back.iter().map(|e| (e.name.as_str(), e.meta.modified)).collect();
         assert_eq!(
             shape,
             [

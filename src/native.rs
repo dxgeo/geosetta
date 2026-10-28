@@ -180,28 +180,45 @@ pub struct KmlNative {
 /// in archive order. A `.kml` entry's `data` is empty — each document is
 /// written from its model (`KmlNative`'s `document` and layers) — and the
 /// rest are kept as read. Flat data, so public, as the other natives' members
-/// are (`plans/kml-standard.org` D-K16).
+/// are (`plans/kml-standard.org` D-K16); `#[non_exhaustive]`, so a field
+/// added later is not a breaking change, and built only by a `.kmz` read.
 ///
-/// *Not here*: what the writer does not reproduce — each entry's compression
-/// (entries are written stored), extra fields and attributes, and the archive
-/// comment.
+/// *Not here*: each entry's compression — entries are written stored — and
+/// zip64's extra field, which describes sizes the writer states plainly.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct KmzArchive {
     pub entries: Vec<KmzEntry>,
     /// Which entry is the root KML document — conventionally `doc.kml`, and
     /// by Google's rule the archive's first `.kml` entry.
     pub document: usize,
+    /// The archive's comment, as bytes: the zip format names no encoding.
+    pub comment: Vec<u8>,
 }
 
-/// One entry of a [`KmzArchive`].
+/// One entry of a [`KmzArchive`]: its bytes, and every field of its headers
+/// a write does not derive, uninterpreted.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct KmzEntry {
     pub name: String,
     pub data: Vec<u8>,
     /// The last modification time as the archive recorded it: an MS-DOS date
-    /// in the high 16 bits and time in the low, uninterpreted. Zero when the
-    /// archive recorded none.
+    /// in the high 16 bits and time in the low. Zero when the archive
+    /// recorded none.
     pub modified: u32,
+    /// "Version made by": the host in the high byte (0 MS-DOS, 3 Unix),
+    /// which says how `external_attrs` reads, and the spec version in the low.
+    pub made_by: u16,
+    /// Bit 0 says the entry is text.
+    pub internal_attrs: u16,
+    /// The host's attributes: under Unix, the file mode in the high 16 bits.
+    pub external_attrs: u32,
+    /// The extra fields of the local header and the central directory,
+    /// apart, as a producer may write them differently.
+    pub local_extra: Vec<u8>,
+    pub central_extra: Vec<u8>,
+    pub comment: Vec<u8>,
 }
 
 /// A KML feature's own element — its `<Placemark>`, with everything in it the

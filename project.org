@@ -84,11 +84,13 @@ validated against DuckDB / GDAL.
   internal =*.kml= entry rather than just the first, since a real multi-layer
   producer's root =doc.kml= can be nothing but a =<NetworkLink>=. A =.kmz=
   written back is the archive it was read from: every entry in its place with
-  its modification time, and each =.kml= document, a layered archive's as much
+  its modification time, extra fields, permissions and comments, the
+  archive's comment, and each =.kml= document, a layered archive's as much
   as a single one's, written from its own model; from anything else it is one
   =doc.kml= entry. Entries are stored (uncompressed) — no DEFLATE encoder in
   the crate yet, so =.kmz= output is bigger than a compressed one but
-  universally readable.
+  universally readable. A =.kmz= made from another format declares a Unix
+  file of mode 0644.
   Validated against real GDAL (=ogrinfo=, =ogr2ogr -f LIBKML=), DuckDB
   fixtures, and a real Info-ZIP archive for the deflate read path.
   A feature's time (=timestamp=, =begin=/=end=), its geometry's altitude

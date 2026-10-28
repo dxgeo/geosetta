@@ -441,9 +441,9 @@ GeoParquet drops the covering-bbox column, and KML loses only a non-UTF-8
 encoding, written back as UTF-8 — since a KML → KML run, in either version,
 gives back the document it read, laid out as it was: styles, folders,
 overlays, models and tracks' times, with any edit to the features applied — an
-overlay moved keeps its box and its turn. KMZ adds only what its zip writer does
-not reproduce: each entry's compression, extra fields and attributes, and the
-archive comment. Those are measured, not
+overlay moved keeps its box and its turn. KMZ adds only each entry's
+compression: entries are written stored, while every other header field —
+extra fields, permissions, comments, the archive comment — is carried. Those are measured, not
 predicted, and each is a gap being closed rather than a design position.
 
 In-process, none of this applies: a Rust consumer holding a `FeatureCollection`

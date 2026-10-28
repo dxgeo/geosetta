@@ -226,7 +226,7 @@ check it off and remove it once the item ships or is shelved.
   1, with a zero or empty =<rotation>= read as unturned. 2.3's own schema
   forbids both boxes in a =<Region>=, so this rescues documents that are
   not valid 2.3 rather than ones that are.
-- [ ] *Carry the rest of a =.kmz= entry* —
+- [X] *Carry the rest of a =.kmz= entry* —
   [[file:same-format-fidelity.org][same-format-fidelity.org]] M3c,
   =Format::Kmz='s =same_format_losses= row. =zip.rs= carries each entry's name,
   bytes and modification time; it reads past, and writes none of, each
@@ -234,6 +234,12 @@ check it off and remove it once the item ships or is shelved.
   external attributes (Unix permissions), and the archive comment. All three
   are bytes the central directory already holds. Compression is the other
   item in that row, and is [[file:compression-encoders.org][compression-encoders.org]]'s.
+  /Built 2026-10-28./ Carried with them: the "made by" host, internal
+  attributes and entry comments, which the row never listed. Local and
+  central extras are kept apart (Info-ZIP's differ); zip64's is dropped as
+  an encoding. An archive created from another format declares Unix mode
+  0644 rather than MS-DOS. The zip64 guards went in first:
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] M3c.
 
 - [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
   *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a

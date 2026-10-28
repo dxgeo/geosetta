@@ -315,6 +315,9 @@ writing whatever can be written rather than warning about it, and it is why
   file, in place, with its time -- /and a layered archive's documents/, each
   with its own model and features. M3c is done but for what the zip writer
   does not reproduce (compression, extra fields, the archive comment)./
+  /2026-10-28, later: every header field is carried/ -- extra fields,
+  attributes, the "made by" host, entry and archive comments -- so M3c is
+  done but for compression, which is =compression-encoders.org='s.
 - *=gpkg_crs_wkt_1_1=*, the last of defect 3 -- a capability, not a carry.
 - *=spatial-index.org= § E*, GeoParquet's covering-bbox write, blocked on the
   Parquet writer never having emitted a nested struct column.

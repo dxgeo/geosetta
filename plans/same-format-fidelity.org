@@ -1813,6 +1813,25 @@ travels with D1's =name= modelling.
   /What is left/ is =Format::Kmz='s loss row: the zip writer stores every
   entry and writes no extra fields, attributes or archive comment. M3c is
   otherwise done.
+  /2026-10-28, later: every header field is carried/ but compression.
+  =zip::EntryMeta= holds what the writer does not derive -- the time, the
+  "made by" host and version, internal and external attributes, the local
+  and central extra fields apart (Info-ZIP's local timestamp is longer than
+  its central one), the entry comment -- and =zip::Archive= the archive
+  comment; =KmzEntry= and =KmzArchive= carry them as public fields, now
+  =#[non_exhaustive]= (a field added later is not a break; only a =.kmz=
+  read builds them). Flags, method, sizes, CRC, offsets and "version
+  needed" stay derived. Zip64's extra field is dropped on read: it gives
+  sizes for header fields that say =0xFFFFFFFF=, and the writer states them
+  plainly. The end record is now found as the one whose comment runs to the
+  end, so a comment holding its signature is not mistaken for it. An
+  archive created from another format declares Unix mode 0644 (a
+  directory 0755) instead of MS-DOS with no attributes -- what Info-ZIP and
+  Python write. Measured on =tests/fixtures/info_zip_carried.kmz= (Info-ZIP
+  3.0: extras, modes 0644/0755, a directory, entry and archive comments):
+  =zipinfo -v= of source and output differ only in offsets, compression and
+  GDAL's data descriptors; =unzip= and =bsdtar= extract =run.sh= as 0755.
+  The row now reads only "each archive entry's compression".
   /Zip64, deferred 2026-10-28./ =zip.rs= reads and writes none of zip64's
   records, and did so silently: a central directory past 65,535 entries was
   read in part (Python's =zipfile= at 65,536 entries leaves a legacy end

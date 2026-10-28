@@ -392,6 +392,16 @@ GeoPackage spec requires.
   how producers that never set bit 11 carry a UTF-8 name.
 - A carried entry's name keeps its original bytes and flag, so a =.kmz=
   written back is byte-faithful in its names (=same-format-fidelity.org= M3c).
+- /Measured 2026-10-28: "clear means CP437" is not safe as stated./ macOS's
+  Info-ZIP 3.0 (Apple's build, no Unicode support) writes UTF-8 names with
+  bit 11 *clear* and no =0x7075= field -- =tests/fixtures/info_zip_carried.kmz='s
+  =files/Zürich.png=, which Python's =zipfile= reads as =Z├╝rich.png=. Read
+  by the rule above, every non-ASCII name an archive made on a Mac holds
+  would become mojibake. The read side needs a rule for this before it is
+  built: a name that is valid UTF-8 read as UTF-8 whatever the flag (what
+  the reader does today), CP437 only for one that is not, is the candidate
+  -- CP437 bytes above 0x7F are rarely valid UTF-8. Measure it against
+  7-Zip's and libarchive's choices first.
 
 ** WHAT THIS OVERTURNS
 - *The old D-E3* ("refuse a multi-byte codepage") and *the old E3* (its

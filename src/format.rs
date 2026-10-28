@@ -291,18 +291,22 @@ impl Format {
             // 2026-10-28* (M3c of `plans/same-format-fidelity.org`): images,
             // icons and model files come back in their places, with their
             // names and modification times. Until then this row read "every
-            // archive entry but the KML document". What the zip writer does
-            // not reproduce is what is left: it stores every entry, and
-            // writes no extra fields, attributes or archive comment. *A
-            // layered archive is carried too, since 2026-10-28*: each of its
-            // `.kml` documents comes back with its own model and features.
-            // Until then this row also read "a layered archive's structure:
-            // several .kml documents are written as one, from the feature
-            // model alone".
+            // archive entry but the KML document". *A layered archive is
+            // carried too, since 2026-10-28*: each of its `.kml` documents
+            // comes back with its own model and features. Until then this
+            // row also read "a layered archive's structure: several .kml
+            // documents are written as one, from the feature model alone".
+            // *Every header field the writer does not derive is carried too,
+            // since 2026-10-28*: extra fields, attributes, the "made by"
+            // host, entry comments and the archive comment. Until then the
+            // second item read "each archive entry's compression (written
+            // stored), extra fields and attributes, and the archive comment".
+            // Zip64's extra field is not carried and not listed: it describes
+            // sizes the writer states in the header, an encoding as the
+            // compression is, but with nothing left to lose.
             Format::Kmz => &[
                 "a non-UTF-8 encoding, written as UTF-8",
-                "each archive entry's compression (written stored), extra fields and attributes, and the archive \
-                 comment",
+                "each archive entry's compression (written stored)",
             ],
             // Measured clean: the `.dbf` field declarations and `.prj` survive
             // intact, and only `DBF_DATE_LAST_UPDATE` differs.

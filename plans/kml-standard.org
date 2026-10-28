@@ -4,7 +4,7 @@
 
 * KML to the Standard
 
-** STATUS -- K1--K5 built (K5 finished 2026-10-28); open question 11 remains
+** STATUS -- K1--K5 built (K5 finished 2026-10-28); every question decided
 /2026-10-28, later:/ ***K5 is built.*** A 2.2 document written as 2.3 is
 raised (=kml/raise.rs=): adopted =gx:= elements into the KML namespace where
 2.3 admits them there, =<Snippet>= to =<snippet>= and =<Metadata>= to
@@ -487,6 +487,37 @@ series is D-K11's and stays in the native.
 | =<end>2026-03-15=                | =2026/03/15 00:00:00=          | =2026-03-15T00:00:00= -- *widened* |
 | =<when>1997=                     | *nothing -- the value is lost* | -- |
 
+*** D-K16 -- the document model stays crate-private
+/Decided 2026-10-28, answering open question 11./
+
+=KmlNative='s =document= and =KmlFeatureNative='s contents stay
+=pub(crate)=. A library caller sees a KML document through the IR, and edits
+it there. This is a ruling, not a deferral, so the difference from the other
+spokes' natives -- whose contents are public -- is not an oversight.
+
+- *The IR is the one edit surface* (D-K4). The writer reconciles the IR
+  against each feature's stored element; a public model would be a second
+  way to change the same member, and the writer would need a rule for which
+  edit wins.
+- *The model carries invariants a caller could break silently.* A feature's
+  =Address= is a path of child indices into the skeleton: a caller adding or
+  removing a folder's children would send features to the wrong container,
+  or to the default one, with no warning -- the spoke's fidelity guarantee
+  made the caller's problem. The other natives are flat members with no such
+  coupling, which is why they can be public.
+- *The surface would be large and unstable*: the node tree, the 168-variant
+  vocabulary generated from the schemas, the spellings, the skeleton and the
+  addresses. A regenerated vocabulary or a later KML version would break
+  callers; K4's own rework of the addressing would have.
+- *No caller needs it.* nazca and geoscribe read no native, and none has been
+  asked for.
+
+/If a caller needs to see what the IR does not hold/ -- styles, folder names,
+network links -- the additive step is a read-only accessor returning the
+skeleton as KML text: no new types, no invariants exposed, stable however the
+model changes. Making the tree itself public stays the last resort, and would
+need =#[non_exhaustive]= on the vocabulary.
+
 ** VERSION DETECTION
 | input                     | namespace                          | detected by |
 |---------------------------+------------------------------------+-------------|
@@ -879,7 +910,8 @@ expressible; the mapping must key on (namespace, local name, parent).
     were.
   - /The model stays crate-private/ (=KmlNative='s =document=,
     =KmlFeatureNative='s contents): whether it is public like the other
-    natives' contents is decided after K5 (2026-10-23).
+    natives' contents was left until after K5 (2026-10-23), and is D-K16:
+    it stays private.
   ***Step 2 built 2026-10-24: the rest of the projection.*** One function,
   =project::project=, still says what a feature is, and the writer still
   re-projects to find what an edit changed; it now reads a =Context= -- the
@@ -1155,12 +1187,9 @@ expressible; the mapping must key on (namespace, local name, parent).
     which the reader already used. A 40°×30° probe separated it from two Web
     Mercator variants and a spherical turn by 160–250 km at its NE corner (§
     MEASURED IN A RENDERER, *The rotation plane, at scale*).
-11. *Is the document model public?* /Opened 2026-10-23, due now K5 is built./
-    =KmlNative='s =document= and =KmlFeatureNative='s contents are
-    crate-private, where every other spoke's native contents are public. The
-    model's shape is settled -- an identified node tree, two transforms over
-    it -- so the question is only whether a library caller should read or
-    build it.
+11. ~~*Is the document model public?*~~ ***DECIDED 2026-10-28: no, D-K16***
+    -- crate-private, the IR the one edit surface; a read-only KML-text
+    accessor is the additive step if a caller ever needs to see the rest.
 
 ** DEPENDS ON / RELATED
 - [[file:kml.org][kml.org]] -- the spoke as built, and § GEOMETRY ELEMENT

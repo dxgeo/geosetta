@@ -193,8 +193,10 @@ check it off and remove it once the item ships or is shelved.
   raised (=kml/raise.rs=), so every version change carries the document. The
   schema oracle (=tests/kml_schemas.rs=) validates eighteen kinds of write,
   nine per version. Open question 10 is decided (2026-10-28): Google Earth
-  turns a =LatLonBox= on the local plane the reader uses. Open: question 11,
-  whether the document model is public.
+  turns a =LatLonBox= on the local plane the reader uses. Question 11 is
+  decided too (D-K16): the document model stays crate-private, the IR the one
+  edit surface. Every question in the plan is decided; KMZ's archive is
+  =same-format-fidelity.org= M3c, separately.
 
 - [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
   *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a

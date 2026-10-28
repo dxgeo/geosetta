@@ -159,9 +159,11 @@ pub struct KmlNative {
     /// and network link, the root's declarations, the comments. `None` when
     /// there is no single document to give back — a `.kmz` holding several.
     ///
-    /// Crate-private: whether the model is public like the other natives'
-    /// contents was left until K5 settled its shape (2026-10-23), and K5 is
-    /// built (`plans/kml-standard.org` open question 11).
+    /// Crate-private by decision (`plans/kml-standard.org` D-K16): the IR is
+    /// the one way to edit a KML document, and the model's feature addresses
+    /// index into this skeleton, so a caller changing it could send features
+    /// to the wrong folder without a word. Unlike the other natives, which
+    /// are flat members with nothing to keep consistent.
     pub(crate) document: Option<Rc<crate::kml::document::Skeleton>>,
 }
 

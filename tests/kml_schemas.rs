@@ -23,8 +23,11 @@
 //! invalid. D-K5 gives such a document back as it was read, so
 //! `hand_hostile.kml` — invalid 2.2 in its order, and read as 2.2 — is
 //! written back invalid on purpose. Raised to 2.3, which orders nothing, it
-//! is valid, and is checked. And a `.kmz`'s `doc.kml` is the same
-//! bytes as the `.kml` write, stored, so the `.kml` stands for it.
+//! is valid, and is checked.
+//!
+//! *KMZ writes are validated document by document*: every `.kml` entry of
+//! each archive written, a layered archive's root and layers alike, read back
+//! by walking the stored entries' local headers.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -196,6 +199,52 @@ fn writes() -> Vec<(String, KmlVersion, Vec<u8>)> {
     let lowered = write_kml_features(Format::Kml, &read(Format::Kml, "tests/fixtures/hand_hostile_2_3.kml"), v22).unwrap();
     let lowered = geosetta::read_features(Format::Kml, &lowered, &mut Vec::new()).unwrap();
     add("hand_hostile_2_3.kml lowered and raised".into(), &lowered, v23);
+    // KMZ (M3c): every .kml entry of each archive written, the layered
+    // archive's network-link root and its layer alike. hand_hostile.kmz's
+    // document is hand_hostile.kml, invalid 2.2 in its order, so only its
+    // raise is checked.
+    let networked = read(Format::Kmz, "tests/fixtures/gdal_networklink.kmz");
+    let hostile_kmz = read(Format::Kmz, "tests/fixtures/hand_hostile.kmz");
+    let from_kml = read(Format::Kml, "tests/fixtures/hand_hostile_2_3.kml");
+    for (label, fc, version) in [
+        ("gdal_networklink.kmz as itself", networked.clone(), v22),
+        ("gdal_networklink.kmz raised", networked.clone(), v23),
+        ("gdal_networklink.kmz edited", edited(networked, extra), v22),
+        ("hand_hostile.kmz raised", hostile_kmz.clone(), v23),
+        ("hand_hostile.kmz edited and raised", edited(hostile_kmz, extra), v23),
+        ("hand_hostile_2_3.kml as a .kmz", from_kml.clone(), v23),
+        ("hand_hostile_2_3.kml as a lowered .kmz", from_kml, v22),
+    ] {
+        let kmz = write_kml_features(Format::Kmz, &fc, version).unwrap_or_else(|e| panic!("{label}: {e}"));
+        let documents = kml_entries(&kmz);
+        assert!(!documents.is_empty(), "{label}: no .kml entry");
+        for (name, bytes) in documents {
+            out.push((format!("{label}, {name}"), version, bytes));
+        }
+    }
+    out
+}
+
+/// The `.kml` entries of a `.kmz` geosetta wrote, by walking its local file
+/// headers. geosetta stores every entry (method 0) with its sizes in the
+/// local header, so nothing needs inflating; anything else is a test failure,
+/// not a case to handle.
+fn kml_entries(kmz: &[u8]) -> Vec<(String, Vec<u8>)> {
+    let u16_at = |at: usize| u16::from_le_bytes([kmz[at], kmz[at + 1]]) as usize;
+    let u32_at = |at: usize| u32::from_le_bytes(kmz[at..at + 4].try_into().unwrap()) as usize;
+    let mut out = Vec::new();
+    let mut at = 0;
+    while kmz.len() >= at + 4 && u32_at(at) == 0x0403_4b50 {
+        assert_eq!(u16_at(at + 8), 0, "geosetta writes stored entries");
+        let size = u32_at(at + 18);
+        let (name_len, extra_len) = (u16_at(at + 26), u16_at(at + 28));
+        let name = String::from_utf8(kmz[at + 30..at + 30 + name_len].to_vec()).unwrap();
+        let data = at + 30 + name_len + extra_len;
+        if name.to_ascii_lowercase().ends_with(".kml") {
+            out.push((name, kmz[data..data + size].to_vec()));
+        }
+        at = data + size;
+    }
     out
 }
 
@@ -263,5 +312,5 @@ fn every_kml_write_is_valid_in_its_version() {
         failures = failures.replace(&*path.to_string_lossy(), label);
     }
     assert!(failures.is_empty(), "writes the schemas reject:\n{failures}");
-    assert_eq!((v22.len(), v23.len()), (9, 9), "the write list changed: update this count with it");
+    assert_eq!((v22.len(), v23.len()), (14, 14), "the write list changed: update this count with it");
 }

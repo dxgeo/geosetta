@@ -1812,6 +1812,12 @@ travels with D1's =name= modelling.
   /What is left/ is =Format::Kmz='s loss row: the zip writer stores every
   entry and writes no extra fields, attributes or archive comment. M3c is
   otherwise done.
+  /Under the schema oracle, 2026-10-28/: =tests/kml_schemas.rs= validates
+  every =.kml= entry of seven =.kmz= writes -- =gdal_networklink.kmz= as
+  itself, raised and edited, both its documents each time;
+  =hand_hostile.kmz= raised, as read and edited; a =.kml= source written as a
+  =.kmz= in each version -- reading the stored entries back from their local
+  headers. All ten documents validate.
 *** The feature id -- DECIDED 2026-08-25, decision 27: *carry it*
 /Raised, measured, filed with a recommendation and taken the same day./
 

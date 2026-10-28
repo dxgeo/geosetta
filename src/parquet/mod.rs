@@ -8,5 +8,5 @@ mod types;
 mod writer;
 
 pub use geo::metadata as geo_metadata;
-pub use reader::read_geoparquet;
+pub use reader::open_geoparquet;
 pub use writer::write_geoparquet;

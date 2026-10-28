@@ -57,17 +57,15 @@ pub struct PropertyColumn {
     pub decl: Option<DeclType>,
 }
 
-/// The decoded contents of a GeoParquet file.
+/// The decoded columns of a GeoParquet file, all at once — for the tests;
+/// see [`open_geoparquet`].
+#[cfg(test)]
 pub struct GeoParquet {
     pub num_rows: usize,
     /// Non-geometry columns, in file order.
     pub properties: Vec<PropertyColumn>,
     /// One WKB blob per row (or `None` where the geometry was null).
     pub geometry: Vec<Option<Vec<u8>>>,
-    /// The CRS recovered from the `geo` metadata, carried through unchanged.
-    pub crs: Option<crate::crs::Crs>,
-    /// File-level metadata with no IR slot, for a same-format write to replay.
-    pub native: ParquetNative,
 }
 
 /// A Parquet leaf's declared type, from its physical type plus any
@@ -123,8 +121,40 @@ fn decl_type(physical: i32, converted: Option<i32>) -> Option<DeclType> {
     })
 }
 
-/// Parse a GeoParquet byte buffer.
+/// Parse a GeoParquet byte buffer, every column at once.
+///
+/// [`open_geoparquet`] decodes a column at a time instead, which is what the
+/// feature IR is built from; this whole-file form remains for the tests.
+#[cfg(test)]
 pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
+    let file = open_geoparquet(bytes)?;
+    let geometry = file.geometry()?;
+    let properties = (0..file.property_count()).map(|i| file.property(i)).collect::<Result<_>>()?;
+    Ok(GeoParquet { num_rows: file.num_rows(), properties, geometry })
+}
+
+/// A GeoParquet file whose footer has been read and checked, ready to decode
+/// one column at a time.
+///
+/// Decoding every column before building a single row held the whole table
+/// twice — as columns, and as the rows being filled from them
+/// (`plans/performance.org`, *Memory*). A caller that decodes a column, moves
+/// its values into rows, and drops it before asking for the next holds one.
+pub struct GeoParquetFile<'a> {
+    bytes: &'a [u8],
+    meta: Meta,
+    /// Each row group's geometry columns, by index into its `columns` —
+    /// one, or none.
+    geometry: Vec<Vec<usize>>,
+    /// Each property, by its column's index in every row group, in file order.
+    properties: Vec<Vec<usize>>,
+}
+
+/// Read and check a GeoParquet file's footer, decoding no column yet.
+///
+/// Every check of a column's *description* is made here, in file order, so
+/// a file this reader cannot hold is refused before anything is decoded.
+pub fn open_geoparquet(bytes: &[u8]) -> Result<GeoParquetFile<'_>> {
     // "PAR1" ... <FileMetaData> <u32 footer len> "PAR1"
     if bytes.len() < 12 || &bytes[..4] != MAGIC || &bytes[bytes.len() - 4..] != MAGIC {
         return Err(Error::Parquet("not a parquet file (bad magic)".into()));
@@ -137,18 +167,14 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
         .ok_or_else(|| Error::Parquet("invalid footer length".into()))?;
     let footer = &bytes[footer_start..len_pos];
 
-    let meta = parse_file_metadata(footer)?;
-    let num_rows = meta.num_rows as usize;
+    let mut meta = parse_file_metadata(footer)?;
 
-    // Accumulate each column across all row groups, in file order.
-    let mut properties: Vec<PropertyColumn> = Vec::new();
-    let mut geometry: Vec<Option<Vec<u8>>> = Vec::new();
-    let mut has_geometry = false;
-
+    let mut geometry: Vec<Vec<usize>> = Vec::with_capacity(meta.row_groups.len());
+    let mut properties: Vec<Vec<usize>> = Vec::new();
     for (rg_idx, rg) in meta.row_groups.iter().enumerate() {
-        let rg_rows = rg.num_rows as usize;
+        let mut rg_geometry = Vec::new();
         let mut prop_idx = 0;
-        for col in &rg.columns {
+        for (col_idx, col) in rg.columns.iter().enumerate() {
             // A GeoParquet "covering" bbox index column (see
             // `Meta::covering_paths`) — a spatial-pruning optimization, not a
             // real feature property, so it's skipped entirely rather than
@@ -188,45 +214,92 @@ pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
                     meta.geometry_column
                 )));
             }
-            match decode_column(bytes, col, rg_rows, is_geometry)? {
-                ColumnSink::Wkb(v) => {
-                    has_geometry = true;
-                    geometry.extend(v);
+            if is_geometry {
+                if col.max_rep_level > 0 {
+                    return Err(Error::Parquet("geometry column can't be list-valued (repeated)".into()));
                 }
-                ColumnSink::Json { out: values, .. } => {
-                    if rg_idx == 0 {
-                        properties.push(PropertyColumn {
-                            name: col.name.clone(),
-                            values,
-                            decl: decl_type(col.physical, col.converted_type),
-                        });
-                    } else {
-                        properties
-                            .get_mut(prop_idx)
-                            .ok_or_else(|| Error::Parquet("row groups disagree on columns".into()))?
-                            .values
-                            .extend(values);
-                    }
-                    prop_idx += 1;
+                rg_geometry.push(col_idx);
+                continue;
+            }
+            if rg_idx == 0 {
+                properties.push(vec![col_idx]);
+            } else {
+                properties
+                    .get_mut(prop_idx)
+                    .ok_or_else(|| Error::Parquet("row groups disagree on columns".into()))?
+                    .push(col_idx);
+            }
+            prop_idx += 1;
+        }
+        // A row group with fewer properties than the first would leave the
+        // ones it lacks short of the file's row count, misaligning every row
+        // after it.
+        if prop_idx != properties.len() {
+            return Err(Error::Parquet("row groups disagree on columns".into()));
+        }
+        geometry.push(rg_geometry);
+    }
+
+    // Recorded now that the property set is known, so a writer can tell
+    // whether a schema-restating key (`ARROW:schema`) is still true.
+    meta.native.columns = properties
+        .iter()
+        .map(|at| meta.row_groups[0].columns[at[0]].name.clone())
+        .collect();
+    Ok(GeoParquetFile { bytes, meta, geometry, properties })
+}
+
+impl GeoParquetFile<'_> {
+    /// The file's row count.
+    pub fn num_rows(&self) -> usize {
+        self.meta.num_rows as usize
+    }
+
+    /// How many property (non-geometry) columns the file has.
+    pub fn property_count(&self) -> usize {
+        self.properties.len()
+    }
+
+    /// One WKB blob per row, `None` where the geometry was null — or every
+    /// row `None` when the file has no geometry column.
+    pub fn geometry(&self) -> Result<Vec<Option<Vec<u8>>>> {
+        if self.geometry.iter().all(Vec::is_empty) {
+            return Ok(vec![None; self.num_rows()]);
+        }
+        let mut out = Vec::with_capacity(self.num_rows());
+        for (rg, at) in self.meta.row_groups.iter().zip(&self.geometry) {
+            for &i in at {
+                match decode_column(self.bytes, &rg.columns[i], rg.num_rows as usize, true)? {
+                    ColumnSink::Wkb(v) => out.extend(v),
+                    ColumnSink::Json { .. } => unreachable!("a geometry column decodes to WKB"),
                 }
             }
         }
+        Ok(out)
     }
 
-    if !has_geometry {
-        geometry = vec![None; num_rows];
+    /// Property `i`, decoded across every row group.
+    pub fn property(&self, i: usize) -> Result<PropertyColumn> {
+        let first = &self.meta.row_groups[0].columns[self.properties[i][0]];
+        let mut values = Vec::with_capacity(self.num_rows());
+        for (rg, &at) in self.meta.row_groups.iter().zip(&self.properties[i]) {
+            match decode_column(self.bytes, &rg.columns[at], rg.num_rows as usize, false)? {
+                ColumnSink::Json { out, .. } => values.extend(out),
+                ColumnSink::Wkb(_) => unreachable!("a property column decodes to JSON"),
+            }
+        }
+        Ok(PropertyColumn {
+            name: first.name.clone(),
+            values,
+            decl: decl_type(first.physical, first.converted_type),
+        })
     }
-    let mut native = meta.native;
-    // Recorded now that the property set is known, so a writer can tell
-    // whether a schema-restating key (`ARROW:schema`) is still true.
-    native.columns = properties.iter().map(|p| p.name.clone()).collect();
-    Ok(GeoParquet {
-        num_rows,
-        properties,
-        geometry,
-        crs: meta.crs,
-        native,
-    })
+
+    /// The CRS from the `geo` metadata, and the file-level metadata with no IR
+    /// slot.
+    pub fn into_parts(self) -> (Option<crate::crs::Crs>, ParquetNative) {
+        (self.meta.crs, self.meta.native)
+    }
 }
 
 // --- footer parsing --------------------------------------------------------

@@ -286,15 +286,18 @@ fn geoparquet_first_position_dim(g: &Geometry) -> (bool, bool) {
 
 /// GeoParquet bytes → Feature IR.
 fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
-    let parsed = parquet::read_geoparquet(bytes)?;
-    let num_cols = parsed.properties.len();
+    let file = parquet::open_geoparquet(bytes)?;
+    let num_cols = file.property_count();
 
-    // Seed one feature per row with its geometry and an empty property vec.
-    let mut features = Vec::with_capacity(parsed.num_rows);
-    for row in 0..parsed.num_rows {
-        let geometry = match &parsed.geometry[row] {
-            Some(wkb) => Some(from_wkb(wkb)?),
-            None => None,
+    // Seed one feature per row with its geometry and an empty property vec,
+    // freeing each row's WKB once it is decoded.
+    let mut features = Vec::with_capacity(file.num_rows());
+    let mut wkbs = file.geometry()?.into_iter();
+    for _ in 0..file.num_rows() {
+        let geometry = match wkbs.next() {
+            Some(Some(wkb)) => Some(from_wkb(&wkb)?),
+            Some(None) => None,
+            None => return Err(Error::Parquet("the geometry column has fewer values than the file has rows".into())),
         };
         features.push(Feature {
             geometry,
@@ -302,12 +305,16 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
             native: None,
         });
     }
+    drop(wkbs);
 
-    // Transpose columns → rows by *draining* each column (values move rather
-    // than being cloned) and sharing one `Rc` key across every row. Columns are
-    // consumed in file order, so each row keeps that property order.
+    // Transpose columns → rows a column at a time: each is decoded, *drained*
+    // into the rows (values move rather than being cloned, sharing one `Rc`
+    // key across every row), and dropped before the next is decoded, so the
+    // table is never held twice (`plans/performance.org`, *Memory*). Columns
+    // are consumed in file order, so each row keeps that property order.
     let mut schema = Vec::new();
-    for col in parsed.properties {
+    for i in 0..num_cols {
+        let col = file.property(i)?;
         // The type the file declared, kept so it can reach a target able to
         // express it — a `TIMESTAMP` column stops becoming text (defect 5).
         if let Some(ty) = col.decl {
@@ -322,10 +329,10 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
             feature.properties.push((Rc::clone(&key), value));
         }
     }
-    let native = parsed.native;
+    let (crs, native) = file.into_parts();
     Ok(FeatureCollection {
         features,
-        crs: parsed.crs,
+        crs,
         name: None,
         schema,
         native: (!native.is_empty()).then(|| {

@@ -390,6 +390,18 @@ composed by a caller or a pipe, never by geosetta depending on geoscribe
 (=architecture.org=
 § THE COMPOSITION MODEL), and the warning names that composition.
 
+/The seam does not reach the document's own heights (2026-10-28)./ A caller
+composing that transform edits through =FeatureCollection::for_each_position_mut=,
+which visits feature geometry alone. A KML document carried through K4/K5
+also holds =<LookAt>=/=<Camera>= positions and altitudes, =<LatLonAltBox>=
+altitude bounds, a =<Model>='s =<Location>= and a ground overlay's
+=<altitude>=; a vertical shift through the seam would leave them as they
+were. Narrow -- the case D-K12 addresses comes from another format and brings
+no document -- but if it is needed, the fix is a geosetta visitor over the
+document's own coordinates, each tagged with its kind, geosetta applying the
+edit. That keeps D-K16. Recorded with the cross-repo item in
+=geocore/todo.org=.
+
 **Measured against GDAL 3.13.3 LIBKML, 2026-10-22** -- and it is a gap, not an
 oracle (=same-format-fidelity.org= § THE ORACLE RULE):
 - *Read*: Z kept verbatim in every mode; =altitudeMode=, =extrude=,

@@ -36,6 +36,10 @@ const LOCAL_SIG: u32 = 0x0403_4b50;
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
 
+/// General-purpose bit 11, the language encoding flag: set, the entry's name
+/// is UTF-8; clear, it is IBM CP437 (APPNOTE 6.3.0 § 4.4.4, Appendix D).
+const FLAG_UTF8_NAME: u16 = 1 << 11;
+
 /// One archive entry: its stored name, decompressed bytes, and last
 /// modification time as the archive recorded it.
 pub(crate) struct ZipEntry {
@@ -178,10 +182,17 @@ fn read_local_data(
     }
 }
 
+/// The general-purpose flags a written entry declares. Names are written as
+/// UTF-8, so a non-ASCII one sets bit 11; an ASCII name reads the same under
+/// CP437 and leaves the flags clear, as every archive written before did.
+fn name_flags(name: &str) -> u16 {
+    if name.is_ascii() { 0 } else { FLAG_UTF8_NAME }
+}
+
 fn write_local_header(out: &mut Vec<u8>, name: &str, len: usize, crc: u32, modified: DosTime) {
     out.extend_from_slice(&LOCAL_SIG.to_le_bytes());
     out.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract (2.0)
-    out.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
+    out.extend_from_slice(&name_flags(name).to_le_bytes()); // general purpose bit flag
     out.extend_from_slice(&METHOD_STORED.to_le_bytes());
     out.extend_from_slice(&modified.to_le_bytes()); // last mod file time, then date
     out.extend_from_slice(&crc.to_le_bytes());
@@ -196,7 +207,7 @@ fn write_central_header(out: &mut Vec<u8>, name: &str, len: usize, crc: u32, mod
     out.extend_from_slice(&CENTRAL_SIG.to_le_bytes());
     out.extend_from_slice(&20u16.to_le_bytes()); // version made by
     out.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract
-    out.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
+    out.extend_from_slice(&name_flags(name).to_le_bytes()); // general purpose bit flag
     out.extend_from_slice(&METHOD_STORED.to_le_bytes());
     out.extend_from_slice(&modified.to_le_bytes()); // last mod file time, then date
     out.extend_from_slice(&crc.to_le_bytes());
@@ -296,6 +307,24 @@ mod tests {
     fn reads_the_time_a_real_archive_recorded() {
         let entries = read(include_bytes!("../tests/fixtures/sample.zip")).unwrap();
         assert_ne!(entries[0].modified, 0, "Info-ZIP records a time");
+    }
+
+    #[test]
+    fn a_non_ascii_name_is_declared_utf8_in_both_headers() {
+        let name = "images/Zürich.png";
+        let bytes = write(&[(name, b"x")]);
+        let local_flags = u16_le(&bytes, 6).unwrap();
+        let central = bytes.windows(4).position(|w| w == CENTRAL_SIG.to_le_bytes()).unwrap();
+        let central_flags = u16_le(&bytes, central + 8).unwrap();
+        assert_eq!((local_flags, central_flags), (FLAG_UTF8_NAME, FLAG_UTF8_NAME));
+        assert_eq!(read(&bytes).unwrap()[0].name, name);
+    }
+
+    #[test]
+    fn an_ascii_name_leaves_the_flags_clear() {
+        let bytes = write(&[("doc.kml", b"<kml/>")]);
+        let central = bytes.windows(4).position(|w| w == CENTRAL_SIG.to_le_bytes()).unwrap();
+        assert_eq!((u16_le(&bytes, 6).unwrap(), u16_le(&bytes, central + 8).unwrap()), (0, 0));
     }
 
     #[test]

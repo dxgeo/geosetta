@@ -26,6 +26,8 @@ Built so far:
 - *E5, partly* (2026-10-23, with =kml-standard.org= K1): =xml::decode= takes
   bytes and honours a BOM, UTF-16's first-bytes pattern and the declaration,
   for UTF-8, UTF-16, US-ASCII and ISO-8859-1.
+- *E8's write side* (2026-10-28): a non-ASCII zip entry name sets
+  general-purpose bit 11 in both headers (=zip.rs= =name_flags=).
 
 This plan was first asked for after
 [[file:native-inventory.org][native-inventory.org]] § QUESTIONS item 3 turned
@@ -59,7 +61,7 @@ All /code/, re-read 2026-10-28.
 | CSV | **refused** unless UTF-8 (=csv.rs:28=) | UTF-8 | /the sharpest gap:/ CSV has no encoding story at all, and a CP1252 export is the single most common real-world text file in this domain |
 | WKT | **refused** unless UTF-8 (=convert.rs:140=) | UTF-8 | ASCII in practice; lowest priority |
 | KML | =xml::decode= (=xml.rs:211=): BOM, UTF-16 sniff, then the declaration. Exact for UTF-8, UTF-16, US-ASCII, ISO-8859-1; any other declared encoding read only over all-ASCII bytes, **refused** otherwise | UTF-8, declared as such | a =kml -> kml= run over a non-UTF-8 source changes its encoding, reported as a same-format loss |
-| KMZ entry names | **refused** unless UTF-8 (=zip.rs:140=) | UTF-8 bytes with general-purpose bit 11 **clear** (=zip.rs:184=, =:199=) | *both sides are wrong* -- see § WHAT IS WRONG TODAY item 4 |
+| KMZ entry names | **refused** unless UTF-8 (=zip.rs:144=) | UTF-8 bytes, general-purpose bit 11 set when a name is not ASCII (=name_flags=) | *the read side is wrong* -- see § WHAT IS WRONG TODAY item 4 |
 | Shapefile =.dbf= | =.cpg= UTF-8 or ISO-8859-1 exact; any other codepage decoded as Latin-1 **with a warning** (E1, =dbf.rs:56=); no =.cpg=: UTF-8 per field, else Latin-1 **silently** | UTF-8, declared in =.cpg= | the only spoke with an in-band sidecar declaration |
 | GeoPackage | **refused** unless the header says UTF-8 (=sqlite.rs:116=, =encoding != 1=) | UTF-8, stamped (=sqlite.rs:1940=) | SQLite allows UTF-16; a UTF-16 =.gpkg= is refused rather than decoded |
 | FlatGeobuf | UTF-8 by FlatBuffers | UTF-8 | no encoding surface |
@@ -108,7 +110,7 @@ and is owed a warning either way -- D-E9.
 an entry name with general-purpose bit 11 *clear* is IBM CP437, and with it
 *set* is UTF-8.
 
-- *Read:* =zip.rs:140= never reads the flag, and refuses any name that is not
+- *Read:* =zip.rs:144= never reads the flag, and refuses any name that is not
   valid UTF-8. An older =.kmz= with a non-ASCII entry name in CP437 is
   refused; one whose CP437 bytes happen to be valid UTF-8 is mis-decoded.
 - *Write:* =write_local_header= and =write_central_header= write UTF-8 name
@@ -118,6 +120,14 @@ an entry name with general-purpose bit 11 *clear* is IBM CP437, and with it
 
 The write side is a one-bit fix (set bit 11 when a name is not ASCII); the
 read side needs CP437, which E2 brings. This is E8.
+/2026-10-28: the write side is fixed./ A carried =Zürich.png= now reads back
+as itself in Python's =zipfile= and =bsdtar=, where it read as
+=Z├╝rich.png= before. macOS's =unzip= still shows it mangled: that build has
+no Unicode support, ignores bit 11, and converts any name from an MS-DOS
+host -- which our "version made by" (=20=, host 0) declares -- out of CP437.
+Python's own archives say host 3 (Unix) and pass through. The host byte goes
+with the external attributes it defines, so it is
+=same-format-fidelity.org= M3c's, not this plan's.
 
 ** WHAT "EVERY ENCODING" MEANS
 "Every" has to be a closed, named set, or it is untestable. The set is:
@@ -375,6 +385,7 @@ GeoPackage spec requires.
 /Added 2026-10-28; § WHAT IS WRONG TODAY item 4./
 - *Write, first and alone:* set general-purpose bit 11 in both headers when a
   name is not ASCII. No table needed; it should not wait for E2.
+  /Built 2026-10-28./
 - *Read:* bit 11 set means UTF-8 (refused if invalid, as now); clear means
   CP437, from E2. Info-ZIP's Unicode Path extra field (=0x7075=), when
   present and its CRC matches the header name, takes precedence -- it is

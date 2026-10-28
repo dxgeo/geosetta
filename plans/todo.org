@@ -139,8 +139,8 @@ check it off and remove it once the item ships or is shelved.
   ISO-8859-1, UTF-32), decoded and encoded exactly -- multi-byte is now
   decoded, not refused. E1 (warn on an approximated =.cpg=) is ***built
   2026-10-23***; E5 (KML's own declaration) is partly built with
-  =kml-standard.org= K1. Order: E8's one-bit zip-name write fix, then E2
-  (shared =src/encoding.rs= and every single-byte table), E3 (multi-byte
+  =kml-standard.org= K1. E8's zip-name write fix is ***built 2026-10-28***.
+  Order: E2 (shared =src/encoding.rs= and every single-byte table), E3 (multi-byte
   decoders), E4 (=--from-encoding=, BOMs), E6 (same-format write-back, which
   is the non-UTF-8 item of KML's XML-layer losses, then =--to-encoding=).
   /Records why the =.dbf= language-driver byte must **not** be trusted:

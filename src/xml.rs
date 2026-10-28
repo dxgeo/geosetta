@@ -472,6 +472,7 @@ pub(crate) fn parse_document_with<B: Builder>(
 /// declaration followed by the element, with text and attribute content
 /// escaped. The inverse of [`parse`], up to lexical form
 /// (`plans/kml-layout.org` tier 3).
+#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn write(root: &XmlElement) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     write_element(root, &mut out);

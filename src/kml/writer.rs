@@ -42,6 +42,35 @@ pub(crate) fn write(fc: &FeatureCollection, version: Option<KmlVersion>, compact
     }
     let written = version.or(source_document(fc).map(|s| s.version)).unwrap_or(KmlVersion::V2_2);
     let typed = Typed::of(fc);
+    let mut out = Emitter::new(compact);
+    out.out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.open_element(&root_element(source_document(fc), version, Vec::new()));
+    out.start("Document");
+    if let Some(schema) = typed.schema() {
+        out.element(&schema);
+    }
+    for f in &fc.features {
+        placemark(&mut out, f, written, &typed);
+    }
+    out.end();
+    out.end();
+    let mut bytes = out.out;
+    if !compact {
+        bytes.push('\n');
+    }
+    bytes.into_bytes()
+}
+
+/// [`write`] by way of a whole document tree, laid out and serialized at the
+/// end: what it was until 2026-10-28, kept as the reference the direct writer
+/// is asserted byte-identical against.
+#[cfg(test)]
+fn write_tree(fc: &FeatureCollection, version: Option<KmlVersion>, compact: bool) -> Vec<u8> {
+    if carries_documents(fc, Format::Kml) {
+        return write_document(fc, 0, version, compact);
+    }
+    let written = version.or(source_document(fc).map(|s| s.version)).unwrap_or(KmlVersion::V2_2);
+    let typed = Typed::of(fc);
     let mut children: Vec<XmlElement> = typed.schema().into_iter().collect();
     children.extend(fc.features.iter().map(|f| feature_to_placemark(f, written, &typed)));
     let document = XmlElement::with_children("Document", children);
@@ -395,6 +424,311 @@ fn coordinates_element(points: &[Position]) -> XmlElement {
     XmlElement::leaf("coordinates", text)
 }
 
+/// Writes a document straight into its text, an element at a time, in the
+/// house layout [`xml::lay_out`] gives a built tree (`plans/kml-layout.org`
+/// D-L2): an element holding elements has each on a line of its own, indented
+/// one [`model::HOUSE_INDENT`] deeper, and its end tag on a line at its own
+/// depth; an element holding text keeps it inline; an empty one closes itself,
+/// as [`xml::write`] writes it. `compact` writes no whitespace at all.
+///
+/// Building the whole document as a tree first held a node for every element
+/// of every feature until the last was written: 455 MB of scratch for a 38 MB
+/// file of 100 000 points (`plans/performance.org`, *Memory*).
+struct Emitter {
+    out: String,
+    compact: bool,
+    /// The open elements' qualified names, end to end, so opening one
+    /// allocates nothing.
+    names: String,
+    /// Each open element's name's start in [`Emitter::names`], and whether it
+    /// holds an element.
+    open: Vec<(usize, bool)>,
+    /// Whether the innermost start tag is still unclosed, so an element with
+    /// nothing in it can close itself.
+    pending: bool,
+}
+
+impl Emitter {
+    fn new(compact: bool) -> Emitter {
+        Emitter { out: String::new(), compact, names: String::new(), open: Vec::new(), pending: false }
+    }
+
+    /// Close the innermost start tag, if it is still open.
+    fn seal(&mut self) {
+        if self.pending {
+            self.out.push('>');
+            self.pending = false;
+        }
+    }
+
+    /// A new line, indented to the depth of the elements open.
+    fn line(&mut self) {
+        self.out.push('\n');
+        for _ in 0..self.open.len() {
+            self.out.push_str(model::HOUSE_INDENT);
+        }
+    }
+
+    /// Open `<name`, on its own line when it is inside another element.
+    fn start(&mut self, name: &str) {
+        self.seal();
+        if let Some((_, holds)) = self.open.last_mut() {
+            *holds = true;
+            if !self.compact {
+                self.line();
+            }
+        }
+        self.out.push('<');
+        self.out.push_str(name);
+        self.open.push((self.names.len(), false));
+        self.names.push_str(name);
+        self.pending = true;
+    }
+
+    /// An attribute of the element just started.
+    fn attr(&mut self, name: &str, value: &str) {
+        self.out.push(' ');
+        self.out.push_str(name);
+        self.out.push_str("=\"");
+        xml::escape_into(value, &mut self.out, true);
+        self.out.push('"');
+    }
+
+    /// Text in the open element. Empty text writes nothing, so an element
+    /// holding only that still closes itself, as a built leaf does.
+    fn text(&mut self, text: &str) {
+        if !text.is_empty() {
+            self.seal();
+            xml::escape_into(text, &mut self.out, false);
+        }
+    }
+
+    /// Close the innermost element.
+    fn end(&mut self) {
+        let (at, holds) = self.open.pop().expect("an open element to end");
+        if std::mem::take(&mut self.pending) {
+            self.out.push_str("/>");
+        } else {
+            if holds && !self.compact {
+                self.line();
+            }
+            self.out.push_str("</");
+            self.out.push_str(&self.names[at..]);
+            self.out.push('>');
+        }
+        self.names.truncate(at);
+    }
+
+    /// `<name>text</name>`.
+    fn leaf(&mut self, name: &str, text: &str) {
+        self.start(name);
+        self.text(text);
+        self.end();
+    }
+
+    /// A built element and everything in it, left open for more children.
+    fn open_element(&mut self, el: &XmlElement) {
+        self.start(&el.qualified_name());
+        for a in &el.attrs {
+            self.attr(&xml::qualify(a.prefix.as_deref(), &a.name), &a.value);
+        }
+        if el.children.is_empty() {
+            self.text(el.text());
+        }
+        for child in &el.children {
+            self.element(child);
+        }
+    }
+
+    /// A built element and everything in it.
+    fn element(&mut self, el: &XmlElement) {
+        self.open_element(el);
+        self.end();
+    }
+}
+
+/// [`feature_to_placemark`], written as it is built.
+fn placemark(out: &mut Emitter, f: &Feature, version: KmlVersion, typed: &Typed) {
+    let placement = place(f, KmlElement::Placemark, |member| f.geometry.as_ref().is_some_and(|g| geometry_carries(g, member)));
+    out.start("Placemark");
+    if let Some(name) = &placement.name {
+        out.leaf("name", name);
+    }
+    if let Some(description) = &placement.description {
+        out.leaf("description", description);
+    }
+    match &placement.time {
+        Time::None => {}
+        Time::Stamp(when) => {
+            out.start("TimeStamp");
+            out.leaf("when", when);
+            out.end();
+        }
+        Time::Span(begin, end) => {
+            out.start("TimeSpan");
+            for (name, value) in [("begin", begin), ("end", end)] {
+                if let Some(value) = value {
+                    out.leaf(name, value);
+                }
+            }
+            out.end();
+        }
+    }
+    // A column `typed` declares goes in `<SchemaData>`, once, after every
+    // `<Data>`; a second property of the same name is a `<Data>`.
+    let mut simple: Vec<(&str, String)> = Vec::new();
+    let mut data: Vec<(&str, String)> = Vec::new();
+    for (key, value) in placement.extended {
+        let text = property_text(value);
+        if typed.types(key) && !simple.iter().any(|(k, _)| *k == key) {
+            simple.push((key, text));
+        } else {
+            data.push((key, text));
+        }
+    }
+    if !data.is_empty() || !simple.is_empty() {
+        out.start("ExtendedData");
+        for (key, text) in &data {
+            out.start("Data");
+            out.attr("name", key);
+            out.leaf("value", text);
+            out.end();
+        }
+        if !simple.is_empty() {
+            out.start("SchemaData");
+            out.attr("schemaUrl", &format!("#{}", typed.id));
+            for (key, text) in &simple {
+                out.start("SimpleData");
+                out.attr("name", key);
+                out.text(text);
+                out.end();
+            }
+            out.end();
+        }
+        out.end();
+    }
+    if let Some(g) = &f.geometry {
+        geometry(out, g, &placement.altitude, version);
+    }
+    out.end();
+}
+
+/// The element a geometry is written as.
+fn geometry_kind(g: &Geometry) -> KmlElement {
+    match g {
+        Geometry::Point(_) => KmlElement::Point,
+        Geometry::LineString(_) => KmlElement::LineString,
+        Geometry::Polygon(_) => KmlElement::Polygon,
+        _ => KmlElement::MultiGeometry,
+    }
+}
+
+/// [`carries`], for a geometry not yet built.
+fn geometry_carries(g: &Geometry, member: KmlElement) -> bool {
+    let point = |member| can_carry(KmlElement::Point, member);
+    can_carry(geometry_kind(g), member)
+        || match g {
+            Geometry::MultiPoint(pts) => !pts.is_empty() && point(member),
+            Geometry::MultiLineString(lines) => !lines.is_empty() && can_carry(KmlElement::LineString, member),
+            Geometry::MultiPolygon(polys) => !polys.is_empty() && can_carry(KmlElement::Polygon, member),
+            Geometry::GeometryCollection(geoms) => geoms.iter().any(|g| geometry_carries(g, member)),
+            _ => false,
+        }
+}
+
+/// [`geometry_to_element`] with [`add_altitude`]'s members, written as built.
+fn geometry(out: &mut Emitter, g: &Geometry, altitude: &[(KmlElement, String)], version: KmlVersion) {
+    match g {
+        Geometry::Point(p) => point(out, p, altitude, version),
+        Geometry::LineString(pts) => line_string(out, pts, altitude, version),
+        Geometry::Polygon(rings) => polygon(out, rings, altitude, version),
+        Geometry::MultiPoint(pts) => {
+            out.start("MultiGeometry");
+            for p in pts {
+                point(out, p, altitude, version);
+            }
+            out.end();
+        }
+        Geometry::MultiLineString(lines) => {
+            out.start("MultiGeometry");
+            for l in lines {
+                line_string(out, l, altitude, version);
+            }
+            out.end();
+        }
+        Geometry::MultiPolygon(polys) => {
+            out.start("MultiGeometry");
+            for p in polys {
+                polygon(out, p, altitude, version);
+            }
+            out.end();
+        }
+        Geometry::GeometryCollection(geoms) => {
+            out.start("MultiGeometry");
+            for g in geoms {
+                geometry(out, g, altitude, version);
+            }
+            out.end();
+        }
+    }
+}
+
+/// The altitude members a geometry element of kind `kind` holds, ahead of
+/// its coordinates, in [`geometry_rank`] order.
+fn altitude_members(out: &mut Emitter, kind: KmlElement, altitude: &[(KmlElement, String)], version: KmlVersion) {
+    let mut leading: Vec<&(KmlElement, String)> = altitude.iter().filter(|(m, _)| can_carry(kind, *m)).collect();
+    leading.sort_by_key(|(m, _)| geometry_rank(*m));
+    for (member, text) in leading {
+        out.element(&altitude_element(*member, text, version));
+    }
+}
+
+fn point(out: &mut Emitter, p: &Position, altitude: &[(KmlElement, String)], version: KmlVersion) {
+    out.start("Point");
+    altitude_members(out, KmlElement::Point, altitude, version);
+    coordinates(out, std::slice::from_ref(p));
+    out.end();
+}
+
+fn line_string(out: &mut Emitter, pts: &[Position], altitude: &[(KmlElement, String)], version: KmlVersion) {
+    out.start("LineString");
+    altitude_members(out, KmlElement::LineString, altitude, version);
+    coordinates(out, pts);
+    out.end();
+}
+
+fn polygon(out: &mut Emitter, rings: &[Vec<Position>], altitude: &[(KmlElement, String)], version: KmlVersion) {
+    out.start("Polygon");
+    altitude_members(out, KmlElement::Polygon, altitude, version);
+    for (i, ring) in rings.iter().enumerate() {
+        out.start(if i == 0 { "outerBoundaryIs" } else { "innerBoundaryIs" });
+        out.start("LinearRing");
+        coordinates(out, ring);
+        out.end();
+        out.end();
+    }
+    out.end();
+}
+
+/// [`coordinates_element`], formatted straight into the output.
+fn coordinates(out: &mut Emitter, points: &[Position]) {
+    use std::fmt::Write;
+    out.start("coordinates");
+    if !points.is_empty() {
+        out.seal();
+        for (i, p) in points.iter().enumerate() {
+            if i > 0 {
+                out.out.push(' ');
+            }
+            let _ = match p.z {
+                Some(z) => write!(out.out, "{},{},{}", p.x, p.y, z),
+                None => write!(out.out, "{},{}", p.x, p.y),
+            };
+        }
+    }
+    out.end();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +752,75 @@ mod tests {
         }
         out.push_str(rest);
         out
+    }
+
+    /// Every way [`write`] is asked to write `fc`, against the tree writer it
+    /// replaced: byte for byte, indented and compact, in the source's own
+    /// version and in each version forced.
+    fn assert_written_as_the_tree_writer_would(fc: &FeatureCollection, what: &str) {
+        for compact in [false, true] {
+            for version in [None, Some(KmlVersion::V2_2), Some(KmlVersion::V2_3)] {
+                let direct = String::from_utf8(write(fc, version, compact)).unwrap();
+                let tree = String::from_utf8(write_tree(fc, version, compact)).unwrap();
+                assert!(direct == tree, "{what}, compact {compact}, {version:?}:\n{direct}\n---\n{tree}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_direct_writer_writes_what_the_tree_writer_did() {
+        let mut fc = crate::geojson::from_geojson_str(
+            r#"{"type":"FeatureCollection","features":[
+             {"type":"Feature","geometry":{"type":"Point","coordinates":[1.5,2,3]},"properties":{
+               "name":"a & <b> \"c\"","description":"","timestamp":"2020-01-02T03:04:05Z","altitudeMode":"absolute",
+               "extrude":"1","tessellate":"1","n":null,"t":1,"t":3,"odd key&\"":[1,{"x":true}],"f":1.0}},
+             {"type":"Feature","geometry":{"type":"LineString","coordinates":[[0,0],[1,1]]},"properties":{
+               "begin":"2020","altitudeMode":"relativeToSeaFloor","tessellate":"0","t":2}},
+             {"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[4,0],[4,4],[0,0]],[[1,1],[2,1],[2,2],[1,1]]]},
+               "properties":{"end":"2021-05","timestamp":"not a time","extrude":"maybe","altitudeMode":"clampToGround"}},
+             {"type":"Feature","geometry":{"type":"GeometryCollection","geometries":[
+               {"type":"Point","coordinates":[0,0]},
+               {"type":"MultiLineString","coordinates":[[[0,0],[1,0]],[[2,2],[3,3]]]},
+               {"type":"GeometryCollection","geometries":[]},
+               {"type":"MultiPolygon","coordinates":[[[[0,0],[1,0],[1,1],[0,0]]]]}]},
+               "properties":{"altitudeMode":"relativeToGround","tessellate":"true","extrude":"0"}},
+             {"type":"Feature","geometry":{"type":"MultiPoint","coordinates":[]},"properties":{"altitudeMode":"absolute"}},
+             {"type":"Feature","geometry":{"type":"GeometryCollection","geometries":[]},"properties":{}},
+             {"type":"Feature","geometry":{"type":"Polygon","coordinates":[]},"properties":{"name":""}},
+             {"type":"Feature","geometry":{"type":"LineString","coordinates":[]},"properties":{}},
+             {"type":"Feature","geometry":null,"properties":{"name":"no geometry","altitudeMode":"absolute"}}]}"#,
+        )
+        .unwrap();
+        assert_written_as_the_tree_writer_would(&fc, "hand-built, untyped");
+        fc.name = Some("typed".into());
+        fc.schema = vec![
+            crate::schema::FieldDecl { name: "t".into(), ty: Some(crate::schema::DeclType::Int32), ..Default::default() },
+            crate::schema::FieldDecl { name: "f".into(), ty: Some(crate::schema::DeclType::Float64), ..Default::default() },
+        ];
+        // Both declarations hold, so `<SchemaData>` is really written, and the
+        // first feature's second `t` goes in a `<Data>`.
+        assert_eq!(Typed::of(&fc).fields.len(), 2);
+        assert_written_as_the_tree_writer_would(&fc, "hand-built, typed");
+        assert_written_as_the_tree_writer_would(&FeatureCollection::new(Vec::new()), "empty");
+
+        // Every fixture any reader here takes, as each one reads it.
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            let name = path.display().to_string();
+            let Some(format) = Format::from_path(&name) else { continue };
+            let bytes = std::fs::read(&path).unwrap();
+            let collections = match format {
+                Format::Gpkg => crate::geopackage::read_layers(&bytes).map(|ls| ls.into_iter().map(|(_, fc)| fc).collect()),
+                _ => crate::convert::read_features(format, &bytes, &mut Vec::new()).map(|fc| vec![fc]),
+            };
+            for fc in collections.into_iter().flatten() {
+                assert_written_as_the_tree_writer_would(&fc, &name);
+                seen += 1;
+            }
+        }
+        assert!(seen > 30, "only {seen} fixtures read");
     }
 
     #[test]

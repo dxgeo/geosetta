@@ -639,8 +639,10 @@ to be what a 2.2 writer has to /lower/, not merely respell.
 
 =hand_hostile.kml= as =doc.kml=, plus =files/overlay.png= (a real 1×1 PNG, not a
 text stub, so it is a plausible referenced asset) and =files/notes.txt=.
-Geosetta writes =doc.kml= *alone*, so both sidecars are dropped and the
-surviving KML keeps a reference to an image that is no longer in the archive.
+Geosetta wrote =doc.kml= *alone*, so both sidecars were dropped and the
+surviving KML kept a reference to an image no longer in the archive. /Since
+2026-10-28 (M3c) every entry comes back, in place, with its modification
+time; the fixture's round trip in =same_format.rs= compares the archive./
 
 This is the fixture for the container obligation that
 =same-format-fidelity.org= M3c added after the inventory found that KMZ is a

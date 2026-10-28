@@ -165,6 +165,39 @@ pub struct KmlNative {
     /// to the wrong folder without a word. Unlike the other natives, which
     /// are flat members with nothing to keep consistent.
     pub(crate) document: Option<Rc<crate::kml::document::Skeleton>>,
+    /// The archive a `.kmz` read came from (`plans/same-format-fidelity.org`
+    /// M3c): its overlay images, icons and model files, so a `.kmz` write
+    /// gives them back. `None` for a `.kml` read.
+    pub archive: Option<Rc<KmzArchive>>,
+}
+
+/// A `.kmz` archive's entries, as a `.kmz` write puts them back: every entry
+/// in archive order, the KML document's included, with its bytes written
+/// from the model rather than kept. Flat data, so public, as the other
+/// natives' members are (`plans/kml-standard.org` D-K16).
+///
+/// *Not here*: the other `.kml` documents of a layered archive, whose
+/// features the read brought into the IR — kept verbatim, they would be
+/// written twice. Nor what the writer does not reproduce: each entry's
+/// compression (entries are written stored), extra fields and attributes, and
+/// the archive comment.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KmzArchive {
+    pub entries: Vec<KmzEntry>,
+    /// Which entry is the KML document — conventionally `doc.kml`, and by
+    /// Google's rule the archive's first `.kml` entry. Its `data` is empty.
+    pub document: usize,
+}
+
+/// One entry of a [`KmzArchive`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct KmzEntry {
+    pub name: String,
+    pub data: Vec<u8>,
+    /// The last modification time as the archive recorded it: an MS-DOS date
+    /// in the high 16 bits and time in the low, uninterpreted. Zero when the
+    /// archive recorded none.
+    pub modified: u32,
 }
 
 /// A KML feature's own element — its `<Placemark>`, with everything in it the

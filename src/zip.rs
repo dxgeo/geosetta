@@ -36,11 +36,19 @@ const LOCAL_SIG: u32 = 0x0403_4b50;
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
 
-/// One archive entry: its stored name and decompressed bytes.
+/// One archive entry: its stored name, decompressed bytes, and last
+/// modification time as the archive recorded it.
 pub(crate) struct ZipEntry {
     pub name: String,
     pub data: Vec<u8>,
+    pub modified: DosTime,
 }
+
+/// An entry's last modification time in MS-DOS form, as the local and central
+/// headers both hold it: the date in the high 16 bits, the time in the low.
+/// Kept as recorded, never interpreted, so a rewritten archive says what the
+/// original did. Zero, the writer's default, reads as no time at all.
+pub(crate) type DosTime = u32;
 
 /// Read and decompress every entry in a ZIP archive, via its central
 /// directory (the authoritative index — entries aren't decoded by scanning
@@ -58,22 +66,29 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Vec<ZipEntry>> {
 }
 
 /// Write a ZIP archive containing `entries`, each stored (method 0,
-/// uncompressed) — see the module doc for why there's no deflate encoder.
+/// uncompressed) — see the module doc for why there's no deflate encoder —
+/// with no modification time.
 pub(crate) fn write(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let timed: Vec<(&str, &[u8], DosTime)> = entries.iter().map(|&(name, data)| (name, data, 0)).collect();
+    write_timed(&timed)
+}
+
+/// [`write`], each entry with the modification time given.
+pub(crate) fn write_timed(entries: &[(&str, &[u8], DosTime)]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut local_info = Vec::with_capacity(entries.len()); // (crc, local offset)
 
-    for (name, data) in entries {
+    for &(name, data, modified) in entries {
         let crc = crc32(data);
         local_info.push((crc, out.len() as u32));
-        write_local_header(&mut out, name, data.len(), crc);
+        write_local_header(&mut out, name, data.len(), crc, modified);
         out.extend_from_slice(data);
     }
 
     let cd_start = out.len() as u32;
     let mut central = Vec::new();
-    for ((name, data), &(crc, local_offset)) in entries.iter().zip(&local_info) {
-        write_central_header(&mut central, name, data.len(), crc, local_offset);
+    for (&(name, data, modified), &(crc, local_offset)) in entries.iter().zip(&local_info) {
+        write_central_header(&mut central, name, data.len(), crc, modified, local_offset);
     }
     out.extend_from_slice(&central);
     write_eocd(&mut out, entries.len() as u16, central.len() as u32, cd_start);
@@ -109,6 +124,7 @@ fn read_central_entry(bytes: &[u8], pos: usize) -> Result<(ZipEntry, usize)> {
         return err("bad central directory file header signature");
     }
     let method = u16_le(bytes, pos + 10)?;
+    let modified = u32_le(bytes, pos + 12)?;
     let crc = u32_le(bytes, pos + 16)?;
     let compressed_size = u32_le(bytes, pos + 20)? as usize;
     let uncompressed_size = u32_le(bytes, pos + 24)? as usize;
@@ -131,7 +147,7 @@ fn read_central_entry(bytes: &[u8], pos: usize) -> Result<(ZipEntry, usize)> {
     }
 
     let next = name_start + name_len + extra_len + comment_len;
-    Ok((ZipEntry { name, data }, next))
+    Ok((ZipEntry { name, data, modified }, next))
 }
 
 /// An entry's data at its local file header offset, decompressed per
@@ -162,13 +178,12 @@ fn read_local_data(
     }
 }
 
-fn write_local_header(out: &mut Vec<u8>, name: &str, len: usize, crc: u32) {
+fn write_local_header(out: &mut Vec<u8>, name: &str, len: usize, crc: u32, modified: DosTime) {
     out.extend_from_slice(&LOCAL_SIG.to_le_bytes());
     out.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract (2.0)
     out.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
     out.extend_from_slice(&METHOD_STORED.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // last mod file time
-    out.extend_from_slice(&0u16.to_le_bytes()); // last mod file date
+    out.extend_from_slice(&modified.to_le_bytes()); // last mod file time, then date
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&(len as u32).to_le_bytes()); // compressed size
     out.extend_from_slice(&(len as u32).to_le_bytes()); // uncompressed size
@@ -177,14 +192,13 @@ fn write_local_header(out: &mut Vec<u8>, name: &str, len: usize, crc: u32) {
     out.extend_from_slice(name.as_bytes());
 }
 
-fn write_central_header(out: &mut Vec<u8>, name: &str, len: usize, crc: u32, local_offset: u32) {
+fn write_central_header(out: &mut Vec<u8>, name: &str, len: usize, crc: u32, modified: DosTime, local_offset: u32) {
     out.extend_from_slice(&CENTRAL_SIG.to_le_bytes());
     out.extend_from_slice(&20u16.to_le_bytes()); // version made by
     out.extend_from_slice(&20u16.to_le_bytes()); // version needed to extract
     out.extend_from_slice(&0u16.to_le_bytes()); // general purpose bit flag
     out.extend_from_slice(&METHOD_STORED.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // last mod file time
-    out.extend_from_slice(&0u16.to_le_bytes()); // last mod file date
+    out.extend_from_slice(&modified.to_le_bytes()); // last mod file time, then date
     out.extend_from_slice(&crc.to_le_bytes());
     out.extend_from_slice(&(len as u32).to_le_bytes()); // compressed size
     out.extend_from_slice(&(len as u32).to_le_bytes()); // uncompressed size
@@ -267,6 +281,21 @@ mod tests {
             assert_eq!(&entry.name, name);
             assert_eq!(&entry.data, data);
         }
+    }
+
+    #[test]
+    fn an_entrys_modification_time_round_trips() {
+        // 2026-10-28 12:34:56: date ((2026-1980)<<9 | 10<<5 | 28), time (12<<11 | 34<<5 | 56/2).
+        let modified: DosTime = (((46 << 9) | (10 << 5) | 28) << 16) | ((12 << 11) | (34 << 5) | 28);
+        let bytes = write_timed(&[("a.png", b"x", modified), ("b", b"", 0)]);
+        let back = read(&bytes).unwrap();
+        assert_eq!((back[0].modified, back[1].modified), (modified, 0));
+    }
+
+    #[test]
+    fn reads_the_time_a_real_archive_recorded() {
+        let entries = read(include_bytes!("../tests/fixtures/sample.zip")).unwrap();
+        assert_ne!(entries[0].modified, 0, "Info-ZIP records a time");
     }
 
     #[test]

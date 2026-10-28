@@ -192,6 +192,7 @@ fn detect(doc: &KmlDocument) -> Result<KmlNative> {
         namespace: namespace.map(str::to_string),
         version_attr: version_attr.map(str::to_string),
         document: None,
+        archive: None,
     })
 }
 

@@ -73,7 +73,7 @@ pub use feature::{Feature, FeatureCollection};
 pub use format::{Format, KmlVersion};
 pub use native::{
     FgbColumnNative, FgbNative, GpkgConstraint, GpkgDataColumn, GpkgFeatureNative, GpkgNative,
-    KmlFeatureNative, KmlNative, Native, NativePayload, ParquetNative,
+    KmlFeatureNative, KmlNative, KmzArchive, KmzEntry, Native, NativePayload, ParquetNative,
 };
 pub use geometry::{Bbox, Geometry, Position};
 // `schema` is crate-internal (its column materialization is a writer detail),

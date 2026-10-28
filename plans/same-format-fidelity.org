@@ -1616,7 +1616,8 @@ travels with D1's =name= modelling.
   Three structural findings the plan did not have:
   1. *KMZ is a second container spoke*, on the same terms as GeoPackage -- a
      =.kmz= is a zip and geosetta writes =doc.kml= alone, so icons and overlays
-     are dropped and the surviving KML keeps dangling references. Now M3c.
+     are dropped and the surviving KML keeps dangling references. Now M3c --
+     the entries carried since 2026-10-28.
   2. *CSV, WKT and Shapefile lose the lexeme, not a member*, which is a class
      the natives channel does not obviously fit -- see that file's proposed
      "infer only when re-rendering reproduces the input" rule, which costs no
@@ -1785,6 +1786,23 @@ travels with D1's =name= modelling.
   obligation as M3b at a fraction of the cost -- the entries are already bytes
   and =src/zip.rs= already reads them. Not part of the KML spoke: that is an
   XML document, this is an archive.
+  ***First half built 2026-10-28: the entries.*** =KmlNative.archive= holds
+  every entry of a =.kmz= read in archive order -- the document's slot marked,
+  its bytes written from the model -- and =write_kmz= puts them back: the
+  same names, the same order, the document under its own name rather than
+  =doc.kml=. Each entry's modification time is carried too: =zip.rs= read and
+  wrote zero before, and the central directory holds it, so it was read
+  rather than listed as a loss. Public (=KmzArchive=, =KmzEntry=), flat data
+  with nothing to keep consistent (=kml-standard.org= D-K16). A =.kmz= read
+  written as anything else warns, naming the entries left behind.
+  =hand_hostile.kmz= comes back with all four entries and their times.
+  /What is left/: the zip writer stores every entry and writes no extra
+  fields, attributes or archive comment -- =Format::Kmz='s loss row -- and
+  *the second half, a layered archive*: several =.kml= documents, read into one
+  collection and written back as one built from the IR. Carrying it means
+  each feature remembering its document and each document its own model.
+  Its other =.kml= entries are deliberately not in =archive=: kept verbatim
+  they would be written twice.
 *** The feature id -- DECIDED 2026-08-25, decision 27: *carry it*
 /Raised, measured, filed with a recommendation and taken the same day./
 

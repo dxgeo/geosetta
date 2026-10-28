@@ -305,6 +305,8 @@ writing whatever can be written rather than warning about it, and it is why
   write validates against its version's schema (=tests/kml_schemas.rs=)./
 - *M3c*, the KMZ container. =hand_hostile.kmz= already exists and carries the
   dangling =files/overlay.png= reference.
+  /2026-10-28: the entries are carried/ -- a =.kmz= written back keeps every
+  file, in place, with its time. Left: a layered archive's several documents./
 - *=gpkg_crs_wkt_1_1=*, the last of defect 3 -- a capability, not a carry.
 - *=spatial-index.org= § E*, GeoParquet's covering-bbox write, blocked on the
   Parquet writer never having emitted a nested struct column.

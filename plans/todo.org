@@ -145,7 +145,7 @@ check it off and remove it once the item ships or is shelved.
   must **not** be trusted: =ogr2ogr= declares Windows-1252 by default while
   writing UTF-8./
 
-- [ ] [[file:kml-standard.org][kml-standard.org]] — M3's KML spoke, rescoped
+- [X] [[file:kml-standard.org][kml-standard.org]] — M3's KML spoke, rescoped
   2026-10-22 to *the standard*: OGC KML 2.3 as a typed model in the KML native,
   both OGC versions (2.2, 2.3) read and detected, and =--kml-version= choosing
   the output, defaulting to the source's version on =kml -> kml= and to 2.2
@@ -195,8 +195,10 @@ check it off and remove it once the item ships or is shelved.
   nine per version. Open question 10 is decided (2026-10-28): Google Earth
   turns a =LatLonBox= on the local plane the reader uses. Question 11 is
   decided too (D-K16): the document model stays crate-private, the IR the one
-  edit surface. Every question in the plan is decided; KMZ's archive is
-  =same-format-fidelity.org= M3c, separately.
+  edit surface. Every question in the plan is decided, and every milestone
+  built; *done*. KMZ's archive is =same-format-fidelity.org= M3c, separately:
+  its entries are carried as of 2026-10-28, and a layered archive's several
+  documents are what is left.
 
 - [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
   *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a

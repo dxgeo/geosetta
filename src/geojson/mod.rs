@@ -202,8 +202,12 @@ fn stream_features(p: &mut Parser) -> Result<Vec<Feature>> {
         return Ok(features);
     }
     let mut keys = KeyInterner::default();
+    // The previous feature's property count: the next one's, in a table.
+    let mut width = 0;
     loop {
-        features.push(stream_feature(p, &mut keys)?);
+        let feature = stream_feature(p, &mut keys, width)?;
+        width = feature.properties.len();
+        features.push(feature);
         p.skip_ws();
         match p.bump() {
             Some(b',') => continue,
@@ -217,7 +221,8 @@ fn stream_features(p: &mut Parser) -> Result<Vec<Feature>> {
 /// Stream one Feature object into a [`Feature`], dispatching on member key so
 /// member order doesn't matter. `geometry` is parsed typed; `properties` stay
 /// arbitrary JSON; every other member (`type`, `id`, `bbox`, …) is skipped.
-fn stream_feature(p: &mut Parser, keys: &mut KeyInterner) -> Result<Feature> {
+/// `width` is how many properties to expect.
+fn stream_feature(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Result<Feature> {
     p.skip_ws();
     p.expect(b'{')?;
     let mut geometry = None;
@@ -244,11 +249,11 @@ fn stream_feature(p: &mut Parser, keys: &mut KeyInterner) -> Result<Feature> {
             }
             // Properties are arbitrary JSON; a non-object (incl. null) means none.
             "properties" => {
-                if let JsonValue::Object(m) = p.parse_value()? {
-                    properties = m
-                        .into_iter()
-                        .map(|(k, v)| (keys.intern(&k), v))
-                        .collect();
+                p.skip_ws();
+                if p.peek() == Some(b'{') {
+                    properties = stream_properties(p, keys, width)?;
+                } else {
+                    p.parse_value()?;
                 }
             }
             // `id` and any foreign member are kept verbatim so a GeoJSON →
@@ -264,7 +269,44 @@ fn stream_feature(p: &mut Parser, keys: &mut KeyInterner) -> Result<Feature> {
             _ => return Err(p.err("expected ',' or '}' in feature")),
         }
     }
-    Ok(Feature { geometry, properties, native: native_from(unmodelled) })
+    Ok(Feature { geometry, properties, native: native_from(unmodelled).map(Box::new) })
+}
+
+/// Stream a `properties` object straight into a feature's members, holding
+/// exactly as many as it has.
+///
+/// Collecting a parsed [`JsonValue::Object`] instead kept that object's own
+/// allocation — grown by doubling, in its larger `(String, JsonValue)`
+/// elements — for the life of the feature: a 200-property feature held 256
+/// slots of 56 bytes (`plans/performance.org`, *Memory*). Errors as the
+/// parser's own object does.
+fn stream_properties(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Result<Vec<(Rc<str>, JsonValue)>> {
+    p.expect(b'{')?;
+    let mut members = Vec::with_capacity(width);
+    p.skip_ws();
+    if p.peek() == Some(b'}') {
+        p.bump();
+        return Ok(members);
+    }
+    loop {
+        p.skip_ws();
+        if p.peek() != Some(b'"') {
+            return Err(p.err("expected string key"));
+        }
+        let key = keys.intern(&p.parse_string()?);
+        p.skip_ws();
+        p.expect(b':')?;
+        members.push((key, p.parse_value()?));
+        p.skip_ws();
+        match p.bump() {
+            Some(b',') => continue,
+            Some(b'}') => break,
+            _ => return Err(p.err("expected ',' or '}'")),
+        }
+    }
+    // Only a feature wider than the one before it has grown past its length.
+    members.shrink_to_fit();
+    Ok(members)
 }
 
 /// Stream one geometry object. `coordinates` are parsed straight into typed
@@ -533,7 +575,7 @@ impl Writer {
         self.open('{');
         self.member("type");
         self.out.push_str("\"Feature\"");
-        self.natives(f.native.as_ref());
+        self.natives(f.native.as_deref());
         self.member("geometry");
         match &f.geometry {
             Some(g) => self.geometry(g),
@@ -672,7 +714,7 @@ fn feature_to_json(f: &Feature) -> JsonValue {
     };
     let mut members = obj_members(
         vec![("type", JsonValue::String("Feature".into()))],
-        f.native.as_ref(),
+        f.native.as_deref(),
     );
     members.push(("geometry".to_string(), geometry));
     members.push((
@@ -767,7 +809,7 @@ fn parse_feature(value: &JsonValue, keys: &mut KeyInterner) -> Result<Feature> {
     Ok(Feature {
         geometry,
         properties,
-        native: native_from(unmodelled),
+        native: native_from(unmodelled).map(Box::new),
     })
 }
 
@@ -894,6 +936,22 @@ mod tests {
         assert_eq!(from_geojson_str(&out).unwrap(), fc);
     }
 
+    #[test]
+    fn streamed_properties_hold_exactly_their_members() {
+        let fc = from_geojson_str(
+            r#"{"type":"FeatureCollection","features":[
+             {"type":"Feature","geometry":null,"properties":{"a":1,"b":2,"c":3}},
+             {"type":"Feature","geometry":null,"properties":{"a":1,"b":2,"c":3}},
+             {"type":"Feature","geometry":null,"properties":{"a":1,"b":2,"c":3,"d":4,"e":5}},
+             {"type":"Feature","geometry":null,"properties":{"a":1}},
+             {"type":"Feature","geometry":null,"properties":null}]}"#,
+        )
+        .unwrap();
+        let held: Vec<_> = fc.features.iter().map(|f| (f.properties.len(), f.properties.capacity())).collect();
+        assert_eq!(held, [(3, 3), (3, 3), (5, 5), (1, 1), (0, 0)]);
+        assert!(from_geojson_str(r#"{"type":"FeatureCollection","features":[{"properties":{"a":1,}}]}"#).is_err());
+    }
+
     /// A native must never leak into a format that did not produce it. This is
     /// the safety property the format tag exists for.
     #[test]
@@ -902,14 +960,14 @@ mod tests {
         let with_natives = to_geojson_string(&fc, true);
 
         // Re-tag every native as if some other spoke had produced it.
-        let retag = |n: &mut Option<crate::native::Native>| {
+        let retag = |n: Option<&mut crate::native::Native>| {
             if let Some(n) = n {
                 n.format = Format::FlatGeobuf;
             }
         };
-        retag(&mut fc.native);
+        retag(fc.native.as_mut());
         for f in &mut fc.features {
-            retag(&mut f.native);
+            retag(f.native.as_deref_mut());
         }
         let ignored = to_geojson_string(&fc, true);
 

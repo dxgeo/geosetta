@@ -101,7 +101,7 @@ pub(crate) fn read_document(text: &str, format: Format, index: usize) -> Result<
             let projection = project(&m.node, &ctx)?;
             vertical = vertical.max(project::vertical(&m.node));
             let native = Native::new(format, NativePayload::KmlFeature(KmlFeatureNative { feature: Rc::new(m), document: index }));
-            Ok(Feature { geometry: projection.geometry, properties: projection.properties, native: Some(native) })
+            Ok(Feature { geometry: projection.geometry, properties: projection.properties, native: Some(Box::new(native)) })
         })
         .collect::<Result<_>>()?;
     let facts = Facts { declarations: ctx.declarations(), vertical };

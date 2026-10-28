@@ -25,7 +25,11 @@ pub struct Feature {
     /// the format that produced it, so only that format's writer replays it.
     /// `None` whenever the reader modelled everything, which is the common
     /// case. See [`crate::native`].
-    pub native: Option<Native>,
+    ///
+    /// Boxed because it is so rarely present: inline, the `Option` made every
+    /// feature 168 bytes larger than one carrying a pointer
+    /// (`plans/performance.org`, *Memory*).
+    pub native: Option<Box<Native>>,
 }
 
 /// A collection of features.

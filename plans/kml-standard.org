@@ -693,7 +693,8 @@ expressible; the mapping must key on (namespace, local name, parent).
   validate. On 2.2 it agrees with =xmllint=: both reject =hand_hostile.kml= at
   the same element (=<visibility>=, line 13). Xerces-J's 1.1 build and Saxon-EE
   are the fallbacks, should =xmlschema= ever disagree with OGC 14-068.
-- *Where the schemas live: outside the tree.* /Decided 2026-10-23./ The schema
+- *Where the schemas live: outside the tree.* /Decided 2026-10-23; the
+  test that reads them is =tests/kml_schemas.rs= (2026-10-28)./ The schema
   test reads =ogckml22.xsd=, =ogckml23.xsd=, =kml22gx.xsd=,
   =atom-author-link.xsd= and =xAL.xsd= from a directory the person running it
   supplies, and fails naming the five files and where each is published when
@@ -983,9 +984,20 @@ expressible; the mapping must key on (namespace, local name, parent).
   - *Oracles, 2026-10-28*: the lowered fixture, the same written as =.kmz=,
     and the same after =--sort-hilbert= validate under =xmllint= against
     =ogckml22.xsd= with =kml22gx.xsd=; the fixture written back as 2.3 still
-    validates under =xmlschema=. The oracle needs the schemas' =import=
-    locations pointed at local copies (=xmllint --nonet=); no in-tree test
-    runs it yet.
+    validates under =xmlschema=.
+  - *The oracle is in the tree, 2026-10-28*: =tests/kml_schemas.rs=,
+    =#[ignore]=d, reads =GEOSETTA_KML_SCHEMAS=, copies the schemas into a
+    directory of its own with each =import= pointed at the local copy (the
+    published ones import by URL, and the validators run =--nonet=), and
+    validates fourteen writes: from GeoJSON and FlatGeobuf in each version;
+    =sample.kml=, =duckdb_geoms.kml= and the 2.3 fixture in their own version,
+    as read and edited; the 2.3 fixture lowered as read, edited and
+    Hilbert-sorted; and a 2.2 source as 2.3. =GEOSETTA_KML_PYTHON= names the
+    Python holding =xmlschema=. A missing schema, validator or module fails
+    the run by name. *Its first run caught a K4 bug*: an edit adding a
+    property to a feature whose values are in =<SchemaData>= appended the new
+    =<Data>= after it, which 2.2 rejects; it now goes after the last =<Data>=,
+    else before the first =<SchemaData>=.
   - /Left as they were/: a 2.3 document holding both =<Metadata>= and
     =<ExtendedData>=, or both =<Snippet>= and =<snippet>=, is invalid 2.2,
     where each pair is one choice; neither is merged.

@@ -323,8 +323,13 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
     for ((k, v), placed) in want.iter().zip(placed) {
         if !placed {
             let data = XmlElement::with_children("Data", vec![XmlElement::leaf("value", property_text(v))]).with_attr("name", *k);
-            let end = ed.children.len();
-            ed.insert_child(end, built(&data, prefix));
+            // After the last `<Data>`, else before the first `<SchemaData>`:
+            // 2.2's sequence holds every `<Data>` ahead of every `<SchemaData>`.
+            let at = match ed.children.iter().rposition(|c| c.is(KmlElement::Data)) {
+                Some(last) => last + 1,
+                None => ed.children.iter().position(|c| c.is(KmlElement::SchemaData)).unwrap_or(ed.children.len()),
+            };
+            ed.insert_child(at, built(&data, prefix));
         }
     }
     if ed.children.is_empty() && ed.misc.is_empty() {
@@ -1004,6 +1009,18 @@ mod tests {
             f.geometry = Some(Geometry::LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)]))
         });
         assert!(written.contains("<Placemark><ExtendedData><Data name=\"icon\">"), "{written}");
+    }
+
+    #[test]
+    fn an_added_property_goes_ahead_of_schema_data() {
+        let source = "<kml><Document><Schema id='s'><SimpleField name='n' type='int'/></Schema><Placemark>\
+            <ExtendedData><SchemaData schemaUrl='#s'><SimpleData name='n'>7</SimpleData></SchemaData></ExtendedData>\
+            </Placemark></Document></kml>";
+        let (_, written) = edited(source, |f| set(f, "added", Some("x")));
+        assert!(
+            written.contains(r#"<ExtendedData><Data name="added"><value>x</value></Data><SchemaData"#),
+            "{written}"
+        );
     }
 
     #[test]

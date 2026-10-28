@@ -440,7 +440,7 @@ fn geom_table(
 fn encode_properties(columns: &[crate::schema::Column], row: usize) -> Vec<u8> {
     let mut blob = Vec::new();
     for (i, col) in columns.iter().enumerate() {
-        let cell = &col.values[row];
+        let cell = &col.cell(row);
         if matches!(cell, Cell::Null) {
             continue;
         }

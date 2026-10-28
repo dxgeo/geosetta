@@ -151,8 +151,8 @@ fn plan_for(col: &Column) -> Plan {
     let Some(declared) = col.declared_type() else {
         return text_default();
     };
-    let strs = || col.values.iter().filter_map(|c| match c {
-        Cell::Str(s) => Some(s.as_str()),
+    let strs = || col.cells().filter_map(|c| match c {
+        Cell::Str(s) => Some(s),
         _ => None,
     });
     match declared {
@@ -171,8 +171,8 @@ fn plan_for(col: &Column) -> Plan {
         // Unannotated BYTE_ARRAY, which is what makes it bytes rather than
         // text; the reader reads the absent annotation back as `Binary`.
         DeclType::Binary => Plan::Bytes,
-        DeclType::Date if strs().all(|s| parse_date_days(s).is_some()) => Plan::DateDays,
-        DeclType::DateTime if strs().all(|s| parse_timestamp_millis(s).is_some()) => {
+        DeclType::Date if strs().all(|s| parse_date_days(&s).is_some()) => Plan::DateDays,
+        DeclType::DateTime if strs().all(|s| parse_timestamp_millis(&s).is_some()) => {
             Plan::TimestampMillis
         }
         // `String` and any temporal type whose text this writer cannot parse
@@ -184,14 +184,14 @@ fn plan_for(col: &Column) -> Plan {
 fn prepare_property(col: &Column) -> Prepared {
     let plan = plan_for(col);
 
-    let mut def = Vec::with_capacity(col.values.len());
+    let mut def = Vec::with_capacity(col.len());
     let mut values = Vec::new();
     // Booleans are bit-packed together, so collect them separately.
     let mut bits: Vec<bool> = Vec::new();
 
-    for cell in &col.values {
+    for cell in col.cells() {
         let mut present = true;
-        match (plan, cell) {
+        match (plan, &cell) {
             (_, Cell::Null) => present = false,
             (Plan::Bool, Cell::Bool(b)) => bits.push(*b),
             (Plan::Int32(_), Cell::Int(n)) => {
@@ -226,7 +226,7 @@ fn prepare_property(col: &Column) -> Prepared {
         name: col.name.clone(),
         ptype: plan.ptype(),
         converted: plan.converted(),
-        num_values: col.values.len(),
+        num_values: col.len(),
         def_levels: def,
         values,
     }

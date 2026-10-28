@@ -1671,7 +1671,7 @@ fn feature_table(
                 None => Value::Null,
             });
             for col in &columns {
-                values.push(cell_to_value(&col.values[i]));
+                values.push(cell_to_value(&col.cell(i)));
             }
             // The rowid is the carried id when there was one — see
             // `feature_ids`, which is also what the R*Tree is built against, so
@@ -1845,8 +1845,8 @@ fn cell_to_value(cell: &Cell) -> Value {
         Cell::Bool(b) => Value::Int(*b as i64),
         Cell::Int(n) => Value::Int(*n),
         Cell::Double(d) => Value::Real(*d),
-        Cell::Str(s) => Value::Text(s.clone()),
-        Cell::Bytes(b) => Value::Blob(b.clone()),
+        Cell::Str(s) => Value::Text(s.to_string()),
+        Cell::Bytes(b) => Value::Blob(b.to_vec()),
     }
 }
 

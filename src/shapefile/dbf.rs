@@ -326,7 +326,7 @@ pub fn write(columns: &[Column]) -> Result<(Vec<u8>, Vec<String>)> {
     }
     resolve_field_names(columns, &mut fields, &mut warnings)?;
 
-    let num_rows = columns.first().map(|c| c.values.len()).unwrap_or(0);
+    let num_rows = columns.first().map(|c| c.len()).unwrap_or(0);
     let header_size = HEADER_LEN + fields.len() * FIELD_DESCRIPTOR_LEN + 1;
     let record_size = 1 + fields.iter().map(|f| f.len).sum::<usize>();
     if header_size > u16::MAX as usize || record_size > u16::MAX as usize {
@@ -367,7 +367,7 @@ pub fn write(columns: &[Column]) -> Result<(Vec<u8>, Vec<String>)> {
     for row in 0..num_rows {
         out.push(b' '); // active
         for (field, col) in fields.iter().zip(columns) {
-            write_cell(&mut out, field, &col.values[row]);
+            write_cell(&mut out, field, &col.cell(row));
         }
     }
     out.push(FILE_TERMINATOR);
@@ -437,8 +437,7 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
             // 255-byte cap — sized to the longest observed value with no
             // separate overflow case needed, unlike `Double` below.
             let len = col
-                .values
-                .iter()
+                .cells()
                 .filter_map(|c| match c {
                     Cell::Int(v) => Some(v.to_string().len()),
                     _ => None,
@@ -487,8 +486,7 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
             // stating a fact, and is left alone to fail loudly below if it
             // cannot fit.
             let integer_digits = col
-                .values
-                .iter()
+                .cells()
                 .filter_map(|c| match c {
                     Cell::Double(v) => Some(format!("{v:.0}").len()),
                     _ => None,
@@ -501,8 +499,7 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
                 None => decimals.min(255usize.saturating_sub(integer_digits + 1)),
             };
             let len = col
-                .values
-                .iter()
+                .cells()
                 .filter_map(|c| match c {
                     Cell::Double(v) => Some(format!("{v:.decimals$}").len()),
                     _ => None,
@@ -536,8 +533,7 @@ fn dbf_field(col: &Column, warnings: &mut Vec<String>) -> Result<DbfField> {
             // readable text) rather than an error, but now surfaced as a
             // warning instead of a silent one.
             let true_max = col
-                .values
-                .iter()
+                .cells()
                 .filter_map(|c| match c {
                     Cell::Str(s) => Some(s.len()),
                     _ => None,
@@ -803,7 +799,8 @@ mod tests {
     #[test]
     fn deleted_flag_is_detected() {
         // Hand-build a minimal one-field, one-record dbf with the deletion flag set.
-        let columns = infer_columns(&features(&[&[("a", JsonValue::String("x".into()))]]));
+        let feats = features(&[&[("a", JsonValue::String("x".into()))]]);
+        let columns = infer_columns(&feats);
         let (mut bytes, _warnings) = write(&columns).unwrap();
         // Record starts right after the header + 1 field descriptor + terminator.
         let header_size = u16_at(&bytes, 8).unwrap() as usize;

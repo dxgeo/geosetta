@@ -1055,12 +1055,17 @@ expressible; the mapping must key on (namespace, local name, parent).
     with the element before it. Comments move with the element they precede.
   - *What 2.2 has no place for*, measured by setting every parent/child pair
     =ogckml23.xsd= admits against the generated table: a geometry in
-    =<Create>= or =<Delete>=, a =<LatLonBox>= or =<LatLonQuad>= in a
-    =<Region>=, a =<LatLonAltBox>= on a ground overlay, and the =uom=
+    =<Create>= or =<Delete>=, a turned =<LatLonBox>= or a =<LatLonQuad>= in
+    a =<Region>=, a =<LatLonAltBox>= on a ground overlay, and the =uom=
     attribute. Every 2.3 /element/ has a 2.2 or =gx:= spelling. These are
-    dropped and named in D-K7's warning 2; =<Region>='s box could instead be
-    written as the =<LatLonAltBox>= it equals when unturned, which is not yet
-    done.
+    dropped and named in D-K7's warning 2. /2026-10-28:/ an unturned
+    =<LatLonBox>= -- no =<rotation>=, or one saying 0 -- that is its
+    =<Region>='s only box is written as the =<LatLonAltBox>= it equals, the
+    same edges and no altitudes, and named in warning 1 as a rename
+    (=LatLonBox→LatLonAltBox=). =ogckml23.xsd= itself asserts that a
+    =<Region>= holds neither a =<LatLonBox>= nor a =<LatLonQuad>= ("Use
+    kml:LatLonAltBox instead"), so only a document 2.3 does not admit reaches
+    this; a quad has no box it equals and stays a drop.
   - *Warnings (D-K7)*: warning 1 counts each respelling
     (=Track→gx:Track ×3=), warning 2 each loss; a run that changes only the
     stamp says nothing. Both are counted before the write over the document as

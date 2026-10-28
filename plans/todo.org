@@ -214,7 +214,7 @@ check it off and remove it once the item ships or is shelved.
     first half (D-E7), on E2/E3's encoders.
   Built beside them: the house layout for new documents (L3), and
   =--compact= (D-L8), with GeoJSON indented by default.
-- [ ] *Write a =<Region>='s =<LatLonBox>= as the =<LatLonAltBox>= it equals* —
+- [X] *Write a =<Region>='s =<LatLonBox>= as the =<LatLonAltBox>= it equals* —
   [[file:kml-standard.org][kml-standard.org]] K5. Lowering 2.3 to 2.2 drops a
   =<LatLonBox>= or =<LatLonQuad>= in a =<Region>= (and a =<LatLonAltBox>= on a
   ground overlay), with a warning, because 2.2 has no place for it. An
@@ -222,6 +222,10 @@ check it off and remove it once the item ships or is shelved.
   edges and no altitudes, so it can be written as one instead of dropped —
   fidelity over warning. A turned box or a quad has no 2.2 equivalent and
   stays a reported drop.
+  /Built 2026-10-28/ (=lower::as_alt_box=): reported as a rename in warning
+  1, with a zero or empty =<rotation>= read as unturned. 2.3's own schema
+  forbids both boxes in a =<Region>=, so this rescues documents that are
+  not valid 2.3 rather than ones that are.
 - [ ] *Carry the rest of a =.kmz= entry* —
   [[file:same-format-fidelity.org][same-format-fidelity.org]] M3c,
   =Format::Kmz='s =same_format_losses= row. =zip.rs= carries each entry's name,

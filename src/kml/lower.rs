@@ -12,10 +12,13 @@
 //! and `<gx:angles>` come out grouped by the same rule.
 //!
 //! *What 2.2 has no place for is dropped, and reported* (D-K7's warning 2):
-//! a geometry in `<Create>` or `<Delete>`, a `<LatLonBox>` or `<LatLonQuad>`
-//! in a `<Region>`, a `<LatLonAltBox>` on a ground overlay, and the `uom`
-//! attribute. Nothing else in 2.3 lacks a 2.2 or `gx:` form
-//! (`every_element_has_a_2_2_spelling`).
+//! a geometry in `<Create>` or `<Delete>`, a turned `<LatLonBox>` or a
+//! `<LatLonQuad>` in a `<Region>`, a `<LatLonAltBox>` on a ground overlay,
+//! and the `uom` attribute. Nothing else in 2.3 lacks a 2.2 or `gx:` form
+//! (`every_element_has_a_2_2_spelling`). An unturned `<LatLonBox>` in a
+//! `<Region>` is the `<LatLonAltBox>` with its edges and no altitudes, so it
+//! is written as one and reported as renamed ([`as_alt_box`]) — what 2.3's
+//! own assertion on `RegionType` asks for.
 //!
 //! *Foreign content keeps its neighbour.* An extension element, or a name in
 //! the KML namespace 2.3 does not define, constrains nothing the tables know
@@ -155,6 +158,24 @@ fn place(parent: (KmlElement, Spelling), element: KmlElement, spelling: Spelling
     }
 }
 
+/// Whether `node`, among `siblings` under `parent`, is a `<Region>`'s
+/// `<LatLonBox>` that 2.2 holds as the `<LatLonAltBox>` it equals: unturned,
+/// and the region's only box. Its edges carry over; an altitude box with
+/// none is on the ground, as a `<LatLonBox>` is.
+fn as_alt_box(parent: KmlElement, node: &Node, siblings: &[Node]) -> bool {
+    use KmlElement as K;
+    let boxes = siblings.iter().filter(|s| matches!(s.element(), Some(K::LatLonBox | K::LatLonAltBox | K::LatLonQuad))).count();
+    parent == K::Region && node.element() == Some(K::LatLonBox) && boxes == 1 && node.children.iter().all(|c| !is_turn(c))
+}
+
+/// Whether `node` is a `<rotation>` that turns its box. An empty one is
+/// the schema's default, 0.
+fn is_turn(node: &Node) -> bool {
+    node.element() == Some(KmlElement::Rotation)
+        && !node.text_trimmed().is_empty()
+        && !node.text_trimmed().parse::<f64>().is_ok_and(|r| r == 0.0)
+}
+
 /// The attributes 2.3 added: `uom` on `<SimpleField>` and `<Data>`.
 fn attr_2_3_only(element: KmlElement, attr: &XmlAttr) -> Option<&'static str> {
     (attr.ns.is_none() && attr.name == "uom" && matches!(element, KmlElement::SimpleField | KmlElement::Data)).then_some("uom")
@@ -196,7 +217,18 @@ pub(crate) fn lower(doc: &mut KmlDocument) -> Changes {
 /// What [`lower`] would report for `node`, read as a child of `parent`,
 /// without changing it — for a warning given before the write.
 pub(crate) fn survey(node: &Node, parent: (KmlElement, Spelling), report: &mut Changes) {
+    survey_as(node, parent, false, report);
+}
+
+/// [`survey`], `node` being written as a `<LatLonAltBox>` when `alt_box`.
+fn survey_as(node: &Node, parent: (KmlElement, Spelling), alt_box: bool, report: &mut Changes) {
     let Kind::Kml { element, spelling } = node.kind else { return };
+    let (element, spelling) = if alt_box {
+        report.rename(element, KmlElement::LatLonAltBox);
+        (KmlElement::LatLonAltBox, Spelling::Kml)
+    } else {
+        (element, spelling)
+    };
     let spelling = match place(parent, element, spelling) {
         Place::Nowhere => {
             report.drop(Dropped::Element { parent: parent.0, child: element });
@@ -215,7 +247,10 @@ pub(crate) fn survey(node: &Node, parent: (KmlElement, Spelling), report: &mut C
         }
     }
     for child in &node.children {
-        survey(child, (element, spelling), report);
+        if alt_box && child.element() == Some(KmlElement::Rotation) {
+            continue;
+        }
+        survey_as(child, (element, spelling), as_alt_box(element, child, &node.children), report);
     }
 }
 
@@ -271,6 +306,7 @@ fn lower_children(
     scope.extend(node.attrs.iter().filter(|a| is_decl(a) && a.prefix.is_some()).map(|a| (a.name.clone(), a.value.clone())));
     let ordered = !order_2_2(parent.0, parent.1).is_empty();
     let children = std::mem::take(&mut node.children);
+    let alt_boxes: Vec<bool> = children.iter().map(|c| as_alt_box(parent.0, c, &children)).collect();
     let mut misc = std::mem::take(&mut node.content).into_iter().peekable();
     // Each child with its slot and the comments and whitespace before it. A
     // dropped child's comments go to the child after it; the whitespace that
@@ -286,6 +322,14 @@ fn lower_children(
             && let Some(at) = foreign_slot(parent, foreign, scope)
         {
             slot = at;
+        }
+        if alt_boxes[i] {
+            // Its `<rotation>`, if any, says 0, which an altitude box is.
+            while let Some(at) = child.children.iter().position(|c| c.element() == Some(KmlElement::Rotation)) {
+                child.remove_child(at);
+            }
+            report.rename(KmlElement::LatLonBox, KmlElement::LatLonAltBox);
+            child.kind = Kind::Kml { element: KmlElement::LatLonAltBox, spelling: Spelling::Kml };
         }
         if let Kind::Kml { element, spelling } = child.kind {
             let to = match place(parent, element, spelling) {
@@ -1338,7 +1382,7 @@ mod tests {
     fn what_2_2_has_no_place_for_is_dropped_and_reported() {
         let (out, report) = lowered(&format!(
             "<kml {NS} version=\"2.3\"><Document><Schema id=\"s\"><SimpleField name=\"h\" type=\"double\" uom=\"m\"/></Schema>\
-             <NetworkLinkControl/><Placemark><Region><LatLonBox><north>1</north></LatLonBox></Region></Placemark></Document></kml>"
+             <NetworkLinkControl/><Placemark><Region><LatLonBox><north>1</north><rotation>45</rotation></LatLonBox></Region></Placemark></Document></kml>"
         ));
         assert!(out.contains("<SimpleField name=\"h\" type=\"double\"/>"), "{out}");
         assert!(out.contains("<Region/>"), "{out}");
@@ -1346,6 +1390,48 @@ mod tests {
             report.dropped_warning().unwrap(),
             "kml: KML 2.2 has no place for uom= on <SimpleField>, <NetworkLinkControl> in <Document>, <LatLonBox> in <Region>; dropped"
         );
+    }
+
+    #[test]
+    fn an_unturned_region_box_is_written_as_the_altitude_box_it_equals() {
+        let (out, report) = lowered(&format!(
+            "<kml {NS} version=\"2.3\"><Placemark><Region><Lod><minLodPixels>128</minLodPixels></Lod>\
+             <LatLonBox id=\"b\"><rotation>0</rotation><west>1</west><north>4</north><south>3</south><east>2</east></LatLonBox>\
+             </Region></Placemark></kml>"
+        ));
+        // The edges in 2.2's order, the zero rotation gone, the box before <Lod>.
+        assert!(
+            out.contains("<Region><LatLonAltBox id=\"b\"><north>4</north><south>3</south><east>2</east><west>1</west></LatLonAltBox><Lod>"),
+            "{out}"
+        );
+        assert_eq!(report.dropped_warning(), None);
+        assert_eq!(
+            report.respelled_warning(KmlVersion::V2_3, KmlVersion::V2_2).unwrap(),
+            "kml: input is KML 2.3; written as KML 2.2 (LatLonBox→LatLonAltBox)"
+        );
+    }
+
+    #[test]
+    fn an_empty_rotation_is_the_default_and_unturned() {
+        let (out, _) = lowered(&format!(
+            "<kml {NS} version=\"2.3\"><Placemark><Region><LatLonBox><north>1</north><rotation/></LatLonBox></Region></Placemark></kml>"
+        ));
+        assert!(out.contains("<Region><LatLonAltBox><north>1</north></LatLonAltBox></Region>"), "{out}");
+    }
+
+    #[test]
+    fn a_turned_box_a_second_box_and_a_box_outside_a_region_stay_as_they_were() {
+        // A ground overlay's box keeps its rotation; a region with two boxes,
+        // which 2.3 does not admit, would have two altitude boxes, which 2.2
+        // does not either.
+        let (out, report) = lowered(&format!(
+            "<kml {NS} version=\"2.3\"><GroundOverlay><LatLonBox><north>1</north><rotation>10</rotation></LatLonBox></GroundOverlay>\
+             <Placemark><Region><LatLonAltBox><north>2</north></LatLonAltBox><LatLonBox><north>3</north></LatLonBox></Region></Placemark></kml>"
+        ));
+        assert!(out.contains("<LatLonBox><north>1</north><rotation>10</rotation></LatLonBox>"), "{out}");
+        assert!(out.contains("<Region><LatLonAltBox><north>2</north></LatLonAltBox></Region>"), "{out}");
+        assert!(report.renamed.is_empty());
+        assert_eq!(report.dropped_warning().unwrap(), "kml: KML 2.2 has no place for <LatLonBox> in <Region>; dropped");
     }
 
     #[test]
@@ -1370,6 +1456,7 @@ mod tests {
     fn a_survey_reports_what_the_lowering_does() {
         let source = format!(
             "<kml {NS} version=\"2.3\"><Placemark><Track><coord>1</coord></Track><Region><LatLonQuad/></Region>\
+             <Region><LatLonBox><rotation>0.0</rotation></LatLonBox></Region><Region><LatLonBox><rotation>5</rotation></LatLonBox></Region>\
              <ExtendedData><Data name=\"d\" uom=\"m\"><value>1</value></Data></ExtendedData></Placemark></kml>"
         );
         let doc = model::parse(&source).unwrap();

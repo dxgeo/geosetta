@@ -573,6 +573,14 @@ the split -- they *live* in container-scoped tables but their rows are keyed by
 layer.
 
 *** KML / KMZ -- /code/, traced; =kml/reader.rs=
+/***Superseded for the same-version run, 2026-10-23*** (=kml-standard.org=
+K4): the reader now raises the whole document into the KML model, and a
+=kml -> kml= run in the source's version gives the document back with the IR's
+edits applied. Everything the trace below lists as dropped is carried. What
+remains lost is in =Format::same_format_losses='s KML row -- CDATA, a non-UTF-8
+encoding, a DOCTYPE, whitespace layout -- plus, for =.kmz=, the archive's
+other entries (M3c). The trace stands as the record of the reader before./
+
 Upgraded from /unverified/ to /code/ by tracing the reader rather than listing
 the spec. The trace found more than the spec list had, because the loss is
 *structural*: =placemark_to_feature= (=reader.rs:66=) reads exactly three
@@ -994,6 +1002,10 @@ answer.
    does, while GDAL's **built-in =KML= driver drops the feature outright**,
    attributes and all. So the warning is stricter than one driver and the
    feature's survival is kinder than the other./
+
+   /2026-10-23: **built**, as § GEOMETRY ELEMENT COVERAGE in =kml.org= rules
+   it -- =<Model>= warns and emits, the other three are parsed. The warning is
+   a write-side one since =kml-standard.org= K4: the =<Model>= is carried./
 
    /2026-10-22: **scoped, still unbuilt -- and the ruling turned out to be
    three pieces of work, one of them not a warning at all.** Re-measured

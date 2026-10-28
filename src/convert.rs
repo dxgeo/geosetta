@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::rc::Rc;
 
-use crate::format::Format;
+use crate::format::{Format, KmlVersion};
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection};
 use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox, Geometry, Position};
@@ -19,9 +19,13 @@ use crate::json;
 /// Convert `input` bytes from one format to another via the Feature IR. The
 /// hub entry point in one call; `main` unrolls it into read/parse/write stages
 /// so it can report `--progress`, so this is used mainly by the tests below.
+///
+/// It reports no warnings, read-side or write-side: a caller who needs to
+/// know what a conversion lost calls [`read_features`] with a sink and runs
+/// the checks `main` runs.
 #[allow(dead_code)]
 pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
-    write_features(to, &read_features(from, input)?)
+    write_features(to, &read_features(from, input, &mut Vec::new())?)
 }
 
 /// Reorder features by Hilbert-curve locality, so spatially-close features are
@@ -38,7 +42,14 @@ pub fn reorder_hilbert(fc: &mut FeatureCollection) {
 }
 
 /// Decode any supported input format into the shared Feature IR.
-pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> {
+///
+/// `warnings` receives what the read itself dropped — message bodies, without
+/// the `warning: ` prefix the CLI adds — counted per cause, so a cause that
+/// recurs on every feature is one line (`plans/lossy-conversion-warnings.org`
+/// § 2b). A loss only the reader can see belongs here: by the time the IR
+/// holds the collection, nothing records that it happened. Most formats never
+/// write to it.
+pub fn read_features(format: Format, input: &[u8], warnings: &mut Vec<String>) -> Result<FeatureCollection> {
     match format {
         Format::GeoJson => {
             let text = std::str::from_utf8(input)
@@ -49,8 +60,8 @@ pub fn read_features(format: Format, input: &[u8]) -> Result<FeatureCollection> 
         Format::FlatGeobuf => flatgeobuf::read(input),
         Format::Csv => csv::read(input),
         Format::Wkt => read_wkt_lines(input),
-        Format::Kml => kml::read_kml(input),
-        Format::Kmz => kml::read_kmz(input),
+        Format::Kml => kml::read_kml(input, warnings),
+        Format::Kmz => kml::read_kmz(input, warnings),
         // GeoPackage is multi-layer, so it's read via geopackage::read_layers in
         // main.rs rather than through this single-collection path.
         Format::Gpkg => Err(Error::Usage(
@@ -73,8 +84,8 @@ pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>>
         Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
         Format::Csv => Ok(csv::write(fc)),
         Format::Wkt => Ok(write_wkt_lines(fc)),
-        Format::Kml => Ok(kml::write_kml(fc)),
-        Format::Kmz => Ok(kml::write_kmz(fc)),
+        Format::Kml => Ok(kml::write_kml(fc, None)),
+        Format::Kmz => Ok(kml::write_kmz(fc, None)),
         // GeoPackage and Shapefile are handled outside this single-buffer path
         // (see read_features above) — GeoPackage via geopackage::write_layers,
         // Shapefile via shapefile::write, both called from main.rs.
@@ -85,6 +96,43 @@ pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>>
             "Shapefile output is handled via its sibling files; this path should not be reached".into(),
         )),
     }
+}
+
+/// [`write_features`] for KML or KMZ in a version the caller chooses —
+/// `--kml-version`. Without it, [`write_features`] writes the source's own
+/// version when the collection came from a KML or KMZ read, and KML 2.2
+/// otherwise (`plans/kml-standard.org` D-K2).
+///
+/// A request for a version is a statement about the output's content, so it
+/// is a usage error for any other format rather than ignored.
+pub fn write_kml_features(format: Format, fc: &FeatureCollection, version: KmlVersion) -> Result<Vec<u8>> {
+    match format {
+        Format::Kml => Ok(kml::write_kml(fc, Some(version))),
+        Format::Kmz => Ok(kml::write_kmz(fc, Some(version))),
+        other => Err(Error::Usage(format!(
+            "--kml-version chooses the KML version of the output, and the output here is {}",
+            other.display_name()
+        ))),
+    }
+}
+
+/// What a write of `fc` as `target` — in `kml_version` when the caller chose
+/// one — cannot carry of what a KML or KMZ read held, as warning message
+/// bodies. Empty for a collection that was not read from KML.
+///
+/// Pre-write, like the checks `main` collects for every conversion, and
+/// separate from them because it needs the requested KML version: the same
+/// collection written back to KML loses nothing as its own version and loses
+/// its styles and folders as the other one (`plans/kml-standard.org` K4).
+pub fn kml_write_warnings(fc: &FeatureCollection, target: Format, kml_version: Option<KmlVersion>) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(version) = kml_version
+        && matches!(target, Format::Kml | Format::Kmz)
+    {
+        out.extend(kml::version_change_warnings(fc, version));
+    }
+    out.extend(kml::drop_warnings(fc, target, kml_version));
+    out
 }
 
 /// Read one WKT geometry per non-blank line (geometry only, no properties).
@@ -971,6 +1019,7 @@ mod tests {
             include_bytes!("../tests/fixtures/duckdb_point.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fc.features.len(), 1);
@@ -990,6 +1039,7 @@ mod tests {
             include_bytes!("../tests/fixtures/duckdb_multiline.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1009,6 +1059,7 @@ mod tests {
             include_bytes!("../tests/fixtures/duckdb_multipoint.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, -1.0)])));
@@ -1022,6 +1073,7 @@ mod tests {
             include_bytes!("../tests/fixtures/duckdb_poly_hole.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1041,6 +1093,7 @@ mod tests {
             include_bytes!("../tests/fixtures/duckdb_multipoly.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1066,6 +1119,7 @@ mod tests {
             include_bytes!("../tests/fixtures/gdal_point_z.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fc.features[0].geometry, Some(Point(Position::with_z(-73.9857, 40.7484, 381.0))));
@@ -1082,6 +1136,7 @@ mod tests {
             include_bytes!("../tests/fixtures/gdal_polygon_z.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1118,6 +1173,7 @@ mod tests {
             include_bytes!("../tests/fixtures/gdal_point_m.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fc.features[0].geometry, Some(Point(Position::with_m(1.0, 2.0, 5.0))));
@@ -1134,6 +1190,7 @@ mod tests {
             include_bytes!("../tests/fixtures/gdal_point_zm.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(fc.features[0].geometry, Some(Point(Position::with_zm(-73.9857, 40.7484, 381.0, 12.5))));
@@ -1151,6 +1208,7 @@ mod tests {
             include_bytes!("../tests/fixtures/gdal_linestring_zm.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1175,6 +1233,7 @@ mod tests {
             include_bytes!("../tests/fixtures/gdal_polygon_zm.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1207,6 +1266,7 @@ mod tests {
             include_bytes!("../tests/fixtures/gdal_multipoint_zm.dbf"),
             None,
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         assert_eq!(
@@ -1229,6 +1289,7 @@ mod tests {
             include_bytes!("../tests/fixtures/duckdb_crs_pt.dbf"),
             Some(prj),
             None,
+            &mut Vec::new(),
         )
         .unwrap();
         match fc.crs {
@@ -1241,7 +1302,7 @@ mod tests {
     }
 
     fn shp_to_fc(shp: &[u8], dbf: &[u8]) -> FeatureCollection {
-        crate::shapefile::read(shp, dbf, None, None).unwrap()
+        crate::shapefile::read(shp, dbf, None, None, &mut Vec::new()).unwrap()
     }
 
     /// The pipeline D1 in `plans/same-format-fidelity.org` is written to make
@@ -1266,7 +1327,7 @@ mod tests {
         assert_eq!(width(&transit, "name"), Some(80), "FlatGeobuf must carry it across the pipe");
 
         let out = crate::shapefile::write(&transit).unwrap();
-        let far_end = crate::shapefile::read(&out.shp, &out.dbf, None, None).unwrap();
+        let far_end = crate::shapefile::read(&out.shp, &out.dbf, None, None, &mut Vec::new()).unwrap();
         assert_eq!(width(&far_end, "name"), Some(80), "the far end must honour it");
         // The numeric declaration travels in its own two slots.
         let price = far_end.schema.iter().find(|d| d.name == "price").unwrap();
@@ -1295,7 +1356,7 @@ mod tests {
         transit.schema.iter_mut().find(|d| d.name == "name").unwrap().width = Some(120);
 
         let out = crate::shapefile::write(&transit).unwrap();
-        let far_end = crate::shapefile::read(&out.shp, &out.dbf, None, None).unwrap();
+        let far_end = crate::shapefile::read(&out.shp, &out.dbf, None, None, &mut Vec::new()).unwrap();
         assert_eq!(
             far_end.schema.iter().find(|d| d.name == "name").unwrap().width,
             Some(120),
@@ -1351,7 +1412,7 @@ mod tests {
         ] {
             let original = shp_to_fc(shp, dbf);
             let encoded = crate::shapefile::write(&original).unwrap();
-            let reread = crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None).unwrap();
+            let reread = crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None, &mut Vec::new()).unwrap();
             assert_eq!(sorted_geoms(&original), sorted_geoms(&reread));
         }
     }
@@ -1368,7 +1429,7 @@ mod tests {
             geojson_fc.features.iter().filter(|f| matches!(f.geometry, Some(crate::geometry::Geometry::Point(_)))).cloned().collect(),
         );
         let encoded = crate::shapefile::write(&points_only).unwrap();
-        let back = crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None).unwrap();
+        let back = crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None, &mut Vec::new()).unwrap();
         assert_eq!(back.features.len(), points_only.features.len());
         assert_eq!(sorted_geoms(&back), sorted_geoms(&points_only));
     }
@@ -1395,7 +1456,8 @@ mod tests {
         // DRIVER 'KML')), the same sourcing method used for the FlatGeobuf/
         // GeoPackage/Shapefile fixtures. Exercises real-world shapes our
         // hand-written test fixtures don't: a <Folder>/<Schema> wrapper, the
-        // <SchemaData>/<SimpleData> ExtendedData form, and a <Style> element
+        // <SchemaData>/<SimpleData> ExtendedData form, typed by the schema's
+        // `int` (`plans/kml-standard.org` D-K9), and a <Style> element
         // (LineStyle/PolyStyle) that must be ignored, not just absent.
         use crate::geometry::Geometry::{LineString, Point, Polygon};
         let bytes = include_bytes!("../tests/fixtures/duckdb_geoms.kml");
@@ -1409,15 +1471,15 @@ mod tests {
         let by_name = |name: &str| fc.features.iter().find(|f| prop(f, "name").as_str() == Some(name)).unwrap();
 
         let alpha = by_name("alpha");
-        assert_eq!(prop(alpha, "n").as_str(), Some("1"));
+        assert_eq!(prop(alpha, "n"), json::JsonValue::Int(1));
         assert_eq!(alpha.geometry, Some(Point(Position::new(1.5, 2.5))));
 
         let beta = by_name("beta");
-        assert_eq!(prop(beta, "n").as_str(), Some("2"));
+        assert_eq!(prop(beta, "n"), json::JsonValue::Int(2));
         assert_eq!(beta.geometry, Some(LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, 0.0)])));
 
         let gamma = by_name("gamma");
-        assert_eq!(prop(gamma, "n").as_str(), Some("3"));
+        assert_eq!(prop(gamma, "n"), json::JsonValue::Int(3));
         assert_eq!(
             gamma.geometry,
             Some(Polygon(vec![
@@ -1459,7 +1521,7 @@ mod tests {
     fn kml_read_produces_wgs84() {
         // KML has no CRS channel at all — always WGS 84 by spec.
         let bytes = include_bytes!("../tests/fixtures/duckdb_geoms.kml");
-        let fc = read_features(Format::Kml, bytes).unwrap();
+        let fc = read_features(Format::Kml, bytes, &mut Vec::new()).unwrap();
         assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
     }
 
@@ -1495,7 +1557,7 @@ mod tests {
         // discarding it.
         use crate::geometry::Geometry::{GeometryCollection, LineString, MultiPolygon, Point, Polygon};
         let bytes = include_bytes!("../tests/fixtures/gdal_networklink.kmz");
-        let fc = read_features(Format::Kmz, bytes).unwrap();
+        let fc = read_features(Format::Kmz, bytes, &mut Vec::new()).unwrap();
         assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
         assert_eq!(fc.features.len(), 3);
 
@@ -1690,7 +1752,7 @@ mod tests {
         for (ty, value, expected) in cases {
             let fc = declared("v", ty, value);
             let out = crate::shapefile::write(&fc).unwrap();
-            let back = crate::shapefile::read(&out.shp, &out.dbf, None, None).unwrap();
+            let back = crate::shapefile::read(&out.shp, &out.dbf, None, None, &mut Vec::new()).unwrap();
             assert_eq!(decl_of(&back, "v"), Some(expected), "{ty:?} did not survive");
         }
     }
@@ -1704,25 +1766,25 @@ mod tests {
         let fc = declared("cnt", crate::schema::DeclType::Int16,
             json::JsonValue::Int(7));
 
-        for target in [Format::GeoJson, Format::Csv, Format::Wkt, Format::Kml] {
+        for target in [Format::GeoJson, Format::Csv, Format::Wkt] {
             assert!(!target.carries_column_schema(), "{target:?}");
             let w = fc.schema_drop_warning(target).expect("the drop must warn");
             assert!(w.contains("cnt"), "{w}");
 
             // And it really is gone at the far end, not merely unwarned.
             let bytes = write_features(target, &fc).unwrap();
-            let back = read_features(target, &bytes).unwrap();
+            let back = read_features(target, &bytes, &mut Vec::new()).unwrap();
             assert_eq!(decl_of(&back, "cnt"), None, "{target:?} kept a declaration it cannot hold");
         }
     }
 
-    /// The three spokes that *do* carry declarations stay silent, which is the
+    /// The spokes that *do* carry declarations stay silent, which is the
     /// other half of the same contract.
     #[test]
     fn formats_with_a_schema_slot_do_not_warn() {
         let fc = declared("cnt", crate::schema::DeclType::Int16,
             json::JsonValue::Int(7));
-        for target in [Format::FlatGeobuf, Format::Shapefile, Format::Gpkg, Format::Parquet] {
+        for target in [Format::FlatGeobuf, Format::Shapefile, Format::Gpkg, Format::Parquet, Format::Kml, Format::Kmz] {
             assert!(target.carries_column_schema(), "{target:?}");
             assert_eq!(fc.schema_drop_warning(target), None, "{target:?}");
         }
@@ -1959,8 +2021,9 @@ mod tests {
             Format::Parquet => parquet_to_features(&features_to_parquet(fc)).unwrap(),
             Format::Shapefile => {
                 let encoded = crate::shapefile::write(fc).unwrap();
-                crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None).unwrap()
+                crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None, &mut Vec::new()).unwrap()
             }
+            Format::Kml | Format::Kmz => read_features(format, &write_features(format, fc).unwrap(), &mut Vec::new()).unwrap(),
             other => panic!("{other:?} carries no column schema"),
         }
     }
@@ -2029,6 +2092,23 @@ mod tests {
                 "Shapefile Json->String",
                 "Shapefile DateTime->String",
                 "Shapefile Binary->String",
+                // KML's eight field types (OGC 12-007r2 §9.9) hold no 64-bit
+                // integer exactly and name no JSON, time, date or bytes. A
+                // `timestamp`/`begin`/`end` column is a `<TimeStamp>` or
+                // `<TimeSpan>` and keeps `DateTime`; that is a key's rule, not
+                // a type's, so the sweep's `v` column does not see it.
+                "Kml Int64->String",
+                "Kml UInt64->String",
+                "Kml Json->String",
+                "Kml DateTime->String",
+                "Kml Date->String",
+                "Kml Binary->String",
+                "Kmz Int64->String",
+                "Kmz UInt64->String",
+                "Kmz Json->String",
+                "Kmz DateTime->String",
+                "Kmz Date->String",
+                "Kmz Binary->String",
             ]
         );
     }

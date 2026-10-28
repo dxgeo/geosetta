@@ -37,7 +37,7 @@
 //!   native never crosses a process boundary: only a modelled field can reach
 //!   an external tool in a pipeline and be edited by it.
 
-use crate::format::Format;
+use crate::format::{Format, KmlVersion};
 use crate::json::JsonValue;
 use std::rc::Rc;
 
@@ -123,6 +123,56 @@ pub enum NativePayload {
     /// variant because its members genuinely are the same members; these are
     /// not./
     GpkgFeature(GpkgFeatureNative),
+    /// A KML document's provenance and the document itself, less its
+    /// features. Collection level only. Read by both the `.kml` and `.kmz`
+    /// writers, since a `.kmz` holds the same document.
+    Kml(KmlNative),
+    /// A KML feature's own element. **Feature level only**; [`Self::Kml`] is
+    /// its collection counterpart.
+    KmlFeature(KmlFeatureNative),
+}
+
+/// What a KML read recorded about the document itself: the version it was
+/// detected as, and how it spelled its namespace and `version` stamp
+/// (`plans/kml-standard.org` D-K5), so a same-version write gives back the
+/// root it was given.
+///
+/// The spellings are only replayed when the output is the version detected:
+/// a run that changes version writes OGC's namespace and the new version's own
+/// stamp, because the source's would then describe a document it no longer is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KmlNative {
+    /// The version detected, by namespace, `version` stamp and the 2.3-only
+    /// components the document uses (`plans/kml-standard.org` § VERSION
+    /// DETECTION).
+    pub version: KmlVersion,
+    /// The root element's namespace URI, verbatim: OGC's, Google's pre-OGC
+    /// `earth.google.com/kml/2.2`, or `None` for a document that declared
+    /// none (D-K13).
+    pub namespace: Option<String>,
+    /// The root's `version` attribute, verbatim (`2.3`, `2.3.0`, `2.2`, ...);
+    /// `None` when absent. Absent and `2.2` are different spellings of the
+    /// same version, and only one of them is valid KML 2.2.
+    pub version_attr: Option<String>,
+    /// The whole document in KML's own terms, less the features the IR
+    /// projects (`plans/kml-standard.org` K4): every container, style, schema
+    /// and network link, the root's declarations, the comments. `None` when
+    /// there is no single document to give back — a `.kmz` holding several.
+    ///
+    /// Crate-private for now: whether the model is public like the other
+    /// natives' contents is decided once K5 has settled its shape
+    /// (2026-10-23).
+    pub(crate) document: Option<Rc<crate::kml::document::Skeleton>>,
+}
+
+/// A KML feature's own element — its `<Placemark>`, with everything in it the
+/// IR does not project (styles, views, a `<Model>`, a track's per-vertex data)
+/// — and where in the document it sat.
+///
+/// Opaque, for the reason [`KmlNative`]'s `document` is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KmlFeatureNative {
+    pub(crate) feature: Rc<crate::kml::document::FeatureModel>,
 }
 
 /// A GeoPackage feature's members the IR does not model.

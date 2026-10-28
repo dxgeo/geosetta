@@ -623,7 +623,20 @@ each element below is in fact dropped.
 The =GroundOverlay= references =files/overlay.png=, which is why the KMZ below
 carries that file: together they pin the dangling-reference failure.
 
-*** =hand_hostile.kmz=
+*** =hand_hostile_2_3.kml=
+Authored, for =plans/kml-standard.org= K5: KML 2.3's hostile fixture, one per
+version. Valid 2.3 under =xmlschema= (=ogckml23.xsd= is XSD 1.1), and written
+to be what a 2.2 writer has to /lower/, not merely respell.
+| carries                                         | why |
+|-------------------------------------------------+-----|
+| =Track= (interleaved, with =angles= and a =SimpleArrayData=), =MultiTrack= | regrouped and respelled to =gx:= |
+| =seaFloorAltitudeMode=, =altitudeOffset=, =balloonVisibility= | renamed or respelled; slots in extension groups |
+| =LookAt= holding =TimeStamp= and =horizFov=     | =TimeStamp= is =gx:= only in a view |
+| =LatLonQuad= ground overlay                     | an extent 2.2 has only as =gx:= |
+| a =Tour= with every tour primitive              | a whole =gx:= subtree |
+| =SimpleArrayField= before =SimpleField=         | order inside =<Schema>= |
+| Placemark children out of 2.2's order, =atom:author=, comments | the reorder, foreign content's slot, comments travelling |
+
 =hand_hostile.kml= as =doc.kml=, plus =files/overlay.png= (a real 1×1 PNG, not a
 text stub, so it is a plausible referenced asset) and =files/notes.txt=.
 Geosetta writes =doc.kml= *alone*, so both sidecars are dropped and the

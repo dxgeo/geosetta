@@ -16,7 +16,8 @@
 //! use geosetta::{read_features, write_features, Format};
 //!
 //! let input = std::fs::read("in.geojson")?;
-//! let fc = read_features(Format::GeoJson, &input)?;
+//! let mut warnings = Vec::new(); // what the read could not keep, if anything
+//! let fc = read_features(Format::GeoJson, &input, &mut warnings)?;
 //! let out = write_features(Format::Parquet, &fc)?;
 //! std::fs::write("out.parquet", out)?;
 //! # Ok::<(), geosetta::Error>(())
@@ -60,6 +61,7 @@ pub(crate) mod parquet;
 pub(crate) mod schema;
 pub(crate) mod spatial;
 pub(crate) mod sqlite;
+pub(crate) mod tally;
 pub(crate) mod xml;
 pub(crate) mod zip;
 
@@ -68,10 +70,10 @@ pub use convert::{convert, read_features, reorder_hilbert, write_features};
 pub use crs::{Crs, NamedCrs, WGS84_CRS_CODE};
 pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection};
-pub use format::Format;
+pub use format::{Format, KmlVersion};
 pub use native::{
     FgbColumnNative, FgbNative, GpkgConstraint, GpkgDataColumn, GpkgFeatureNative, GpkgNative,
-    Native, NativePayload, ParquetNative,
+    KmlFeatureNative, KmlNative, Native, NativePayload, ParquetNative,
 };
 pub use geometry::{Bbox, Geometry, Position};
 // `schema` is crate-internal (its column materialization is a writer detail),

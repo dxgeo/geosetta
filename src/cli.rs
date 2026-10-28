@@ -27,7 +27,7 @@
 //! (`plans/crs-definition-output.org`).
 
 use crate::error::{Error, Result};
-use crate::format::Format;
+use crate::format::{Format, KmlVersion};
 
 /// What this invocation is asking for.
 ///
@@ -93,10 +93,14 @@ pub struct Args {
     /// source carried. Geosetta neither produces nor fetches this text — see
     /// the module doc comment.
     pub crs: Option<String>,
+    /// `--kml-version`: the OGC KML version to write. Valid only when the
+    /// output is KML or KMZ; without it the output is the source's own version
+    /// after a KML read, and KML 2.2 otherwise (`plans/kml-standard.org` D-K2).
+    pub kml_version: Option<KmlVersion>,
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--crs PATH] [--sort-hilbert] [--rtree] [--envelope] [--progress] [--quiet]\n       geosetta <input> --print-crs-code [--from FMT] [--layer NAME]\n       geosetta <input> --print-crs [--escape] [--from FMT] [--layer NAME]\n  \"-\" for <input>/<output> means stdin/stdout (needs --from/--to; not for Shapefile)\n  --crs PATH reads WKT or PROJJSON text (\"-\" for stdin) and uses it as the output CRS\n  --print-crs-code prints the source's AUTHORITY:CODE; --print-crs prints the CRS\n  definition the source recorded, verbatim (PROJJSON when it carries both)\n  --escape renders control bytes visibly (cat -v style) for reading at a terminal;\n  it is not round-trip safe, so leave it off when piping";
+pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--crs PATH] [--sort-hilbert] [--rtree] [--envelope] [--kml-version 2.2|2.3] [--progress] [--quiet]\n       geosetta <input> --print-crs-code [--from FMT] [--layer NAME]\n       geosetta <input> --print-crs [--escape] [--from FMT] [--layer NAME]\n  \"-\" for <input>/<output> means stdin/stdout (needs --from/--to; not for Shapefile)\n  --crs PATH reads WKT or PROJJSON text (\"-\" for stdin) and uses it as the output CRS\n  --print-crs-code prints the source's AUTHORITY:CODE; --print-crs prints the CRS\n  definition the source recorded, verbatim (PROJJSON when it carries both)\n  --escape renders control bytes visibly (cat -v style) for reading at a terminal;\n  it is not round-trip safe, so leave it off when piping";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -117,6 +121,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let mut print_crs_code = false;
     let mut print_crs = false;
     let mut escape = false;
+    let mut kml_version: Option<KmlVersion> = None;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -146,6 +151,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
                     iter.next()
                         .ok_or_else(|| Error::Usage("--layer needs a value".into()))?,
                 );
+            }
+            "--kml-version" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| Error::Usage("--kml-version needs a value (2.2 or 2.3)".into()))?;
+                kml_version = Some(KmlVersion::parse(&v)?);
             }
             "--crs" => {
                 crs = Some(
@@ -246,8 +257,23 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
                 Error::Usage(format!("cannot infer output format from \"{output}\""))
             }
         })?;
+        // Unlike --rtree and --envelope, which are ignored for other outputs,
+        // a version is a statement about the output's content: ignoring it
+        // would drop an explicit request silently.
+        if let Some(version) = kml_version
+            && !matches!(to, Format::Kml | Format::Kmz)
+        {
+            return Err(Error::Usage(format!(
+                "--kml-version {} chooses the KML version of the output, and the output here is {}",
+                version.as_str(),
+                to.display_name()
+            )));
+        }
         Mode::Convert { output, to }
     };
+    if let (Some(flag), Some(_)) = (diagnostic, kml_version) {
+        return Err(Error::Usage(format!("{flag} writes no file, so --kml-version has no output to choose a version for")));
+    }
 
     Ok(Args {
         input,
@@ -261,6 +287,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         quiet,
         escape,
         crs,
+        kml_version,
     })
 }
 
@@ -304,6 +331,30 @@ mod tests {
         assert!(a.envelope);
         let b = args(&["geosetta", "in.geojson", "out.gpkg"]).unwrap();
         assert!(!b.envelope, "off by default — it is an opt-in optimization");
+    }
+
+    #[test]
+    fn parses_kml_version_for_kml_and_kmz_output() {
+        for out in ["out.kml", "out.kmz"] {
+            let a = args(&["geosetta", "in.geojson", out, "--kml-version", "2.3"]).unwrap();
+            assert_eq!(a.kml_version, Some(KmlVersion::V2_3));
+        }
+        assert_eq!(args(&["geosetta", "in.geojson", "out.kml"]).unwrap().kml_version, None);
+    }
+
+    #[test]
+    fn kml_version_is_a_usage_error_for_any_other_output() {
+        let err = args(&["geosetta", "in.kml", "out.geojson", "--kml-version", "2.2"]).unwrap_err().to_string();
+        assert!(err.contains("GeoJSON"), "{err}");
+        assert!(args(&["geosetta", "in.kml", "--print-crs", "--kml-version", "2.2"]).is_err());
+    }
+
+    #[test]
+    fn kml_version_refuses_versions_it_cannot_write() {
+        for v in ["2.1", "2.3.0", "3"] {
+            assert!(args(&["geosetta", "in.geojson", "out.kml", "--kml-version", v]).is_err(), "{v}");
+        }
+        assert!(args(&["geosetta", "in.geojson", "out.kml", "--kml-version"]).is_err());
     }
 
     #[test]

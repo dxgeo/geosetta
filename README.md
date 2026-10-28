@@ -92,14 +92,35 @@ validated against DuckDB / GDAL.
     `.gpkg` layer, either direction). Validated against real DuckDB-generated
     fixtures and GDAL/DuckDB's own readers.
 -   **KML** and **KMZ** (read + write) on a from-scratch XML reader/writer
-    (`src/xml.rs`) and a minimal ZIP container codec (`src/zip.rs`). CRS is always
-    WGS 84 (KML has no other CRS concept). `.kmz` reading flattens **every**
+    (`src/xml.rs`) and a minimal ZIP container codec (`src/zip.rs`). Coordinates
+    are always WGS 84 longitude/latitude; a document whose every height is
+    `altitudeMode` `absolute` reads as EPSG:9707 (WGS 84 + EGM96 height), the one
+    vertical datum KML states. `.kmz` reading flattens **every**
     internal `*.kml` entry rather than just the first, since a real multi-layer
     producer's root `doc.kml` can be nothing but a `<NetworkLink>`; writing packs
     one stored (uncompressed) entry — no DEFLATE encoder in the crate yet, so
     `.kmz` output is bigger than a compressed one but universally readable.
     Validated against real GDAL (`ogrinfo`, `ogr2ogr -f LIBKML`), DuckDB
     fixtures, and a real Info-ZIP archive for the deflate read path.
+    Both OGC versions are read and detected — KML 2.2 and 2.3, including Google's
+    pre-OGC `earth.google.com/kml/2.2` namespace; Google's KML 2.0 and 2.1 are
+    refused. Output is the source's own version on a KML → KML run and KML 2.2
+    from anything else, since 2.2 is what Google Earth, GDAL and CesiumJS read;
+    `--kml-version 2.3` writes 2.3. A version rides in the in-process native, so a
+    pipe through another format comes back as 2.2. The whole document rides there
+    too, so a KML → KML run in the source's version keeps everything the feature
+    model does not hold; a version change is built from the features alone and
+    says so. What other formats see of a feature: its `name` and `description`;
+    its time as `timestamp` or `begin`/`end`, GDAL's names, as written; its
+    geometry's `altitudeMode`, `seaFloorAltitudeMode`, `extrude` and
+    `tessellate` where the source has them; and its `<ExtendedData>`, typed by
+    the document's `<Schema>` (`int` → integer, `double` → float, `bool` →
+    boolean), which also declares the columns. A `<GroundOverlay>` is a feature
+    too, as the polygon its image covers — with its `rotation` turned on the
+    ground, as Google Earth draws it — and a `<PhotoOverlay>` as its point, each
+    with an `icon`. Written to KML from another format, those properties become
+    the elements again, and declared columns a `<Schema>`. See
+    [plans/kml-standard.org](plans/kml-standard.org).
 
 **Z and M ordinates travel end to end.** `Position` carries optional `z` and `m`,
 so every spoke reads and writes Z, and M is supported everywhere a format can
@@ -353,6 +374,7 @@ one row group, and property columns typed by scanning all features
     geosetta places.kmz    places.parquet   # KMZ        -> GeoParquet (reads every internal .kml)
     geosetta places.geojson places.kml      # GeoJSON    -> KML
     geosetta places.geojson places.kmz      # GeoJSON    -> KMZ (stored, uncompressed)
+    geosetta places.geojson places.kml --kml-version 2.3  # …as OGC KML 2.3 (default 2.2)
     # formats may also be given explicitly:
     geosetta in.txt out.bin --from geojson --to parquet
     # a CRS geosetta can't resolve (a bare authority code, no definition) is resolved
@@ -399,8 +421,12 @@ Where a same-format re-encode still loses something, the run says so on stderr
 rather than leaving you to find out. Today Shapefile is the only format that
 round-trips with nothing to report; GeoJSON drops both `bbox` members and
 reformats numbers, CSV re-renders its geometry column's coordinates,
-GeoParquet drops the covering-bbox column, and KML keeps little more than
-placemarks. Those are measured, not
+GeoParquet drops the covering-bbox column, and KML loses only what its XML
+layer normalises — CDATA comes back as escaped text, a UTF-16 document as UTF-8,
+a DOCTYPE is dropped — since a KML → KML run in the source's own version gives
+back the document it read: styles, folders, overlays, models and tracks' times,
+with any edit to the features applied — an overlay moved keeps its box and its
+turn. Those are measured, not
 predicted, and each is a gap being closed rather than a design position.
 
 In-process, none of this applies: a Rust consumer holding a `FeatureCollection`

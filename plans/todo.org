@@ -133,12 +133,13 @@ check it off and remove it once the item ships or is shelved.
   at all.
 
 - [ ] [[file:encodings.org][encodings.org]] — text encodings across every
-  spoke, not just Shapefile. *Scoping only*, written 2026-10-21 out of
+  spoke, not just Shapefile. Written 2026-10-21 out of
   =native-inventory.org= § QUESTIONS item 3. Two of its milestones are
   *correctness* rather than capability and should go first: E1 warns when an
-  unrecognised =.cpg= is approximated as Latin-1 (silent today, and wrong in
-  exactly the =0x80=--=0x9F= bytes that distinguish =CP1252=), and E3 refuses a
-  multi-byte codepage instead of producing mojibake. E2's single-byte tables
+  unrecognised =.cpg= is approximated as Latin-1 -- ***built 2026-10-23*** --
+  and E3 refuses a multi-byte codepage instead of producing mojibake. E5
+  (KML's own declaration) is partly built with =kml-standard.org= K1: what it
+  lacks is E2's tables. E2's single-byte tables
   and E4's =--encoding= for the four spokes that currently refuse non-UTF-8
   input are the capability half. /Records why the =.dbf= language-driver byte
   must **not** be trusted: =ogr2ogr= declares Windows-1252 by default while
@@ -147,41 +148,59 @@ check it off and remove it once the item ships or is shelved.
 - [ ] [[file:kml-standard.org][kml-standard.org]] — M3's KML spoke, rescoped
   2026-10-22 to *the standard*: OGC KML 2.3 as a typed model in the KML native,
   both OGC versions (2.2, 2.3) read and detected, and =--kml-version= choosing
-  the output, defaulting to the source's version on =kml -> kml= and to 2.3
+  the output, defaulting to the source's version on =kml -> kml= and to 2.2
   otherwise. Pre-OGC 2.0/2.1 are refused. Starts at K1 (a namespace-aware
   =xml.rs=). All eight open questions were decided on 2026-10-22 (D-K11 to
-  D-K15). One measurement is left: the plane in which a =GroundOverlay='s
-  =rotation= applies (D-K14).
+  D-K15).
 
-- [ ] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
-  both of this crate's warning mechanisms are write-side, and **two owed
-  warnings are blocked behind that**: =native-inventory.org= § QUESTIONS item
-  6 (an unrecognised KML geometry yields a geometry-less feature, silently —
-  ruled *warn and emit* on 2026-08-20 and unbuilt since) and =encodings.org=
-  E1 (an unrecognised =.cpg= approximated as Latin-1). Neither can use a
-  pre-write check: the source fact is destroyed at read, and a
-  =geometry: None= left by a =<Model>= is indistinguishable in the IR from a
-  Placemark that legitimately has none. *Scoped 2026-10-22*: a
-  =&mut Vec<String>= sink on =read_features=, counted per cause so a GPS
-  export's thousands of =gx:Track= Placemarks say one line rather than
-  thousands.
+  /2026-10-23:/ measured in Google Earth Web, GDAL LIBKML and CesiumJS. *A
+  =GroundOverlay= turns on the ground*, which closes D-K14. *No reader measured
+  reads 2.3's =kml:Track=*, while all three read =gx:Track=, so the default
+  output from another format is now **2.2** (D-K2) and an explicit
+  =--kml-version 2.3= writes the standard's spelling with no warning about
+  readers (open question 9, decided). K5 builds the 2.2 writer first. The
+  2.3 XSD 1.1 oracle runs under Python's =xmlschema= -- no JVM. See
+  =kml-standard.org= § MEASURED IN A RENDERER and § ORACLES.
 
-  /The KML half is **mostly not a warning at all**, which the GDAL
-  measurement settled: of the four geometry elements that drop silently
-  today, three are geometry the IR can hold -- a bare =<LinearRing>= and a
-  =<gx:Track>=/=<gx:MultiTrack>= are *parsed* (LIBKML reads them as
-  =LINEARRING= and =LINESTRING Z=; GDAL's built-in =KML= driver drops the
-  features outright), and only =<Model>= earns the warning. Ruled in
-  =kml.org= § GEOMETRY ELEMENT COVERAGE, under the preference stated at
-  =lossy-conversion-warnings.org= § THE COMPLEMENT. That section also
-  enumerates the positive geometry list the warning needs, since
-  =parse_geometry='s catch-all is how every *non*-geometry child is passed
-  over too./
+  /2026-10-23, later:/ ***K1 and K2 are built*** -- a namespace-aware
+  =xml.rs=, applied to the reader at once; version detection from the 2.3
+  schema's own assertions; Google's 2.0/2.1 refused; =--kml-version=; and the
+  output's version resolved as D-K2 says, every write schema-valid. ***K3 is
+  built too*** -- the document model, as an identified node tree over the
+  whole 2.3 vocabulary (D-K4a), generated from the schema and round-tripping
+  every fixture. ***K4's first step is built***: the reader parses into the
+  model, each Placemark's element travels as its feature's native, and a
+  =kml -> kml= run in the source's version gives the document back --
+  styles, folders, overlays, models, tracks' times -- with the IR's edits
+  applied. The schema oracle reads its =.xsd= files from a directory
+  you supply, not from the tree.
 
-  /Remaining loss once the parsers land: a =<gx:Track>='s per-vertex
-  =<when>= series, which belongs in the KML native channel
-  (=same-format-fidelity.org= M3) rather than the =m= ordinate, and owes
-  =Format::Kml= a loss entry of its own in the meantime./
+  /2026-10-24:/ ***K4 is built.*** Ground and photo overlays are features
+  (a footprint turned on the ground, a point, each with an =icon=); a
+  feature's time is =timestamp=/=begin=/=end=; =<Schema>= types
+  =<SimpleData>= and declares the columns, so KML now carries a column
+  schema; and the altitude members are properties, with an all-=absolute=
+  document read as EPSG:9707. Every write validates against both schemas.
+  What remains is K5, the version writers: lowering to 2.2, then 2.3.
+
+  /2026-10-28:/ ***K5's 2.2 writer is built.*** A 2.3 read written as 2.2 is
+  the same document lowered (=kml/lower.rs=): adopted elements back to =gx:=
+  by parent, children in =ogckml22.xsd='s sequence from a table generated
+  from the two schemas, and the five things 2.2 has no place for dropped and
+  reported. A 2.3 hostile fixture lowers to valid 2.2. What remains is the
+  2.3 writer, raising a 2.2 document.
+
+- [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
+  *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a
+  =&mut Vec<String>= sink, counted per cause (=crate::tally::Tally=) so a GPS
+  export's thousands of tracks say one line. Both owed warnings are in: a KML
+  =<Model>= (warn and emit), and =encodings.org= E1's approximated =.cpg=. As
+  =kml.org= § GEOMETRY ELEMENT COVERAGE ruled, a bare =<LinearRing>= and
+  =gx:Track=/=gx:MultiTrack= are *parsed* rather than reported; what a track
+  still drops -- its per-vertex =<when>=, =<gx:angles>= and arrays -- warns
+  until K3 carries it. =geopackage::read_layers= takes no sink yet: no
+  GeoPackage read loss exists, and its library caller (the destination merge)
+  has no channel to pass one to.
 
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a

@@ -34,15 +34,19 @@ pub struct Record {
 }
 
 /// The text encoding to decode `C` (character) field bytes with.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Encoding {
     Utf8,
-    /// ISO-8859-1: every byte maps directly to the Unicode code point of the
-    /// same value. Used both as the declared Latin-1 encoding and as the
-    /// fallback when `.cpg` names a codepage we don't have a table for (e.g.
-    /// Windows-1252) — an approximation documented as a known gap, not a full
-    /// codepage library, to keep the crate dependency-free.
+    /// ISO-8859-1, declared as such: every byte maps directly to the Unicode
+    /// code point of the same value, which is exactly what the codepage means.
     Latin1,
+    /// A `.cpg` naming a codepage this build has no table for (Windows-1252,
+    /// a DOS codepage, a multi-byte one), decoded as ISO-8859-1 anyway — an
+    /// approximation, not a full codepage library, to keep the crate
+    /// dependency-free. Exact for ASCII bytes and wrong wherever the named
+    /// codepage differs; [`TextLosses::approximated`] counts the values that
+    /// held a byte it could be wrong about (`plans/encodings.org` E1).
+    Latin1Approximating,
 }
 
 /// Resolve the encoding to decode field text with, from an optional `.cpg`
@@ -50,19 +54,34 @@ pub enum Encoding {
 /// with a Latin-1 fallback (see [`decode_text`]); this only handles the case
 /// where a codepage *was* declared.
 pub fn encoding_from_cpg(cpg: Option<&str>) -> Encoding {
-    match cpg {
-        Some(s) if s.trim().eq_ignore_ascii_case("utf-8") || s.trim().eq_ignore_ascii_case("utf8") => {
-            Encoding::Utf8
-        }
-        Some(_) => Encoding::Latin1,
-        None => Encoding::Utf8,
+    let Some(cpg) = cpg else {
+        return Encoding::Utf8;
+    };
+    match cpg.trim().to_ascii_lowercase().replace(['-', '_', ' '], "").as_str() {
+        "utf8" => Encoding::Utf8,
+        "iso88591" | "88591" | "latin1" | "l1" | "cp819" => Encoding::Latin1,
+        _ => Encoding::Latin1Approximating,
     }
+}
+
+/// What decoding a `.dbf`'s text could not do exactly, counted per value, so
+/// the reader can say so (`plans/lossy-conversion-warnings.org` § 2b).
+#[derive(Debug, Default, PartialEq)]
+pub struct TextLosses {
+    /// Values holding a non-ASCII byte, decoded under
+    /// [`Encoding::Latin1Approximating`]. An all-ASCII value is exact under
+    /// every codepage, so it is not counted.
+    pub approximated: usize,
+    /// Values a `.cpg` declared UTF-8 that were not, whose invalid bytes were
+    /// replaced with U+FFFD.
+    pub replaced: usize,
 }
 
 /// Parse a `.dbf` file into its records. `cpg_declared` is whether a `.cpg`
 /// file was present (see [`encoding_from_cpg`]) — when it wasn't, a UTF-8
 /// decode failure per field falls back to Latin-1 rather than erroring.
-pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool) -> Result<Vec<Record>> {
+/// `losses` counts the text values that did not decode exactly.
+pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool, losses: &mut TextLosses) -> Result<Vec<Record>> {
     if data.len() < HEADER_LEN {
         return Err(Error::Convert("shapefile: dbf file shorter than its header".into()));
     }
@@ -92,7 +111,7 @@ pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool) -> Result<Vec<R
                 .get(field_pos..field_pos + field.len)
                 .ok_or_else(|| Error::Convert("shapefile: dbf record shorter than its schema".into()))?;
             field_pos += field.len;
-            let value = decode_field(field, raw, encoding, cpg_declared)?;
+            let value = decode_field(field, raw, encoding, cpg_declared, losses)?;
             properties.push((Rc::clone(key), value));
         }
         records.push(Record { deleted, properties });
@@ -169,9 +188,15 @@ fn read_fields(data: &[u8]) -> Result<Vec<Field>> {
     Ok(fields)
 }
 
-fn decode_field(field: &Field, raw: &[u8], encoding: Encoding, cpg_declared: bool) -> Result<JsonValue> {
+fn decode_field(
+    field: &Field,
+    raw: &[u8],
+    encoding: Encoding,
+    cpg_declared: bool,
+    losses: &mut TextLosses,
+) -> Result<JsonValue> {
     Ok(match field.ty {
-        b'C' => JsonValue::String(decode_text(raw, encoding, cpg_declared).trim_end().to_string()),
+        b'C' => JsonValue::String(decode_text(raw, encoding, cpg_declared, losses).trim_end().to_string()),
         b'D' => {
             // Raw YYYYMMDD digits, rendered as ISO-8601 text (matches
             // parquet/reader.rs's date-as-formatted-string convention).
@@ -216,7 +241,7 @@ fn decode_field(field: &Field, raw: &[u8], encoding: Encoding, cpg_declared: boo
     })
 }
 
-fn decode_text(raw: &[u8], encoding: Encoding, cpg_declared: bool) -> String {
+fn decode_text(raw: &[u8], encoding: Encoding, cpg_declared: bool, losses: &mut TextLosses) -> String {
     match encoding {
         Encoding::Utf8 => match std::str::from_utf8(raw) {
             Ok(s) => s.to_string(),
@@ -224,9 +249,18 @@ fn decode_text(raw: &[u8], encoding: Encoding, cpg_declared: bool) -> String {
             // guess) and the bytes aren't valid UTF-8: fall back to Latin-1
             // rather than lossily replacing bytes.
             Err(_) if !cpg_declared => latin1(raw),
-            Err(_) => String::from_utf8_lossy(raw).into_owned(),
+            Err(_) => {
+                losses.replaced += 1;
+                String::from_utf8_lossy(raw).into_owned()
+            }
         },
         Encoding::Latin1 => latin1(raw),
+        Encoding::Latin1Approximating => {
+            if !raw.is_ascii() {
+                losses.approximated += 1;
+            }
+            latin1(raw)
+        }
     }
 }
 
@@ -673,7 +707,7 @@ mod tests {
         assert_eq!(read_schema(&honoured).unwrap()[0].width, Some(80));
         // And the values still read back intact at the wider size.
         assert_eq!(
-            read(&honoured, Encoding::Utf8, true).unwrap()[0].properties[0].1,
+            read(&honoured, Encoding::Utf8, true, &mut TextLosses::default()).unwrap()[0].properties[0].1,
             JsonValue::String("Zürich".into())
         );
     }
@@ -689,7 +723,7 @@ mod tests {
         let (bytes, warnings) = write(&columns).unwrap();
         assert_eq!(read_schema(&bytes).unwrap()[0].width, Some(40));
         assert!(warnings.is_empty(), "widening is not a loss and must not warn: {warnings:?}");
-        assert_eq!(read(&bytes, Encoding::Utf8, true).unwrap()[0].properties[0].1, JsonValue::String(long));
+        assert_eq!(read(&bytes, Encoding::Utf8, true, &mut TextLosses::default()).unwrap()[0].properties[0].1, JsonValue::String(long));
     }
 
     #[test]
@@ -702,7 +736,7 @@ mod tests {
         let d = &read_schema(&bytes).unwrap()[0];
         assert_eq!((d.precision, d.scale), (Some(24), Some(15)));
         assert_eq!(
-            read(&bytes, Encoding::Utf8, true).unwrap()[0].properties[0].1,
+            read(&bytes, Encoding::Utf8, true, &mut TextLosses::default()).unwrap()[0].properties[0].1,
             JsonValue::Float(1.5)
         );
     }
@@ -735,7 +769,7 @@ mod tests {
         let columns = infer_columns(&feats);
         let (bytes, warnings) = write(&columns).unwrap();
         assert!(warnings.is_empty());
-        let records = read(&bytes, Encoding::Utf8, false).unwrap();
+        let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(records.len(), 2);
         assert!(!records[0].deleted);
 
@@ -759,7 +793,7 @@ mod tests {
         ]);
         let columns = infer_columns(&feats);
         let (bytes, _warnings) = write(&columns).unwrap();
-        let records = read(&bytes, Encoding::Utf8, false).unwrap();
+        let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         let get = |props: &[(Rc<str>, JsonValue)], k: &str| {
             props.iter().find(|(name, _)| &**name == k).map(|(_, v)| v.clone()).unwrap()
         };
@@ -774,7 +808,7 @@ mod tests {
         // Record starts right after the header + 1 field descriptor + terminator.
         let header_size = u16_at(&bytes, 8).unwrap() as usize;
         bytes[header_size] = b'*';
-        let records = read(&bytes, Encoding::Utf8, false).unwrap();
+        let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert!(records[0].deleted);
     }
 
@@ -783,14 +817,14 @@ mod tests {
         // 0xE9 is 'é' in Latin-1 but not valid standalone UTF-8.
         let raw = [0xE9u8, b' ', b' '];
         let field = Field { name: "n".into(), ty: b'C', len: 3, decimals: 0 };
-        let v = decode_field(&field, &raw, Encoding::Utf8, false).unwrap();
+        let v = decode_field(&field, &raw, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(v.as_str(), Some("é"));
     }
 
     #[test]
     fn date_field_renders_iso8601() {
         let field = Field { name: "d".into(), ty: b'D', len: 8, decimals: 0 };
-        let v = decode_field(&field, b"20200101", Encoding::Utf8, false).unwrap();
+        let v = decode_field(&field, b"20200101", Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(v.as_str(), Some("2020-01-01"));
     }
 
@@ -801,7 +835,7 @@ mod tests {
         let (bytes, warnings) = write(&columns).unwrap();
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains('s') && warnings[0].contains("300") && warnings[0].contains("255"), "{warnings:?}");
-        let records = read(&bytes, Encoding::Utf8, false).unwrap();
+        let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(records[0].properties[0].1.as_str().unwrap().len(), 255);
     }
 
@@ -813,7 +847,7 @@ mod tests {
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].contains("a_very_long_property_name"), "{warnings:?}");
         assert!(warnings[0].contains("a_very_lon"), "{warnings:?}");
-        let records = read(&bytes, Encoding::Utf8, false).unwrap();
+        let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(records[0].properties[0].0.as_ref(), "a_very_lon");
     }
 
@@ -859,7 +893,7 @@ mod tests {
         let columns = infer_columns(&feats);
         let (bytes, warnings) = write(&columns).unwrap();
         assert!(warnings.is_empty());
-        let records = read(&bytes, Encoding::Utf8, false).unwrap();
+        let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(records[0].properties[0].1.as_f64(), Some(123_456_789_012.5));
     }
 }

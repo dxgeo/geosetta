@@ -1,38 +1,56 @@
 #!/usr/bin/env python3
-"""Compare geosetta against ogr2ogr (GDAL) and duckdb on equivalent conversions.
+"""Compare geosetta against ogr2ogr (GDAL), duckdb and terrio on equivalent conversions.
 
-Whole-process, best-of-3 wall-clock timing over a mixed-geometry dataset
+Whole-process, best-of-3 wall-clock timing (and peak RSS, from the same runs)
+over a mixed-geometry dataset
 (~80% points, ~15% lines, ~5% polygons, 4 typed properties), plus a
 wide-column dataset (points with WIDE_COLS typed properties) that isolates
 per-column schema-inference cost — the same shapes as the in-repo
-`tests/perf.rs` benchmarks, but comparing three tools side by side.
+`tests/perf.rs` benchmarks, but comparing four tools side by side.
 
 Usage:
-    cargo build --release           # build the geosetta binary first
+    cargo build --release           # build the geosetta binary first (the
+                                    # workspace target dir is used by default)
     python3 bench/compare.py        # N=100000 features by default
     N=200000 python3 bench/compare.py
     BIN=/path/to/geosetta python3 bench/compare.py
+    TERRIO=/path/to/terrio python3 bench/compare.py
+    GEOSCRIBE=/path/to/geoscribe python3 bench/compare.py
     WIDE_N=50000 WIDE_COLS=200 python3 bench/compare.py  # wide-column cases
 
-Requirements: `ogr2ogr` (GDAL) and `duckdb` (with the `spatial` extension
-available to install) on PATH. Any tool/conversion that isn't available is
+Requirements: `ogr2ogr` (GDAL), `duckdb` (with the `spatial` extension
+available to install), `terrio` (`cargo install terrio`) and `geoscribe` on PATH. Any tool/conversion that isn't available is
 reported as `n/a` rather than aborting the run.
 
 Fairness notes (so the numbers aren't misread):
+  * geosetta carries no CRS registry, so for the EPSG:3857 cases its source CRS
+    (which it can only reference by code) is resolved the way its own warning
+    says: `geoscribe EPSG:3857 --projjson` writes the definition once, untimed,
+    and geosetta gets `--crs <file>`. The other tools resolve 3857 internally;
+    that one-time lookup is the cost geosetta's design moves out of the binary.
   * Timing is whole-process, so it includes binary/library startup and file I/O
     — the real cost of a one-shot CLI conversion. Startup is very asymmetric
-    (geosetta ~2 ms vs ogr2ogr / duckdb+spatial ~100 ms), which flatters
-    geosetta on the fastest conversions; it still wins clearly once startup is
-    subtracted, and the small startup is itself a dependency-free advantage.
+    (geosetta ~2 ms, terrio ~4 ms, ogr2ogr ~80 ms, duckdb+spatial ~65 ms),
+    which flatters geosetta and terrio on the fastest conversions; geosetta
+    still wins clearly once startup is subtracted, and the small startup is
+    itself a dependency-free advantage.
   * DuckDB's vector I/O (GeoJSON / FlatGeobuf / GeoPackage) is GDAL-backed; only
     its Parquet path is native, so its non-Parquet numbers track GDAL's.
   * geosetta cannot yet read GDAL-written Parquet (a known level-encoding gap),
     so the parquet->geojson read input is DuckDB-written Parquet (which all
     three tools read).
-  * All tools produce equivalent output (same feature count); this measures
-    speed on the same work, not one tool doing less.
+  * All tools produce equivalent output; this measures speed on the same work,
+    not one tool doing less. After timing, every output is read back through
+    ogr2ogr and checked against the case's input: feature count, geometry type
+    and coordinates (abs tol COORD_TOL), and every input property's value
+    (numbers by value, so CSV strings compare equal). Extra output columns
+    (an FID, a WKT column) are ignored; a missing or wrong one fails. Set
+    VERIFY=0 to skip, which also skips the ogr2ogr read-back's cost on big N.
 """
+import json
+import math
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -42,7 +60,23 @@ N = int(os.environ.get("N", "100000"))
 WIDE_N = int(os.environ.get("WIDE_N", "50000"))
 WIDE_COLS = int(os.environ.get("WIDE_COLS", "200"))
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BIN = os.environ.get("BIN", os.path.join(REPO, "target", "release", "geosetta"))
+
+
+def default_bin():
+    """The release binary cargo builds for this crate. geosetta is a workspace
+    member, so it lands in the workspace's target dir, not REPO/target: ask
+    cargo rather than guess (a stale REPO/target binary can linger)."""
+    r = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps"],
+                       cwd=REPO, capture_output=True)
+    target = json.loads(r.stdout)["target_directory"] if r.returncode == 0 else os.path.join(REPO, "target")
+    return os.path.join(target, "release", "geosetta")
+
+
+BIN = os.environ.get("BIN") or default_bin()
+GEOSCRIBE = os.environ.get("GEOSCRIBE", "geoscribe")
+TERRIO = os.environ.get("TERRIO", "terrio")
+VERIFY = os.environ.get("VERIFY", "1") != "0"
+COORD_TOL = float(os.environ.get("COORD_TOL", "1e-6"))
 D = tempfile.mkdtemp(prefix="geosetta-bench-")
 p = lambda f: os.path.join(D, f)
 
@@ -100,16 +134,25 @@ def gen_wide_geojson(n, cols):
 
 
 def run(cmd, shell=False):
-    """Best-of-3 wall time in ms, or (None, stderr) on failure."""
-    best = None
+    """Best-of-3 wall time in ms and lowest peak RSS in MB, as (ms, err, mb);
+    (None, stderr, None) on failure. Peak RSS is the child's own ru_maxrss from
+    wait4, so it is per-run, not the running max RUSAGE_CHILDREN would give."""
+    best = rss = None
     for _ in range(3):
-        t = time.perf_counter()
-        r = subprocess.run(cmd, shell=shell, capture_output=True)
-        dt = (time.perf_counter() - t) * 1000
-        if r.returncode != 0:
-            return None, r.stderr.decode()[:200]
+        with tempfile.TemporaryFile() as err:
+            t = time.perf_counter()
+            proc = subprocess.Popen(cmd, shell=shell, stdout=subprocess.DEVNULL, stderr=err)
+            _, status, ru = os.wait4(proc.pid, 0)
+            dt = (time.perf_counter() - t) * 1000
+            proc.returncode = os.waitstatus_to_exitcode(status)
+            if proc.returncode != 0:
+                err.seek(0)
+                return None, err.read().decode()[:200], None
+        # ru_maxrss is bytes on macOS, kilobytes on Linux
+        mb = ru.ru_maxrss / (1048576 if sys.platform == "darwin" else 1024)
         best = dt if best is None else min(best, dt)
-    return best, None
+        rss = mb if rss is None else min(rss, mb)
+    return best, None, rss
 
 
 def rm(f):
@@ -125,6 +168,16 @@ def ogr(out, inp, driver, *extra):
 def ogr_reproject(out, inp, driver, s_srs, t_srs):
     rm(out)
     return ["ogr2ogr", "-f", driver, "-s_srs", s_srs, "-t_srs", t_srs, out, inp]
+
+
+def terrio(inp, out):
+    """`terrio convert` of the same input to a terrio-private output path, so
+    it never races or overwrites geosetta's. Output format comes from the
+    extension; CSV needs WKT geometry to match the other tools' output."""
+    out = os.path.join(os.path.dirname(out), "t_" + os.path.basename(out))
+    rm(out)
+    extra = ["--lco", "GEOMETRY=AS_WKT"] if out.endswith(".csv") else []
+    return [TERRIO, "convert", inp, out, *extra]
 
 
 def duck(sql):
@@ -145,6 +198,94 @@ def gen_points_geojson(n):
             % (x, y, i, i, i * 1.5, "true" if i % 2 == 0 else "false"))
     parts.append("]}")
     return "".join(parts)
+
+
+def read_features(path):
+    """Features of any dataset, as GeoJSON dicts in the file's own CRS."""
+    oo = ["-oo", "GEOM_POSSIBLE_NAMES=geometry,WKT"] if path.endswith(".csv") else []
+    r = subprocess.run(["ogr2ogr", "-f", "GeoJSONSeq", "-preserve_fid", "/vsistdout/", path, *oo],
+                       capture_output=True)
+    if r.returncode != 0:
+        return None, r.stderr.decode()[:120]
+    fts = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
+    for ft in fts:
+        # an integer `id` stored as a GeoPackage/GDAL FID reads back as the
+        # feature's own id, not a property: it's the same value
+        # (the wide fixture has no id column; its FIDs are just row numbers)
+        if "id" not in ft["properties"] and "c0" not in ft["properties"] and ft.get("id") is not None:
+            ft["properties"]["id"] = ft["id"]
+    return fts, None
+
+
+def num(v):
+    """A property as a float if it is numeric, boolean or numeric text, else as
+    text: tools disagree on whether true is a bool, 1, or "true"."""
+    if isinstance(v, bool):
+        return float(v)
+    if isinstance(v, (int, float)):
+        return float(v)
+    if isinstance(v, str):
+        if v.lower() in ("true", "false"):
+            return float(v.lower() == "true")
+        try:
+            return float(v)
+        except ValueError:
+            return v
+    return v
+
+
+def same_value(a, b):
+    a, b = num(a), num(b)
+    if isinstance(a, float) and isinstance(b, float):
+        return math.isclose(a, b, rel_tol=1e-9, abs_tol=1e-9)
+    return a == b
+
+
+def flat(c):
+    return [c] if isinstance(c, (int, float)) else [x for part in c for x in flat(part)]
+
+
+def same_geometry(a, b):
+    if not a or not b or a.get("type") != b.get("type"):
+        return False
+    fa, fb = flat(a["coordinates"]), flat(b["coordinates"])
+    return len(fa) == len(fb) and all(abs(x - y) <= COORD_TOL for x, y in zip(fa, fb))
+
+
+def verify(expected, got):
+    """None if `got` matches `expected`, else a short reason."""
+    if got is None:
+        return "unreadable"
+    if len(got) != len(expected):
+        return f"count {len(got)} != {len(expected)}"
+    key = next(k for k in ("c0", "id") if k in expected[0]["properties"])
+    by_key = {}
+    for ft in got:
+        by_key[num(ft["properties"].get(key))] = ft
+    bad_geom = bad_prop = 0
+    first = None
+    for ex in expected:
+        ft = by_key.get(num(ex["properties"][key]))
+        if ft is None:
+            return f"missing feature {key}={ex['properties'][key]}"
+        if not same_geometry(ex["geometry"], ft["geometry"]):
+            bad_geom += 1
+            first = first or f"geometry of {key}={ex['properties'][key]}"
+        for k, v in ex["properties"].items():
+            if not same_value(v, ft["properties"].get(k)):
+                bad_prop += 1
+                first = first or f"{k} of {key}={ex['properties'][key]}: {ft['properties'].get(k)!r} != {v!r}"
+    if bad_geom or bad_prop:
+        return f"{bad_geom} geometries, {bad_prop} values differ (first: {first})"
+    return None
+
+
+def newest_source_mtime():
+    newest = os.path.getmtime(os.path.join(REPO, "Cargo.toml"))
+    for root, _, files in os.walk(os.path.join(REPO, "src")):
+        for name in files:
+            newest = max(newest, os.path.getmtime(os.path.join(root, name)))
+    return newest
 
 
 # --- setup: common source geojson + neutral read-inputs ---------------------
@@ -194,7 +335,14 @@ subprocess.run(ogr_reproject(in_gpkg_3857, gjp, "GPKG", "EPSG:4326", "EPSG:3857"
 subprocess.run(ogr_reproject(in_shp_3857, gjp, "ESRI Shapefile", "EPSG:4326", "EPSG:3857"), capture_output=True)
 subprocess.run(ogr_reproject(in_fgb_3857, gjp, "FlatGeobuf", "EPSG:4326", "EPSG:3857"), capture_output=True)
 
-# --- conversions: (label, geosetta_cmd, ogr_cmd, duckdb_cmd) -----------------
+# EPSG:3857's definition, resolved once by geoscribe (see the fairness notes).
+crs_3857 = p("epsg3857.projjson")
+r = subprocess.run([GEOSCRIBE, "EPSG:3857", "--projjson"], capture_output=True)
+if r.returncode != 0:
+    sys.exit(f"{GEOSCRIBE} EPSG:3857 failed: {r.stderr.decode()[:200]}")
+open(crs_3857, "wb").write(r.stdout)
+
+# --- conversions: (label, geosetta_cmd, ogr_cmd, duckdb_cmd); terrio's is derived -----------------
 cases = [
     ("geojson->parquet", [BIN, gj, gpq],
      ogr(p("o.parquet"), gj, "Parquet"),
@@ -219,7 +367,7 @@ cases = [
      duck(f"COPY (SELECT * EXCLUDE(geom), ST_AsText(geom) AS geometry FROM ST_Read('{gj}')) "
           f"TO '{dcsv}' (FORMAT CSV, HEADER);")),
     ("csv->geojson", [BIN, in_csv, g4],
-     ogr(p("o4.geojson"), in_csv, "GeoJSON"),
+     ogr(p("o4.geojson"), in_csv, "GeoJSON", "-oo", "GEOM_POSSIBLE_NAMES=geometry"),
      duck(f"COPY (SELECT * EXCLUDE(geometry), ST_GeomFromText(geometry) AS geom FROM read_csv('{in_csv}')) "
           f"TO '{d4}' {GDAL_GJ};")),
     ("geojson->shp", [BIN, gjp, gshp],
@@ -229,13 +377,13 @@ cases = [
     ("shp->geojson", [BIN, in_shp, g5],
      ogr(p("o5.geojson"), in_shp, "GeoJSON"),
      duck(f"COPY (SELECT * FROM ST_Read('{in_shp}')) TO '{d5}' {GDAL_GJ};")),
-    ("gpkg(3857)->parquet", [BIN, in_gpkg_3857, p("g_gpkg3857.parquet")],
+    ("gpkg(3857)->parquet", [BIN, in_gpkg_3857, p("g_gpkg3857.parquet"), "--crs", crs_3857],
      ogr(p("o_gpkg3857.parquet"), in_gpkg_3857, "Parquet"),
      duck(f"COPY (SELECT * FROM ST_Read('{in_gpkg_3857}')) TO '{p('d_gpkg3857.parquet')}' (FORMAT PARQUET);")),
-    ("shp(3857)->parquet", [BIN, in_shp_3857, p("g_shp3857.parquet")],
+    ("shp(3857)->parquet", [BIN, in_shp_3857, p("g_shp3857.parquet"), "--crs", crs_3857],
      ogr(p("o_shp3857.parquet"), in_shp_3857, "Parquet"),
      duck(f"COPY (SELECT * FROM ST_Read('{in_shp_3857}')) TO '{p('d_shp3857.parquet')}' (FORMAT PARQUET);")),
-    ("fgb(3857)->gpkg", [BIN, in_fgb_3857, p("g_fgb3857.gpkg")],
+    ("fgb(3857)->gpkg", [BIN, in_fgb_3857, p("g_fgb3857.gpkg"), "--crs", crs_3857],
      ogr(p("o_fgb3857.gpkg"), in_fgb_3857, "GPKG"),
      duck(f"COPY (SELECT * EXCLUDE(OGC_FID) FROM ST_Read('{in_fgb_3857}')) TO '{p('d_fgb3857.gpkg')}' "
           f"WITH (FORMAT GDAL, DRIVER 'GPKG', SRS 'EPSG:3857');")),
@@ -254,23 +402,71 @@ cases = [
 if not os.path.exists(BIN):
     sys.exit(f"geosetta binary not found at {BIN}; run `cargo build --release` first "
              f"(or set BIN=...).")
+if os.path.getmtime(BIN) < newest_source_mtime():
+    print(f"warning: {BIN} is older than the source; run `cargo build --release`.",
+          file=sys.stderr)
+print(f"geosetta binary: {BIN}", file=sys.stderr)
 
 print(f"\n=== conversion benchmark: {N} features (source geojson {gj_mb:.1f} MB), "
       f"{WIDE_N} x {WIDE_COLS} cols for the wide cases, best-of-3 ms ===\n")
 label_w = max(len(label) for label, *_ in cases) + 2
-print(f"{'conversion':<{label_w}}{'geosetta':>12}{'ogr2ogr':>12}{'duckdb':>12}   {'vs ogr':>8} {'vs duck':>8}")
-print("-" * (label_w + 12 * 3 + 3 + 8 + 1 + 8))
+print(f"{'conversion':<{label_w}}{'geosetta':>12}{'ogr2ogr':>12}{'duckdb':>12}{'terrio':>12}"
+      f"   {'vs ogr':>8} {'vs duck':>8} {'vs terrio':>9}")
+print("-" * (label_w + 12 * 4 + 3 + 8 + 1 + 8 + 1 + 9))
+outs = {}
+mems = []
 for label, gc, oc, dc in cases:
-    gt, _ = run(gc)
-    ot, oe = run(oc)
-    dt, de = run(dc)
+    gt, _, gm = run(gc)
+    ot, oe, om = run(oc)
+    dt, de, dm = run(dc)
+    tc = terrio(gc[1], gc[2])
+    tt, te, tm = run(tc)
+    mems.append((label, gm, om, dm, tm))
     cell = lambda t: f"{t:>10.0f}ms" if t is not None else f"{'n/a':>12}"
     ratio = lambda base, other: f"{other / base:>7.1f}x" if base and other else f"{'-':>8}"
-    print(f"{label:<{label_w}}{cell(gt)}{cell(ot)}{cell(dt)}   {ratio(gt, ot)} {ratio(gt, dt)}")
-    for tool, err in (("ogr", oe), ("duck", de)):
+    print(f"{label:<{label_w}}{cell(gt)}{cell(ot)}{cell(dt)}{cell(tt)}   {ratio(gt, ot)} {ratio(gt, dt)} {ratio(gt, tt):>9}")
+    for tool, err in (("ogr", oe), ("duck", de), ("terrio", te)):
         if err:
             print(f"    ! {tool} failed: {err.strip()[:120]}")
+    outs[label] = (gc[1], {"geosetta": gc[2], "ogr2ogr": oc[3],
+                           "duckdb": re.search(r"TO '([^']+)'", dc[2]).group(1),
+                           "terrio": tc[3]})
 
 print("\n(ratio = competitor_time / geosetta_time; >1 means geosetta is faster)")
+
+print(f"\n=== peak memory (max RSS of the whole process, lowest of 3 runs, MB) ===\n")
+print(f"{'conversion':<{label_w}}{'geosetta':>12}{'ogr2ogr':>12}{'duckdb':>12}{'terrio':>12}"
+      f"   {'vs ogr':>8} {'vs duck':>8} {'vs terrio':>9}")
+print("-" * (label_w + 12 * 4 + 3 + 8 + 1 + 8 + 1 + 9))
+for label, gm, om, dm, tm in mems:
+    cell = lambda m: f"{m:>10.1f}MB" if m is not None else f"{'n/a':>12}"
+    ratio = lambda base, other: f"{other / base:>7.1f}x" if base and other else f"{'-':>8}"
+    print(f"{label:<{label_w}}{cell(gm)}{cell(om)}{cell(dm)}{cell(tm)}   {ratio(gm, om)} {ratio(gm, dm)} {ratio(gm, tm):>9}")
+print("\n(ratio = competitor_rss / geosetta_rss; >1 means geosetta uses less memory)")
+
+if VERIFY:
+    print("\n=== output check: count, geometry and every input property vs the input ===\n")
+    tools = ("geosetta", "ogr2ogr", "duckdb", "terrio")
+    print(f"{'conversion':<{label_w}}" + "".join(f"{t:>12}" for t in tools))
+    print("-" * (label_w + 12 * len(tools)))
+    failures = []
+    expected = {}
+    for label, (src, paths) in outs.items():
+        # a CSV input has no CRS or typed columns to read back reliably; the
+        # source geojson holds the same features
+        src = gj if src.endswith(".csv") else src
+        if src not in expected:
+            expected[src] = read_features(src)[0]
+        row = []
+        for tool in tools:
+            path = paths[tool]
+            got = read_features(path)[0] if os.path.exists(path) else None
+            why = verify(expected[src], got)
+            row.append("ok" if why is None else "FAIL")
+            if why:
+                failures.append(f"{label} / {tool}: {why}")
+        print(f"{label:<{label_w}}" + "".join(f"{c:>12}" for c in row))
+    for fl in failures:
+        print(f"    ! {fl}")
 import shutil
 shutil.rmtree(D, ignore_errors=True)

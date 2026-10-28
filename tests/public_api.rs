@@ -53,7 +53,7 @@ fn built_by_hand() -> FeatureCollection {
 fn a_caller_can_build_a_collection_and_its_declarations_reach_the_file() {
     let fc = built_by_hand();
     let bytes = geosetta::write_features(Format::FlatGeobuf, &fc).unwrap();
-    let back = geosetta::read_features(Format::FlatGeobuf, &bytes).unwrap();
+    let back = geosetta::read_features(Format::FlatGeobuf, &bytes, &mut Vec::new()).unwrap();
 
     let decl = |name: &str| back.schema.iter().find(|d| d.name == name).unwrap().clone();
     assert_eq!(decl("count").ty, Some(DeclType::Int16), "a caller-set type was lost");
@@ -74,7 +74,7 @@ fn a_caller_can_build_a_collection_and_its_declarations_reach_the_file() {
 #[test]
 fn a_caller_can_widen_a_declaration_between_a_read_and_a_write() {
     let bytes = geosetta::write_features(Format::FlatGeobuf, &built_by_hand()).unwrap();
-    let mut fc = geosetta::read_features(Format::FlatGeobuf, &bytes).unwrap();
+    let mut fc = geosetta::read_features(Format::FlatGeobuf, &bytes, &mut Vec::new()).unwrap();
 
     // The middle stage: a value arrives that the declared Int16 cannot hold,
     // so the caller widens the declaration to match.
@@ -92,7 +92,7 @@ fn a_caller_can_widen_a_declaration_between_a_read_and_a_write() {
     }
 
     let out = geosetta::write_features(Format::FlatGeobuf, &fc).unwrap();
-    let back = geosetta::read_features(Format::FlatGeobuf, &out).unwrap();
+    let back = geosetta::read_features(Format::FlatGeobuf, &out, &mut Vec::new()).unwrap();
     let count = back.schema.iter().find(|d| d.name == "count").unwrap();
     assert_eq!(count.ty, Some(DeclType::Int32), "the widened declaration did not survive");
     let value = back.features[0].properties.iter().find(|(k, _)| &**k == "count").unwrap().1.clone();

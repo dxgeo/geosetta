@@ -170,6 +170,16 @@ Ordered by what each one costs against what it fixes. E1 and E3 are
 *correctness*; everything after is capability.
 
 *** E1 -- warn when a declared codepage is approximated
+/***Built 2026-10-23.***/ =Encoding::Latin1Approximating= is the unrecognised
+codepage, kept apart from a declared ISO-8859-1 (which is exact and silent).
+The warning counts only values holding a non-ASCII byte, since ASCII is exact
+under every codepage: an unrecognised =.cpg= over all-ASCII text says nothing.
+Beside it, the same pass found a =.cpg= declaring UTF-8 over invalid bytes
+replacing them with U+FFFD silently; that warns too. /Not warned, and still
+open: with no =.cpg= at all, a field that is not valid UTF-8 is decoded as
+Latin-1 -- a guess, not a declared encoding approximated, so it is a
+different question from E1's./
+
 The smallest unit of work in this plan and the only one owed under an existing
 rule. =encoding_from_cpg= knows it is approximating; it must say so.
 
@@ -224,6 +234,15 @@ UTF-16 input, which needs no table.
 lookup from opposite directions./
 
 *** E5 -- honour KML's own XML declaration
+/***Partly built 2026-10-23, with =kml-standard.org= K1.*** =xml::decode=
+takes bytes and decides by Appendix F: a BOM, then UTF-16's first-bytes
+pattern, then the declaration's =encoding=. It decodes UTF-8, UTF-16 (both
+byte orders, BOM or not), US-ASCII and ISO-8859-1 exactly. Any other declared
+encoding is accepted over all-ASCII bytes and refused otherwise, naming the
+encoding -- so a declared Windows-1252 file with curly quotes is refused rather
+than guessed at. What remains is E2's tables, which turn those refusals into
+reads./
+
 Requires =xml.rs= to take bytes rather than =&str=, sniff the prolog it
 currently discards, decode, and *then* parse -- a small restructuring of the
 layering described in § THE THREE THINGS item 3. Worth doing after E4 because

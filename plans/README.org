@@ -137,7 +137,8 @@ why, not to implement the spec's table from symmetry.
 - [[file:kml.org][kml.org]] :: Add KML/KMZ — a from-scratch XML reader/writer
   (=src/xml.rs=) and a minimal ZIP container codec (=src/zip.rs=, stored +
   the existing DEFLATE decoder for reads, stored-only for writes), with CRS
-  always =Crs::Wgs84= (KML has no other CRS concept). *DONE* (=.kml= and
+  =Crs::Wgs84= -- or EPSG:9707 since =kml-standard.org= D-K12, when every
+  height is =absolute=. *DONE* (=.kml= and
   =.kmz=, read + write, both directions, wired into the hub via
   =Format::Kml=/=Format::Kmz=) — oracle-validated against real GDAL
   (=ogrinfo=, =ogr2ogr -f LIBKML=) and DuckDB, including a real multi-layer

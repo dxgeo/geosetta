@@ -191,7 +191,7 @@ pub struct Column {
     pub values: Vec<Cell>,
     /// What the *source* declared this column to be, when it declared
     /// anything — see [`FieldDecl`]. `None` when nothing was declared, which
-    /// is every format that has no schema of its own (GeoJSON, CSV, WKT, KML)
+    /// is every format that has no schema of its own (GeoJSON, CSV, WKT)
     /// and every collection built in memory.
     ///
     /// A writer treats this as a *floor*, never a ceiling: it may widen a

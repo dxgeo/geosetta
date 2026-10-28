@@ -295,6 +295,11 @@ writing whatever can be written rather than warning about it, and it is why
   /2026-10-22: **decided, as neither option alone** -- the spoke is rescoped to
   the KML standard, with a typed 2.3 model in the native.
   =same-format-fidelity.org= D18; [[file:plans/kml-standard.org][plans/kml-standard.org]]./
+  /2026-10-24: **K1--K4 are built**, so the same-version run carries the
+  whole document and the IR projects overlays, time, =<Schema>= types and
+  altitude modes. KML's native is no longer unbuilt; what is left of the spoke
+  is K5, writing a version other than the source's from the model rather than
+  from the IR./
 - *M3c*, the KMZ container. =hand_hostile.kmz= already exists and carries the
   dangling =files/overlay.png= reference.
 - *=gpkg_crs_wkt_1_1=*, the last of defect 3 -- a capability, not a carry.

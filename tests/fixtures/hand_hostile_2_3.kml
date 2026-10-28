@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- KML 2.3's hostile fixture (plans/kml-standard.org K5): valid 2.3, and
+     everything 2.3 adopted from gx: in its 2.3 spelling, with children in
+     orders 2.3 admits and 2.2 does not. Lowered to 2.2 it must validate
+     against ogckml22.xsd with kml22gx.xsd, losing nothing. -->
+<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:atom="http://www.w3.org/2005/Atom" version="2.3">
+ <Document>
+  <Schema name="track" id="trackSchema">
+   <SimpleArrayField name="heartrate" type="int"><displayName>Heart rate</displayName></SimpleArrayField>
+   <SimpleField name="rider" type="string"/>
+  </Schema>
+  <name>hostile 2.3 document</name>
+  <Style id="cityStyle"><IconStyle><color>ff0000ff</color></IconStyle></Style>
+  <Folder>
+   <name>nested folder</name>
+   <Placemark id="kbh">
+    <description>with a style reference</description>
+    <name>København</name>
+    <atom:author><atom:name>someone</atom:name></atom:author>
+    <styleUrl>#cityStyle</styleUrl>
+    <visibility>1</visibility>
+    <balloonVisibility>0</balloonVisibility>
+    <TimeStamp><when>2019-05-01T00:00:00Z</when></TimeStamp>
+    <!-- the view comes after the feature's time here, and before it in 2.2 -->
+    <LookAt>
+     <TimeStamp><when>2019-05-01T12:00:00Z</when></TimeStamp>
+     <horizFov>60</horizFov>
+     <longitude>12.5683</longitude><latitude>55.6761</latitude><range>1000</range>
+    </LookAt>
+    <ExtendedData>
+     <Data name="zip"><value>007</value></Data>
+     <Data name="price"><value>1.50</value></Data>
+    </ExtendedData>
+    <Point><coordinates>12.5683,55.6761,-20</coordinates><seaFloorAltitudeMode>relativeToSeaFloor</seaFloorAltitudeMode></Point>
+   </Placemark>
+  </Folder>
+  <Placemark>
+   <name>ride</name>
+   <Track>
+    <altitudeMode>absolute</altitudeMode>
+    <when>2026-10-22T10:00:00Z</when><coord>8.54 47.37 410</coord><angles>45 0 0</angles>
+    <when>2026-10-22T10:00:05Z</when><coord>8.55 47.38 412</coord><angles>46 0 0</angles>
+    <ExtendedData>
+     <SchemaData schemaUrl="#trackSchema">
+      <SimpleData name="rider">anna</SimpleData>
+      <SimpleArrayData name="heartrate"><value>120</value><value>124</value></SimpleArrayData>
+     </SchemaData>
+    </ExtendedData>
+   </Track>
+  </Placemark>
+  <Placemark>
+   <name>two rides</name>
+   <MultiTrack>
+    <interpolate>1</interpolate>
+    <altitudeMode>clampToGround</altitudeMode>
+    <Track><when>2026-10-23T09:00:00Z</when><coord>8.5 47.3 0</coord></Track>
+    <Track><when>2026-10-23T09:30:00Z</when><coord>8.6 47.4 0</coord></Track>
+   </MultiTrack>
+  </Placemark>
+  <Placemark>
+   <name>raised path</name>
+   <LineString>
+    <altitudeOffset>5</altitudeOffset>
+    <coordinates>8.5,47.3,400 8.6,47.4,420</coordinates>
+    <tessellate>1</tessellate>
+   </LineString>
+  </Placemark>
+  <GroundOverlay>
+   <Icon><href>files/overlay.png</href></Icon>
+   <name>a quad</name>
+   <LatLonQuad><coordinates>12,55 13,55 13.2,56 12.1,56</coordinates></LatLonQuad>
+  </GroundOverlay>
+  <Tour>
+   <name>fly over</name>
+   <Playlist>
+    <FlyTo>
+     <flyToMode>smooth</flyToMode>
+     <duration>4</duration>
+     <Camera><longitude>8.54</longitude><latitude>47.37</latitude><altitude>800</altitude><horizFov>50</horizFov></Camera>
+    </FlyTo>
+    <AnimatedUpdate>
+     <delayedStart>1</delayedStart>
+     <duration>2</duration>
+     <Update><targetHref/><Change><Placemark targetId="kbh"><visibility>0</visibility></Placemark></Change></Update>
+    </AnimatedUpdate>
+    <SoundCue><delayedStart>0.5</delayedStart><href>files/ding.mp3</href></SoundCue>
+    <Wait><duration>1</duration></Wait>
+    <TourControl><playMode>pause</playMode></TourControl>
+   </Playlist>
+  </Tour>
+ </Document>
+</kml>

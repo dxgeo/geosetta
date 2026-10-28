@@ -44,6 +44,12 @@ fixture came out as a database =sqlite3= refuses to open (=handoff.org= entry
 *M3 in progress:* the *FlatGeobuf*, *GeoParquet* and *GeoPackage* spokes are
 done. Still to do: CSV, WKT, KML, and Shapefile's remaining *natives*, then
 M3c and the *rest* of M3b. Four readers still pass =native: None=.
+/2026-10-23: **KML's native is built** for the same-version run
+(=kml-standard.org= K4) -- the document model, split between the collection
+and each feature -- so three readers pass =native: None= now, CSV among them
+by design. The KML spoke's remaining work is K5's version transforms: K4's
+projections -- overlays, time, =Schema=, altitude modes -- are built as of
+2026-10-24./
 ***The exhaustive-match fixture registry (M5/D6) is built as of 2026-10-21***
 -- see D6 → BUILT.
 
@@ -1488,8 +1494,8 @@ M3's KML spoke had been gated on a mechanism question -- raw names in
 is now *fidelity to the KML standard*. OGC KML 2.3 is the model, both OGC
 versions (2.2 and 2.3) are read and detected, and output is written in the
 version the user asks for (=--kml-version=), defaulting to the source's own
-version on a =kml -> kml= run and to 2.3 from any other format. Google's
-pre-OGC 2.0 and 2.1 are refused.
+version on a =kml -> kml= run and to 2.2 from any other format /(2.3 until
+2026-10-23)/. Google's pre-OGC 2.0 and 2.1 are refused.
 
 What that settles here:
 - *The invariant needs no KML clause.* The default is same-version, so
@@ -1500,10 +1506,18 @@ What that settles here:
   bytes carry only content outside every KML namespace. D1 holds: the model is
   the spoke's payload, opaque to the hub.
 - *D5 applies to the version too*: a pipe or a cross-format transit loses it,
-  and the run comes back as 2.3.
+  and the run comes back as 2.2.
 - *D6's registry grows a second axis*: one hostile fixture per KML version.
 - *D1's column-schema exception gains a fifth spoke*: =<Schema>='s typed
   =SimpleField=s are declarations.
+
+/2026-10-23:/ *the default from another format is 2.2, not 2.3.* No KML reader
+measured reads 2.3's own spellings of the elements it adopted from =gx:= --
+Google Earth Web, GDAL LIBKML and CesiumJS all drop a =kml:Track='s geometry,
+silently -- while all three read the =gx:= spelling. So the default writes what
+the readers read, and =--kml-version 2.3= writes the standard as written (D-K10
+unchanged), with no warning about readers: whoever asks for 2.3 has chosen it.
+See =kml-standard.org= open question 9.
 
 ** SEQUENCING -- this inverts part of =same-format-output.org=
 That plan currently scopes closing the fidelity gap *out*, and ships a warning

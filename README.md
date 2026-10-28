@@ -97,9 +97,13 @@ validated against DuckDB / GDAL.
     `altitudeMode` `absolute` reads as EPSG:9707 (WGS 84 + EGM96 height), the one
     vertical datum KML states. `.kmz` reading flattens **every**
     internal `*.kml` entry rather than just the first, since a real multi-layer
-    producer's root `doc.kml` can be nothing but a `<NetworkLink>`; writing packs
-    one stored (uncompressed) entry — no DEFLATE encoder in the crate yet, so
-    `.kmz` output is bigger than a compressed one but universally readable.
+    producer's root `doc.kml` can be nothing but a `<NetworkLink>`. A `.kmz`
+    written back is the archive it was read from: every entry in its place with
+    its modification time — overlay images, icons, model files — and each
+    `.kml` document, a layered archive's as much as a single one's, written
+    from its own model. From anything else it is one `doc.kml` entry. Entries
+    are stored (uncompressed) — no DEFLATE encoder in the crate yet, so `.kmz`
+    output is bigger than a compressed one but universally readable.
     Validated against real GDAL (`ogrinfo`, `ogr2ogr -f LIBKML`), DuckDB
     fixtures, and a real Info-ZIP archive for the deflate read path.
     Both OGC versions are read and detected — KML 2.2 and 2.3, including Google's
@@ -426,10 +430,12 @@ round-trips with nothing to report; GeoJSON drops both `bbox` members and
 reformats numbers, CSV re-renders its geometry column's coordinates,
 GeoParquet drops the covering-bbox column, and KML loses only what its XML
 layer normalises — CDATA comes back as escaped text, a UTF-16 document as UTF-8,
-a DOCTYPE is dropped — since a KML → KML run in the source's own version gives
-back the document it read: styles, folders, overlays, models and tracks' times,
-with any edit to the features applied — an overlay moved keeps its box and its
-turn. Those are measured, not
+a DOCTYPE is dropped, and whitespace between elements is moved — since a KML →
+KML run, in either version, gives back the document it read: styles, folders,
+overlays, models and tracks' times, with any edit to the features applied — an
+overlay moved keeps its box and its turn. KMZ adds only what its zip writer does
+not reproduce: each entry's compression, extra fields and attributes, and the
+archive comment. Those are measured, not
 predicted, and each is a gap being closed rather than a design position.
 
 In-process, none of this applies: a Rust consumer holding a `FeatureCollection`

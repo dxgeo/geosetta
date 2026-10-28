@@ -1,7 +1,11 @@
-//! KML/KMZ format spoke — see `plans/kml.org` for the design writeup.
+//! KML/KMZ format spoke — see `plans/kml.org` for the design writeup, and
+//! `plans/kml-standard.org`, which rescopes it to the OGC standard.
 //!
-//! `.kml` (plain XML) read/write routes through [`crate::xml`]; `.kmz` wraps
-//! the same `.kml` bytes in a [`crate::zip`] container.
+//! `.kml` (plain XML) read/write routes through [`crate::xml`] and the KML
+//! document model. A `.kmz` is a [`crate::zip`] archive of one or more `.kml`
+//! documents and the files they reference; one written back keeps its
+//! archive — every entry, each document from its own model
+//! (`plans/same-format-fidelity.org` M3c).
 
 use crate::error::{Error, Result};
 use crate::feature::FeatureCollection;

@@ -912,7 +912,8 @@ expressible; the mapping must key on (namespace, local name, parent).
     or a track's per-vertex data when the write cannot give the model back --
     another format, a version change, a layered =.kmz= -- and a track an edit
     gave another vertex count. A *version change* is built from the IR alone
-    until K5, and says so.
+    until K5, and says so. /K5 built 2026-10-28: a version change now lowers
+    or raises the document./
   - *Cost, on a 35 MB, 200,000-Placemark file*: a read takes 546 MB and 0.30 s
     (534 MB and 0.27 s before); =kml -> fgb= 560 MB, less than before, since
     =main.rs= releases natives the target's writer will not read; =kml -> kml=

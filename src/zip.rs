@@ -15,8 +15,8 @@
 //! against the central directory's recorded value.
 //!
 //! Write: stored-only. There is no DEFLATE *encoder* in the crate (`gzip.rs`
-//! is decoder-only) — a deliberate, deferred trade-off, not an oversight; see
-//! `plans/kml.org`'s open questions.
+//! is decoder-only) — a deliberate, deferred trade-off, not an oversight;
+//! `plans/compression-encoders.org` plans the encoder, `.kmz` its consumer.
 
 use crate::compress::gzip;
 use crate::error::{Error, Result};

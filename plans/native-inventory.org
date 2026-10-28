@@ -48,7 +48,8 @@ $ geosetta src.geojson made.kmz && unzip -l made.kmz
 #+end_src
 
 So a source =.kmz= carrying =files/icon.png= loses it, and the surviving
-=doc.kml= keeps its now-dangling reference. Under container scope this is the
+=doc.kml= keeps its now-dangling reference. /Carried since 2026-10-28
+(=same-format-fidelity.org= M3c): a =.kmz= written back keeps every entry./ Under container scope this is the
 same obligation as =gpkg='s, at a fraction of the cost -- a zip's other entries
 are already bytes, and =src/zip.rs= already reads the archive. *It should get
 its own milestone beside M3b rather than being absorbed into the KML spoke*,

@@ -151,7 +151,9 @@ why, not to implement the spec's table from symmetry.
   in the version asked for (=--kml-version=), defaulting to the source's own.
   It is =same-format-fidelity.org='s M3 KML spoke (D18) and supersedes parts of
   =kml.org=. Depends on =lossy-conversion-warnings.org= § 2b and
-  =encodings.org=. *Scoping only.*
+  =encodings.org=. *DONE 2026-10-28*: K1--K5 built, every question decided
+  (D-K1 to D-K16), and every kind of write validated against its version's
+  schema by =tests/kml_schemas.rs=.
 - [[file:projjson-to-wkt.org][projjson-to-wkt.org]] :: The reverse of
   =crs.org= milestone C — translate a PROJJSON CRS with no authority code
   into WKT1, so a GeoParquet source can still express its CRS when converted
@@ -330,6 +332,9 @@ why, not to implement the spec's table from symmetry.
   *recast matrix* -- every declared type through every declaring format,
   checked for types *and values*, against GDAL as a second opinion. Remaining:
   M3's four spokes, both containers (M3b/M3c), defect 3's fix, D6's registry.
+  /2026-10-28: M3's KML spoke is done (=kml-standard.org=), and so is M3c, the
+  KMZ container -- its entries and a layered archive's every document -- but
+  for what the zip writer does not reproduce./
 - [[file:native-inventory.org][native-inventory.org]] :: *Reference, not a
   plan.* What each of the nine readers discards -- and, since 2026-08-21, what
   the *IR itself* discarded -- classified per
@@ -348,7 +353,7 @@ why, not to implement the spec's table from symmetry.
   FlatGeobuf's =Column= table drops *nine* fields of per-column schema, and
   *KMZ is a second container spoke* -- a =.kmz= is a zip and geosetta writes
   =doc.kml= alone, so icons and overlays are dropped and the surviving KML
-  keeps its dangling references. GeoParquet, measured against a real =ogr2ogr=
+  keeps its dangling references (/carried since 2026-10-28, M3c/). GeoParquet, measured against a real =ogr2ogr=
   file, dropped two of three =key_value_metadata= keys (=ARROW:schema=,
   =gdal:metadata=), =orientation=, and the whole =covering= bbox index with its
   five schema entries — *the first three are carried as of 2026-08-20*; the

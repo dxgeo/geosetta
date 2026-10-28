@@ -264,7 +264,7 @@ fn pipes_through_proj_cs2cs() {
 /// `write_features`. Runs by default (no external tool/PATH dependency).
 #[test]
 fn composes_with_wbprojection_library() {
-    let fc = geosetta::read_features(geosetta::Format::GeoJson, FIXTURE_GEOJSON.as_bytes()).unwrap();
+    let fc = geosetta::read_features(geosetta::Format::GeoJson, FIXTURE_GEOJSON.as_bytes(), &mut Vec::new()).unwrap();
     let mut fc = fc;
 
     let wgs84 = wbprojection::Crs::from_epsg(4326).expect("wbprojection knows EPSG:4326");

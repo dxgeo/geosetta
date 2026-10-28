@@ -82,11 +82,23 @@ why, not to implement the spec's table from symmetry.
   reader-internal column fusion; bulk-copy string writing instead of
   char-by-char; =Rc<str>= property-key sharing/interning to cut per-row key
   allocation; a Parquet all-present level-decoding fast path and WKB =Vec=
-  pre-sizing to avoid reallocs. *Remaining:* a hand-rolled float formatter
+  pre-sizing to avoid reallocs. *Memory* (2026-10-28, measured by peak RSS in
+  =compare.py= and a phase-splitting allocator probe): =Feature::native= boxed
+  and GeoJSON properties sized exactly (Mem1--2), property columns borrowing
+  the features' cells (Mem3, which also removed a quadratic FlatGeobuf write),
+  Parquet decoded a column at a time (Mem4), and KML written straight into its
+  text with no element tree (Mem5: 600 → 85 MB on 100 000 points). What is
+  left is KML's read, and KML carried back to KML. *Remaining:* a hand-rolled float formatter
   (dtoa/Ryū) is parked — correctness-risk and effort not worth it yet against
   =std='s formatter; the compression codecs are untuned but unlikely to be the
   bottleneck; full streaming (vs. whole-file-in-RAM) is tracked separately in
   [[file:streaming-progress.org][streaming-progress.org]].
+- [[file:columnar.org][columnar.org]] :: The hub as a table rather than rows:
+  typed column buffers with validity and presence bitmaps, a row's own key
+  order recorded only where it deviates, and a =Number= column that keeps =1=
+  and =1.0= apart, so every same-format guarantee holds. Every format fits;
+  GeoJSON and KML need the exceptions. Milestones C0--C6, from an in-repo
+  equivalence harness to geometry buffers. /Scoping only./
 - [[file:crs.org][crs.org]] :: CRS pass-through across all formats — warnings when
   a CRS-degrading target (GeoJSON/CSV/WKT) can't express the source CRS (those
   formats stay as-is), making authority+code universal among the rich formats,
@@ -137,7 +149,8 @@ why, not to implement the spec's table from symmetry.
 - [[file:kml.org][kml.org]] :: Add KML/KMZ — a from-scratch XML reader/writer
   (=src/xml.rs=) and a minimal ZIP container codec (=src/zip.rs=, stored +
   the existing DEFLATE decoder for reads, stored-only for writes), with CRS
-  always =Crs::Wgs84= (KML has no other CRS concept). *DONE* (=.kml= and
+  =Crs::Wgs84= -- or EPSG:9707 since =kml-standard.org= D-K12, when every
+  height is =absolute=. *DONE* (=.kml= and
   =.kmz=, read + write, both directions, wired into the hub via
   =Format::Kml=/=Format::Kmz=) — oracle-validated against real GDAL
   (=ogrinfo=, =ogr2ogr -f LIBKML=) and DuckDB, including a real multi-layer
@@ -150,7 +163,18 @@ why, not to implement the spec's table from symmetry.
   in the version asked for (=--kml-version=), defaulting to the source's own.
   It is =same-format-fidelity.org='s M3 KML spoke (D18) and supersedes parts of
   =kml.org=. Depends on =lossy-conversion-warnings.org= § 2b and
-  =encodings.org=. *Scoping only.*
+  =encodings.org=. *DONE 2026-10-28*: K1--K5 built, every question decided
+  (D-K1 to D-K16), and every kind of write validated against its version's
+  schema by =tests/kml_schemas.rs=.
+- [[file:kml-layout.org][kml-layout.org]] :: How a KML document is laid
+  out on write, balancing the source's layout against well-formatted output:
+  the source's whitespace and DOCTYPE are kept where geosetta did not touch
+  them; what geosetta writes follows the document's inferred style, or a
+  two-space house style for a new document; lexical form (quotes, references,
+  CDATA, which is always written escaped) is normalised and is not a loss.
+  =--compact= (D-L8) writes GeoJSON and KML on one line; both are indented
+  by default. Answers =todo.org='s "KML's XML-layer losses" but the
+  encoding, which is =encodings.org= E6. *Built 2026-10-28*: L1--L4.
 - [[file:projjson-to-wkt.org][projjson-to-wkt.org]] :: The reverse of
   =crs.org= milestone C — translate a PROJJSON CRS with no authority code
   into WKT1, so a GeoParquet source can still express its CRS when converted
@@ -329,6 +353,9 @@ why, not to implement the spec's table from symmetry.
   *recast matrix* -- every declared type through every declaring format,
   checked for types *and values*, against GDAL as a second opinion. Remaining:
   M3's four spokes, both containers (M3b/M3c), defect 3's fix, D6's registry.
+  /2026-10-28: M3's KML spoke is done (=kml-standard.org=), and so is M3c, the
+  KMZ container -- its entries and a layered archive's every document -- but
+  for what the zip writer does not reproduce./
 - [[file:native-inventory.org][native-inventory.org]] :: *Reference, not a
   plan.* What each of the nine readers discards -- and, since 2026-08-21, what
   the *IR itself* discarded -- classified per
@@ -347,7 +374,7 @@ why, not to implement the spec's table from symmetry.
   FlatGeobuf's =Column= table drops *nine* fields of per-column schema, and
   *KMZ is a second container spoke* -- a =.kmz= is a zip and geosetta writes
   =doc.kml= alone, so icons and overlays are dropped and the surviving KML
-  keeps its dangling references. GeoParquet, measured against a real =ogr2ogr=
+  keeps its dangling references (/carried since 2026-10-28, M3c/). GeoParquet, measured against a real =ogr2ogr=
   file, dropped two of three =key_value_metadata= keys (=ARROW:schema=,
   =gdal:metadata=), =orientation=, and the whole =covering= bbox index with its
   five schema entries — *the first three are carried as of 2026-08-20*; the
@@ -448,24 +475,24 @@ why, not to implement the spec's table from symmetry.
   =shapefile::writer::write=. The =Gpkg= arm's "not supported yet" wording,
   which invited exactly that misreading, is *fixed in 0.26.1*.
   See [[file:../../wasm-plan.org][wasm-plan.org]].
-- *Text encodings* (cross-spoke) :: Every spoke that reads or writes text, and
-  the picture is uneven in a way no single flag fixes: *four spokes refuse
-  non-UTF-8 input outright* (GeoJSON, CSV, WKT, KML -- with no remedy to offer,
-  which is what makes the refusal awkward rather than wrong), *one guesses*
-  (Shapefile's =.dbf= maps any unrecognised =.cpg= to Latin-1 **silently**, and
-  =CP1252= -- the common case -- differs from Latin-1 in exactly the bytes real
-  data uses), and *one throws away the declaration it needs* (=xml.rs= skips
-  KML's =<?xml encoding=…?>= prolog unread, then refuses the file for being
-  what it said it was). The write side is settled and UTF-8 everywhere,
-  declared in a =.cpg= since 2026-10-21.
+- *Text encodings* (cross-spoke) :: Every encoding in a closed, named set --
+  the whole WHATWG Encoding Standard (UTF-8/16, 28 single-byte, 7 multi-byte
+  including gb18030, Big5, Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR), the DOS
+  OEM codepages dBase and zip names use, true ISO-8859-1 and UTF-32 -- decoded
+  *and* encoded exactly, from tables generated out of the published mappings
+  committed as oracles. /Rescoped 2026-10-28/ from "single-byte, refuse
+  multi-byte": the old refusal was a warning standing in for a parser. Today
+  four spokes refuse non-UTF-8 input with no remedy, a =.dbf= approximates an
+  unrecognised =.cpg= as Latin-1 (warned since E1), and a non-UTF-8 zip entry
+  name is refused on read (E8's write side, declaring a non-ASCII name UTF-8,
+  is built).
 
-  Two measurements shape it. =ogr2ogr='s default output declares LDID =0x57=
+  One measurement shapes it: =ogr2ogr='s default output declares LDID =0x57=
   (Windows-1252) while writing UTF-8 bytes, so **honouring the in-band
-  declaration would mis-decode the reference tool's own files** -- the existing
-  UTF-8-probe is better than the declaration. And the dependency-free
-  constraint puts a sharp boundary between single-byte codepages (a 128-entry
-  table each, cheap, reversible for the write side) and multi-byte ones
-  (thousands of entries -- where the answer is *refusal*, not approximation).
-  Correctness first (E1 warn, E3 refuse), capability after (E2 tables, E4
-  =--encoding=). *Scoping only.*
+  declaration would mis-decode the reference tool's own files** (D-E2). A
+  same-format run writes the source's encoding back (D-E7), which is the
+  non-UTF-8 item of KML's XML-layer losses. E1 built; E5 partly; E8's write
+  side built. Next: E2
+  (shared module, single-byte tables), E3 (multi-byte), E4
+  (=--from-encoding=), E6 (writing).
   See [[file:encodings.org][encodings.org]].

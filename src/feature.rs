@@ -25,7 +25,11 @@ pub struct Feature {
     /// the format that produced it, so only that format's writer replays it.
     /// `None` whenever the reader modelled everything, which is the common
     /// case. See [`crate::native`].
-    pub native: Option<Native>,
+    ///
+    /// Boxed because it is so rarely present: inline, the `Option` made every
+    /// feature 168 bytes larger than one carrying a pointer
+    /// (`plans/performance.org`, *Memory*).
+    pub native: Option<Box<Native>>,
 }
 
 /// A collection of features.
@@ -51,7 +55,7 @@ pub struct FeatureCollection {
     /// What the source declared about its property columns — widths,
     /// precisions, `NOT NULL`, and so on — for the columns it declared
     /// anything about. Empty when the source has no schema of its own
-    /// (GeoJSON, CSV, WKT, KML) or declared nothing.
+    /// (GeoJSON, CSV, WKT) or declared nothing.
     ///
     /// Modelled here for the same reason as [`Self::name`], and see
     /// [`crate::schema::FieldDecl`] for the argument in full: four spokes give
@@ -125,11 +129,37 @@ impl FeatureCollection {
     /// file that holds today's rows and cannot hold tomorrow's.
     ///
     /// Silent whenever [`Self::schema`] is empty, which is every source that
-    /// declares nothing (GeoJSON, CSV, WKT, KML) and so the overwhelmingly
-    /// common case — the rule against warning noise in
-    /// `plans/lossy-conversion-warnings.org` § THE RULE.
+    /// declares nothing (GeoJSON, CSV, WKT, a KML with no `<Schema>` and no
+    /// times) and so the overwhelmingly common case — the rule against warning
+    /// noise in `plans/lossy-conversion-warnings.org` § THE RULE.
+    ///
+    /// A target that declares a column's type and nothing else — KML — keeps
+    /// the types, so it warns only about the declarations that say more: a
+    /// width, a precision or scale, or a constraint.
     pub fn schema_drop_warning(&self, target: Format) -> Option<String> {
-        if self.schema.is_empty() || target.carries_column_schema() {
+        if self.schema.is_empty() {
+            return None;
+        }
+        if target.declares_type_only() {
+            let mut names: Vec<&str> = self
+                .schema
+                .iter()
+                .filter(|d| !FieldDecl { ty: None, ..(*d).clone() }.is_empty())
+                .map(|d| d.name.as_str())
+                .collect();
+            if names.is_empty() {
+                return None;
+            }
+            names.sort_unstable();
+            return Some(format!(
+                "source declares a field width/precision/constraints for {}; {} declares a column's type \
+                 only, so the rest is not carried — a field sized to hold more than it currently holds comes \
+                 back narrower.",
+                names.join(", "),
+                target.display_name()
+            ));
+        }
+        if target.carries_column_schema() {
             return None;
         }
         let mut names: Vec<&str> = self.schema.iter().map(|d| d.name.as_str()).collect();
@@ -171,7 +201,7 @@ impl FeatureCollection {
         let mut recast: Vec<String> = Vec::new();
         for decl in &self.schema {
             let Some(ty) = decl.ty else { continue };
-            let Some(landed) = target.recast(ty) else { continue };
+            let Some(landed) = target.recast_column(&decl.name, ty) else { continue };
             if !landed.admits(ty) {
                 recast.push(format!("{} ({ty:?} → {landed:?})", decl.name));
             }

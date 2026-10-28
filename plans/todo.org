@@ -3,9 +3,8 @@
 #+DATE: {{{time(%Y-%m-%d)}}}
 
 * Current Working Items
-/Picking up the fidelity work? Read [[file:../handoff.org][handoff.org]] first
--- it carries the sequencing, the nine settled decisions, and the live bugs
-found but not fixed./
+/A citation of =handoff.org= by entry or section means one of the two
+revisions [[file:../handoff.org][handoff.org]] names./
 
 Live list of what's open right now — not the full historical plan index (see
 [[file:README.org][README.org]] for that, ordered by dependency, everything
@@ -133,56 +132,135 @@ check it off and remove it once the item ships or is shelved.
   at all.
 
 - [ ] [[file:encodings.org][encodings.org]] — text encodings across every
-  spoke, not just Shapefile. *Scoping only*, written 2026-10-21 out of
-  =native-inventory.org= § QUESTIONS item 3. Two of its milestones are
-  *correctness* rather than capability and should go first: E1 warns when an
-  unrecognised =.cpg= is approximated as Latin-1 (silent today, and wrong in
-  exactly the =0x80=--=0x9F= bytes that distinguish =CP1252=), and E3 refuses a
-  multi-byte codepage instead of producing mojibake. E2's single-byte tables
-  and E4's =--encoding= for the four spokes that currently refuse non-UTF-8
-  input are the capability half. /Records why the =.dbf= language-driver byte
-  must **not** be trusted: =ogr2ogr= declares Windows-1252 by default while
-  writing UTF-8./
+  spoke, not just Shapefile. Written 2026-10-21 out of
+  =native-inventory.org= § QUESTIONS item 3; *rescoped 2026-10-28 to every
+  encoding* in a closed set (all of WHATWG's, the DOS OEM codepages, true
+  ISO-8859-1, UTF-32), decoded and encoded exactly -- multi-byte is now
+  decoded, not refused. E1 (warn on an approximated =.cpg=) is ***built
+  2026-10-23***; E5 (KML's own declaration) is partly built with
+  =kml-standard.org= K1. E8's zip-name write fix is ***built 2026-10-28***.
+  Order: E2 (shared =src/encoding.rs= and every single-byte table), E3 (multi-byte
+  decoders), E4 (=--from-encoding=, BOMs), E6 (same-format write-back, which
+  is the non-UTF-8 item of KML's XML-layer losses, then =--to-encoding=).
+  /Records why the =.dbf= language-driver byte must **not** be trusted:
+  =ogr2ogr= declares Windows-1252 by default while writing UTF-8./
 
-- [ ] [[file:kml-standard.org][kml-standard.org]] — M3's KML spoke, rescoped
+- [X] [[file:kml-standard.org][kml-standard.org]] — M3's KML spoke, rescoped
   2026-10-22 to *the standard*: OGC KML 2.3 as a typed model in the KML native,
   both OGC versions (2.2, 2.3) read and detected, and =--kml-version= choosing
-  the output, defaulting to the source's version on =kml -> kml= and to 2.3
+  the output, defaulting to the source's version on =kml -> kml= and to 2.2
   otherwise. Pre-OGC 2.0/2.1 are refused. Starts at K1 (a namespace-aware
   =xml.rs=). All eight open questions were decided on 2026-10-22 (D-K11 to
-  D-K15). One measurement is left: the plane in which a =GroundOverlay='s
-  =rotation= applies (D-K14).
+  D-K15).
 
-- [ ] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
-  both of this crate's warning mechanisms are write-side, and **two owed
-  warnings are blocked behind that**: =native-inventory.org= § QUESTIONS item
-  6 (an unrecognised KML geometry yields a geometry-less feature, silently —
-  ruled *warn and emit* on 2026-08-20 and unbuilt since) and =encodings.org=
-  E1 (an unrecognised =.cpg= approximated as Latin-1). Neither can use a
-  pre-write check: the source fact is destroyed at read, and a
-  =geometry: None= left by a =<Model>= is indistinguishable in the IR from a
-  Placemark that legitimately has none. *Scoped 2026-10-22*: a
-  =&mut Vec<String>= sink on =read_features=, counted per cause so a GPS
-  export's thousands of =gx:Track= Placemarks say one line rather than
-  thousands.
+  /2026-10-23:/ measured in Google Earth Web, GDAL LIBKML and CesiumJS. *A
+  =GroundOverlay= turns on the ground*, which closes D-K14. *No reader measured
+  reads 2.3's =kml:Track=*, while all three read =gx:Track=, so the default
+  output from another format is now **2.2** (D-K2) and an explicit
+  =--kml-version 2.3= writes the standard's spelling with no warning about
+  readers (open question 9, decided). K5 builds the 2.2 writer first. The
+  2.3 XSD 1.1 oracle runs under Python's =xmlschema= -- no JVM. See
+  =kml-standard.org= § MEASURED IN A RENDERER and § ORACLES.
 
-  /The KML half is **mostly not a warning at all**, which the GDAL
-  measurement settled: of the four geometry elements that drop silently
-  today, three are geometry the IR can hold -- a bare =<LinearRing>= and a
-  =<gx:Track>=/=<gx:MultiTrack>= are *parsed* (LIBKML reads them as
-  =LINEARRING= and =LINESTRING Z=; GDAL's built-in =KML= driver drops the
-  features outright), and only =<Model>= earns the warning. Ruled in
-  =kml.org= § GEOMETRY ELEMENT COVERAGE, under the preference stated at
-  =lossy-conversion-warnings.org= § THE COMPLEMENT. That section also
-  enumerates the positive geometry list the warning needs, since
-  =parse_geometry='s catch-all is how every *non*-geometry child is passed
-  over too./
+  /2026-10-23, later:/ ***K1 and K2 are built*** -- a namespace-aware
+  =xml.rs=, applied to the reader at once; version detection from the 2.3
+  schema's own assertions; Google's 2.0/2.1 refused; =--kml-version=; and the
+  output's version resolved as D-K2 says, every write schema-valid. ***K3 is
+  built too*** -- the document model, as an identified node tree over the
+  whole 2.3 vocabulary (D-K4a), generated from the schema and round-tripping
+  every fixture. ***K4's first step is built***: the reader parses into the
+  model, each Placemark's element travels as its feature's native, and a
+  =kml -> kml= run in the source's version gives the document back --
+  styles, folders, overlays, models, tracks' times -- with the IR's edits
+  applied. The schema oracle reads its =.xsd= files from a directory
+  you supply, not from the tree.
 
-  /Remaining loss once the parsers land: a =<gx:Track>='s per-vertex
-  =<when>= series, which belongs in the KML native channel
-  (=same-format-fidelity.org= M3) rather than the =m= ordinate, and owes
-  =Format::Kml= a loss entry of its own in the meantime./
+  /2026-10-24:/ ***K4 is built.*** Ground and photo overlays are features
+  (a footprint turned on the ground, a point, each with an =icon=); a
+  feature's time is =timestamp=/=begin=/=end=; =<Schema>= types
+  =<SimpleData>= and declares the columns, so KML now carries a column
+  schema; and the altitude members are properties, with an all-=absolute=
+  document read as EPSG:9707. Every write validates against both schemas.
+  What remains is K5, the version writers: lowering to 2.2, then 2.3.
 
+  /2026-10-28:/ ***K5's 2.2 writer is built.*** A 2.3 read written as 2.2 is
+  the same document lowered (=kml/lower.rs=): adopted elements back to =gx:=
+  by parent, children in =ogckml22.xsd='s sequence from a table generated
+  from the two schemas, and the five things 2.2 has no place for dropped and
+  reported. A 2.3 hostile fixture lowers to valid 2.2.
+
+  /2026-10-28, later:/ ***K5 is built.*** A 2.2 document written as 2.3 is
+  raised (=kml/raise.rs=), so every version change carries the document. The
+  schema oracle (=tests/kml_schemas.rs=) validates eighteen kinds of write,
+  nine per version. Open question 10 is decided (2026-10-28): Google Earth
+  turns a =LatLonBox= on the local plane the reader uses. Question 11 is
+  decided too (D-K16): the document model stays crate-private, the IR the one
+  edit surface. Every question in the plan is decided, and every milestone
+  built; *done*. KMZ's archive is =same-format-fidelity.org= M3c, separately,
+  and carried as of 2026-10-28: its entries, and a layered archive's every
+  document.
+
+- [ ] *KML's XML-layer losses* — [[file:kml-layout.org][kml-layout.org]].
+  =Format::Kml='s =same_format_losses= row, and =native-inventory.org=
+  § KML / KMZ: what a =kml -> kml= run still warns it loses, now that the
+  document itself is carried. *Only the encoding is left* (2026-10-28):
+  - [X] *Whitespace between elements* — L1 (positioned text runs) and L2
+    (edits in the document's style), built 2026-10-28.
+  - [X] *CDATA sections* — written escaped, every time (D-L1); normalisation,
+    not a loss, so it left the row with L1.
+  - [X] *A DOCTYPE* — carried verbatim, never interpreted (L4, built with L1).
+  - [ ] *A non-UTF-8 encoding* — [[file:encodings.org][encodings.org]] E6's
+    first half (D-E7), on E2/E3's encoders.
+  Built beside them: the house layout for new documents (L3), and
+  =--compact= (D-L8), with GeoJSON indented by default.
+- [X] *Write a =<Region>='s =<LatLonBox>= as the =<LatLonAltBox>= it equals* —
+  [[file:kml-standard.org][kml-standard.org]] K5. Lowering 2.3 to 2.2 drops a
+  =<LatLonBox>= or =<LatLonQuad>= in a =<Region>= (and a =<LatLonAltBox>= on a
+  ground overlay), with a warning, because 2.2 has no place for it. An
+  unturned =<LatLonBox>= in a =<Region>= is a =<LatLonAltBox>= with the same
+  edges and no altitudes, so it can be written as one instead of dropped —
+  fidelity over warning. A turned box or a quad has no 2.2 equivalent and
+  stays a reported drop.
+  /Built 2026-10-28/ (=lower::as_alt_box=): reported as a rename in warning
+  1, with a zero or empty =<rotation>= read as unturned. 2.3's own schema
+  forbids both boxes in a =<Region>=, so this rescues documents that are
+  not valid 2.3 rather than ones that are.
+- [X] *Carry the rest of a =.kmz= entry* —
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] M3c,
+  =Format::Kmz='s =same_format_losses= row. =zip.rs= carries each entry's name,
+  bytes and modification time; it reads past, and writes none of, each
+  entry's extra fields (Info-ZIP's extended timestamps and Unix ids, say) and
+  external attributes (Unix permissions), and the archive comment. All three
+  are bytes the central directory already holds. Compression is the other
+  item in that row, and is [[file:compression-encoders.org][compression-encoders.org]]'s.
+  /Built 2026-10-28./ Carried with them: the "made by" host, internal
+  attributes and entry comments, which the row never listed. Local and
+  central extras are kept apart (Info-ZIP's differ); zip64's is dropped as
+  an encoding. An archive created from another format declares Unix mode
+  0644 rather than MS-DOS. The zip64 guards went in first:
+  [[file:same-format-fidelity.org][same-format-fidelity.org]] M3c.
+
+- [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
+  *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a
+  =&mut Vec<String>= sink, counted per cause (=crate::tally::Tally=) so a GPS
+  export's thousands of tracks say one line. Both owed warnings are in: a KML
+  =<Model>= (warn and emit), and =encodings.org= E1's approximated =.cpg=. As
+  =kml.org= § GEOMETRY ELEMENT COVERAGE ruled, a bare =<LinearRing>= and
+  =gx:Track=/=gx:MultiTrack= are *parsed* rather than reported; what a track
+  still drops -- its per-vertex =<when>=, =<gx:angles>= and arrays -- warns
+  until K3 carries it. =geopackage::read_layers= takes no sink yet: no
+  GeoPackage read loss exists, and its library caller (the destination merge)
+  has no channel to pass one to.
+
+- [ ] [[file:performance.org::*KML's read, and KML carried back to KML][performance.org — KML's read, and KML carried back to KML]] —
+  what remains of geosetta's memory cost after Mem1--Mem5. Step 2: a reader
+  that keeps a feature's element only when the target is KML or KMZ, set by
+  the CLI as a read option (=kml -> geojson= peaks at 586 MB on 100 000
+  points; ~80 MB expected). Step 3, undecided: carry a KML feature back as a
+  byte span re-parsed at write time, or accept GeoJSON's weaker promise.
+- [ ] [[file:columnar.org][columnar.org]] — the hub as a table rather than
+  rows, keeping every same-format guarantee the row IR gives. Milestones
+  C0--C6. Scoping only.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

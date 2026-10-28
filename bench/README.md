@@ -22,8 +22,11 @@ Two complementary benchmarks:
   conversion never touches the WKT/PROJJSON CRS-translation path the way these
   do — and three wide-column cases (many typed properties per feature, narrow
   geometry) that isolate `schema::infer_columns`'s per-column cost, which the
-  narrow 4-property cases above barely touch. Needs `ogr2ogr` and `duckdb` on
-  `PATH`.
+  narrow 4-property cases above barely touch, and four KML/KMZ cases (read and
+  write each) on the points-only source. It reports peak RSS beside wall time,
+  and reads every output back through ogr2ogr to check it against the input.
+  Needs `ogr2ogr`, `duckdb`, `terrio` and `geoscribe` on `PATH`; a tool that is
+  missing, or has no command for a case, is reported as `n/a`.
 
   ```sh
   cargo build --release

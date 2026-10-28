@@ -1,0 +1,281 @@
+#+TITLE: Plan: A Columnar IR
+#+AUTHOR: Daniel Okuniewicz Jr.
+
+* A Columnar IR
+
+** STATUS -- scoping only
+Nothing here is built. Written 2026-10-28, after =performance.org='s
+/Memory/ section measured where the hub's bytes go and Mem1--Mem5 took the
+contained wins. What remains is the shape of the IR itself, and that is this
+plan.
+
+** WHY
+The hub stores a collection as rows: =FeatureCollection { features:
+Vec<Feature> }=, and each =Feature= owns =properties: Vec<(Rc<str>,
+JsonValue)>=. A cell is 48 bytes: a 16-byte key pointer and a 32-byte value,
+plus a heap allocation for every string. Measured (=performance.org=, the
+probe):
+| collection                          | IR held     | per row     |
+|-------------------------------------+-------------+-------------|
+| 100 000 mixed features, 4 props     | 33.2 MB     | 348 B       |
+| 50 000 points × 200 typed props     | 484.8 MB    | 10 168 B    |
+On the wide table geosetta peaks at 820--850 MB where duckdb peaks at
+130--230 MB (=compare.py=, 2026-10-28), and every contained fix has been
+taken. The row layout is the remaining cost, and it is paid twice more on
+the way through: a Parquet read transposes columns into rows, and every
+tabular write transposes them back (=schema::infer_columns=).
+
+Columnar storage holds a number in 8 bytes, a boolean in a bit, and a string
+as its own bytes plus an offset, with no allocation per cell. The wide
+fixture's columns are a quarter each integer, float, string (=v12345_67=)
+and boolean, so a row is about 50 × 8 + 50 × 8 + 50 × ~15 + 50 / 8 ≈ 1.6 KB:
+*~80 MB for the table that is 485 MB today.* The narrow collection's
+properties fall from ~200 bytes a row to ~25, leaving geometry as most of
+what is left.
+
+** THE GOAL
+The hub is a table. Every reader builds one, every writer reads one, and
+nothing in between turns it into rows -- with *every same-format guarantee
+the row IR gives today kept exactly*. The equivalence corpus (C0) is
+byte-identical before and after every milestone; this is a change of
+representation, not of behaviour.
+
+** WHAT A ROW IR GIVES THAT A TABLE MUST STILL GIVE
+Each of these is a guarantee some format relies on today. A table that
+loses one has changed behaviour, so each needs a home in the design:
+1. *Absent is not null.* GeoJSON's ={"a": null}= and a feature with no =a=
+   are different documents, and both come back as they went in.
+2. *Each feature's own key order.* A GeoJSON feature writes its properties
+   in the order it read them, whatever order its neighbours used.
+3. *Duplicate keys in one feature.* The JSON model keeps them as separate
+   members (=schema.rs='s =duplicate_key_in_one_row_keeps_the_first_value=);
+   GeoJSON writes both back.
+4. *A value's own type, per cell.* =1=, =1.0= and ="1"= in one column are
+   three values. =JsonValue::Int= is exact to 64 bits; =1= and =1.0= are
+   written differently.
+5. *Nested values.* Arrays and objects are values (=Mixed=-only today).
+6. *Per-feature natives.* GeoJSON's =id= and foreign members, a GeoPackage
+   feature's carried fid, a KML feature's element. Almost always absent.
+7. *Order is meaning.* =--sort-hilbert= reorders features; nothing else may.
+
+** DECISIONS (proposed)
+*** D-C1 -- the collection is a table; a row is a view
+#+begin_src rust
+pub struct FeatureCollection {
+    len: usize,
+    geometry: GeometryColumn,       // one Option<Geometry> per row (D-C6)
+    columns: Vec<Column>,           // first-seen order
+    shapes: RowShapes,              // D-C4: rows that deviate from column order
+    natives: RowNatives,            // D-C7: sparse, row -> Box<Native>
+    pub crs: Option<Crs>,           // unchanged
+    pub name: Option<String>,       // unchanged
+    pub schema: Vec<FieldDecl>,     // unchanged
+    pub native: Option<Native>,     // unchanged
+}
+#+end_src
+The four collection-level fields keep their meaning and stay public. The rest
+is reached through methods (D-C8), so the layout can keep changing without
+breaking callers again.
+
+*** D-C2 -- a column is a typed buffer, a validity bitmap, and a presence bitmap
+#+begin_src rust
+pub struct Column { name: Rc<str>, data: ColumnData, valid: Bitmap, present: Option<Bitmap> }
+enum ColumnData {
+    Bool(Bitmap),
+    Number { bits: Vec<u64>, is_int: Bitmap },  // D-C3
+    Str { offsets: Vec<u32>, bytes: Vec<u8> },  // u64 offsets past 4 GiB
+    Binary { offsets: Vec<u32>, bytes: Vec<u8> },
+    Mixed(Vec<JsonValue>),                      // the escape hatch, D-C3
+}
+#+end_src
+=valid= is null-ness; =present= is absence, and is =None= -- costing
+nothing -- for a column every row holds, which is every column a tabular
+source produces. Guarantee 1 is the two bitmaps being different.
+
+*** D-C3 -- a column's type is the narrowest that holds every value exactly
+Built as the reader appends, by the same lattice =schema::Infer= uses today,
+with one change: *integers and floats share a =Number= column*, each cell's
+eight bytes holding an =i64= or an =f64= and =is_int= saying which. That
+keeps guarantee 4 (=1= and =1.0= stay distinct, and an integer past 2^53
+stays exact) without falling back to =Mixed= on the most common mixture
+there is. Anything else that disagrees -- a string beside a number, any
+array or object -- makes the column =Mixed=, which costs what a row cell
+costs today, so the worst case is today's case, not worse.
+
+A column that starts narrow and meets a value it cannot hold is *promoted*
+once (=Bool= → =Mixed=, say), copying what it holds. A reader that knows its
+types up front (Parquet, FlatGeobuf, Shapefile, GeoPackage's declarations)
+never promotes.
+
+*** D-C4 -- a row's shape is recorded only when it deviates
+A row is /regular/ when its keys are its present columns in column order,
+each once. A tabular source's rows always are; a GeoJSON file written by
+any tool that writes a table is too. A row that is not -- keys in another
+order, a key repeated -- gets an entry in =RowShapes=: its members in its
+own order, each a column index or, for a repeat, the extra =(key,
+JsonValue)= pair itself. Guarantees 2 and 3 live here, and a regular file
+pays nothing for them. =RowShapes= is a sorted =Vec<(row, Box<Shape>)>= or
+a map; profiling decides.
+
+*** D-C5 -- writers read columns, and =infer_columns= goes away
+=schema::Column= (Mem3's borrowing column) was the table, reconstructed for
+every write. With the table in the hub, a tabular writer reads the hub's
+columns directly; =columns_for='s declaration matching moves onto the
+table. The reconciliation =FieldDecl::type_for= does stays, against the
+column's real type rather than an inferred one.
+
+*** D-C6 -- geometry stays a column of =Option<Geometry>= until C6
+Geometry is the other half of the memory story (=Position= is 48 bytes for
+16 of XY), but it is independent of properties and every format already
+reads and writes it per feature. C6 replaces it with flat coordinate buffers
+(GeoArrow's layout: coordinates, ring and part offsets, dimension per
+column), which absorbs =performance.org='s "compact =Position=" item.
+
+*** D-C7 -- per-row natives are a sparse side table
+=Vec<(row, Box<Native>)>= sorted by row, or a map. Today's =Option<Box<Native>>=
+per row is already 8 bytes a row for something nearly always absent; this
+makes it nothing. A permutation (=--sort-hilbert=) carries them along.
+
+*** D-C8 -- the public API: build and edit through methods, read through views
+The route (a) story (=edit-composability.org=, =tests/public_api.rs=) is
+read, edit, write, from outside the crate. It stays possible and gets
+explicit:
+- *Read:* =fc.len()=, =fc.row(i) -> FeatureRef<'_>= (=geometry()=,
+  =properties()= iterating =(&str, Value<'_>)= in the row's own order,
+  =get(key)=, =native()=), =fc.rows()=, and =fc.column(name) -> ColumnRef<'_>=
+  for typed column access.
+- *Build:* =FeatureCollection::from_features(Vec<Feature>)= and =push(Feature)=,
+  with =Feature= kept as the owned row type it is today, so a caller building
+  a collection by hand changes one line.
+- *Edit:* =set(row, key, JsonValue)=, =remove(row, key)=,
+  =set_geometry(row, ..)=, =retain(|row| ..)=, =permute(&order)=.
+- =Value<'_>= is a borrowed cell (=Null=, =Bool=, =Int=, =Float=, =Str(&str)=,
+  =Binary(&[u8])=, =Json(&JsonValue)=) with =to_owned() -> JsonValue=.
+
+*This is a breaking release.* =fc.features= and =Feature::properties= as a
+field of the collection disappear. Nothing in the workspace links geosetta
+(geoscribe and nazca compose over pipes, by =../architecture.org=), so the
+break reaches only the published crate's users. It takes the next version
+that may break the API -- under 1.0, the next minor -- whenever C5 lands.
+
+*** D-C9 -- one chunk now, chunk-ready API
+Every accessor works by row index and column, never by "the whole buffer",
+so a later table of several chunks (record batches) changes no caller.
+That is the seam =streaming-progress.org= and a batched pipeline would build
+on; this plan does not build either.
+
+** HOW EACH FORMAT FITS
+| format      | fit                | notes                                                                                                                                           |
+|-------------+--------------------+-------------------------------------------------------------------------------------------------------------------------------------------------|
+| GeoParquet  | native             | Columns on disk are columns in the hub: the transpose (Mem4) and =infer_columns= both disappear. A =Str= column can take a page's bytes nearly as-is. |
+| Shapefile   | natural            | Fixed, typed DBF schema; every record has every field.                                                                                          |
+| FlatGeobuf  | natural            | The header declares typed columns; a row's omitted cell is null (=edit-composability.org=), which is =valid=, not =present=.                    |
+| CSV         | natural            | Rectangular. Types are inferred per value (=csv.rs='s =unwidened= gate), so a disagreeing column is =Mixed=.                                    |
+| GeoPackage  | mostly             | Declared types, but SQLite stores any type in any column (=sqlite_altered.gpkg=), so a column meeting one is promoted. Row-shaped writes stay row-shaped (the =sqlite= encoder takes rows), built a row at a time from the table. |
+| WKT         | trivial            | Geometry only.                                                                                                                                  |
+| GeoJSON     | needs D-C3/D-C4    | Schemaless. Regular files get the whole saving; a ragged one pays for its exceptions in =RowShapes= and =Mixed= columns, never more than today. |
+| KML         | needs D-C3/D-C4    | Like GeoJSON: =<ExtendedData>= is per Placemark. Projection (=project.rs=) appends to columns; =place.rs= and reconcile read a row view. A KML feature's element is a per-row native (D-C7), and is its own cost (=performance.org=, KML steps 2--3). |
+
+So *every format can be columnar*, and none falls back to worse than
+today. The schemaless two are where the work is.
+
+** MILESTONES
+Each one lands with the equivalence corpus byte-identical and =compare.py=
+no slower on any case.
+
+*** C0 -- the harness, in the repo
+- =bench/memprobe/=: the counting-allocator probe from =performance.org=,
+  moved in from a scratch directory, excluded from the published crate like
+  =bench/=.
+- An equivalence corpus and runner: every fixture, =compare.py='s inputs, a
+  sparse/ragged GeoJSON (shuffled key order, missing and late columns, mixed
+  types, duplicate keys, =1= beside =1.0=, integers past 2^53, nested
+  values), each converted to every format with each option that changes
+  output, compared against a pinned binary: outputs, stderr and exit status.
+  This is the check Mem1--Mem5 ran by hand.
+
+*** C1 -- the table type, behind the old API
+=Table=, =Column=, =RowShapes=, =RowNatives= and the views, with
+=from_features= / =to_features= converting both ways and a property test
+that =to_features(from_features(x)) == x= for arbitrary collections,
+including every guarantee above. =FeatureCollection= holds
+=enum Storage { Rows(Vec<Feature>), Table(Table) }=, converting on demand,
+so every spoke keeps working untouched. A migration device; C5 removes it.
+
+*** C2 -- tabular spokes go columnar
+Parquet, FlatGeobuf, Shapefile, CSV and GeoPackage read into =Table= and
+write from it. A tabular-to-tabular conversion (=parquet → fgb=, the wide
+cases) never builds a row. Expected: the wide =geojson→parquet= peak moves
+only partly (its GeoJSON read is still rows until C3); =parquet→fgb= wide
+should fall to roughly input + table + output.
+
+*** C3 -- GeoJSON goes columnar
+The streaming reader appends to columns, recording =RowShapes= for
+irregular rows and promoting columns as D-C3 says. The direct writer reads
+row views. This is the milestone the guarantees above exist for; the ragged
+fixture in C0 is its test.
+
+*** C4 -- KML goes columnar
+=project= appends to the table; =place=, the direct writer and reconcile
+read row views; =drop_warnings= and the read-time tally (=performance.org=,
+KML step 2) read the table. Best done after KML step 2, which changes the
+same reader.
+
+*** C5 -- the hub is only a table
+=Storage::Rows= goes, and with it =Vec<Feature>= in the hub. The rest of the
+crate moves onto views: =reorder_hilbert= becomes =permute=, the CRS
+override, =collect_conversion_warnings= and =m_downgrade_warning=, the
+GeoPackage layer fan-out, =release_foreign_natives=, the same-format
+machinery. The public API of D-C8 is settled, =tests/public_api.rs= rewritten
+to it, and the breaking release made (D-C8).
+
+*** C6 -- geometry buffers
+D-C6: flat coordinate buffers with offsets, dimension-aware, replacing
+=Option<Geometry>= per row. Measured separately, because the property
+milestones above leave geometry untouched.
+
+** ACCEPTANCE
+- The equivalence corpus is byte-identical at every milestone.
+- No =compare.py= case slower than before C1, by more than noise.
+- Wide =geojson→parquet= and =parquet→geojson= IR within 2× of the
+  ~80 MB estimate; narrow IR roughly halved before C6.
+- Every guarantee in § WHAT A ROW IR GIVES has a named test.
+
+** RISKS
+- *Scope.* 79 uses of =.features= in =convert.rs= alone, every spoke's
+  reader and writer, the KML projection and reconcile. C1's dual storage is
+  what keeps each milestone shippable.
+- *Promotion cost.* A column that is narrow for a million rows and then
+  meets a string copies a million cells once. Bounded (once per column), and
+  =Mixed= from the start is today's cost.
+- *GeoJSON's worst case.* A file with every feature's keys in a different
+  order records a shape per row. Still no worse than today, but the saving
+  goes; the benchmark should include one.
+- *Editing ergonomics.* A caller used to =fc.features[i].properties.push(..)=
+  writes =fc.set(i, key, value)=. Worth a migration note in the release.
+- *Row-shaped formats pay a conversion per row.* GeoPackage's SQLite writer
+  and the GeoJSON and KML writers walk rows. That walk is over borrowed views,
+  not materialized rows, so it costs time, not memory.
+
+** OPEN QUESTIONS
+- =RowShapes= and =RowNatives= as sorted vectors or maps: decide by
+  profiling a ragged GeoJSON.
+- =Str= offsets: =u32= with promotion to =u64=, or =u64= throughout? A
+  column past 4 GiB of text is plausible only on inputs this crate already
+  cannot hold in memory.
+- Does =Value<'_>= replace =JsonValue= in the public API anywhere, or only
+  sit beside it? D-C8 assumes beside.
+- Should =FieldDecl= move onto =Column= (a column's declaration is a fact
+  about the column), or stay matched by name as =columns_for= does?
+
+** DEPENDS ON / RELATED
+- [[file:performance.org][performance.org]] -- the measurements behind this
+  plan, and Mem1--Mem5, which this builds on (Mem3's borrowing =Column= is
+  the seed of D-C5).
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] and
+  [[file:edit-composability.org][edit-composability.org]] -- the guarantees
+  the table must keep, and route (a), which D-C8 must keep possible.
+- [[file:streaming-progress.org][streaming-progress.org]] -- D-C9's chunk
+  seam is where batching would start.
+- [[file:kml-standard.org][kml-standard.org]] -- D-K4: a KML feature's
+  element stays a native; C4 changes where the IR side of it lives, not that.

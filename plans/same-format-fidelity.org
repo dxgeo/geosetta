@@ -44,6 +44,12 @@ fixture came out as a database =sqlite3= refuses to open (=handoff.org= entry
 *M3 in progress:* the *FlatGeobuf*, *GeoParquet* and *GeoPackage* spokes are
 done. Still to do: CSV, WKT, KML, and Shapefile's remaining *natives*, then
 M3c and the *rest* of M3b. Four readers still pass =native: None=.
+/2026-10-23: **KML's native is built** for the same-version run
+(=kml-standard.org= K4) -- the document model, split between the collection
+and each feature -- so three readers pass =native: None= now, CSV among them
+by design. The KML spoke's remaining work is K5's version transforms: K4's
+projections -- overlays, time, =Schema=, altitude modes -- are built as of
+2026-10-24, and K5's version transforms as of 2026-10-28./
 ***The exhaustive-match fixture registry (M5/D6) is built as of 2026-10-21***
 -- see D6 → BUILT.
 
@@ -1488,8 +1494,8 @@ M3's KML spoke had been gated on a mechanism question -- raw names in
 is now *fidelity to the KML standard*. OGC KML 2.3 is the model, both OGC
 versions (2.2 and 2.3) are read and detected, and output is written in the
 version the user asks for (=--kml-version=), defaulting to the source's own
-version on a =kml -> kml= run and to 2.3 from any other format. Google's
-pre-OGC 2.0 and 2.1 are refused.
+version on a =kml -> kml= run and to 2.2 from any other format /(2.3 until
+2026-10-23)/. Google's pre-OGC 2.0 and 2.1 are refused.
 
 What that settles here:
 - *The invariant needs no KML clause.* The default is same-version, so
@@ -1500,10 +1506,18 @@ What that settles here:
   bytes carry only content outside every KML namespace. D1 holds: the model is
   the spoke's payload, opaque to the hub.
 - *D5 applies to the version too*: a pipe or a cross-format transit loses it,
-  and the run comes back as 2.3.
+  and the run comes back as 2.2.
 - *D6's registry grows a second axis*: one hostile fixture per KML version.
 - *D1's column-schema exception gains a fifth spoke*: =<Schema>='s typed
   =SimpleField=s are declarations.
+
+/2026-10-23:/ *the default from another format is 2.2, not 2.3.* No KML reader
+measured reads 2.3's own spellings of the elements it adopted from =gx:= --
+Google Earth Web, GDAL LIBKML and CesiumJS all drop a =kml:Track='s geometry,
+silently -- while all three read the =gx:= spelling. So the default writes what
+the readers read, and =--kml-version 2.3= writes the standard as written (D-K10
+unchanged), with no warning about readers: whoever asks for 2.3 has chosen it.
+See =kml-standard.org= open question 9.
 
 ** SEQUENCING -- this inverts part of =same-format-output.org=
 That plan currently scopes closing the fidelity gap *out*, and ships a warning
@@ -1602,7 +1616,8 @@ travels with D1's =name= modelling.
   Three structural findings the plan did not have:
   1. *KMZ is a second container spoke*, on the same terms as GeoPackage -- a
      =.kmz= is a zip and geosetta writes =doc.kml= alone, so icons and overlays
-     are dropped and the surviving KML keeps dangling references. Now M3c.
+     are dropped and the surviving KML keeps dangling references. Now M3c --
+     the entries carried since 2026-10-28.
   2. *CSV, WKT and Shapefile lose the lexeme, not a member*, which is a class
      the natives channel does not obviously fit -- see that file's proposed
      "infer only when re-rendering reproduces the input" rule, which costs no
@@ -1630,7 +1645,8 @@ travels with D1's =name= modelling.
     intent so it is not "fixed" by stashing it.
   - The tree writer (=to_json=, test-only) had to change in lockstep with
     =to_geojson_string=, since one is the byte-for-byte reference model for the
-    other. Member order matters: natives sit after =type=/=name= and before
+    other (the compact form, since GeoJSON is indented by default from
+    2026-10-28). Member order matters: natives sit after =type=/=name= and before
     =features=/=geometry=, which is where GDAL puts =id= too.
 
   *The column-schema half, added after the above.* =crate::FieldDecl= on
@@ -1771,6 +1787,72 @@ travels with D1's =name= modelling.
   obligation as M3b at a fraction of the cost -- the entries are already bytes
   and =src/zip.rs= already reads them. Not part of the KML spoke: that is an
   XML document, this is an archive.
+  ***First half built 2026-10-28: the entries.*** =KmlNative.archive= holds
+  every entry of a =.kmz= read in archive order -- the document's slot marked,
+  its bytes written from the model -- and =write_kmz= puts them back: the
+  same names, the same order, the document under its own name rather than
+  =doc.kml=. Each entry's modification time is carried too: =zip.rs= read and
+  wrote zero before, and the central directory holds it, so it was read
+  rather than listed as a loss. Public (=KmzArchive=, =KmzEntry=), flat data
+  with nothing to keep consistent (=kml-standard.org= D-K16). A =.kmz= read
+  written as anything else warns, naming the entries left behind.
+  =hand_hostile.kmz= comes back with all four entries and their times.
+  ***Second half built 2026-10-28: a layered archive.*** GDAL writes a
+  multi-layer =.kmz= as a =doc.kml= of network links beside =layers/*.kml=;
+  geosetta read every document into one collection and wrote one document
+  back, built from the IR. Now every document keeps its skeleton -- the first
+  as =KmlNative='s =document=, the rest as its crate-private =layers=, each
+  with its archive slot and its own version -- and each feature records which
+  document it came from. =write_kmz= writes every =.kml= entry from its own
+  skeleton and features, lowering or raising each from its own version. A
+  feature added since the read joins the first document. Measured on
+  =gdal_networklink.kmz=: the archive, both documents and the features come
+  back equal, each document as XML-equal to the one read.
+  /A =.kml= write of a layered read/ holds one document, so it is still built
+  from the IR, and now says so, naming the archive's documents.
+  /What is left/ is =Format::Kmz='s loss row: the zip writer stores every
+  entry and writes no extra fields, attributes or archive comment. M3c is
+  otherwise done.
+  /2026-10-28, later: every header field is carried/ but compression.
+  =zip::EntryMeta= holds what the writer does not derive -- the time, the
+  "made by" host and version, internal and external attributes, the local
+  and central extra fields apart (Info-ZIP's local timestamp is longer than
+  its central one), the entry comment -- and =zip::Archive= the archive
+  comment; =KmzEntry= and =KmzArchive= carry them as public fields, now
+  =#[non_exhaustive]= (a field added later is not a break; only a =.kmz=
+  read builds them). Flags, method, sizes, CRC, offsets and "version
+  needed" stay derived. Zip64's extra field is dropped on read: it gives
+  sizes for header fields that say =0xFFFFFFFF=, and the writer states them
+  plainly. The end record is now found as the one whose comment runs to the
+  end, so a comment holding its signature is not mistaken for it. An
+  archive created from another format declares Unix mode 0644 (a
+  directory 0755) instead of MS-DOS with no attributes -- what Info-ZIP and
+  Python write. Measured on =tests/fixtures/info_zip_carried.kmz= (Info-ZIP
+  3.0: extras, modes 0644/0755, a directory, entry and archive comments):
+  =zipinfo -v= of source and output differ only in offsets, compression and
+  GDAL's data descriptors; =unzip= and =bsdtar= extract =run.sh= as 0755.
+  The row now reads only "each archive entry's compression".
+  /Zip64, deferred 2026-10-28./ =zip.rs= reads and writes none of zip64's
+  records, and did so silently: a central directory past 65,535 entries was
+  read in part (Python's =zipfile= at 65,536 entries leaves a legacy end
+  record of 65,535 with true offsets, so the last entry vanished), and a
+  write past 65,535 entries or 4 GiB truncated its fields. *Now refused,
+  both ways*: a read that meets the zip64 locator, a =0xFFFF…= placeholder
+  in the end record or a central header, or more central headers than the
+  end record counts (what a writer wrapping the 16-bit count leaves) is
+  refused by name, and a write past the limits is refused rather than
+  written. A zip64 field in a /local/ header alone -- Python's
+  =force_zip64= -- is read, the sizes coming from the central directory
+  (=tests/fixtures/local_zip64.kmz=). Zip64 itself waits for an archive
+  that needs it: a =.kmz= that large is an imagery super-overlay, and
+  =zip::read= takes the whole archive as one slice, so the memory, not the
+  records, is the real limit (=streaming-progress.org=).
+  /Under the schema oracle, 2026-10-28/: =tests/kml_schemas.rs= validates
+  every =.kml= entry of seven =.kmz= writes -- =gdal_networklink.kmz= as
+  itself, raised and edited, both its documents each time;
+  =hand_hostile.kmz= raised, as read and edited; a =.kml= source written as a
+  =.kmz= in each version -- reading the stored entries back from their local
+  headers. All ten documents validate.
 *** The feature id -- DECIDED 2026-08-25, decision 27: *carry it*
 /Raised, measured, filed with a recommendation and taken the same day./
 

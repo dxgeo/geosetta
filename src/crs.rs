@@ -256,6 +256,23 @@ impl Crs {
             Crs::Wgs84 => return None,
         };
         let label = named.label();
+        if self.is_wgs84_egm96() {
+            match target {
+                // KML's own heights: what a KML read states its absolute
+                // altitudes in (`plans/kml-standard.org` D-K12).
+                Format::Kml | Format::Kmz => return None,
+                // The horizontal half is GeoJSON's own; only the heights move
+                // to another surface, so say that rather than "reproject".
+                Format::GeoJson => {
+                    return Some(format!(
+                        "{label}'s heights are EGM96 heights, and GeoJSON's are heights above the WGS 84 ellipsoid \
+                         (RFC 7946 §4) — output Z values will be mislabeled, by up to ~100 m. Longitude and \
+                         latitude are unaffected."
+                    ));
+                }
+                _ => {}
+            }
+        }
         match target {
             // GeoJSON and KML/KMZ have no CRS channel at all — all *always*
             // WGS 84 by spec, so a non-WGS-84 source doesn't get dropped, it
@@ -354,6 +371,32 @@ impl Crs {
                 ))
             }
             Format::Parquet | Format::FlatGeobuf | Format::Gpkg | Format::Shapefile => None,
+        }
+    }
+}
+
+/// The authority and code of KML's three-dimensional CRS, *WGS 84 + EGM96
+/// height*: what a KML document's altitudes are in when it says they are
+/// absolute (OGC 12-007r2 §6.2, §9.20).
+const WGS84_EGM96: (&str, &str) = ("EPSG", "9707");
+
+impl Crs {
+    /// EPSG:9707, *WGS 84 + EGM96 height*, by code alone. KML states this CRS
+    /// for heights it marks `absolute` (`plans/kml-standard.org` D-K12) and
+    /// gives no definition text for it, so none is invented here.
+    pub(crate) fn wgs84_egm96() -> Crs {
+        Crs::Named(NamedCrs {
+            authority: Some(WGS84_EGM96.0.into()),
+            code: Some(WGS84_EGM96.1.into()),
+            ..NamedCrs::default()
+        })
+    }
+
+    /// Whether this is EPSG:9707, however it arrived.
+    pub(crate) fn is_wgs84_egm96(&self) -> bool {
+        match self {
+            Crs::Named(n) => n.authority_code().is_some_and(|(a, c)| a.eq_ignore_ascii_case(WGS84_EGM96.0) && c == WGS84_EGM96.1),
+            Crs::Wgs84 => false,
         }
     }
 }

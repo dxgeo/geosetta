@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 use geosetta::{cli, convert, geopackage, shapefile};
 use geosetta::Crs;
-use geosetta::{Error, FeatureCollection, Format, Result};
+use geosetta::{Error, FeatureCollection, Format, Result, WriteOptions};
 
 /// Read `path`'s bytes, or all of stdin when `path` is `"-"`.
 fn read_bytes(path: &str) -> Result<Vec<u8>> {
@@ -148,10 +148,34 @@ fn run() -> Result<()> {
     }
     print_warnings(&same_format_warning(args.from, out.format), args.quiet);
     print_warnings(&collect_conversion_warnings(&fc, out.format), args.quiet);
+    print_warnings(&convert::kml_write_warnings(&fc, out.format, args.kml_version), args.quiet);
+    release_foreign_natives(&mut fc, out.format);
     if args.progress {
         eprintln!("writing {}...", out.format.extension());
     }
-    write_collection(out.format, out.path, &fc, args.quiet)
+    write_collection(out.format, out.path, &fc, args.quiet, args.write_options())
+}
+
+/// Drop every native the target's writer will not read, once the warnings
+/// that inspect them have run.
+///
+/// Only a memory saving: a writer replays a payload only when its tag matches
+/// (`Native::payload_for`), so this changes no output. It matters for KML,
+/// whose natives are each feature's whole element — on a large `kml -> fgb`
+/// run they would otherwise be held through the write for nothing. KML and KMZ
+/// read each other's natives, since the two hold one document.
+fn release_foreign_natives(fc: &mut FeatureCollection, target: Format) {
+    let kept = |format: Format| {
+        format == target || matches!((format, target), (Format::Kml, Format::Kmz) | (Format::Kmz, Format::Kml))
+    };
+    if fc.native.as_ref().is_some_and(|n| !kept(n.format)) {
+        fc.native = None;
+    }
+    for f in &mut fc.features {
+        if f.native.as_ref().is_some_and(|n| !kept(n.format)) {
+            f.native = None;
+        }
+    }
 }
 
 /// The destination half of a conversion — where output goes and in what format.
@@ -240,8 +264,9 @@ fn apply_crs_override(layers: &mut [(String, FeatureCollection)], crs: &Crs) -> 
 /// WKT, or a GeoPackage's placeholder `NONE` id, which
 /// [`Crs::authority_code`] declines to report because geosetta invented it).
 /// Note that a GeoJSON or KML source is *not* that case: its spec fixes it at
-/// WGS 84, so it has a real identity that simply isn't written in the file (see
-/// `Crs::authority_code`).
+/// WGS 84 — or, for a KML document whose heights are all `absolute`, at
+/// EPSG:9707 — so it has a real identity that simply isn't written in the file
+/// (see `Crs::authority_code`).
 fn print_crs_code(args: &cli::Args) -> Result<()> {
     let sources = read_crs_sources(args)?;
 
@@ -312,8 +337,9 @@ fn read_crs_sources(args: &cli::Args) -> Result<Vec<(Option<String>, FeatureColl
 ///
 /// Empty stdout with a nonzero exit means there was genuinely nothing to print,
 /// the same contract `print_crs_code` keeps. Note that the two flags disagree
-/// about a GeoJSON or KML source, and correctly: its spec fixes it at WGS 84, so
-/// it has an identity to report but recorded no text to quote.
+/// about a GeoJSON or KML source, and correctly: its spec fixes its CRS (WGS 84,
+/// or EPSG:9707 for KML heights that are all `absolute`), so it has an identity
+/// to report but recorded no text to quote.
 ///
 /// Unlike a code, a definition body can span multiple lines, so more than one
 /// distinct definition among the selected layers is an error rather than a
@@ -459,18 +485,26 @@ fn nothing_to_print(args: &cli::Args, sources: &[(Option<String>, FeatureCollect
 /// `args.input` and read explicitly (and can't be `"-"` — see the module doc
 /// comment); every other format reads a single buffer — `args.input`'s bytes,
 /// or all of stdin when it's `"-"` — through [`convert::read_features`].
+///
+/// What the read itself dropped is printed here, as the read finishes — before
+/// any write-side warning, since it happened first
+/// (`plans/lossy-conversion-warnings.org` § 2b).
 fn read_input(args: &cli::Args) -> Result<FeatureCollection> {
-    if args.from == Format::Shapefile {
+    let mut warnings = Vec::new();
+    let fc = if args.from == Format::Shapefile {
         if args.input == "-" {
             return Err(no_stdio_for_multifile("Shapefile"));
         }
-        return read_shapefile_from_path(&args.input, args.progress);
-    }
-    let input = read_bytes(&args.input)?;
-    if args.progress {
-        eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
-    }
-    convert::read_features(args.from, &input)
+        read_shapefile_from_path(&args.input, args.progress, &mut warnings)?
+    } else {
+        let input = read_bytes(&args.input)?;
+        if args.progress {
+            eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
+        }
+        convert::read_features(args.from, &input, &mut warnings)?
+    };
+    print_warnings(&warnings, args.quiet);
+    Ok(fc)
 }
 
 /// Write the Feature IR to `output_path`. Shapefile is multi-file, so its
@@ -480,15 +514,23 @@ fn read_input(args: &cli::Args) -> Result<FeatureCollection> {
 /// `"-"` — through [`convert::write_features`]. Shared by the plain
 /// single-collection path and GeoPackage's per-layer fan-out
 /// (`run_geopackage_read`), so a multi-layer `.gpkg` → Shapefile conversion
-/// gets one `layer.shp` sibling set per layer for free.
-fn write_collection(to: Format, output_path: &str, fc: &FeatureCollection, quiet: bool) -> Result<()> {
+/// gets one `layer.shp` sibling set per layer for free. `options` are
+/// `--kml-version`, which the CLI only accepts for KML/KMZ output, and
+/// `--compact`.
+fn write_collection(
+    to: Format,
+    output_path: &str,
+    fc: &FeatureCollection,
+    quiet: bool,
+    options: WriteOptions,
+) -> Result<()> {
     if to == Format::Shapefile {
         if output_path == "-" {
             return Err(no_stdio_for_multifile("Shapefile"));
         }
         return write_shapefile_to_path(output_path, fc, quiet);
     }
-    let bytes = convert::write_features(to, fc)?;
+    let bytes = convert::write_features_with(to, fc, options)?;
     write_bytes(output_path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", io_label(output_path, "stdout"), bytes.len());
     Ok(())
@@ -496,7 +538,7 @@ fn write_collection(to: Format, output_path: &str, fc: &FeatureCollection, quiet
 
 /// Read a Shapefile given its `.shp` path, locating `.dbf` (required),
 /// `.prj`, and `.cpg` (both optional) alongside it.
-fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<FeatureCollection> {
+fn read_shapefile_from_path(shp_path: &str, progress: bool, warnings: &mut Vec<String>) -> Result<FeatureCollection> {
     let shp = std::fs::read(shp_path)?;
     let dbf_path = sibling_path(shp_path, "dbf")
         .ok_or_else(|| Error::Usage(format!("shapefile: no .dbf found alongside {shp_path}")))?;
@@ -511,7 +553,7 @@ fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<FeatureCol
             if prj.is_some() { " + .prj" } else { "" },
         );
     }
-    shapefile::read(&shp, &dbf_bytes, prj.as_deref(), cpg.as_deref())
+    shapefile::read(&shp, &dbf_bytes, prj.as_deref(), cpg.as_deref(), warnings)
 }
 
 /// Every path a side of the conversion touches, canonicalised for comparison.
@@ -818,7 +860,7 @@ fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs
         && (out.path.ends_with('/') || std::path::Path::new(out.path).is_dir());
     if layers.len() == 1 && !as_dir {
         let (_, fc) = &layers[0];
-        return write_collection(out.format, out.path, fc, args.quiet);
+        return write_collection(out.format, out.path, fc, args.quiet, args.write_options());
     }
     if !as_dir {
         return Err(Error::Usage(
@@ -830,7 +872,7 @@ fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs
     let dir = std::path::Path::new(out.path);
     for (name, fc) in &layers {
         let path = dir.join(format!("{name}.{}", out.format.extension()));
-        write_collection(out.format, &path.to_string_lossy(), fc, args.quiet)?;
+        write_collection(out.format, &path.to_string_lossy(), fc, args.quiet, args.write_options())?;
     }
     Ok(())
 }

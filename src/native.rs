@@ -37,7 +37,7 @@
 //!   native never crosses a process boundary: only a modelled field can reach
 //!   an external tool in a pipeline and be edited by it.
 
-use crate::format::Format;
+use crate::format::{Format, KmlVersion};
 use crate::json::JsonValue;
 use std::rc::Rc;
 
@@ -123,6 +123,115 @@ pub enum NativePayload {
     /// variant because its members genuinely are the same members; these are
     /// not./
     GpkgFeature(GpkgFeatureNative),
+    /// A KML document's provenance and the document itself, less its
+    /// features. Collection level only. Read by both the `.kml` and `.kmz`
+    /// writers, since a `.kmz` holds the same document.
+    Kml(KmlNative),
+    /// A KML feature's own element. **Feature level only**; [`Self::Kml`] is
+    /// its collection counterpart.
+    KmlFeature(KmlFeatureNative),
+}
+
+/// What a KML read recorded about the document itself: the version it was
+/// detected as, and how it spelled its namespace and `version` stamp
+/// (`plans/kml-standard.org` D-K5), so a same-version write gives back the
+/// root it was given.
+///
+/// The spellings are only replayed when the output is the version detected:
+/// a run that changes version writes OGC's namespace and the new version's own
+/// stamp, because the source's would then describe a document it no longer is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KmlNative {
+    /// The version detected, by namespace, `version` stamp and the 2.3-only
+    /// components the document uses (`plans/kml-standard.org` § VERSION
+    /// DETECTION).
+    pub version: KmlVersion,
+    /// The root element's namespace URI, verbatim: OGC's, Google's pre-OGC
+    /// `earth.google.com/kml/2.2`, or `None` for a document that declared
+    /// none (D-K13).
+    pub namespace: Option<String>,
+    /// The root's `version` attribute, verbatim (`2.3`, `2.3.0`, `2.2`, ...);
+    /// `None` when absent. Absent and `2.2` are different spellings of the
+    /// same version, and only one of them is valid KML 2.2.
+    pub version_attr: Option<String>,
+    /// The whole document in KML's own terms, less the features the IR
+    /// projects (`plans/kml-standard.org` K4): every container, style, schema
+    /// and network link, the root's declarations, the comments. For a `.kmz`,
+    /// the archive's first document; the others are `layers`.
+    ///
+    /// Crate-private by decision (`plans/kml-standard.org` D-K16): the IR is
+    /// the one way to edit a KML document, and the model's feature addresses
+    /// index into this skeleton, so a caller changing it could send features
+    /// to the wrong folder without a word. Unlike the other natives, which
+    /// are flat members with nothing to keep consistent.
+    pub(crate) document: Option<Rc<crate::kml::document::Skeleton>>,
+    /// A layered `.kmz`'s other documents — GDAL's `layers/*.kml` beside a
+    /// `doc.kml` of network links — each with its own skeleton, so a `.kmz`
+    /// write gives every document back (`plans/same-format-fidelity.org`
+    /// M3c). Empty for one document. Crate-private, as `document` is.
+    pub(crate) layers: Vec<crate::kml::document::Layer>,
+    /// The archive a `.kmz` read came from (`plans/same-format-fidelity.org`
+    /// M3c): its overlay images, icons and model files, so a `.kmz` write
+    /// gives them back. `None` for a `.kml` read.
+    pub archive: Option<Rc<KmzArchive>>,
+}
+
+/// A `.kmz` archive's entries, as a `.kmz` write puts them back: every entry
+/// in archive order. A `.kml` entry's `data` is empty — each document is
+/// written from its model (`KmlNative`'s `document` and layers) — and the
+/// rest are kept as read. Flat data, so public, as the other natives' members
+/// are (`plans/kml-standard.org` D-K16); `#[non_exhaustive]`, so a field
+/// added later is not a breaking change, and built only by a `.kmz` read.
+///
+/// *Not here*: each entry's compression — entries are written stored — and
+/// zip64's extra field, which describes sizes the writer states plainly.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct KmzArchive {
+    pub entries: Vec<KmzEntry>,
+    /// Which entry is the root KML document — conventionally `doc.kml`, and
+    /// by Google's rule the archive's first `.kml` entry.
+    pub document: usize,
+    /// The archive's comment, as bytes: the zip format names no encoding.
+    pub comment: Vec<u8>,
+}
+
+/// One entry of a [`KmzArchive`]: its bytes, and every field of its headers
+/// a write does not derive, uninterpreted.
+#[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
+pub struct KmzEntry {
+    pub name: String,
+    pub data: Vec<u8>,
+    /// The last modification time as the archive recorded it: an MS-DOS date
+    /// in the high 16 bits and time in the low. Zero when the archive
+    /// recorded none.
+    pub modified: u32,
+    /// "Version made by": the host in the high byte (0 MS-DOS, 3 Unix),
+    /// which says how `external_attrs` reads, and the spec version in the low.
+    pub made_by: u16,
+    /// Bit 0 says the entry is text.
+    pub internal_attrs: u16,
+    /// The host's attributes: under Unix, the file mode in the high 16 bits.
+    pub external_attrs: u32,
+    /// The extra fields of the local header and the central directory,
+    /// apart, as a producer may write them differently.
+    pub local_extra: Vec<u8>,
+    pub central_extra: Vec<u8>,
+    pub comment: Vec<u8>,
+}
+
+/// A KML feature's own element — its `<Placemark>`, with everything in it the
+/// IR does not project (styles, views, a `<Model>`, a track's per-vertex data)
+/// — and where in the document it sat.
+///
+/// Opaque, for the reason [`KmlNative`]'s `document` is.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KmlFeatureNative {
+    pub(crate) feature: Rc<crate::kml::document::FeatureModel>,
+    /// Which of the source's documents it was read from: 0 for the first, `n`
+    /// for `KmlNative`'s `layers[n - 1]`.
+    pub(crate) document: usize,
 }
 
 /// A GeoPackage feature's members the IR does not model.

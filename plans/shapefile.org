@@ -424,7 +424,9 @@ throughout, which was always the bar that mattered.
   crate-wide -- the same gap runs through CSV, WKT, KML and GeoJSON, which
   refuse non-UTF-8 input outright, and the two correctness items (warn on
   approximation, refuse a multi-byte codepage) are not Shapefile's alone. The
-  sizing above stands and is restated there as E2/E3.
+  sizing above stands and is restated there as E2/E3. /2026-10-28: rescoped
+  there to every encoding -- multi-byte codepages are decoded (E3), not
+  refused./
 - *Bare-stem input* (=roads= with no extension, a convention some Shapefile
   tooling accepts) vs. requiring the explicit =.shp= extension — affects
   =Format::from_path='s contract, which currently assumes every input has one.

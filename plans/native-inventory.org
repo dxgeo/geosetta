@@ -48,7 +48,8 @@ $ geosetta src.geojson made.kmz && unzip -l made.kmz
 #+end_src
 
 So a source =.kmz= carrying =files/icon.png= loses it, and the surviving
-=doc.kml= keeps its now-dangling reference. Under container scope this is the
+=doc.kml= keeps its now-dangling reference. /Carried since 2026-10-28
+(=same-format-fidelity.org= M3c): a =.kmz= written back keeps every entry./ Under container scope this is the
 same obligation as =gpkg='s, at a fraction of the cost -- a zip's other entries
 are already bytes, and =src/zip.rs= already reads the archive. *It should get
 its own milestone beside M3b rather than being absorbed into the KML spoke*,
@@ -573,6 +574,19 @@ the split -- they *live* in container-scoped tables but their rows are keyed by
 layer.
 
 *** KML / KMZ -- /code/, traced; =kml/reader.rs=
+/***Superseded for the same-version run, 2026-10-23*** (=kml-standard.org=
+K4): the reader now raises the whole document into the KML model, and a
+=kml -> kml= run in the source's version gives the document back with the IR's
+edits applied. Everything the trace below lists as dropped is carried. What
+remains lost is in =Format::same_format_losses='s KML row -- a non-UTF-8
+encoding; /CDATA, the DOCTYPE and the whitespace layout listed here until
+2026-10-28 are carried or normalised (=kml-layout.org=)/ -- plus, for =.kmz=, each
+entry's compression (entries are written stored). /The archive's other
+entries, listed here until 2026-10-28, are carried (M3c), and so is a layered
+archive's every document; so, since the same day, is every header field the
+writer does not derive -- extra fields, attributes, the "made by" host,
+entry comments and the archive comment./ The trace stands as the record of the reader before./
+
 Upgraded from /unverified/ to /code/ by tracing the reader rather than listing
 the spec. The trace found more than the spec list had, because the loss is
 *structural*: =placemark_to_feature= (=reader.rs:66=) reads exactly three
@@ -994,6 +1008,10 @@ answer.
    does, while GDAL's **built-in =KML= driver drops the feature outright**,
    attributes and all. So the warning is stricter than one driver and the
    feature's survival is kinder than the other./
+
+   /2026-10-23: **built**, as § GEOMETRY ELEMENT COVERAGE in =kml.org= rules
+   it -- =<Model>= warns and emits, the other three are parsed. The warning is
+   a write-side one since =kml-standard.org= K4: the =<Model>= is carried./
 
    /2026-10-22: **scoped, still unbuilt -- and the ruling turned out to be
    three pieces of work, one of them not a warning at all.** Re-measured

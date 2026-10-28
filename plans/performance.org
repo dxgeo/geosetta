@@ -56,7 +56,10 @@ feature, plus a temporary =String= per number. Replaced with
 =geojson::to_geojson_string=, which writes GeoJSON straight into the output
 buffer (numbers formatted in place via =fmt::Write=), reusing the existing value
 serializer only for property values. The old tree builder is kept =#[cfg(test)]=
-as the reference the direct writer is asserted byte-for-byte against.
+as the reference the direct writer is asserted byte-for-byte against -- its
+=--compact= form, since GeoJSON is indented by default from 2026-10-28
+(=kml-layout.org= D-L8); the indented form is asserted to parse to the same
+tree.
 
 Result (N=400k, best-of-3): every =* → geojson= path roughly *2× faster*.
 | conversion       | before      | after       |
@@ -294,4 +297,324 @@ the narrow cases) — both external tools scale worse with column count too.
 - Everything is fully materialized in RAM (whole file → =FeatureCollection= →
   whole output). True streaming is tracked separately in
   [[file:streaming-progress.org][streaming-progress.org]]; it is a memory-footprint concern more than a
-  throughput one.
+  throughput one. The memory cost of that design is measured below, under
+  /Memory/.
+
+** Memory — the speed is partly bought with RAM
+=bench/compare.py= reports peak RSS beside wall time. On 2026-10-28 it showed
+geosetta using 1.5–2.5× duckdb's memory on the narrow cases and 5–9× on the
+wide (200-column) ones, where it also used more than ogr2ogr and terrio:
+| conversion (=compare.py=, peak RSS) | geosetta | ogr2ogr | duckdb | terrio |
+|-------------------------------------+----------+---------+--------+---------|
+| geojson→parquet                     | 106.5 MB | 655.8   | 70.5   | 106.6   |
+| parquet→geojson                     | 102.9    | 370.8   | 56.3   | 94.5    |
+| geojson→parquet (wide, 200 cols)    | 1254.7   | 867.6   | 227.7  | 841.9   |
+| geojson→fgb (wide, 200 cols)        | 1172.7   | 900.3   | 166.2  | 606.4   |
+| parquet→geojson (wide, 200 cols)    | 1108.2   | 662.0   | 130.4  | 666.1   |
+
+*** The probe
+RSS says how much, not where. A small crate outside the repo links geosetta as
+a library under a counting =#[global_allocator]= (live bytes, high-water mark,
+allocation count) and splits a conversion into phases: the input bytes, the
+read (=read_features=), the IR left resident once the input is dropped, and the
+write (=write_features=), whose scratch is its peak less the IR and the output.
+On the GeoJSON-read cases its peaks agree with =compare.py='s RSS to within
+~5%, so the excess there is geosetta's own allocations. Not on
+=parquet→geojson (wide)=: the probe binary itself reached 1230 MB RSS against
+a counted peak of 823 MB, so about 400 MB there was memory freed and kept
+resident by the allocator — the column buffers freed during the transpose,
+confirmed when Mem4 removed them. Inputs are =compare.py='s own generators (100 000 narrow features;
+50 000 × 200 wide).
+
+Baseline:
+| conversion             | input | IR resident             | read peak | write peak | output |
+|------------------------+-------+-------------------------+-----------+------------+--------|
+| narrow geojson→parquet | 16 MB | 54.2 MB (568 B/feature) | 70.3      | 90.5       | 2.7    |
+| narrow geojson→fgb     | 16    | 54.2                    | 70.3      | 112.4      | 16.5   |
+| narrow parquet→geojson | 2.7   | 45.6 (478 B/feature)    | 65.6      | 82.2       | 25.5   |
+| wide geojson→parquet   | 146   | 719.6 (15 092 B/feature) | 865.6    | 1212.1     | 31.9   |
+| wide geojson→fgb       | 146   | 719.6                   | 865.6     | 1261.7     | 97.4   |
+| wide parquet→geojson   | 32    | 491.6 (10 310 B/feature) | 830.9    | 784.6      | 239.5  |
+
+*** Diagnosis
+The structural cause is the batch design: input bytes, then the whole IR, then
+the writer's scratch, then the whole output buffer, each held in full. duckdb
+streams 2048-row vectors, which is why it stays at 130–230 MB on the wide cases.
+Within that design:
+1. *=Feature= is 248 bytes, 176 of them an inline =Option<Native>=* that is
+   almost always =None= — about 30% of the narrow IR.
+2. *A property cell is 48 bytes* (=(Rc<str>, JsonValue)=), and a =Position= is
+   48 (two =Option<f64>=) where an XY pair needs 16.
+3. *The GeoJSON reader leaves slack in every property =Vec=.* The same wide
+   table is 720 MB read from GeoJSON and 492 MB read from Parquet: 200
+   properties grow a =Vec= to 256 slots, ~134 MB of the gap.
+4. *Two whole second copies.* On write, =schema::infer_columns= copies every
+   cell into a =Cell= owning its own =String= — the wide write's ~460 MB of
+   scratch. On Parquet read, every column is decoded before the transpose
+   starts, so all columns (~320 MB) and all pre-sized rows (~480 MB) are live
+   together.
+5. *The output is one =Vec<u8>=* written only once complete — 240 MB on the
+   wide GeoJSON output.
+
+*** Courses of action, by payoff ÷ effort
+Contained:
+- *DONE — box =Feature::native=* (Mem1 below).
+- *DONE — size property =Vec=s exactly on GeoJSON read* (Mem2 below).
+- *DONE — =infer_columns= borrows instead of cloning* (Mem3 below).
+- *DONE — Parquet: decode and transpose one column at a time* (Mem4 below).
+- *Stream output through a =BufWriter=* instead of a =Vec<u8>=: saves the whole
+  output. Easy for GeoJSON/CSV/WKT/KML, doable for FlatGeobuf and Parquet (the
+  footer's offsets need only a byte count), impractical for GeoPackage. Today an
+  encoding failure leaves the destination untouched, since nothing opens it
+  until the bytes exist; streaming truncates first, so it needs a temporary
+  file and a rename.
+Larger:
+- *Compact =Position=* (XY in 16 bytes, Z/M tracked per geometry). The bench is
+  80% points and understates it; on polygon-heavy data coordinates dominate.
+- *Columnar properties in the IR*: the only route near duckdb on wide tables
+  without streaming, and likely faster, but it breaks =Feature::properties= and
+  touches every spoke.
+- *A streaming, batched pipeline*. Blocked wherever the whole collection is
+  needed first: schema inference over schemaless input (two passes, which stdin
+  cannot give), =--sort-hilbert=, FlatGeobuf's index and header count, the
+  pre-write warnings, GeoPackage append. A first cut would be a fast path for
+  conversions with no such step (=parquet→geojson=, =fgb→geojson=).
+Also seen, not yet acted on:
+- The GeoPackage writer builds every row as a =Vec<Value>= before writing,
+  another whole copy — why =geojson→gpkg= still peaks highest of the narrow
+  cases.
+- The GeoJSON reader still allocates each property key as a =String= per
+  feature before interning it: 10 million short-lived allocations on the wide
+  read. Not a peak-memory cost, but a time one.
+- *KML is now the heaviest spoke by far.* =compare.py='s KML cases (added
+  2026-10-28; 100 000 points): 580–680 MB peak RSS and ~410–540 ms, against
+  74 MB and 87 ms for =geojson→parquet= on the same machine. The probe splits
+  it:
+  | conversion (probe) | IR                       | read peak | write peak | output  |
+  |--------------------+--------------------------+-----------+------------+---------|
+  | points geojson→kml | 29.1 MB (305 B/feature)  | 44.0      | 522.7      | 38.5 MB |
+  | points kml→geojson | 540.4 MB (5667 B/feature) | 586.2    | 577.1      | 24.9 MB |
+  The read keeps each feature's whole element tree as its native, for a
+  KML→KML run to replay — 5.7 KB a point. =release_foreign_natives= drops it
+  before a non-KML write, but only after the read has peaked. The write builds
+  a node tree for the whole document before serializing it: 455 MB of scratch
+  and 81 allocations a feature for 38 MB of output. Writing straight to the
+  buffer, as the GeoJSON writer does, and keeping the read's tree only when
+  the target is KML or KMZ, are the obvious first moves. /The write is done:/
+  Mem5 below.
+
+*** DONE Mem1. Box =Feature::native=
+=Option<Native>= was stored inline in every =Feature= — 176 of its 248 bytes —
+and is =None= unless a reader found something it could not model. Now
+=Option<Box<Native>>=: a =Feature= is 80 bytes. This changes the public
+=Feature::native= field's type, which library users constructing a =Feature=
+will notice.
+| conversion (probe)     | IR before → after | read peak    | write peak    |
+|------------------------+-------------------+--------------+---------------|
+| narrow geojson→parquet | 54.2 → 33.2 MB    | 70.3 → 49.3  | 90.5 → 69.5   |
+| narrow parquet→geojson | 45.6 → 29.6       | 65.6 → 49.6  | 82.2 → 66.2   |
+| wide geojson→parquet   | 719.6 → 709.1     | 865.6 → 855.1 | 1212.1 → 1201.6 |
+568 → 348 B/feature on the narrow GeoJSON read: the 168 bytes, plus the
+features =Vec='s own growth slack, which scaled with the element.
+
+*** DONE Mem2. GeoJSON properties streamed into exact-size =Vec=s
+The wide gap (720 MB read from GeoJSON, 492 from Parquet) was more than
+growth slack. =properties= was parsed as a =JsonValue::Object= — a
+=Vec<(String, JsonValue)>= of 56-byte elements, grown by doubling to 256
+slots — then =.into_iter().map(..).collect()='d into the IR's 48-byte
+elements. Rust's in-place collect *reuses the source allocation*, so every
+feature kept its 256 × 56 bytes, about 14 KB, for life.
+=stream_properties= now parses the object straight into the IR's element type,
+sized from the previous feature's property count (exact for a table), and
+shrinks only a feature wider than its predecessor.
+| conversion (probe)   | IR before → after | read peak     | write peak     |
+|----------------------+-------------------+---------------+----------------|
+| wide geojson→parquet | 709.1 → 484.8 MB  | 855.1 → 630.8 | 1201.6 → 977.3 |
+The GeoJSON-read IR now equals the Parquet-read one (484.8 against 483.6 MB).
+Narrow was already exact: four properties never overshoot.
+
+*** DONE Mem3. Columns read their cells from the features
+=infer_columns= built every =Column= as a =Vec<Cell>= — 32 bytes a cell, each
+string cloned — a second copy of the table for the length of the write. A
+=Column= now borrows the features and records only *where* each row keeps its
+value: one index for a column every row holds at the same position (a table
+whose rows list keys in one order — no per-row storage at all), or a =u32= per
+row otherwise. =Column::cell= / =cells= materialize on demand, and
+=Cell::Str= / =Cell::Bytes= are =Cow=s that borrow the feature's own text.
+Duplicate keys and type merging behave as before. Every writer (Parquet,
+FlatGeobuf, GeoPackage, CSV, Shapefile) reads cells through the accessor.
+
+*Found on the way: a quadratic FlatGeobuf write.* =encode_properties= asked
+=fgb_column_type= for every non-null cell, which called =declared_type=, which
+re-scanned the whole column through =FieldDecl::type_for=. Any column carrying a
+declaration made the write O(rows²): =fgb/gpkg/parquet → fgb= took 3.6 s for
+100 000 features against 0.1 s from GeoJSON, which declares nothing — a path
+=compare.py= never ran. =declared_type= is now reconciled once per column and
+remembered.
+| conversion (probe)     | write scratch before → after | write peak     |
+|------------------------+------------------------------+----------------|
+| narrow geojson→parquet | 33.6 → 20.8 MB               | 69.5 → 56.7    |
+| narrow geojson→fgb     | 41.7 → 28.9                  | 91.4 → 78.6    |
+| wide geojson→parquet   | 460.6 → 133.4                | 977.3 → 650.1  |
+| wide geojson→fgb       | 444.7 → 117.5                | 1026.9 → 699.7 |
+Wide =geojson→parquet='s write peak is now barely above its read peak (630.8).
+
+*** Mem1–Mem3 together
+Verified against the build before them: 321 conversions (every fixture in
+=tests/fixtures=, =compare.py='s narrow and wide inputs, and a 3000-row sparse
+table with shuffled key order, missing and late columns, mixed types and a
+duplicate key, each written to GeoJSON, Parquet, FlatGeobuf, GeoPackage, CSV,
+Shapefile and KML) give byte-identical output, stderr and exit status.
+
+Probe, baseline → after:
+| conversion             | IR             | peak            |
+|------------------------+----------------+-----------------|
+| narrow geojson→parquet | 54.2 → 33.2 MB | 90.5 → 56.7     |
+| narrow geojson→fgb     | 54.2 → 33.2    | 112.4 → 78.6    |
+| narrow parquet→geojson | 45.6 → 29.6    | 82.2 → 66.2     |
+| wide geojson→parquet   | 719.6 → 484.8  | 1212.1 → 650.1  |
+| wide geojson→fgb       | 719.6 → 484.8  | 1261.7 → 699.7  |
+| wide parquet→geojson   | 491.6 → 483.6  | 830.9 → 822.9   |
+
+=compare.py= peak RSS, before → after (MB):
+| conversion                       | before | after | duckdb | terrio |
+|----------------------------------+--------+-------+--------+--------|
+| geojson→parquet                  | 106.5  | 73.6  | 70.0   | 103.1  |
+| geojson→fgb                      | 130.0  | 97.2  | 78.1   | 85.5   |
+| geojson→csv                      | 91.0   | 57.8  | 51.6   | 72.9   |
+| geojson→shp                      | 92.2   | 59.3  | 55.7   | 76.0   |
+| geojson→parquet (wide, 200 cols) | 1254.7 | 836.6 | 228.0  | 884.4  |
+| geojson→fgb (wide, 200 cols)     | 1172.7 | 819.0 | 166.3  | 606.8  |
+| parquet→geojson (wide, 200 cols) | 1237*  | 1229  | 130.5  | 666.3  |
+=*= Measured directly against the old binary: 1237 MB in three runs out of three.
+The first =compare.py= run's 1108 was the outlier. The three changes do not
+touch this path; Mem4 does.
+
+Wall time, old and new binaries interleaved, median of 7:
+| conversion             | before    | after   | change |
+|------------------------+-----------+---------+--------|
+| narrow geojson→parquet | 90.0 ms   | 80.3 ms | −10.7% |
+| narrow geojson→fgb     | 111.0     | 99.4    | −10.4% |
+| narrow geojson→csv     | 134.6     | 121.1   | −10.0% |
+| narrow parquet→geojson | 67.9      | 61.9    | −8.8%  |
+| narrow fgb→fgb         | 3872.4    | 66.5    | −98.3% |
+| wide geojson→parquet   | 1155.9    | 1034.9  | −10.5% |
+| wide geojson→fgb       | 1162.8    | 917.8   | −21.1% |
+Less memory has also meant less time: fewer allocations, and nothing written
+twice.
+
+*** DONE Mem4. Parquet decoded a column at a time
+=read_geoparquet= decoded every column of every row group before
+=parquet_to_features= built a row, so all the columns (~320 MB on the wide
+table) and all the pre-sized rows they were being moved into were live
+together. Row groups alone would not have fixed that: Geosetta writes exactly
+one. The reader is now split. =open_geoparquet= reads the footer and makes
+every check of a column's description up front, in file order, so a file the
+reader cannot hold is still refused before anything is decoded. =GeoParquetFile=
+then decodes the geometry, or property =i= across every row group, on request.
+=parquet_to_features= seeds the rows from the geometry, freeing each WKB as it
+goes, then takes a column, drains it into the rows, and drops it before
+decoding the next. The whole-file =read_geoparquet= remains, for the tests.
+
+One behaviour changed, on malformed files only: a row group with /fewer/
+property columns than the first is now refused ("row groups disagree on
+columns"), as one with more already was. It used to leave those columns short,
+misaligning every row after it.
+| conversion (probe)     | read peak before → after | RSS before → after |
+|------------------------+--------------------------+--------------------|
+| narrow parquet→geojson | 49.6 → 41.7 MB           | 87 → 80 MB         |
+| wide parquet→geojson   | 822.9 → 520.5            | 1229 → 845         |
+RSS fell further than the counted peak: the ~400 MB the allocator kept resident
+on this path (see /The probe/) was these column buffers. Byte-identical against
+the pre-Mem1 build on 143 conversions (every Parquet fixture to every format);
+wall time unchanged (wide =parquet→geojson= 790 → 769 ms). Its peak is now the
+write: the IR plus the 240 MB output buffer, which streaming output would
+remove.
+
+*** DONE Mem5. KML written straight into its text
+A KML write from the IR (any source but a KML document carried back) built
+every =<Placemark>= as an =XmlElement=, wrapped them in one document tree,
+laid it out and serialized it. Now an =Emitter= writes each element straight
+into the output in the same house layout — child elements a line each, text
+inline, an empty element self-closed — mirroring =xml::lay_out= and
+=xml::write=. The tree writer stays, =#[cfg(test)]=, as the reference: a test
+asserts the two byte-identical on every fixture any reader takes and a
+hand-built collection covering times, every altitude member (2.2's =gx:=
+spelling included), nested and empty collections, escaping and typed
+=<SchemaData>=, indented and compact, in each version. Two injected mutations
+(altitude order, a repeated typed key) both fail it. The tree builders
+themselves (=feature_to_placemark= and its helpers) stay too: reconcile adds a
+new feature to a carried document with them.
+
+The emitter keeps its open elements' names end to end in one buffer and
+indents in place, so a tag allocates nothing: 36 allocations a feature fell
+to 8, the rest being =place='s and =property_text='s, which reconcile shares.
+| =points.geojson→kml= (100 000 points) | before   | after   |
+|---------------------------------------+----------+---------|
+| write peak (probe)                    | 522.7 MB | 68.1 MB |
+| write scratch beyond IR + output      | 455.1 MB | 0.5 MB  |
+| peak RSS                              | 600 MB   | 85 MB   |
+Wall time, old and new interleaved, median of 7:
+| conversion                    | before   | after    | change |
+|-------------------------------+----------+----------+--------|
+| points geojson→kml            | 435.7 ms | 157.2 ms | −63.9% |
+| points geojson→kml --compact  | 280.5    | 146.8    | −47.6% |
+| points geojson→kmz            | 516.7    | 235.9    | −54.4% |
+| narrow (mixed) geojson→kml    | 452.2    | 162.0    | −64.2% |
+Byte-identical against the build before Mem1 on 432 CLI conversions: every
+fixture and bench input to =.kml= and =.kmz=, plain, =--compact= and with each
+=--kml-version=, outputs, stderr and exit status. A KML document carried back
+to KML (=write_document=, reconcile) still goes through its tree; that, and
+the read, are what remain of KML's cost.
+
+*** KML's read, and KML carried back to KML
+What remains of KML's cost, in three steps — Mem5 was the first:
+1. /Done (Mem5):/ the direct writer.
+2. *A KML reader that keeps a feature's element only when the target is
+   KML or KMZ.* =kml→geojson= peaks at 586 MB on 100 000 points because every
+   feature keeps its whole element (5.7 KB a point) until
+   =release_foreign_natives= drops it after the read. Instead the reader
+   would project each feature element as the parser finishes it and drop the
+   element then and there, unless told to keep it. Expected: about the IR
+   plus the input, ~80 MB.
+3. *KML carried back to KML*, which still holds every element and goes
+   through the document tree. Undecided between keeping KML's same-format
+   promise — each feature stores its byte span in the kept source text and
+   is re-parsed for reconcile at write time, which amends D-K4's choice of
+   what a native holds — and GeoJSON's weaker one, where a feature keeps
+   only what the IR does not project and an unedited feature no longer comes
+   back byte for byte (a new =same_format_losses= entry). The first is the
+   fidelity-over-warning answer.
+
+*Constraints on step 2, from a middle stage that edits geometry.* A pipe
+(=geosetta a.kml - --to X | tool | geosetta - out.kml=) loses natives at the
+first =|= whatever is done (=same-format-fidelity.org= D5, restated in
+=kml-standard.org= D-K3), so dropping the element early costs a pipe nothing.
+A library caller (=read_features= → edit → =write_features(Kml)=) is the case
+the element exists for: reconcile compares it with the edited feature and
+rewrites only what changed. Hence:
+- *The reader does not decide.* =read_features= does not know the target.
+  Dropping must be a read option the CLI sets, since it knows the output;
+  the library's default stays "keep".
+- *The drop warnings must still fire.* =kml::drop_warnings= reads the kept
+  elements to report what a non-KML target loses (styles, tracks, overlays).
+  A reader that drops an element tallies what it would have reported first.
+- *A streaming write reconciles a feature at a time.* Reconcile is already
+  per feature, so step 3's writer need not hold the document either.
+
+*Precedent.* Nothing in geosetta streams end to end: every conversion holds
+its whole input, collection and output. But each part of step 2 has a
+precedent:
+- =kml::model::parse= already builds the model through =xml::Builder= as the
+  parser finishes each element, so no =XmlElement= tree exists beside it;
+  step 2 extends that builder.
+- The GeoJSON reader parses straight into the IR with no =JsonValue= tree.
+- Mem3 and Mem4 hold one intermediate at a time and drop it.
+- =release_foreign_natives= already drops a non-target native; step 2 moves
+  that drop earlier.
+New: a read option naming the target (=read_features= takes none today), and
+the warnings' tally made during the read rather than after. =plans/kml.org=
+chose a whole tree over a streaming cursor "unless profiling says otherwise
+(this format is not on the performance-critical path)". The probe now says
+otherwise, though step 2 keeps the tree per element and only stops keeping
+all of them; worth recording in =kml.org= when it is built.

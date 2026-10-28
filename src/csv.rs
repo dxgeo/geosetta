@@ -100,7 +100,7 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     for (row, feat) in fc.features.iter().enumerate() {
         let mut fields: Vec<String> = columns
             .iter()
-            .map(|c| field(&cell_text(&c.values[row])))
+            .map(|c| field(&cell_text(&c.cell(row))))
             .collect();
         let wkt = feat.geometry.as_ref().map(to_wkt).unwrap_or_default();
         fields.push(field(&wkt));
@@ -252,12 +252,12 @@ fn infer_typed(cell: &str) -> Option<JsonValue> {
 /// see a widening another row forces: a mixed `[9007199254740993, 1.5]` column
 /// is typed `Double` and loses the integer's low bits on the way out, which
 /// `Format::same_format_losses` still declares.
-fn unwidened(value: &JsonValue) -> Cell {
+fn unwidened(value: &JsonValue) -> Cell<'_> {
     match value {
         JsonValue::Bool(b) => Cell::Bool(*b),
         JsonValue::Int(n) => Cell::Int(*n),
         JsonValue::Float(f) => Cell::Double(*f),
-        other => Cell::Str(other.to_json_string()),
+        other => Cell::Str(other.to_json_string().into()),
     }
 }
 
@@ -267,7 +267,7 @@ fn cell_text(cell: &Cell) -> String {
         Cell::Bool(b) => b.to_string(),
         Cell::Int(n) => n.to_string(),
         Cell::Double(d) => d.to_string(),
-        Cell::Str(s) => s.clone(),
+        Cell::Str(s) => s.to_string(),
         // CSV is text; bytes render as hex, the same spelling the JSON
         // serializer and `materialize` use when a byte column meets a target
         // with no byte-level type.

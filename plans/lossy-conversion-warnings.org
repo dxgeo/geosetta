@@ -206,7 +206,44 @@ without redoing that step's own work.
   use (see below), same =--quiet= gate.
 
 **** 2b. The read side -- OWED, and owed twice
-/Scoped 2026-10-22, unbuilt./ ***A reader that drops a member leaves no trace
+/Scoped 2026-10-22; ***built 2026-10-23***, with both owed instances./ What
+shipped: =convert::read_features= and =shapefile::read= take
+=warnings: &mut Vec<String>=; =main.rs='s =read_input= prints them through
+=print_warnings= as the read finishes, before any write-side warning. The
+counting helper is =crate::tally::Tally=, keyed by a cause type each reader
+defines. The KML instance warned for =<Model>= and, as the GDAL measurement
+below ruled, *parses* the other three (=LinearRing=, =Track=, =MultiTrack=),
+with one more cause for the per-vertex data a track drops. /***Later the same
+day both KML causes moved to the write side***, with =kml-standard.org= K4:
+the KML model now carries a =<Model>= and a track's per-vertex data, so a
+=kml -> kml= run loses neither, and the loss is the write's -- a § 1 check,
+=convert::kml_write_warnings=, that fires on a cross-format write, a version
+change or a layered =.kmz=, plus one new cause, a track an edit gave a
+different vertex count. So D-K11's "only cross-format does it warn" holds, and
+this section's KML instance turned out to be a write-side loss read early. The
+sink stays: the =.cpg= instance below is a genuine read loss./
+/2026-10-24, with =kml-standard.org= K4's second step, three more write-side
+causes:/ an overlay an edit gave a geometry it cannot hold, written as a
+Placemark; a cross-format write of Z values that are no EGM96 heights, which
+the target's CRS cannot describe (D-K12); and, in =schema_drop_warning=, a
+width, precision or constraint bound for KML, which declares a column's type
+and nothing else. A KML source's absolute heights reach other formats as
+EPSG:9707, so a GeoJSON write of them says the heights move from EGM96 to the
+ellipsoid (=Crs::downgrade_warning=). The =.cpg= instance
+is =encodings.org= E1, plus a second cause found beside it: a =.cpg= declaring
+UTF-8 over invalid bytes had them replaced with U+FFFD, silently.
+
+/One departure: =geopackage::read_layers= does *not* take the sink yet./ No
+GeoPackage read loss exists to report, and its one library caller is the
+destination merge inside =geopackage::write_layers=, which has no warning
+channel of its own -- a sink there would be discarded, which is the silence
+this section exists to end with more code around it. Add the two together,
+with the first GeoPackage read loss.
+
+/The prefix wart below is gone./ =xml.rs= is namespace-aware as of the same
+day (=kml-standard.org= K1), and a =gx:Track= is parsed rather than reported.
+
+***A reader that drops a member leaves no trace
 in the IR for a § 1 check to find***, so the predictive shape cannot cover a
 read-time loss however it is written. Two are already owed and both are
 blocked on there being nowhere to put the message:
@@ -429,6 +466,9 @@ next pass through this area doesn't have to rediscover them:
   128-entry table and no dependency, multi-byte ones (Shift-JIS, GBK, Big5) are
   where the answer should be a refusal rather than an approximation.
   **The warning is owed either way**, and owed first./
+  /2026-10-28: =encodings.org= was rescoped to every encoding; E3 now
+  *decodes* multi-byte codepages, and E2 retires the approximation -- and
+  with it this warning -- for every codepage in its set./
 
 ** AN OPEN CALL -- the mixed-number column, and whether it earns a warning
 /Raised 2026-08-21, deliberately not decided./

@@ -153,16 +153,27 @@ impl Format {
     /// Unlike [`Self::supports_m`], which is a statement about each format's
     /// *spec*, this is a statement about this crate's *implementation*, and it
     /// will shrink as the spokes land. GeoPackage and GeoParquet both joined
-    /// the list with M4, so **all four declaring spokes now carry one** and
-    /// this predicate has stopped shrinking. GeoJSON, CSV, WKT and KML have no
-    /// slot for a declaration at all and will always answer `false`.
+    /// the list with M4, and KML/KMZ with `plans/kml-standard.org` D-K9: a
+    /// `<Schema>`'s `<SimpleField type>` declares a column, so a KML read
+    /// reports the declaration and a KML write emits one. KML carries a
+    /// column's *type* and nothing else — no width, precision or constraint —
+    /// which [`crate::FeatureCollection::schema_drop_warning`] reports
+    /// separately. GeoJSON, CSV and WKT have no slot for a declaration at all
+    /// and will always answer `false`.
     ///
     /// The distinction matters because the two cases warn for different
     /// reasons: one is the target's incapacity, the other is geosetta's, and
     /// only the second has a fix pending. Both drop the same information, so
     /// both warn — see `plans/lossy-conversion-warnings.org` § OWED WARNING.
     pub fn carries_column_schema(self) -> bool {
-        matches!(self, Format::FlatGeobuf | Format::Shapefile | Format::Gpkg | Format::Parquet)
+        matches!(self, Format::FlatGeobuf | Format::Shapefile | Format::Gpkg | Format::Parquet | Format::Kml | Format::Kmz)
+    }
+
+    /// Whether this spoke's declarations hold a column's type and nothing
+    /// more: KML's `<SimpleField>` has a `type` and a `name`, and no size or
+    /// constraint of any kind.
+    pub(crate) fn declares_type_only(self) -> bool {
+        matches!(self, Format::Kml | Format::Kmz)
     }
 
     /// What a **same-format** run still fails to preserve, as phrases naming
@@ -253,13 +264,49 @@ impl Format {
             Format::Parquet => {
                 &["the covering-bbox column", "the geometry column's name"]
             }
-            // Measured: of everything in `hand_hostile.kml`, the output keeps
-            // Placemark, Point, name, description and ExtendedData. Styles,
-            // folders, overlays, models, timestamps and altitude modes all go.
-            Format::Kml | Format::Kmz => &[
-                "styles and styleUrls",
-                "folders, overlays and models",
-                "timestamps and altitude modes",
+            // *The document itself is carried, since 2026-10-23* — K4 of
+            // `plans/kml-standard.org`: a `kml -> kml` run in the source's own
+            // version writes back the document it read, with the IR's edits
+            // applied, and `hand_hostile.kml` (styles, folders, an overlay, a
+            // model, a timestamp, altitude modes) comes back as the same XML.
+            // Until then this row read "styles and styleUrls; folders,
+            // overlays and models; timestamps and altitude modes".
+            //
+            // What remained was what the XML layer normalised: CDATA, a
+            // UTF-16 document, a DOCTYPE, whitespace between elements. *The
+            // layout and the DOCTYPE are carried since 2026-10-28*
+            // (`plans/kml-layout.org` L1): text runs keep their places, and
+            // the DOCTYPE its bytes. CDATA written as escaped text left the row
+            // the same day as normalisation rather than loss (D-L1), with the
+            // rest of lexical form — the declaration's spelling, quotes,
+            // `<a></a>` as `<a/>`, references. Until then this row also read
+            // "CDATA sections, written as escaped text", "a DOCTYPE" and "the
+            // layout of whitespace between elements". The encoding is
+            // `plans/encodings.org` E6's. A *version change* carries the
+            // document too, respelled into the other version's terms (K5,
+            // 2026-10-28), and what it respells or drops is warned about only
+            // on a run that makes one (`convert::kml_write_warnings`).
+            Format::Kml => &["a non-UTF-8 encoding, written as UTF-8"],
+            // KML's row, plus the archive. *Its entries are carried since
+            // 2026-10-28* (M3c of `plans/same-format-fidelity.org`): images,
+            // icons and model files come back in their places, with their
+            // names and modification times. Until then this row read "every
+            // archive entry but the KML document". *A layered archive is
+            // carried too, since 2026-10-28*: each of its `.kml` documents
+            // comes back with its own model and features. Until then this
+            // row also read "a layered archive's structure: several .kml
+            // documents are written as one, from the feature model alone".
+            // *Every header field the writer does not derive is carried too,
+            // since 2026-10-28*: extra fields, attributes, the "made by"
+            // host, entry comments and the archive comment. Until then the
+            // second item read "each archive entry's compression (written
+            // stored), extra fields and attributes, and the archive comment".
+            // Zip64's extra field is not carried and not listed: it describes
+            // sizes the writer states in the header, an encoding as the
+            // compression is, but with nothing left to lose.
+            Format::Kmz => &[
+                "a non-UTF-8 encoding, written as UTF-8",
+                "each archive entry's compression (written stored)",
             ],
             // Measured clean: the `.dbf` field declarations and `.prj` survive
             // intact, and only `DBF_DATE_LAST_UPDATE` differs.
@@ -341,11 +388,62 @@ impl Format {
                 other => other,
             },
             Format::Parquet => ty,
+            // KML's eight field types: a byte widens to `short`/`ushort`, and
+            // what no KML number holds exactly (a 64-bit integer) or no field
+            // type names (JSON, a time, a date, bytes) is written `string`.
+            Format::Kml | Format::Kmz => crate::kml::field_type_recast(ty),
             // `carries_column_schema` already returned for these.
-            Format::GeoJson | Format::Csv | Format::Wkt | Format::Kml | Format::Kmz => {
+            Format::GeoJson | Format::Csv | Format::Wkt => {
                 unreachable!("no column schema")
             }
         })
+    }
+
+    /// [`Self::recast`] for the column named `name`. The same answer but for
+    /// KML's three time keys: a date-time column called `timestamp`, `begin`
+    /// or `end` is written as a `<TimeStamp>` or `<TimeSpan>` and read back
+    /// as a date-time (`plans/kml-standard.org` D-K15), which no `<Schema>`
+    /// field type could do.
+    pub fn recast_column(self, name: &str, ty: DeclType) -> Option<DeclType> {
+        if self.declares_type_only() && ty == DeclType::DateTime && crate::kml::is_time_key(name) {
+            return Some(ty);
+        }
+        self.recast(ty)
+    }
+}
+
+/// An OGC KML version: detected on read, chosen on write (`--kml-version`).
+///
+/// Only the two OGC standards. Google's pre-OGC 2.0 and 2.1 are refused on
+/// read rather than represented here (`plans/kml-standard.org` D-K8).
+///
+/// `#[non_exhaustive]` for D7's reason: a KML 2.4 would otherwise be a breaking
+/// change for every downstream `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[non_exhaustive]
+pub enum KmlVersion {
+    /// OGC KML 2.2 (OGC 07-147r2), with Google's `gx:` extensions.
+    V2_2,
+    /// OGC KML 2.3 (OGC 12-007r2).
+    V2_3,
+}
+
+impl KmlVersion {
+    /// Parse a `--kml-version` value: `2.2` or `2.3`.
+    pub fn parse(value: &str) -> Result<KmlVersion> {
+        match value {
+            "2.2" => Ok(KmlVersion::V2_2),
+            "2.3" => Ok(KmlVersion::V2_3),
+            other => Err(Error::Usage(format!("unknown KML version \"{other}\" (expected 2.2 or 2.3)"))),
+        }
+    }
+
+    /// The version as `--kml-version` spells it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KmlVersion::V2_2 => "2.2",
+            KmlVersion::V2_3 => "2.3",
+        }
     }
 }
 

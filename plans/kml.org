@@ -357,7 +357,13 @@ spoke so far.
 
 ** GEOMETRY ELEMENT COVERAGE — the positive list, and which gaps close rather than warn
 /Added 2026-10-22, scoping =native-inventory.org= § QUESTIONS item 6's "warn
-and emit" ruling into something buildable. Unbuilt./
+and emit" ruling into something buildable. ***Built 2026-10-23***: the
+positive list is =parse_geometry='s match in =kml/reader.rs=, dispatched by
+namespace as well as name; =LinearRing=, =gx:Track=/=gx:MultiTrack= and
+2.3's =Track=/=MultiTrack= are parsed. =<Model>= warns and emits, as ruled --
+since =kml-standard.org= K4 (the same day) from the *write* side, because the
+model carries the =<Model>= and only a write that cannot give the model back
+loses it; a track's per-vertex data likewise. Now =kml/project.rs=./
 
 KML's =Geometry= is an abstract element with a substitution group, so a
 =<Placemark>= may hold any one of six concrete members — plus Google's two

@@ -182,7 +182,7 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
         features.push(Feature {
             geometry,
             properties,
-            native: carried_fid(&row, rowid_alias, position),
+            native: carried_fid(&row, rowid_alias, position).map(Box::new),
         });
     }
     // Carry each column's declared type into the IR, so it survives to a

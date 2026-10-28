@@ -4,7 +4,46 @@
 
 * KML to the Standard
 
-** STATUS -- scoping only (2026-10-22); every open question decided
+** STATUS -- K1--K5 built (K5 finished 2026-10-28); every question decided
+/2026-10-28, later:/ ***K5 is built.*** A 2.2 document written as 2.3 is
+raised (=kml/raise.rs=): adopted =gx:= elements into the KML namespace where
+2.3 admits them there, =<Snippet>= to =<snippet>= and =<Metadata>= to
+=<ExtendedData>= when nothing is lost, OGC's namespace and the =2.3= stamp on
+the root. Every version change now carries the document, so a version-changing
+run is as faithful as a same-version one. =tests/kml_schemas.rs= validates
+eighteen kinds of write, nine per version. See § MILESTONES, K5.
+
+/2026-10-28:/ ***K5's first half is built*** -- a 2.3 document written as 2.2
+is lowered, not rebuilt from the IR: =kml/lower.rs= respells each adopted
+element back to =gx:= where 2.2 has it only there, puts every element's
+children in =ogckml22.xsd='s sequence, and drops (and reports) the few things
+2.2 has no place for. The 2.3 hostile fixture lowers to a document =xmllint=
+validates against =ogckml22.xsd= with =kml22gx.xsd=. See § MILESTONES, K5.
+What is left of the plan is the 2.3 writer: raising a 2.2 document.
+
+/2026-10-24:/ ***K4 is built*** -- overlays as features (D-K14), a feature's
+time as properties (D-K15), =<Schema>= typing (D-K9), and altitude modes with
+EPSG:9707 (D-K12). See § MILESTONES, K4. What is left of the plan is K5's
+version writers.
+
+/2026-10-23, later:/ ***K1 is built*** -- see § MILESTONES. The read-time
+warning channel K2 needs (=lossy-conversion-warnings.org= § 2b) shipped the
+same day, so K2 has no prerequisite left.
+
+/2026-10-23:/ the three facts the plan left unmeasured are measured -- see §
+MEASURED IN A RENDERER and § WHAT THE SCHEMAS SAY. One closes a decision, and one
+changed the default output version:
+
+- *D-K14's rotation plane is settled*: Google Earth turns a =LatLonBox= on the
+  ground, not in degree space.
+- *The default output from another format is 2.2* (D-K2, changed). No reader
+  measured -- Google Earth Web, GDAL LIBKML, CesiumJS -- reads 2.3's own spelling
+  of a track, and all three read =gx:Track=. So the default writes what readers
+  read, and =--kml-version 2.3= writes the standard as written, with D-K10
+  standing unchanged. Open question 9, decided.
+- *The adopted-element list was wrong in one entry*: =drawOrder= is not an
+  adoption, and three 2.3-only additions were missing.
+
 This plan rescopes the KML spoke from "the subset =kml.org= scoped" to *the
 standard*: both OGC KML versions (2.2 and 2.3) read and detected, the latest
 (2.3) as the model, and either written back on request. It is
@@ -20,7 +59,7 @@ OVERTURNS.
 #+begin_quote
 *Read either OGC KML version, detecting which one was given. Write the version
 the user asks for; by default the source's own version on a =kml -> kml= run,
-and KML 2.3 from any other format. Warn when the version changes.*
+and KML 2.2 from any other format. Warn when the version changes.*
 #+end_quote
 
 So =geosetta a.kml b.kml= on a KML 2.2 file writes KML 2.2, and
@@ -37,7 +76,11 @@ numbers are that document's.
 - *The namespace did not change.* "The namespace for KML 2.3 is unchanged" from
   =http://www.opengis.net/kml/2.2= (§5.2). The version lives only in the root
   =version= attribute (=kml:kmlVersionType=, *default =2.2.0=*, §7.1). A 2.2
-  document is a 2.3 document in the same namespace.
+  document is a 2.3 document in the same namespace. /=ogckml23.xsd= itself
+  declares =default="2.2"= (line 767) -- the same version either way. And
+  =ogckml22.xsd= declares *no* =version= attribute at all, so a 2.2 document
+  carrying one is invalid 2.2 (measured 2026-10-23): a 2.2 write never adds a
+  stamp, it only gives back one its source had./
 - *Minor-version compatibility* (§5.2): new components are optional, nothing is
   removed (only deprecated), and "any schema components unrecognized by a KML
   application shall be gracefully ignored". Deprecated components (§5.3) stay in
@@ -59,10 +102,19 @@ numbers are that document's.
 - *2.3 brought Google extensions into the standard*: =kml:Track= (§10.15),
   =kml:MultiTrack= (§10.16), =kml:Tour= and its primitives (§9.23--9.32),
   =kml:SimpleArrayData=/=SimpleArrayField= (§9.7, §9.12), =kml:LatLonQuad=
-  (§11.4), =drawOrder=, =balloonVisibility=, =horizFov=, =duration=,
-  =altitudeOffset=, and the seafloor altitude modes. /Not/ adopted, by a search
-  of the text: =outerColor=, =outerWidth=, =labelVisibility=,
-  =physicalWidth=, =ViewerOptions=.
+  (§11.4), =balloonVisibility=, =horizFov=, =duration=, =altitudeOffset=,
+  =TimeStamp=/=TimeSpan= inside =Camera= and =LookAt=, and the seafloor
+  altitude modes. /Not/ adopted, by a search of the text and confirmed against
+  the schemas on 2026-10-23: =outerColor=, =outerWidth=, =labelVisibility=,
+  =physicalWidth=, =ViewerOptions=, =rank=, and =Icon='s =x=/=y=/=w=/=h=.
+  /=drawOrder= was listed here as adopted until 2026-10-23, and is not:/
+  =gx:drawOrder= orders line strings, while =kml:drawOrder= belongs to overlays
+  and was already in 2.2 -- two elements sharing a local name. See § WHAT THE
+  SCHEMAS SAY.
+- *2.3 added three things that are not Google adoptions*, found by the
+  schema's own version assertions rather than the text: a =uom= attribute on
+  =SimpleField= and =Data=; =MultiGeometry= inside =Create=; and every
+  geometry inside =Delete=.
 - *Scale*: 147 =kml:= components are defined. The reader today handles about
   ten.
 - *Conformance*: three classes, CL1--CL3 (Annex A); the abstract test suite is
@@ -77,7 +129,8 @@ From =native-inventory.org= § KML / KMZ (traced) and the code:
   every non-Placemark feature -- overlays, =NetworkLink=, =Tour=.
 - =xml.rs= matches on local name only, discards comments and PIs, concatenates
   mixed content, drops foreign attributes' prefixes, and =read()= rejects
-  anything not UTF-8.
+  anything not UTF-8. /All but the mixed-content concatenation is fixed by K1
+  (2026-10-23)./
 - The writer emits OGC-2.2-namespace KML with no =version=, always as =<Data>=,
   and every property as a string.
 - =Crs::Wgs84= is stamped outright; the vertical datum is unstated.
@@ -91,7 +144,7 @@ model. A pre-OGC namespace (2.0, 2.1), an unknown KML namespace or an unknown
 =version= is *refused* with an error naming what was found, not guessed at --
 the crate's convention everywhere else.
 
-*** D-K2 -- the output version is the flag, else the source's, else 2.3
+*** D-K2 -- the output version is the flag, else the source's, else 2.2
 =--kml-version <2.2|2.3>= is a format-specific output flag like
 =--rtree= and =--envelope=, with one difference: those are ignored for other
 output formats, and this one is a *usage error* unless the output is
@@ -101,7 +154,18 @@ Resolution, in order:
 1. =--kml-version=, if given;
 2. the version recorded in the KML native (visible only through
    =payload_for(Format::Kml)=, so only after a KML read);
-3. 2.3.
+3. 2.2.
+
+/Step 3 was 2.3 until 2026-10-23./ It changed on measurement, not preference:
+2.3 renamed the =gx:= elements it adopted into the KML namespace, and no reader
+measured reads those names (§ MEASURED IN A RENDERER). A non-KML source written
+as 2.3 would carry its tracks as =kml:Track=, which Google Earth Web, GDAL LIBKML
+and CesiumJS all accept as a Placemark with no geometry, silently. The same
+track as 2.2 + =gx:= is read by all three. 2.3 stays fully supported -- read,
+detected, modelled, and written on request -- and is still the model (D-K4),
+since it holds everything 2.2 does. It is the *default* that moved. It is also
+what this writer emitted before the plan: OGC's 2.2 namespace, no =version=, so
+the default output does not change for anyone.
 
 The library exposes a public =KmlVersion= enum, threaded to the KML writer the
 way =rtree= reaches the GeoPackage writer. =#[non_exhaustive]=, for D7's
@@ -113,7 +177,7 @@ version written, =kml -> kml= is never an upgrade. KML needs *no* clause of its
 own in =same-format-fidelity.org=: a 2.2 or 2.3 input comes back as it went in.
 
 *A version does not cross a pipe.* =kml -> geojson | tool | -> kml= and
-=kml -> fgb -> kml= both come back as 2.3, because the version rides in a native
+=kml -> fgb -> kml= both come back as 2.2, because the version rides in a native
 and natives do not survive a pipe (=same-format-fidelity.org= D5). That is the
 contract working, not a defect; the README must say so before someone files it.
 
@@ -149,6 +213,37 @@ feature-level native (the folder path), so =--sort-hilbert= and edits do not
 detach a Placemark from its folder -- the identity class of D4. A skeleton of
 the document with numbered slots for the placemarks was rejected: it breaks the
 moment a feature is added, removed or reordered.
+
+*** D-K4a -- "typed" means an identified node tree, not a struct per type
+/Decided 2026-10-23, before K3./ 2.3 defines 168 concrete elements and 81
+complex types, and "a typed model" fits two designs that differ by thousands
+of lines. Taken: *every element in a KML namespace is resolved to a closed enum
+of the 2.3 vocabulary*, with the namespace it was spelled in recorded beside it,
+and keeps its attributes, children, text and comments on a generic node; an
+element in no KML namespace is carried as its source bytes. Rejected: one Rust
+struct per complex type, with a typed field per child and attribute. Four
+reasons:
+
+- *The round trip has to survive invalid documents*, and real ones are:
+  =hand_hostile.kml= is out of 2.2's order, gpslogger interleaves track
+  children, a stampless =kml:Track= is invalid 2.3. Per-type structs need a slot
+  for every misplaced or duplicated child; a node tree keeps what was there.
+- *The transforms are tables*: respelling is keyed on (namespace, local name,
+  parent) and 2.2's order is =ogckml22.xsd='s sequences. As tables they are
+  transcribed from the schemas and checked against them, as the 23 version
+  assertions were (K2).
+- *Typed reading is needed only where something reads*: the projection
+  touches about fifteen element kinds; the other ~150 are carried, reordered
+  and respelled.
+- *It is still typed where D-K6 needs it*: no raw name reaches the logic, so
+  local-name matching cannot return.
+
+/The cost/: the compiler does not check an element's structure. The XSD
+oracle on every write (K5) checks it instead, and more thoroughly. /When this
+would be the wrong call/: if the crate came to *build* rich KML from other
+formats -- styles, views, regions, network links. It builds placemarks,
+geometry, =ExtendedData= and time. Typed builders producing nodes can be added
+for whatever it starts building, without redoing the model.
 
 *** D-K5 -- spelling provenance is recorded, and the round trip is the test
 Several source spellings map to one 2.3 construct. The model records which one
@@ -194,6 +289,13 @@ whose local name is =Point= is read as a KML Point today.
    has none is reported.
 3. *Cross-format losses* -- unchanged, =lossy-conversion-warnings.org=.
 
+/No fourth warning about readers./ A 2.3 write whose adopted elements no
+measured reader reads (§ MEASURED IN A RENDERER) says nothing about it. Nothing
+is lost -- the output is the standard -- and =--kml-version 2.3= is only ever
+an explicit request, so whoever made it has chosen the standard over what
+readers support. Ruled 2026-10-23. The *version-changed* warning above still
+fires on a 2.2 source written as 2.3, because that one reports a respelling.
+
 *** D-K8 -- KML 2.0 and 2.1 are out of scope
 Google's pre-OGC versions are neither read nor written; D-K1 refuses them by
 namespace. Taken 2026-10-22, on two grounds:
@@ -224,6 +326,14 @@ namespace (=gx:altitudeMode= with a seafloor mode becomes
 =kml:seaFloorAltitudeMode=) unless the source spelled it =gx:= and the run is
 same-version (D-K5). On a write to 2.2 they lower back to =gx:=. Elements 2.3
 did *not* adopt stay =gx:= foreign content, carried verbatim.
+
+/Reopened and re-closed 2026-10-23, unchanged./ § ORACLES made this decision
+conditional on one measurement -- whether Google Earth reads =kml:Track= -- and
+it does not; nor do GDAL LIBKML or CesiumJS (§ MEASURED IN A RENDERER). The
+rule did not change. The default did: D-K2's step 3 is now 2.2, so this rule
+applies only when 2.3 is asked for, and then the standard's spelling is the
+right one to write (open question 9). =gx:drawOrder= joins the non-adopted
+group, carried verbatim.
 
 *** D-K11 -- a Track's per-vertex data lives in the native only
 /Decided 2026-10-22, answering open question 1./
@@ -280,6 +390,18 @@ composed by a caller or a pipe, never by geosetta depending on geoscribe
 (=architecture.org=
 § THE COMPOSITION MODEL), and the warning names that composition.
 
+/The seam does not reach the document's own heights (2026-10-28)./ A caller
+composing that transform edits through =FeatureCollection::for_each_position_mut=,
+which visits feature geometry alone. A KML document carried through K4/K5
+also holds =<LookAt>=/=<Camera>= positions and altitudes, =<LatLonAltBox>=
+altitude bounds, a =<Model>='s =<Location>= and a ground overlay's
+=<altitude>=; a vertical shift through the seam would leave them as they
+were. Narrow -- the case D-K12 addresses comes from another format and brings
+no document -- but if it is needed, the fix is a geosetta visitor over the
+document's own coordinates, each tagged with its kind, geosetta applying the
+edit. That keeps D-K16. Recorded with the cross-repo item in
+=geocore/todo.org=.
+
 **Measured against GDAL 3.13.3 LIBKML, 2026-10-22** -- and it is a gap, not an
 oracle (=same-format-fidelity.org= § THE ORACLE RULE):
 - *Read*: Z kept verbatim in every mode; =altitudeMode=, =extrude=,
@@ -333,12 +455,26 @@ LIBKML returns a =GroundOverlay= as =POLYGON Z= with an =icon= field and
 is not where the image is. It *drops* =PhotoOverlay= and =ScreenOverlay=. The
 built-in =KML= driver drops all three.
 
-/Open within the decision: the plane of the rotation./ §11.3.3 says =rotation=
-turns the overlay "about its center, in decimal degrees ... counterclockwise",
-with 0 at north, but not whether the corners rotate in degree space or on a
-local metric plane. The two differ away from the equator. Settle it by
-measuring a renderer (Google Earth web) before the footprint is computed, and
-state the choice in the reader's docs.
+/The plane of the rotation -- ***measured 2026-10-23: the ground.***/ §11.3.3
+says =rotation= turns the overlay "about its center, in decimal degrees ...
+counterclockwise", with 0 at north, but not whether the corners rotate in
+degree space or on a local metric plane. The two differ away from the equator.
+Google Earth Web turns it *on the ground*, counter-clockwise: at 60°N all four
+corners of a 45° turn land on the ground-plane prediction, and the
+degree-space prediction is ~80 km off (§ MEASURED IN A RENDERER). So the reader
+computes the footprint by scaling longitude offsets by cos(latitude of the
+centre), turning, and scaling back. Its docs say so, and cite this measurement.
+
+/What the measurement could not separate/: a local metric plane and Web
+Mercator put those corners 1.7 km apart, about 3 pixels at the zoom that
+showed the whole overlay. ***Separated 2026-10-28: the local plane*** (§
+MEASURED IN A RENDERER, *The rotation plane, at scale*) -- open question 10,
+decided. The reader's model is the renderer's.
+
+/A 2008 claim to the contrary/ -- "GE draws GroundOverlays by rotating them on
+the lat/lon plane", from a member of Google's KML developer group, not Google --
+does not describe current Earth Web. It is the source of the degree-space
+corner formula that circulates online, so expect to meet it.
 
 *** D-K15 -- a feature's time projects as GDAL-named properties, verbatim
 /Decided 2026-10-22, answering open question 6./
@@ -363,6 +499,37 @@ series is D-K11's and stays in the native.
 | =<end>2026-03-15=                | =2026/03/15 00:00:00=          | =2026-03-15T00:00:00= -- *widened* |
 | =<when>1997=                     | *nothing -- the value is lost* | -- |
 
+*** D-K16 -- the document model stays crate-private
+/Decided 2026-10-28, answering open question 11./
+
+=KmlNative='s =document= and =KmlFeatureNative='s contents stay
+=pub(crate)=. A library caller sees a KML document through the IR, and edits
+it there. This is a ruling, not a deferral, so the difference from the other
+spokes' natives -- whose contents are public -- is not an oversight.
+
+- *The IR is the one edit surface* (D-K4). The writer reconciles the IR
+  against each feature's stored element; a public model would be a second
+  way to change the same member, and the writer would need a rule for which
+  edit wins.
+- *The model carries invariants a caller could break silently.* A feature's
+  =Address= is a path of child indices into the skeleton: a caller adding or
+  removing a folder's children would send features to the wrong container,
+  or to the default one, with no warning -- the spoke's fidelity guarantee
+  made the caller's problem. The other natives are flat members with no such
+  coupling, which is why they can be public.
+- *The surface would be large and unstable*: the node tree, the 168-variant
+  vocabulary generated from the schemas, the spellings, the skeleton and the
+  addresses. A regenerated vocabulary or a later KML version would break
+  callers; K4's own rework of the addressing would have.
+- *No caller needs it.* nazca and geoscribe read no native, and none has been
+  asked for.
+
+/If a caller needs to see what the IR does not hold/ -- styles, folder names,
+network links -- the additive step is a read-only accessor returning the
+skeleton as KML text: no new types, no invariants exposed, stable however the
+model changes. Making the tree itself public stays the last resort, and would
+need =#[non_exhaustive]= on the vocabulary.
+
 ** VERSION DETECTION
 | input                     | namespace                          | detected by |
 |---------------------------+------------------------------------+-------------|
@@ -378,14 +545,45 @@ whatever it declares. Whether to write such a file back with the stamp it lacked
 is answered by D-K5: provenance records the absent stamp, and a same-version run
 reproduces it./
 
+/The list of 2.3-only components is not ours to compile./ =ogckml23.xsd=
+carries it as XSD 1.1 assertions on the root (around lines 770--930), one per
+component: =Track=, =MultiTrack=, =Tour=, =LatLonQuad=,
+=seaFloorAltitudeMode=, =altitudeOffset=, =balloonVisibility=,
+=SimpleArrayField=, =horizFov= and a time primitive inside =Camera=/=LookAt=,
+=@uom= on =SimpleField=/=Data=, and geometry inside =Create=/=Delete=. K2's
+detection should be that list, transcribed with its line references, the way
+=build_spec_fixtures.sh= transcribes GeoPackage DDL. /***Transcribed 2026-10-23***
+into =kml/reader.rs='s =uses_2_3_only=, with line numbers and the schema's
+SHA-256: 23 assertions at lines 770--924. One detail the summary above
+blurs: =Create= is listed only with a =MultiGeometry= child, while =Delete= is
+listed with six geometries (=MultiGeometry=, =Point=, =LineString=,
+=LinearRing=, =Polygon=, =Model=). The assertions are written against OGC's
+namespace, so a document in Google's pre-OGC 2.2 namespace is not scanned./
+
+/And it makes a stampless 2.3 document invalid./ Each assertion has the form
+=if (.//kml:Track) then starts-with(@version,'2.3')=, and =version= defaults to
+2.2. So a file using =kml:Track= with no =version= fails the 2.3 schema, and
+D-K5's same-version run, which reproduces the absent stamp, writes a file that
+fails it too. That is still the identity D-K3 promises -- the input was invalid
+the same way -- but the XSD oracle in K5 must expect the failure for that
+fixture rather than report it.
+
 ** VERSION TRANSFORMS
 *** 2.2 ⇄ 2.3 -- sourced
 - Version stamp.
 - =Snippet= ⇄ =snippet=; =Metadata= → =ExtendedData= (upward only; 2.3 still
   admits =Metadata= as deprecated, so a same-version run keeps it).
 - Each adopted =gx:= element ⇄ its =kml:= form (D-K10). /The =gx:= spellings of
-  =horizFov=, =duration= and =altitudeOffset= are to be confirmed against
-  Google's KML reference before this table is relied on./
+  =horizFov=, =duration= and =altitudeOffset= are confirmed (2026-10-23)/:
+  same local name, same parents, in =kml22gx.xsd=, =ogckml23.xsd= and Google's
+  KML reference. The full mapping is § WHAT THE SCHEMAS SAY.
+- =gx:Track='s children must be *grouped* -- every =<when>=, then every
+  =<gx:coord>=, then every =<gx:angles>=: =kml22gx.xsd= declares them as a
+  =sequence=. 2.3 declares =kml:Track='s as =xs:all=, which also admits
+  interleaving. So lowering an interleaved 2.3 track to 2.2 must regroup it,
+  and the writer should emit the grouped order in both versions, since it is
+  the only order both accept. /An interleaved =gx:Track= is reported not to
+  draw in Google Earth Pro -- gpslogger issue 1335./
 - Expected lossless in both directions, because =gx:= covers what 2.3 adopted.
   Each claim is a test, not an assumption, and every transform gets a fixture
   before it is implemented, per README.org § Sourcing a fixture from a real
@@ -413,38 +611,531 @@ reproduces it./
 - *Writer output order* follows schema order. 2.3 does not enforce it, but 2.2
   does, and a 2.2-only consumer must accept a 2.2 write.
 
+** MEASURED IN A RENDERER -- Google Earth Web, 2026-10-23
+The two facts only a renderer could answer, measured in Google Earth Web
+(earth.google.com/web, Chrome, macOS) from the three probes
+=tests/fixtures/gen_kml_render_probes.py= builds. That script's docstring says
+why each probe has the shape it has. Each file was opened with File → Open
+local KML file. /The third probe was opened through that same menu item, with
+the page's =showOpenFilePicker= replaced to hand it the file's bytes -- Earth
+Web uses the File System Access API, not a file input -- so the parse is
+Earth's own./ Google Earth Pro was not measured: it is not installed here, and
+Google is discontinuing its downloads (D-K8). The same tracks were then read by
+GDAL and CesiumJS; see the last subsection.
+
+*** The rotation plane
+=probe_rotation_gxtrack.kmz=: a 4°×2° =LatLonBox= centred on 10°E 60°N -- a
+~222 km square on the ground, since cos 60° = ½ -- with =rotation= 45, its image
+a circle with a red arm to the top edge and a blue arm to the right. Pins mark
+each corner as the two hypotheses predict:
+
+| corner | degree space    | ground plane    | where the overlay's corner landed |
+|--------+-----------------+-----------------+-----------------------------------|
+| NE     | 10.707, 62.121  | 10.000, 61.414  | on the ground-plane pin           |
+| NW     | 7.879, 59.293   | 7.172, 60.000   | on the ground-plane pin           |
+| SW     | 9.293, 57.879   | 10.000, 58.586  | on the ground-plane pin           |
+| SE     | 12.121, 60.707  | 12.828, 60.000  | on the ground-plane pin           |
+
+Two independent reads agree. The corners sit on the ground-plane pins, with
+every degree-space pin well outside the overlay; and the image's circle drew as
+a circle, with its arms at a right angle, which a degree-space turn would have
+sheared into a tilted ellipse. The red arm pointed at the ground-plane
+image-top pin, to the northwest: *counter-clockwise*, as §11.3.3 says.
+
+*** The rotation plane, at scale -- 2026-10-28
+=probe_rotation_plane.kmz=: a 40°×30° =LatLonBox= centred on 10°E 45°N
+(spanning 10°W–30°E, 30°N–60°N), =rotation= 30, the same image, with pins at
+the corners four "on the ground" hypotheses predict. At the first probe's
+size they agree to within 4 km; at this one each pair is 41 km apart or more
+at some corner and 140–310 km at another:
+
+- *G*, a local plane: longitude offsets scaled by cos(centre latitude),
+  turned, scaled back -- what =kml/project.rs= implements.
+- *M1*, Web Mercator, turned about the box's Mercator midpoint.
+- *M2*, Web Mercator, turned about its midpoint in degrees.
+- *S*, the sphere: each corner's bearing from the centre turned, its distance
+  kept.
+
+| corner | G               | M1              | M2              | S               | where it landed |
+|--------+-----------------+-----------------+-----------------+-----------------+-----------------|
+| NE     | 16.714, 65.061  | 16.325, 63.343  | 14.842, 63.165  | 11.055, 64.151  | G, ~12 km off   |
+| NW     | -17.927, 50.919 | -18.316, 52.868 | -19.799, 52.627 | -17.362, 51.171 | G or S (48 km apart) |
+| SW     | 3.286, 24.939   | 3.675, 23.712   | 2.193, 23.348   | 0.787, 24.601   | G               |
+| SE     | 37.927, 39.081  | 38.316, 40.540  | 36.834, 40.237  | 38.105, 38.737  | G or S (41 km apart) |
+
+Read in Google Earth Web, loaded as a local KML file. At NE, the decisive
+corner, the overlay's tip sat ~10 px from G's pin at 1.2 km/px -- inside the
+pushpin icon's own offset -- and M1, M2 and S were 160, 170 and 250 km away.
+SW agreed; NW and SE, where only G and S are close, fit G. *Google Earth turns
+a =LatLonBox= on the local plane the reader already uses*, so nothing changed
+in the code. The image's edges drew as curves on the globe, consistent with an
+image laid on that plane rather than in degree space.
+
+/How it was loaded, for a rerun/: Earth Web's "Open local KML file" calls
+=showOpenFilePicker=; replacing that in the page with one returning a handle
+to a file staged in a page-side =<input type=file>= loads a file without the
+native dialog. Synthetic drag-and-drop events did not load anything: no
+element of the page cancels =dragover=.
+
+*** =gx:Track= versus =kml:Track=
+Each probe carries a control =LineString= beside its track: the same eight
+vertices, 2° of latitude apart.
+
+| construct                                 | listed in the sidebar   | drawn |
+|-------------------------------------------+-------------------------+-------|
+| =LineString= (control, both files)         | yes                     | yes   |
+| =gx:Track=, KML 2.2 + =gx:=                 | yes                     | *yes*, the whole track |
+| =gx:Track=, =version="2.3"=                | yes                     | *yes*, the whole track |
+| =kml:Track=, =version="2.3"=               | yes, with no geometry   | *no*  |
+
+The =version= stamp makes no difference to Earth: a =gx:Track= in a 2.3
+document draws as in a 2.2 one, and opening it frames the camera on both the
+track and its control.
+
+The =kml:Track= is accepted as a Placemark with nothing in it. Selecting it does
+not move the camera, opening the file frames only the control, and nothing is
+drawn across the 46°N band it spans. *The failure is silent*: no message
+names the element.
+
+/This contradicts a report two months older./ gpslogger issue 1335 (opened
+2026-08-15) says Earth Web reports =gx:Track= as unsupported. That file
+interleaved =<when>= and =<gx:coord>=, which =kml22gx.xsd= forbids (§ VERSION
+TRANSFORMS); the probe groups them. Whether Earth Web changed since, or rejects
+only the invalid order, the probe does not say. What it does establish is the
+case this crate will write.
+
+*** The same tracks in GDAL and CesiumJS
+*GDAL 3.13.3*, =ogrinfo= on each probe:
+
+| probe                         | LIBKML                     | built-in =KML=    |
+|-------------------------------+----------------------------+-------------------|
+| =gx:Track=, KML 2.2 + =gx:=    | =LINESTRING Z=, 8 vertices | feature dropped   |
+| =gx:Track=, =version="2.3"=   | =LINESTRING Z=, 8 vertices | feature dropped   |
+| =kml:Track=, =version="2.3"=  | feature, *no geometry*     | feature dropped   |
+
+LIBKML fails on =kml:Track= exactly as Earth does: the Placemark survives,
+empty, with nothing on stderr. The built-in driver drops every track, which is
+known (=kml.org= § GEOMETRY ELEMENT COVERAGE) and not an oracle on its own.
+
+*CesiumJS*, read in =packages/engine/Source/DataSources/KmlDataSource.js= on
+=main= -- the source, not a render. It has no notion of 2.3: no =version=
+attribute is read, and the namespaces it accepts are OGC 2.2, Google's
+2.0--2.2 and =gx:=. Geometry is dispatched on *local name*, so a =kml:Track=
+reaches =processTrack=, which then looks for =<coord>= in =gx:= only and builds
+the track from the shorter of the =coord= and =when= lists: zero vertices, no
+warning. =Playlist= (so every tour), =LatLonQuad= and the seafloor
+=altitudeMode= values are likewise looked up in =gx:= only.
+
+/So of the three readers measured -- the main viewer, the main geospatial
+library and the main web 3D engine -- none reads 2.3's adopted spellings, and
+all read the =gx:= ones./ ArcGIS and Marble were not measured.
+
+** WHAT THE SCHEMAS SAY -- =gx:= against 2.3, 2026-10-23
+Every global element of =kml22gx.xsd= set against =ogckml23.xsd=, by where each
+may appear, from the schemas fetched from developers.google.com and
+schemas.opengis.net, and checked against Google's KML reference where the =gx:=
+schema is looser than its documentation.
+
+| =gx:= element                         | in 2.3                                | ruling |
+|---------------------------------------+---------------------------------------+--------|
+| =Track=, =MultiTrack=, =coord=, =angles=, =interpolate= | =kml:=, same parents           | adopted |
+| =Tour=, =Playlist=, =FlyTo=, =Wait=, =AnimatedUpdate=, =SoundCue=, =TourControl= | =kml:=, same parents | adopted |
+| =duration=, =delayedStart=, =flyToMode=, =playMode= | =kml:=, same parents          | adopted |
+| =horizFov=                            | =kml:=, child of =Camera= and =LookAt= | adopted; =gx:= attaches it to any =AbstractView=, which is the same two |
+| =altitudeOffset=                      | =kml:=, child of =LineString=, =LinearRing= | adopted; the =gx:= schema admits any geometry, Google's reference documents only these two |
+| =balloonVisibility=                   | =kml:=, child of every feature         | adopted |
+| =LatLonQuad=                          | =kml:=, an extent of =GroundOverlay=   | adopted |
+| =SimpleArrayField=, =SimpleArrayData=, =value= | =kml:=, in =Schema=/=SchemaData=  | adopted |
+| =TimeStamp=, =TimeSpan= inside a view | =kml:= time primitive on =Camera=/=LookAt= | adopted (2.3-only, asserted) |
+| =altitudeMode= (seafloor values)      | =kml:seaFloorAltitudeMode=             | adopted, *renamed* |
+| =drawOrder=                           | =kml:drawOrder= exists, on overlays, since 2.2 | *not* adopted: a different element |
+| =outerColor=, =outerWidth=, =physicalWidth= | absent (2.3 declares an =outerWidthType= and no element uses it) | not adopted |
+| =labelVisibility=, =rank=, =ViewerOptions=, =option= | absent                      | not adopted |
+| =x=, =y=, =w=, =h= on =Icon=          | =kml:x=/=kml:y= exist, on =Scale=      | *not* adopted: different elements |
+
+/The trap in this table is the shared local names./ =drawOrder=, =x= and =y=
+each exist in both namespaces as *unrelated* elements. A mapping keyed on local
+name alone would respell =gx:drawOrder= on a line string into a
+=kml:drawOrder= no line string may hold -- invalid output, and a silent change
+of meaning. D-K6's namespace-aware =xml.rs= is what makes the right ruling
+expressible; the mapping must key on (namespace, local name, parent).
+
 ** ORACLES
 - *2.2 schema*: =ogckml22.xsd= is XSD 1.0; =xmllint --schema= validates it.
+  /Not on its own/: it imports the xAL (=AddressDetails=) and Atom schemas, and
+  =xmllint= refuses to compile it until both are fetched beside it (measured
+  2026-10-23). A 2.2 document with =gx:= content also needs =kml22gx.xsd=
+  loaded: the =gx:= elements are in substitution groups, not open content, so
+  without it a valid =gx:Track= is reported as unexpected. *This is the oracle
+  every default write is checked against* (D-K2).
 - *2.3 schema*: =ogckml23.xsd= is *XSD 1.1*, which libxml2 does not implement.
-  Needs a 1.1 validator -- Xerces-J with 1.1 support, or Saxon-EE. =#[ignore]=d
-  like =tests/crs_external.rs=, never run silently.
+  The validator is Python's =xmlschema= (=xmlschema.XMLSchema11=, 4.3.2), so the
+  oracle needs no JVM. =#[ignore]=d like =tests/crs_external.rs=, never run
+  silently. /Measured 2026-10-23/: it compiles =ogckml23.xsd= in 0.3 s once xAL
+  is fetched beside it (as for 2.2), and it rejects four hostile documents for
+  the right reason each -- an unknown =altitudeMode=, two geometries in one
+  Placemark, an unknown =kml:= element, and a =Track= with more =<coord>= than
+  =<when>=. The last is caught only by an XSD 1.1 =assert=, so 1.1 is really
+  being enforced. All of this tree's =.kml= fixtures and both render probes
+  validate. On 2.2 it agrees with =xmllint=: both reject =hand_hostile.kml= at
+  the same element (=<visibility>=, line 13). Xerces-J's 1.1 build and Saxon-EE
+  are the fallbacks, should =xmlschema= ever disagree with OGC 14-068.
+- *Where the schemas live: outside the tree.* /Decided 2026-10-23; the
+  test that reads them is =tests/kml_schemas.rs= (2026-10-28)./ The schema
+  test reads =ogckml22.xsd=, =ogckml23.xsd=, =kml22gx.xsd=,
+  =atom-author-link.xsd= and =xAL.xsd= from a directory the person running it
+  supplies, and fails naming the five files and where each is published when
+  they are missing -- the =tests/crs_external.rs= pattern. Committing them was
+  the alternative; it needs OGC's and Google's redistribution terms checked,
+  and buys nothing an =#[ignore]=d test needs. The directory is
+  =GEOSETTA_KML_SCHEMAS=, holding =2.3/ogckml23.xsd=, =2.2.0/ogckml22.xsd=,
+  =kml22gx.xsd= and the two imports beside each schema that needs them; the
+  first test to read it is =kml::model='s =the_vocabulary_is_the_schemas=.
 - *OGC 14-068*, the abstract test suite: its assertions become test cases
   whether or not an executable suite exists.
 - *GDAL LIBKML* for reads, as in =kml.org= § What GDAL does -- and never the
   built-in =KML= driver alone, which drops features (same-format-fidelity.org §
   THE ORACLE RULE).
-- *Google Earth*, for one measurement before shipping D-K10: whether it reads
-  =kml:Track= as well as =gx:Track=. If it does not, "emit the latest" makes
-  2.3 output worse for the main KML consumer, and D-K10 needs revisiting.
+- *Google Earth Web*, by hand, from the probes =tests/fixtures/gen_kml_render_probes.py=
+  builds. Measured 2026-10-23 (§ MEASURED IN A RENDERER): it does *not* read
+  =kml:Track=, which is why D-K2 now defaults to 2.2. Rerun the probes when a
+  renderer changes; that is why they are kept. If readers take up 2.3's
+  spellings, D-K2's step 3 is the one line to revisit.
 - *The fixture registry* (D6) gains an exhaustive =match= on =KmlVersion=, so
   a version cannot be added without its hostile fixture.
 
 ** MILESTONES
 - *K1 -- =xml.rs=*: namespace resolution, prefixes kept, foreign attributes
   kept, comments kept, byte offsets, UTF-16 and declared encodings. D-K6.
+  ***Built 2026-10-23.*** Every element and attribute carries its namespace
+  URI and its prefix as written; declarations are attributes in the xmlns
+  namespace, scoped to their element, and an unbound prefix is kept with no
+  namespace rather than refused. Comments and processing instructions keep
+  their position among an element's children (=XmlElement::misc=), and those
+  around the root are on =XmlDocument=. Each parsed element records its
+  source =span=. =xml::decode= takes bytes: BOM, UTF-16's first-bytes pattern,
+  then the declared =encoding= -- UTF-8, UTF-16, US-ASCII and ISO-8859-1
+  exactly, any other only over all-ASCII bytes (=encodings.org= E5). The
+  namespace-blind =child=/=children_named= are gone, so local-name matching
+  cannot come back by accident. Measured on a 35 MB, 200,000-Placemark file:
+  0.36 s before, 0.38 s after.
+
+  *Applied to today's reader at once*, since leaving it on local names would
+  have kept the bug D-K6 names: =kml/reader.rs= matches KML by namespace
+  (OGC 2.2, Google's 2.0--2.2, or none), so an extension's =<x:Point>= is no
+  longer read as a Point, and does not descend into extension subtrees. A
+  root in a non-KML namespace is refused with the namespace named -- D-K1's
+  refusal, early, because matching by namespace would otherwise read such a
+  file as empty, silently. Google's 2.0/2.1 are still *read*; refusing them
+  stays K2's, with the version detection it belongs to.
 - *K2 -- versions*: detection per § VERSION DETECTION, =KmlVersion=, the version
   in the native, =--kml-version=, the refusal of 2.0/2.1, and warning 1.
   Needs the read-time warning channel
   (=lossy-conversion-warnings.org= § 2b) -- the source version is a read fact.
+  /Built 2026-10-23./ ***K2 built 2026-10-23.*** =KmlVersion= is public and
+  =#[non_exhaustive]=; =NativePayload::Kml(KmlNative)= records the detected
+  version and the namespace and =version= stamp as written. Both the =.kml= and
+  =.kmz= writers read a native tagged either way, since the two hold one
+  document; a =.kmz='s provenance is its first entry's, the one it is written
+  back as. Resolution is D-K2's: =--kml-version= (a usage error for any other
+  output, and with =--print-crs*=), else the native's version, else 2.2. The
+  library form is =convert::write_kml_features=, or =write_features_with= and
+  =WriteOptions::kml_version= since =--compact= joined it
+  (=kml-layout.org= D-L8). Every write validated:
+  geosetta's 2.2 output against =ogckml22.xsd= under =xmllint=, its 2.3 output
+  and a 2.3 round trip against =ogckml23.xsd= under =xmlschema='s XSD 1.1.
+
+  /Warning 1 is built as nothing, correctly./ It fires only when a version
+  change *respells* a construct, and today's writer emits no construct that
+  2.2 and 2.3 spell differently -- a track is written as a =LineString=, its
+  per-vertex data already reported at read. It gains its first respelling with
+  K5's writers, which is where it belongs. The same holds for D-K7's warning 2.
 - *K3 -- the model*: the typed 2.3 document model with extension slots, raised
   from 2.2 and 2.3. Geometry group first (=LinearRing=, then =Track=/
   =MultiTrack=, =Model= carried), then features and containers, ids, styles,
   =Schema=/=ExtendedData=, time, views.
+  ***Built 2026-10-23, as D-K4a's node tree*** -- =src/kml/model.rs=. Under
+  that design the element-by-element order above collapses: the whole
+  vocabulary is raised at once, and the order it lists becomes the order K4
+  *reads* the model in. What is there:
+  - =KmlElement=, all 168 concrete 2.3 elements, with =from_name=/=name= and one
+    predicate per abstract group the model reads (geometry, feature, container,
+    overlay, style selector, sub-style, time primitive, view, tour primitive).
+    *Generated* from =ogckml23.xsd= by =tests/fixtures/gen_kml_vocab.py=; 2.2's
+    145 elements are a subset, so 2.3's vocabulary is the model's. Two pairs
+    collide when capitalised -- =snippet=/=Snippet=, =scale=/=Scale= -- and the
+    capitalised one is =...Upper=.
+  - =GX_ADOPTED=, the 26 adopted =gx:= elements, 25 by the same name and
+    =gx:altitudeMode= as =seaFloorAltitudeMode=; =drawOrder=, =x= and =y= are
+    left out by name, as § WHAT THE SCHEMAS SAY requires.
+  - =Node=/=KmlDocument=, =raise= and a same-version =write=. Foreign content is
+    its source slice; a name in a KML namespace that 2.3 does not define is
+    foreign too, flagged.
+  - *D-K5's invariant at the XML level*: writing a raised document parses to
+    the document it came from. Tested over every =.kml= fixture, every entry of
+    GDAL's layered =.kmz=, and a hand-built document with comments, PIs,
+    foreign elements and attributes, and a =gx:Track=.
+  - =the_vocabulary_is_the_schemas= (=#[ignore]=d) checks the enum and the
+    adoption table against the schemas, parsed with this crate's own =xml.rs=.
+  /Not yet used outside its tests/: K4 is what reads it -- the reader still
+  projects from =XmlElement=, and the model is not yet in the native. The 2.2
+  order table and the version transforms are K5's./
 - *K4 -- projection and reconcile*: the IR as a projection; IR wins for
   projected members on write; =Schema= → =DeclType= (D-K9).
-- *K5 -- writers*: 2.3, and the lowering to 2.2 (D-K10). One hostile fixture
+  ***Step 1 built 2026-10-23: Placemarks, and the same-version write.***
+  - *The reader parses straight into the model* (=model::parse=, through a
+    =Builder= the XML parser now takes), so a large document never exists as
+    an =XmlElement= tree beside its model. =document::split= takes each
+    projected feature out, with its address -- the container's path and its
+    slot among the container's other children -- and the comments just before
+    it; the rest is the collection's skeleton, in =KmlNative=. Each feature's
+    element is a new =NativePayload::KmlFeature(KmlFeatureNative)=.
+  - *Only containers hold features*: the root, =Document= and =Folder=. A
+    Placemark inside a =NetworkLinkControl='s =Update= is an instruction to
+    another document and stays in the skeleton -- before this it became a
+    feature.
+  - *The writer reconciles* (=kml/reconcile.rs=), when the source was KML or a
+    single-document KMZ and the output is its own version. An unedited
+    feature is written exactly as read; an edited one has only what changed
+    rewritten -- =<name>=, =<description>=, an =<ExtendedData>= value, the
+    geometry -- and an added element goes where =PlacemarkType='s sequence
+    puts it. An edited geometry keeps its element's other children where it
+    can: a Point or line string takes new coordinates in place, and a track
+    edited to the same vertex count keeps its =<when>= series. A feature with
+    no native joins the document's first container, in its KML prefix.
+    Reordering moves a feature only among the features beside it: it is not
+    carried past content the IR does not hold.
+  - *Measured*: =hand_hostile.kml= and the =gx:Track= probe come back from
+    =kml -> kml= as the same XML; the registry's =kml= and =kmz= hops compare
+    every native equal. =Format::same_format_losses='s KML row lost its three
+    entries (styles, folders/overlays/models, timestamps/altitude modes) and
+    now names only what the XML layer normalises.
+  - *Warnings moved to the write* (=convert::kml_write_warnings=): a =<Model>=
+    or a track's per-vertex data when the write cannot give the model back --
+    another format, a version change, a layered =.kmz= -- and a track an edit
+    gave another vertex count. A *version change* is built from the IR alone
+    until K5, and says so. /K5 built 2026-10-28: a version change now lowers
+    or raises the document./
+  - *Cost, on a 35 MB, 200,000-Placemark file*: a read takes 546 MB and 0.30 s
+    (534 MB and 0.27 s before); =kml -> fgb= 560 MB, less than before, since
+    =main.rs= releases natives the target's writer will not read; =kml -> kml=
+    812 MB (626 MB), because it now carries the document. The first version
+    held 3.5 KB per feature -- =collect= reusing the parse tree's buffers in
+    place -- and built two trees; both are fixed and commented where they
+    were.
+  - /The model stays crate-private/ (=KmlNative='s =document=,
+    =KmlFeatureNative='s contents): whether it is public like the other
+    natives' contents was left until after K5 (2026-10-23), and is D-K16:
+    it stays private.
+  ***Step 2 built 2026-10-24: the rest of the projection.*** One function,
+  =project::project=, still says what a feature is, and the writer still
+  re-projects to find what an edit changed; it now reads a =Context= -- the
+  document's =<Schema>=s, which stay in the skeleton -- and the properties come
+  in a fixed order: =name=, =description=, time, =icon=, the altitude members,
+  then =<ExtendedData>=.
+  - *Overlays (D-K14).* =<GroundOverlay>= and =<PhotoOverlay>= are features
+    beside =<Placemark>= (=project::is_projected=); =<ScreenOverlay>= stays in
+    the skeleton. A ground overlay's footprint is its =<LatLonQuad>= (either
+    spelling) as written, else its =<LatLonBox>= turned on the ground --
+    longitude offsets scaled by cos(centre latitude), turned
+    counter-clockwise, scaled back -- and an unturned box is its edges with
+    no arithmetic. The test is § MEASURED IN A RENDERER's own table: the 4°×2°
+    box at 60°N turned 45° lands on all four ground-plane corners. A missing
+    edge takes 2.3's default; 2.2's puts =north= at 180°, which is not a
+    latitude. /On write/: a footprint that is still a turned box goes back
+    into its =<LatLonBox>=, an edge the edit did not move keeping its
+    spelling; one that is a quadrilateral but no box becomes =<LatLonQuad>=,
+    =<gx:LatLonQuad>= in 2.2, declared on itself; an overlay already given as
+    a quad stays one. The inverse rounds to 10 decimal places of a degree --
+    a hundredth of a millimetre -- because turning there and back gives
+    =13.000000000000002=. *A geometry an overlay cannot hold* -- a triangle, a
+    hole, a line -- makes the feature a Placemark, its =icon= in
+    =<ExtendedData>=, and =drop_warnings= says so; D-K14 did not rule this
+    case.
+  - *Time (D-K15).* =timestamp=, =begin=, =end= as the source's text; a column
+    is declared =DateTime= when it has a value and every value is a whole
+    =xsd:dateTime=. On write the properties rebuild =<TimeStamp>= or
+    =<TimeSpan>=, keeping the stored primitive's =id= when the kind is the
+    same; a stamp wins over a span, and a value that is no KML time
+    (=dateTime=, =date=, =gYearMonth=, =gYear=) goes to =<ExtendedData>=.
+    =Format::recast_column= knows the three keys, so a time column into KML is
+    not reported as recast to text.
+  - *=<Schema>= (D-K9).* A =<SimpleData>= is typed by the =<SimpleField>= its
+    =<SchemaData schemaUrl="#id">= names: =int=/=uint=/=short=/=ushort= to
+    integers in range, =float=/=double= to finite floats, =bool= from
+    =true=/=false=/=1=/=0=. A value that is not of its type stays its text --
+    kept, not refused or guessed at -- and empty text in a typed field is
+    null. Each field is a =FieldDecl= (=int= → =Int32=, =short= → =Int16=,
+    =float= → =Float32=, ...); a name two schemas type differently is declared
+    by neither, and a schema in another document is not read.
+    =Format::carries_column_schema= answers =true= for KML and KMZ, and the
+    writer emits one =<Schema>= for the columns a collection declares, with
+    =<SchemaData>= per feature. KML has eight field types, so =Int8=/=UInt8=
+    widen to =short=/=ushort=, and =Int64=, =UInt64=, =Json=, =DateTime=,
+    =Date= and =Binary= are written =string= -- six recasts, warned, and
+    pinned in =every_declared_type_survives_or_is_admitted=. KML declares a
+    type and nothing else, so =schema_drop_warning= now reports a width,
+    precision or constraint bound for KML on its own. An unedited typed value
+    keeps its spelling (=1.50= in a =double=): the reconcile compares values
+    as the projection reads them.
+  - *Altitude modes (D-K12).* =altitudeMode=, =seaFloorAltitudeMode=, =extrude=
+    and =tessellate= project as their text, where the source has the element;
+    across a =<MultiGeometry>= a member projects when every member stating it
+    states the same, and one they disagree on stays in the model. On write a
+    member is set on every carrier that can hold it -- =<tessellate>= only on
+    line-like geometry -- and a value the element does not admit goes to
+    =<ExtendedData>=. The two modes are one choice in the schema, so setting
+    one removes the other; a sea-floor mode is =<gx:altitudeMode>= in 2.2.
+    *The collection is EPSG:9707* when every leaf with a Z is =absolute= -- a
+    track inheriting its multi-track's mode, an absent mode =clampToGround= --
+    and =Crs::Wgs84= otherwise. 9707 is carried *by code alone*: geosetta has
+    no registry and invents no definition (=crs.rs=), so a GeoParquet or
+    Shapefile write of an all-absolute KML asks for one with =--crs=, as any
+    bare code does. A KML write of 9707 does not warn; a GeoJSON write says
+    the heights move from EGM96 to the ellipsoid. *Warning 3's vertical
+    meaning* is =drop_warnings='s =Vertical= cause: a write to another format
+    of features whose Z is no EGM96 height.
+  - *What the spec text left to this milestone*, decided in the code: a
+    property under a member's key is never lost, only moved -- written as the
+    element when the value admits it, in =<ExtendedData>= otherwise, and only
+    its first occurrence is the member (=kml/place.rs=); a feature built
+    fresh for a reconciled document writes =<Data>=, since the document's
+    schemas were written for the features it held.
+  - *Measured* on the 35 MB, 200,000-Placemark file (peak resident size,
+    release build): =kml -> fgb= 587 MB (560 MB at step 1), =kml -> kml= 869 MB
+    (812 MB at step 1), the output byte-identical to its input. It measured
+    913 MB at first; the same build with the write-side projection skipped
+    measured 821 MB, and turning off the new members' projection changed
+    nothing, so the cost is the comparison pass's temporaries rather than
+    what step 2 projects. Comparing the projection without first cloning each
+    feature's properties took 44 MB of it back. No build of step 1 was kept to
+    measure beside this one, so the step-1 figures are the ones recorded
+    above, not re-measured.
+  - *Oracles*: every kind of write -- fresh 2.2 and 2.3, and an edited 2.2 and
+    2.3 document with a moved turned box, a quad, a sea-floor mode, a span and
+    an icon -- validates against =ogckml22.xsd= (with =kml22gx.xsd=) and
+    =ogckml23.xsd= under =xmlschema=, and GDAL LIBKML reads the fresh 2.2
+    output's typed =double= as =Real=, its =timestamp= as =DateTime= and its
+    =gx:altitudeMode= as =altitudeMode=.
+- *K5 -- writers*: the lowering to 2.2 first, since it is the default (D-K2),
+  then 2.3 (D-K10). One hostile fixture
   per version; the D-K5 round trip over each; XSD validation of every write.
   =Format::Kml='s three =same_format_losses= entries go.
+  /Lowering is a reorder as well as a respelling./ =ogckml23.xsd= declares 79
+  =<all>= groups and =ogckml22.xsd= none, so 2.3 admits children in any order
+  where 2.2 fixes one. A valid 2.3 document lowered by respelling alone can be
+  invalid 2.2: =hand_hostile.kml= is valid 2.3 and invalid 2.2 for exactly this
+  reason. The 2.2 writer emits children in =ogckml22.xsd='s sequence, and
+  D-K5's spelling provenance does not extend to order on a version change.
+  ***The lowering to 2.2 is built, 2026-10-28.*** A 2.3 read written with
+  =--kml-version 2.2= is reconciled into its own document as a same-version
+  run is, and the result lowered (=kml/lower.rs=); a write from another
+  format was already 2.2 and is unchanged.
+  - *The order is generated, not transcribed*:
+    =tests/fixtures/gen_kml22_order.py= reads =ogckml22.xsd= and
+    =kml22gx.xsd= and emits, per parent and spelling, each child's slot in
+    the type's sequence, flattened through base types, with every element
+    that substitutes for an abstract group -- which is how =gx:Track= reaches
+    a Placemark's geometry slot and =gx:altitudeMode= a Point's mode slot.
+    Children are stably sorted by slot. *The schema's order is not the one a
+    reader guesses*: =gx:altitudeOffset= and =gx:horizFov= sit in their
+    parent's extension groups, which come /before/ the parent's own members,
+    and =gx:balloonVisibility= comes after =<ExtendedData>= and before a
+    Placemark's geometry.
+  - *Spelling is keyed on the parent* (§ WHAT THE SCHEMAS SAY): the spelling a
+    child has is kept where 2.2 admits it there, else the one 2.2 admits.
+    =<TimeStamp>= stays =kml:= on a feature and becomes =gx:= in a view;
+    =<value>= stays =kml:= in =<Data>= and becomes =gx:= in
+    =<SimpleArrayData>=. A track's =<when>=, =<gx:coord>= and =<gx:angles>=
+    come out grouped by the same sort. =gx:= is declared once, on the root,
+    reusing a binding the source already has.
+  - *Foreign content*: what the schemas name -- =atom:author=,
+    =xal:AddressDetails=, a =gx:= element 2.3 did not adopt -- takes its slot,
+    its prefix resolved through the declarations in scope; anything else moves
+    with the element before it. Comments move with the element they precede.
+  - *What 2.2 has no place for*, measured by setting every parent/child pair
+    =ogckml23.xsd= admits against the generated table: a geometry in
+    =<Create>= or =<Delete>=, a turned =<LatLonBox>= or a =<LatLonQuad>= in
+    a =<Region>=, a =<LatLonAltBox>= on a ground overlay, and the =uom=
+    attribute. Every 2.3 /element/ has a 2.2 or =gx:= spelling. These are
+    dropped and named in D-K7's warning 2. /2026-10-28:/ an unturned
+    =<LatLonBox>= -- no =<rotation>=, or one saying 0 -- that is its
+    =<Region>='s only box is written as the =<LatLonAltBox>= it equals, the
+    same edges and no altitudes, and named in warning 1 as a rename
+    (=LatLonBox→LatLonAltBox=). =ogckml23.xsd= itself asserts that a
+    =<Region>= holds neither a =<LatLonBox>= nor a =<LatLonQuad>= ("Use
+    kml:LatLonAltBox instead"), so only a document 2.3 does not admit reaches
+    this; a quad has no box it equals and stays a drop.
+  - *Warnings (D-K7)*: warning 1 counts each respelling
+    (=Track→gx:Track ×3=), warning 2 each loss; a run that changes only the
+    stamp says nothing. Both are counted before the write over the document as
+    read (=lower::survey=), so an edit that removes a respelled element still
+    counts it. The lowering carries the model, so =drop_warnings= no longer
+    reports a =<Model>= or a track's per-vertex data on a 2.3 → 2.2 write.
+  - *Fixture*: =tests/fixtures/hand_hostile_2_3.kml=, valid 2.3 under
+    =xmlschema=, every adopted element in its 2.3 spelling, children in orders
+    2.2 rejects. =tests/same_format.rs= writes each version's hostile fixture
+    as 2.2 and compares the features; the model's round-trip test covers it
+    too.
+  - *Oracles, 2026-10-28*: the lowered fixture, the same written as =.kmz=,
+    and the same after =--sort-hilbert= validate under =xmllint= against
+    =ogckml22.xsd= with =kml22gx.xsd=; the fixture written back as 2.3 still
+    validates under =xmlschema=.
+  - *The oracle is in the tree, 2026-10-28*: =tests/kml_schemas.rs=,
+    =#[ignore]=d, reads =GEOSETTA_KML_SCHEMAS=, copies the schemas into a
+    directory of its own with each =import= pointed at the local copy (the
+    published ones import by URL, and the validators run =--nonet=), and
+    validates fourteen writes: from GeoJSON and FlatGeobuf in each version;
+    =sample.kml=, =duckdb_geoms.kml= and the 2.3 fixture in their own version,
+    as read and edited; the 2.3 fixture lowered as read, edited and
+    Hilbert-sorted; and a 2.2 source as 2.3. =GEOSETTA_KML_PYTHON= names the
+    Python holding =xmlschema=. A missing schema, validator or module fails
+    the run by name. *Its first run caught a K4 bug*: an edit adding a
+    property to a feature whose values are in =<SchemaData>= appended the new
+    =<Data>= after it, which 2.2 rejects; it now goes after the last =<Data>=,
+    else before the first =<SchemaData>=.
+  - /Not a gap after all/: a document holding both =<Metadata>= and
+    =<ExtendedData>=, or both =<Snippet>= and =<snippet>=, is invalid 2.2,
+    where each pair is one choice -- and invalid 2.3 too, where each pair
+    substitutes for one =AbstractExtendedDataGroup= or =AbstractSnippetGroup=.
+    No valid source holds both, so neither transform merges them.
+  ***The raising to 2.3 is built, 2026-10-28.*** A 2.2 read written with
+  =--kml-version 2.3= is reconciled into its own document and raised
+  (=kml/raise.rs=). Nothing is reordered: 2.3's 79 content models are all
+  =<all>= groups, and the generator asserts the schema has no =<sequence>=.
+  - *Adopted =gx:= elements move into the KML namespace* (D-K10) where 2.3
+    admits that element in that parent, from a table
+    =tests/fixtures/gen_kml23_children.py= generates from =ogckml23.xsd=. Where
+    it does not, the element stays =gx:=, which 2.3's =defaultOpenContent=
+    admits anywhere: the =gx:= schema puts =altitudeOffset= on every geometry
+    and 2.3 on line strings and rings only, so a =gx:altitudeOffset= on a
+    Point is carried rather than respelled into something invalid.
+    =every_2_2_placement_is_a_2_3_placement= checks the rest: every other
+    child 2.2 admits, 2.3 admits too, so a raise never drops.
+  - *=<Snippet>= → =<snippet>=, =<Metadata>= → =<ExtendedData>=* (§ VERSION
+    TRANSFORMS), each only when nothing is lost: =<snippet>= is a plain
+    string, so a =<Snippet>= with a =maxLines= other than its default, or any
+    other attribute, stays; =<Metadata>= becomes =<ExtendedData>= when it
+    holds only =<Data>=, =<SchemaData>= and other namespaces' elements. What
+    stays is deprecated and still 2.3. Neither is projected, so the IR does not
+    see the rename.
+  - *The root*: =version="2.3"=, OGC's namespace -- Google's pre-OGC
+    namespace rebound to it wherever declared, keeping each element's prefix
+    -- and 2.3's schema where =xsi:schemaLocation= named 2.2's.
+  - *Warning 1 (D-K7)* counts each respelling and rename:
+    =kml: input is KML 2.2; written as KML 2.3 (gx:Track→Track, gx:coord→coord ×2)=.
+    D-K7's warning 2 has nothing to report on the way up.
+  - *What it retired*: =version_change_warnings='s "built from the feature
+    model alone" message, and =drop_warnings='s version parameter -- every
+    version change gives the model back, so a =<Model>= or a track's
+    per-vertex data is never lost to one.
+  - *Measured*: =tests/same_format.rs= writes each version's hostile fixture as
+    each version and compares the features, and lowers the 2.3 fixture and
+    raises it back to a document with no =gx:= left in it. Under the schema
+    oracle, =sample.kml=, =duckdb_geoms.kml=, =hand_hostile.kml= (as read and
+    edited) and the lowered 2.3 fixture all raise to valid 2.3.
+    =hand_hostile.kml= is invalid 2.2 only in its order, which 2.3 does not
+    fix, so raising it repairs it.
 - *KMZ* stays =same-format-fidelity.org= M3c, separately -- an archive, not a
   document.
 
@@ -456,7 +1147,9 @@ reproduces it./
 - =handoff.org= § WHAT IS NOT BUILT, "decide this before writing any of the
   spoke": decided, as neither option alone (D-K4).
 - =Format::carries_column_schema= "GeoJSON, CSV, WKT and KML have no slot and
-  never will": KML has one (D-K9).
+  never will": KML has one (D-K9). /Done 2026-10-24./
+- =reader.rs='s "every collection this produces carries =Crs::Wgs84=
+  outright": an all-absolute document is EPSG:9707 (D-K12). /Done 2026-10-24./
 
 ** OPEN QUESTIONS
 1. ~~*Track in the IR.*~~ ***DECIDED 2026-10-22: D-K11*** -- the native
@@ -481,6 +1174,42 @@ reproduces it./
    it to OGC's on write. So refusing 2.0/2.1 (D-K8) makes geosetta stricter
    than GDAL, and D-K1's error must say why: only OGC KML 2.2 and 2.3 are
    supported./
+9. ~~*Which spelling of an adopted element does a 2.3 write use, when the source
+   gives none?*~~ ***DECIDED 2026-10-23: (c) for the default, (b) on
+   request*** -- output from another format is 2.2 (D-K2), and an explicit
+   =--kml-version 2.3= writes the =kml:= spelling with no warning about readers
+   (D-K7). (a) was the recommendation until GDAL and CesiumJS were measured as
+   well: with no reader of =kml:= spellings found at all, writing 2.3 by default
+   bought the version stamp and nothing a reader uses. /Opened 2026-10-23, by
+   D-K10's reopening./ This is the case of a
+   non-KML source, or a KML source asked to change version. The candidates:
+   - *(a) the =gx:= spelling, stamped 2.3.* Valid: 2.3's open content admits
+     =gx:= anywhere (§6.7.2.3) -- /measured 2026-10-23/: a =gx:Track= in a
+     =version="2.3"= Placemark passes =ogckml23.xsd= under =xmlschema='s XSD 1.1
+     validator (§ ORACLES). Google Earth draws =gx:Track= in a 2.2
+     document and in a 2.3-stamped one alike, and LIBKML reads both. The cost
+     is that the standard's own
+     spelling is never produced unless a source supplied it, which weakens THE
+     GOAL's "write the standard".
+   - *(b) the =kml:= spelling, as D-K10 says, with a warning.* Faithful to the
+     standard, and read by none of Google Earth Web, LIBKML or CesiumJS.
+   - *(c) default output to 2.2 instead of 2.3 (D-K2's step 3).* Every adopted
+     element then lowers to =gx:=, which Earth draws and every 2.2 consumer
+     accepts. The cost is that a non-KML source never produces 2.3 unless asked.
+   - /Rejected: writing both spellings/, as gpslogger did after issue 1335. It
+     emits two Placemarks for one feature, which breaks D-K3's round trip.
+
+   The measurements behind the decision are in § MEASURED IN A RENDERER: (a)
+   also passed every check -- valid 2.3, drawn by Google Earth Web, read by
+   LIBKML -- so it remains the fallback if a 2.3 default is ever wanted again.
+10. ~~*A local metric plane or Web Mercator for the rotation?*~~ ***DECIDED
+    2026-10-28: the local plane*** -- longitude scaled by cos(centre latitude),
+    which the reader already used. A 40°×30° probe separated it from two Web
+    Mercator variants and a spherical turn by 160–250 km at its NE corner (§
+    MEASURED IN A RENDERER, *The rotation plane, at scale*).
+11. ~~*Is the document model public?*~~ ***DECIDED 2026-10-28: no, D-K16***
+    -- crate-private, the IR the one edit surface; a read-only KML-text
+    accessor is the additive step if a caller ever needs to see the rest.
 
 ** DEPENDS ON / RELATED
 - [[file:kml.org][kml.org]] -- the spoke as built, and § GEOMETRY ELEMENT

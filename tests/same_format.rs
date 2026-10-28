@@ -24,7 +24,7 @@
 
 use std::process::Command;
 
-use geosetta::{Feature, FeatureCollection, Format, Geometry, JsonValue, Position};
+use geosetta::{Feature, FeatureCollection, Format, Geometry, JsonValue, KmlVersion, Position};
 
 const GEOSETTA: &str = env!("CARGO_BIN_EXE_geosetta");
 
@@ -152,6 +152,75 @@ fn hostile_fixture(format: Format) -> Fixture {
     }
 }
 
+/// One hostile fixture per KML version (`plans/kml-standard.org` § ORACLES).
+/// Not catch-all-free, as [`hostile_fixture`] is: `KmlVersion` is
+/// `#[non_exhaustive]`, so outside the crate the compiler demands the
+/// wildcard, and a third version fails here at run time instead.
+fn hostile_kml_fixture(version: KmlVersion) -> &'static str {
+    match version {
+        KmlVersion::V2_2 => "tests/fixtures/hand_hostile.kml",
+        KmlVersion::V2_3 => "tests/fixtures/hand_hostile_2_3.kml",
+        other => panic!("KML {} has no hostile fixture", other.as_str()),
+    }
+}
+
+fn read_kml(path: &std::path::Path) -> FeatureCollection {
+    geosetta::read_features(Format::Kml, &std::fs::read(path).unwrap(), &mut Vec::new()).unwrap()
+}
+
+/// `geosetta src dst --kml-version version`, which must report nothing lost.
+fn write_kml_as(src: &std::path::Path, dst: &std::path::Path, version: KmlVersion) {
+    let (ok, stderr) = run(&[src.to_str().unwrap(), dst.to_str().unwrap(), "--kml-version", version.as_str()]);
+    assert!(ok, "{}: {stderr}", src.display());
+    for lost in ["dropped", "cannot carry", "no place"] {
+        assert!(!stderr.contains(lost), "{} as {}: {stderr}", src.display(), version.as_str());
+    }
+}
+
+fn assert_same_features(before: &FeatureCollection, after: &FeatureCollection, what: &str) {
+    assert!(!before.features.is_empty(), "{what}: read as nothing");
+    assert_eq!(before.features.len(), after.features.len(), "{what}");
+    for (i, (b, a)) in before.features.iter().zip(&after.features).enumerate() {
+        assert_eq!(b.properties, a.properties, "{what}: feature {i}");
+        assert_eq!(b.geometry, a.geometry, "{what}: feature {i}");
+    }
+    assert_eq!(before.schema, after.schema, "{what}");
+    assert_eq!(before.crs, after.crs, "{what}");
+}
+
+/// Every KML version written as either comes back as the features it was read
+/// as, with nothing reported lost: in its own version, lowered to 2.2 or
+/// raised to 2.3 (K5) — tracks with their times, angles and arrays, tours, a
+/// quad, a sea-floor mode. That each output is valid in its version is the
+/// schema oracle's to say (`kml_schemas.rs`).
+#[test]
+fn every_kml_version_written_as_either_keeps_its_features() {
+    for source in [KmlVersion::V2_2, KmlVersion::V2_3] {
+        let fixture = std::path::Path::new(hostile_kml_fixture(source));
+        for target in [KmlVersion::V2_2, KmlVersion::V2_3] {
+            let dst = tmp_dir().join(format!("{}-as-{}.kml", source.as_str(), target.as_str()));
+            write_kml_as(fixture, &dst, target);
+            let what = format!("{} as {}", fixture.display(), target.as_str());
+            assert_same_features(&read_kml(fixture), &read_kml(&dst), &what);
+        }
+    }
+}
+
+/// 2.3 lowered to 2.2 and raised back is 2.3 again: the same features, and
+/// every adopted element in the KML namespace, as the fixture spells them.
+#[test]
+fn a_2_3_document_lowered_and_raised_is_2_3_again() {
+    let fixture = std::path::Path::new(hostile_kml_fixture(KmlVersion::V2_3));
+    let dir = tmp_dir();
+    let (lowered, raised) = (dir.join("lowered.kml"), dir.join("raised.kml"));
+    write_kml_as(fixture, &lowered, KmlVersion::V2_2);
+    write_kml_as(&lowered, &raised, KmlVersion::V2_3);
+    assert_same_features(&read_kml(fixture), &read_kml(&raised), "2.3 -> 2.2 -> 2.3");
+    let text = std::fs::read_to_string(&raised).unwrap();
+    assert!(text.contains(r#" version="2.3""#), "{text}");
+    assert!(!text.contains("<gx:"), "an adopted element stayed gx:\n{text}");
+}
+
 /// One read/write/read cycle in the format's own on-disk shape, returning the
 /// IR before and after so a caller can compare them.
 ///
@@ -169,10 +238,10 @@ fn round_trip(format: Format, fixture: &Fixture) -> (Vec<FeatureCollection>, Vec
         | Format::Wkt
         | Format::Kml
         | Format::Kmz => {
-            let first = geosetta::read_features(format, &bytes)
+            let first = geosetta::read_features(format, &bytes, &mut Vec::new())
                 .unwrap_or_else(|e| panic!("{format:?}: reading {} failed: {e}", fixture.path));
             let written = geosetta::write_features(format, &first).unwrap();
-            let again = geosetta::read_features(format, &written)
+            let again = geosetta::read_features(format, &written, &mut Vec::new())
                 .unwrap_or_else(|e| panic!("{format:?}: re-reading our own output failed: {e}"));
             (vec![first], vec![again])
         }
@@ -213,7 +282,7 @@ fn round_trip(format: Format, fixture: &Fixture) -> (Vec<FeatureCollection>, Vec
             let prj = sib("prj").map(|b| String::from_utf8(b).unwrap());
             let cpg = sib("cpg").map(|b| String::from_utf8(b).unwrap());
             let first =
-                geosetta::shapefile::read(&bytes, &dbf, prj.as_deref(), cpg.as_deref()).unwrap();
+                geosetta::shapefile::read(&bytes, &dbf, prj.as_deref(), cpg.as_deref(), &mut Vec::new()).unwrap();
             let enc = geosetta::shapefile::write(&first).unwrap();
             // The writer declares its own encoding now, so the hop reads back
             // through `enc.cpg` rather than the source's. /Until 2026-10-21 it
@@ -225,6 +294,7 @@ fn round_trip(format: Format, fixture: &Fixture) -> (Vec<FeatureCollection>, Vec
                 &enc.dbf,
                 enc.prj.as_deref(),
                 Some(enc.cpg),
+                &mut Vec::new(),
             )
             .unwrap();
             (vec![first], vec![again])
@@ -335,7 +405,7 @@ fn every_format_converts_to_itself() {
         let (ok, err) = run(&[src.to_str().unwrap(), dst.to_str().unwrap()]);
         assert!(ok, "{format:?} to itself failed: {err}");
 
-        let back = geosetta::read_features(format, &std::fs::read(&dst).unwrap()).unwrap();
+        let back = geosetta::read_features(format, &std::fs::read(&dst).unwrap(), &mut Vec::new()).unwrap();
         assert_eq!(back.features.len(), 1, "{format:?}");
         assert_eq!(
             back.features[0].properties.iter().find(|(k, _)| &**k == "name").map(|(_, v)| v),
@@ -370,7 +440,7 @@ fn the_pipe_pass_through_stage_runs() {
         .unwrap();
     assert!(piped.status.success(), "{}", String::from_utf8_lossy(&piped.stderr));
 
-    let back = geosetta::read_features(Format::FlatGeobuf, &std::fs::read(&dst).unwrap()).unwrap();
+    let back = geosetta::read_features(Format::FlatGeobuf, &std::fs::read(&dst).unwrap(), &mut Vec::new()).unwrap();
     assert_eq!(back.features.len(), 1);
 }
 

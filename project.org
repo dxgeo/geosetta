@@ -31,7 +31,7 @@ boundary wherever the format is externally specified, and no shared internal
 structs across a repo boundary.
 
 ** STATUS
-Current version: *0.26.1*.
+Current version: *0.27.0*.
 
 Eight formats are supported, all routed through a shared feature IR
 (=read(from) → FeatureCollection → write(to)=), so every format composes with
@@ -39,7 +39,10 @@ every other automatically — no per-pair code. Any input converts to any output
 (CSV→GeoParquet, FlatGeobuf→GeoJSON, GeoPackage↔Shapefile, KMZ→GeoParquet, …),
 validated against DuckDB / GDAL.
 
-- *GeoJSON* (read + write)
+- *GeoJSON* (read + write). Written indented — the collection, each feature
+  and each geometry one member per line, every value inside them compact on
+  its line; =--compact= writes it all on one line
+  ([[file:plans/kml-layout.org][plans/kml-layout.org]] D-L8).
 - *GeoParquet* (read + write; reads common foreign files — see below). The
   =geo= metadata's =bbox= is written in the spec's six-element 3D form
   (=[minx,miny,minz,maxx,maxy,maxz]=) whenever the data carries Z, and the 2D
@@ -74,14 +77,35 @@ validated against DuckDB / GDAL.
   =.gpkg= layer, either direction). Validated against real DuckDB-generated
   fixtures and GDAL/DuckDB's own readers.
 - *KML* and *KMZ* (read + write) on a from-scratch XML reader/writer
-  (=src/xml.rs=) and a minimal ZIP container codec (=src/zip.rs=). CRS is always
-  WGS 84 (KML has no other CRS concept). =.kmz= reading flattens *every*
+  (=src/xml.rs=) and a minimal ZIP container codec (=src/zip.rs=). Coordinates
+  are always WGS 84 longitude/latitude; a document whose every height is
+  =altitudeMode= =absolute= reads as EPSG:9707 (WGS 84 + EGM96 height), the one
+  vertical datum KML states. =.kmz= reading flattens *every*
   internal =*.kml= entry rather than just the first, since a real multi-layer
-  producer's root =doc.kml= can be nothing but a =<NetworkLink>=; writing packs
-  one stored (uncompressed) entry — no DEFLATE encoder in the crate yet, so
-  =.kmz= output is bigger than a compressed one but universally readable.
+  producer's root =doc.kml= can be nothing but a =<NetworkLink>=. A =.kmz=
+  written back is the archive it was read from: every entry in its place with
+  its modification time, extra fields, permissions and comments, the
+  archive's comment, and each =.kml= document, a layered archive's as much
+  as a single one's, written from its own model; from anything else it is one
+  =doc.kml= entry. Entries are stored (uncompressed) — no DEFLATE encoder in
+  the crate yet, so =.kmz= output is bigger than a compressed one but
+  universally readable. A =.kmz= made from another format declares a Unix
+  file of mode 0644. An archive that needs zip64 — past 65,535 entries or
+  4 GiB — is refused by name on read and on write, never read or written in
+  part.
   Validated against real GDAL (=ogrinfo=, =ogr2ogr -f LIBKML=), DuckDB
   fixtures, and a real Info-ZIP archive for the deflate read path.
+  A feature's time (=timestamp=, =begin=/=end=), its geometry's altitude
+  members and its =<Schema>=-typed =<ExtendedData>= project as properties,
+  and the declared types as column declarations; =<GroundOverlay>= and
+  =<PhotoOverlay>= are features, as a footprint polygon (=rotation= turned on
+  the ground) and a point. See [[file:plans/kml-standard.org][plans/kml-standard.org]].
+  A KML → KML run keeps the document's layout — whitespace, comments and a
+  DOCTYPE in their places, what an edit adds indented as the document
+  indents — and writes only lexical form (quotes, =<a></a>=, CDATA and
+  character references) the house way; a document built from another format
+  is indented two spaces, and =--compact= writes any KML on one line. See
+  [[file:plans/kml-layout.org][plans/kml-layout.org]].
 
 *Z and M ordinates travel end to end.* =Position= carries optional =z= and =m=,
 so every spoke reads and writes Z, and M is supported everywhere a format can
@@ -267,6 +291,7 @@ geosetta places.kml    places.geojson   # KML        -> GeoJSON
 geosetta places.kmz    places.parquet   # KMZ        -> GeoParquet (reads every internal .kml)
 geosetta places.geojson places.kml      # GeoJSON    -> KML
 geosetta places.geojson places.kmz      # GeoJSON    -> KMZ (stored, uncompressed)
+geosetta places.geojson places.kml --compact  # …on one line, to save space
 # formats may also be given explicitly:
 geosetta in.txt out.bin --from geojson --to parquet
 # a CRS geosetta can't resolve (a bare authority code, no definition) is resolved

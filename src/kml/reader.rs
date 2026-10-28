@@ -43,7 +43,7 @@ fn err(message: &str) -> Error {
 /// The sink is the read-side channel every reader takes.
 pub(crate) fn read(input: &[u8], _warnings: &mut Vec<String>) -> Result<FeatureCollection> {
     let text = xml::decode(input)?;
-    let document = read_document(&text, Format::Kml)?;
+    let document = read_document(&text, Format::Kml, 0)?;
     let facts = document.facts;
     Ok(finish(document.features, document.native, Some(document.skeleton), facts, Format::Kml))
 }
@@ -86,8 +86,8 @@ impl Facts {
 }
 
 /// Parse, detect, raise, split and project one document's text — the piece
-/// `.kmz` repeats per entry.
-pub(crate) fn read_document(text: &str, format: Format) -> Result<ReadDocument> {
+/// `.kmz` repeats per entry, `index` numbering the documents in archive order.
+pub(crate) fn read_document(text: &str, format: Format, index: usize) -> Result<ReadDocument> {
     let parsed = model::parse(text)?;
     let native = detect(&parsed)?;
     let (skeleton, models) = document::split(parsed);
@@ -100,7 +100,7 @@ pub(crate) fn read_document(text: &str, format: Format) -> Result<ReadDocument> 
         .map(|m| {
             let projection = project(&m.node, &ctx)?;
             vertical = vertical.max(project::vertical(&m.node));
-            let native = Native::new(format, NativePayload::KmlFeature(KmlFeatureNative { feature: Rc::new(m) }));
+            let native = Native::new(format, NativePayload::KmlFeature(KmlFeatureNative { feature: Rc::new(m), document: index }));
             Ok(Feature { geometry: projection.geometry, properties: projection.properties, native: Some(native) })
         })
         .collect::<Result<_>>()?;
@@ -192,6 +192,7 @@ fn detect(doc: &KmlDocument) -> Result<KmlNative> {
         namespace: namespace.map(str::to_string),
         version_attr: version_attr.map(str::to_string),
         document: None,
+        layers: Vec::new(),
         archive: None,
     })
 }

@@ -290,19 +290,18 @@ impl Format {
             // names and modification times. Until then this row read "every
             // archive entry but the KML document". What the zip writer does
             // not reproduce is what is left: it stores every entry, and
-            // writes no extra fields, attributes or archive comment. And an
-            // archive of several `.kml` documents is written back as one,
-            // built from the feature model alone, since a lone `doc.kml`
-            // would point at layers that are no longer there.
+            // writes no extra fields, attributes or archive comment. *A
+            // layered archive is carried too, since 2026-10-28*: each of its
+            // `.kml` documents comes back with its own model and features.
+            // Until then this row also read "a layered archive's structure:
+            // several .kml documents are written as one, from the feature
+            // model alone".
             Format::Kmz => &[
                 "CDATA sections, written as escaped text",
                 "a non-UTF-8 encoding, written as UTF-8, and a DOCTYPE",
                 "the layout of whitespace between elements",
                 "each archive entry's compression (written stored), extra fields and attributes, and the archive \
                  comment",
-                "a layered archive's structure: several .kml documents are written as one, from the feature model \
-                 alone, without their styles, folders or network links, and with ground and photo overlays as \
-                 Placemarks",
             ],
             // Measured clean: the `.dbf` field declarations and `.prj` survive
             // intact, and only `DBF_DATE_LAST_UPDATE` differs.

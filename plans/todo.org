@@ -196,9 +196,9 @@ check it off and remove it once the item ships or is shelved.
   turns a =LatLonBox= on the local plane the reader uses. Question 11 is
   decided too (D-K16): the document model stays crate-private, the IR the one
   edit surface. Every question in the plan is decided, and every milestone
-  built; *done*. KMZ's archive is =same-format-fidelity.org= M3c, separately:
-  its entries are carried as of 2026-10-28, and a layered archive's several
-  documents are what is left.
+  built; *done*. KMZ's archive is =same-format-fidelity.org= M3c, separately,
+  and carried as of 2026-10-28: its entries, and a layered archive's every
+  document.
 
 - [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
   *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a

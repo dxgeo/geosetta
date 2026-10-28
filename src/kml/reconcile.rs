@@ -34,23 +34,33 @@ use crate::xml::XmlElement;
 
 /// The stored element of a feature read from KML or KMZ, if it has one.
 pub(crate) fn feature_model(f: &Feature) -> Option<&FeatureModel> {
+    stored(f).map(|(m, _)| m)
+}
+
+/// A feature's stored element and which of the source's documents it was
+/// read from (0 for the first, `n` for layer `n - 1`).
+pub(crate) fn stored(f: &Feature) -> Option<(&FeatureModel, usize)> {
     let native = f.native.as_ref()?;
     match native.payload_for(Format::Kml).or_else(|| native.payload_for(Format::Kmz))? {
-        NativePayload::KmlFeature(k) => Some(&k.feature),
+        NativePayload::KmlFeature(k) => Some((&k.feature, k.document)),
         _ => None,
     }
 }
 
-/// `fc` put back into `skeleton`, a document of `version`: every feature at
-/// its address, reconciled with its stored element; a feature with none built
-/// fresh.
-pub(crate) fn assemble(fc: &FeatureCollection, skeleton: &Skeleton, version: KmlVersion) -> KmlDocument {
+/// `features` put back into `skeleton`, a document of `version`: each with a
+/// stored element of this document at its address, reconciled with it; each
+/// without one built fresh. Which features belong to the document is the
+/// caller's to say (`crate::kml::writer`), since a layered `.kmz` holds
+/// several.
+pub(crate) fn assemble<'f>(
+    features: impl Iterator<Item = (&'f Feature, Option<&'f FeatureModel>)>,
+    skeleton: &Skeleton,
+    version: KmlVersion,
+) -> KmlDocument {
     let ctx = Context::of(&skeleton.doc.root);
     let w = Writing { prefix: skeleton.doc.root.prefix.as_deref(), version, ctx: &ctx };
-    let features = fc
-        .features
-        .iter()
-        .map(|f| match feature_model(f) {
+    let features = features
+        .map(|(f, model)| match model {
             Some(m) => (Some(m.address.clone()), m.leading.clone(), w.reconcile(&m.node, f)),
             None => (None, Vec::new(), w.fresh(f)),
         })
@@ -864,11 +874,11 @@ mod tests {
         let fc = read(DOC);
         let written = String::from_utf8(crate::kml::writer::write(&fc, Some(KmlVersion::V2_3))).unwrap();
         assert!(written.contains(r#"<Style id="s">"#) && written.contains("<!-- keep me -->"), "{written}");
-        assert!(crate::kml::version_change_warnings(&fc, KmlVersion::V2_3).is_empty(), "nothing was respelled");
+        assert!(crate::kml::version_change_warnings(&fc, Format::Kml, KmlVersion::V2_3).is_empty(), "nothing was respelled");
         // A track is respelled, and it carries its times into either version.
         let fc = read(TRACK);
         assert_eq!(
-            crate::kml::version_change_warnings(&fc, KmlVersion::V2_3),
+            crate::kml::version_change_warnings(&fc, Format::Kml, KmlVersion::V2_3),
             ["kml: input is KML 2.2; written as KML 2.3 (gx:Track→Track, gx:coord→coord ×2)"]
         );
         assert!(crate::kml::drop_warnings(&fc, Format::Kml).is_empty());

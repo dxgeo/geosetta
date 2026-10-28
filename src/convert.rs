@@ -129,7 +129,7 @@ pub fn kml_write_warnings(fc: &FeatureCollection, target: Format, kml_version: O
     if let Some(version) = kml_version
         && matches!(target, Format::Kml | Format::Kmz)
     {
-        out.extend(kml::version_change_warnings(fc, version));
+        out.extend(kml::version_change_warnings(fc, target, version));
     }
     out.extend(kml::drop_warnings(fc, target));
     out

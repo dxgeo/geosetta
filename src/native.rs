@@ -156,8 +156,8 @@ pub struct KmlNative {
     pub version_attr: Option<String>,
     /// The whole document in KML's own terms, less the features the IR
     /// projects (`plans/kml-standard.org` K4): every container, style, schema
-    /// and network link, the root's declarations, the comments. `None` when
-    /// there is no single document to give back — a `.kmz` holding several.
+    /// and network link, the root's declarations, the comments. For a `.kmz`,
+    /// the archive's first document; the others are `layers`.
     ///
     /// Crate-private by decision (`plans/kml-standard.org` D-K16): the IR is
     /// the one way to edit a KML document, and the model's feature addresses
@@ -165,6 +165,11 @@ pub struct KmlNative {
     /// to the wrong folder without a word. Unlike the other natives, which
     /// are flat members with nothing to keep consistent.
     pub(crate) document: Option<Rc<crate::kml::document::Skeleton>>,
+    /// A layered `.kmz`'s other documents — GDAL's `layers/*.kml` beside a
+    /// `doc.kml` of network links — each with its own skeleton, so a `.kmz`
+    /// write gives every document back (`plans/same-format-fidelity.org`
+    /// M3c). Empty for one document. Crate-private, as `document` is.
+    pub(crate) layers: Vec<crate::kml::document::Layer>,
     /// The archive a `.kmz` read came from (`plans/same-format-fidelity.org`
     /// M3c): its overlay images, icons and model files, so a `.kmz` write
     /// gives them back. `None` for a `.kml` read.
@@ -172,20 +177,19 @@ pub struct KmlNative {
 }
 
 /// A `.kmz` archive's entries, as a `.kmz` write puts them back: every entry
-/// in archive order, the KML document's included, with its bytes written
-/// from the model rather than kept. Flat data, so public, as the other
-/// natives' members are (`plans/kml-standard.org` D-K16).
+/// in archive order. A `.kml` entry's `data` is empty — each document is
+/// written from its model (`KmlNative`'s `document` and layers) — and the
+/// rest are kept as read. Flat data, so public, as the other natives' members
+/// are (`plans/kml-standard.org` D-K16).
 ///
-/// *Not here*: the other `.kml` documents of a layered archive, whose
-/// features the read brought into the IR — kept verbatim, they would be
-/// written twice. Nor what the writer does not reproduce: each entry's
-/// compression (entries are written stored), extra fields and attributes, and
-/// the archive comment.
+/// *Not here*: what the writer does not reproduce — each entry's compression
+/// (entries are written stored), extra fields and attributes, and the archive
+/// comment.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KmzArchive {
     pub entries: Vec<KmzEntry>,
-    /// Which entry is the KML document — conventionally `doc.kml`, and by
-    /// Google's rule the archive's first `.kml` entry. Its `data` is empty.
+    /// Which entry is the root KML document — conventionally `doc.kml`, and
+    /// by Google's rule the archive's first `.kml` entry.
     pub document: usize,
 }
 
@@ -208,6 +212,9 @@ pub struct KmzEntry {
 #[derive(Debug, Clone, PartialEq)]
 pub struct KmlFeatureNative {
     pub(crate) feature: Rc<crate::kml::document::FeatureModel>,
+    /// Which of the source's documents it was read from: 0 for the first, `n`
+    /// for `KmlNative`'s `layers[n - 1]`.
+    pub(crate) document: usize,
 }
 
 /// A GeoPackage feature's members the IR does not model.

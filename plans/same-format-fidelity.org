@@ -1796,13 +1796,22 @@ travels with D1's =name= modelling.
   with nothing to keep consistent (=kml-standard.org= D-K16). A =.kmz= read
   written as anything else warns, naming the entries left behind.
   =hand_hostile.kmz= comes back with all four entries and their times.
-  /What is left/: the zip writer stores every entry and writes no extra
-  fields, attributes or archive comment -- =Format::Kmz='s loss row -- and
-  *the second half, a layered archive*: several =.kml= documents, read into one
-  collection and written back as one built from the IR. Carrying it means
-  each feature remembering its document and each document its own model.
-  Its other =.kml= entries are deliberately not in =archive=: kept verbatim
-  they would be written twice.
+  ***Second half built 2026-10-28: a layered archive.*** GDAL writes a
+  multi-layer =.kmz= as a =doc.kml= of network links beside =layers/*.kml=;
+  geosetta read every document into one collection and wrote one document
+  back, built from the IR. Now every document keeps its skeleton -- the first
+  as =KmlNative='s =document=, the rest as its crate-private =layers=, each
+  with its archive slot and its own version -- and each feature records which
+  document it came from. =write_kmz= writes every =.kml= entry from its own
+  skeleton and features, lowering or raising each from its own version. A
+  feature added since the read joins the first document. Measured on
+  =gdal_networklink.kmz=: the archive, both documents and the features come
+  back equal, each document as XML-equal to the one read.
+  /A =.kml= write of a layered read/ holds one document, so it is still built
+  from the IR, and now says so, naming the archive's documents.
+  /What is left/ is =Format::Kmz='s loss row: the zip writer stores every
+  entry and writes no extra fields, attributes or archive comment. M3c is
+  otherwise done.
 *** The feature id -- DECIDED 2026-08-25, decision 27: *carry it*
 /Raised, measured, filed with a recommendation and taken the same day./
 

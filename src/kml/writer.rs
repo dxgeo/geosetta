@@ -33,19 +33,8 @@ use crate::xml::{self, XmlElement};
 /// and a `<Schema>` for the columns the collection declares a type for
 /// (D-K9).
 pub(crate) fn write(fc: &FeatureCollection, version: Option<KmlVersion>) -> Vec<u8> {
-    if let Some(skeleton) = carried_skeleton(fc) {
-        let source = source_document(fc).expect("a carried skeleton has a source");
-        let mut doc = reconcile::assemble(fc, skeleton, source.version);
-        match (source.version, version) {
-            (KmlVersion::V2_3, Some(KmlVersion::V2_2)) => {
-                lower::lower(&mut doc);
-            }
-            (KmlVersion::V2_2, Some(KmlVersion::V2_3)) => {
-                raise::raise(&mut doc);
-            }
-            _ => {}
-        }
-        return model::write(&doc).into_bytes();
+    if carries_documents(fc, Format::Kml) {
+        return write_document(fc, 0, version);
     }
     let written = version.or(source_document(fc).map(|s| s.version)).unwrap_or(KmlVersion::V2_2);
     let typed = Typed::of(fc);
@@ -113,12 +102,48 @@ fn is_ncname(s: &str) -> bool {
         && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
 }
 
-/// The document to write `fc` back into, when this write gives the model
-/// back: the source was KML or KMZ with one document. Either output version
-/// takes it, since a version change lowers or raises the document
-/// (`plans/kml-standard.org` K5).
-pub(crate) fn carried_skeleton(fc: &FeatureCollection) -> Option<&Skeleton> {
-    source_document(fc)?.document.as_deref()
+/// Whether a write of `fc` as `target` gives the source's documents back: it
+/// was read from KML or KMZ, and the target holds as many documents as it
+/// had. A `.kmz` holds any number; a `.kml` holds one, so a layered `.kmz`
+/// written as `.kml` is built from the IR. Either output version gives them
+/// back, since a version change lowers or raises each (K5).
+pub(crate) fn carries_documents(fc: &FeatureCollection, target: Format) -> bool {
+    source_document(fc).is_some_and(|s| {
+        s.document.is_some()
+            && match target {
+                Format::Kmz => true,
+                Format::Kml => s.layers.is_empty(),
+                _ => false,
+            }
+    })
+}
+
+/// The source's document `index` — 0 for the first, `n` for layer `n - 1` —
+/// written back with its own features, in `version` when one is asked for.
+/// A feature added since the read, or holding an element of no document this
+/// collection keeps, joins the first document, built fresh.
+pub(crate) fn write_document(fc: &FeatureCollection, index: usize, version: Option<KmlVersion>) -> Vec<u8> {
+    let source = source_document(fc).expect("a carried document has a source");
+    let (skeleton, own): (&Skeleton, KmlVersion) = match index {
+        0 => (source.document.as_deref().expect("the first document is kept"), source.version),
+        n => (&source.layers[n - 1].skeleton, source.layers[n - 1].version),
+    };
+    let documents = 1 + source.layers.len();
+    let features = fc.features.iter().filter_map(|f| match reconcile::stored(f) {
+        Some((m, d)) if d < documents => (d == index).then_some((f, Some(m))),
+        _ => (index == 0).then_some((f, None)),
+    });
+    let mut doc = reconcile::assemble(features, skeleton, own);
+    match (own, version) {
+        (KmlVersion::V2_3, Some(KmlVersion::V2_2)) => {
+            lower::lower(&mut doc);
+        }
+        (KmlVersion::V2_2, Some(KmlVersion::V2_3)) => {
+            raise::raise(&mut doc);
+        }
+        _ => {}
+    }
+    model::write(&doc).into_bytes()
 }
 
 /// The provenance a KML or KMZ read recorded. Both writers read either tag:

@@ -39,12 +39,36 @@ pub(crate) fn field_type_recast(ty: crate::schema::DeclType) -> crate::schema::D
 /// version gives the model back. And of a `.kmz` read, the archive's other
 /// files, which only a `.kmz` write has anywhere to put.
 pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format) -> Vec<String> {
-    let carried = matches!(target, Format::Kml | Format::Kmz) && writer::carried_skeleton(fc).is_some();
+    let carried = writer::carries_documents(fc, target);
     let mut out = reconcile::drop_warnings(fc, target, carried);
+    if target == Format::Kml {
+        out.extend(layers_warning(fc));
+    }
     if target != Format::Kmz {
         out.extend(archive_warning(fc, target));
     }
     out
+}
+
+/// The warning a layered `.kmz` read written as one `.kml` owes: a `.kml`
+/// holds one document, so the archive's are built into one from the IR.
+fn layers_warning(fc: &FeatureCollection) -> Option<String> {
+    let source = writer::source_document(fc)?;
+    let archive = source.archive.as_deref()?;
+    if source.layers.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = std::iter::once(archive.document)
+        .chain(source.layers.iter().map(|l| l.entry))
+        .map(|i| archive.entries[i].name.as_str())
+        .collect();
+    Some(format!(
+        "kmz: the archive holds {} KML documents ({}), and a KML write holds one; written as one document built \
+         from the feature model alone, without their styles, folders or network links, and with ground and photo \
+         overlays as Placemarks",
+        names.len(),
+        names.join(", ")
+    ))
 }
 
 /// The warning a write of a `.kmz` read as `target`, not a `.kmz`, owes for
@@ -56,7 +80,7 @@ fn archive_warning(fc: &FeatureCollection, target: Format) -> Option<String> {
         .entries
         .iter()
         .enumerate()
-        .filter(|&(i, e)| i != archive.document && !e.name.ends_with('/'))
+        .filter(|(_, e)| !is_kml_entry(&e.name) && !e.name.ends_with('/'))
         .map(|(_, e)| e.name.as_str())
         .collect();
     if lost.is_empty() {
@@ -80,36 +104,36 @@ fn archive_warning(fc: &FeatureCollection, target: Format) -> Option<String> {
 /// (`plans/kml-standard.org` D-K7): what the change respells or renames and,
 /// lowering to 2.2, what 2.2 has no place for, each counted over the document
 /// as read. Changing only the version stamp says nothing.
-pub(crate) fn version_change_warnings(fc: &FeatureCollection, version: KmlVersion) -> Vec<String> {
-    let Some(source) = writer::source_document(fc) else {
+pub(crate) fn version_change_warnings(fc: &FeatureCollection, target: Format, version: KmlVersion) -> Vec<String> {
+    let Some(source) = writer::source_document(fc).filter(|_| writer::carries_documents(fc, target)) else {
         return Vec::new();
     };
-    let Some(skeleton) = source.document.as_deref().filter(|_| source.version != version) else {
+    let Some(first) = source.document.as_deref() else {
         return Vec::new();
     };
     use model::{KmlElement, Spelling};
+    let documents = std::iter::once((first, source.version))
+        .chain(source.layers.iter().map(|l| (&*l.skeleton, l.version)))
+        .enumerate()
+        .filter(|(_, (_, own))| *own != version);
     let mut report = lower::Changes::default();
-    // A feature sits in a container; every container admits it alike.
-    let features = || fc.features.iter().filter_map(reconcile::feature_model).map(|m| &m.node);
-    match version {
-        KmlVersion::V2_2 => {
-            for node in skeleton.doc.root.children.iter() {
-                lower::survey(node, (KmlElement::Kml, Spelling::Kml), &mut report);
-            }
-            for node in features() {
-                lower::survey(node, (KmlElement::Document, Spelling::Kml), &mut report);
-            }
-        }
-        KmlVersion::V2_3 => {
-            for node in skeleton.doc.root.children.iter() {
-                raise::survey(node, KmlElement::Kml, &mut report);
-            }
-            for node in features() {
-                raise::survey(node, KmlElement::Document, &mut report);
+    let mut from = None;
+    for (index, (skeleton, own)) in documents {
+        from = Some(own);
+        // A feature sits in a container; every container admits it alike.
+        let features = fc.features.iter().filter_map(reconcile::stored).filter(|(_, d)| *d == index).map(|(m, _)| &m.node);
+        let nodes = skeleton.doc.root.children.iter().map(|n| (n, KmlElement::Kml)).chain(features.map(|n| (n, KmlElement::Document)));
+        for (node, parent) in nodes {
+            match version {
+                KmlVersion::V2_2 => lower::survey(node, (parent, Spelling::Kml), &mut report),
+                KmlVersion::V2_3 => raise::survey(node, parent, &mut report),
             }
         }
     }
-    report.respelled_warning(source.version, version).into_iter().chain(report.dropped_warning()).collect()
+    let Some(from) = from else {
+        return Vec::new();
+    };
+    report.respelled_warning(from, version).into_iter().chain(report.dropped_warning()).collect()
 }
 
 /// `.kmz` bytes -> Feature IR: unwrap the zip container and flatten every
@@ -121,38 +145,46 @@ pub(crate) fn version_change_warnings(fc: &FeatureCollection, version: KmlVersio
 /// would silently produce zero features for archives shaped that way.
 pub(crate) fn read_kmz(bytes: &[u8], _warnings: &mut Vec<String>) -> Result<FeatureCollection> {
     let entries = crate::zip::read(bytes)?;
-    let kml_entries: Vec<_> = entries.iter().filter(|e| is_kml_entry(&e.name)).collect();
+    let kml_entries: Vec<_> = entries.iter().enumerate().filter(|(_, e)| is_kml_entry(&e.name)).collect();
     if kml_entries.is_empty() {
         return Err(Error::Convert("kmz: no .kml entry found in the archive".into()));
     }
     let mut features = Vec::new();
-    // The document's provenance is the first entry's — conventionally the
-    // root `doc.kml`, the one the archive is written back as. Its skeleton is
-    // kept only when it is the archive's one document: a layered archive's
-    // structure is the container's to carry (`plans/same-format-fidelity.org`
-    // M3c), and a `doc.kml` written back alone would point at layers that are
-    // no longer there.
+    // The collection's provenance is the first document's — conventionally
+    // the root `doc.kml`, which a layered archive (GDAL's) fills with network
+    // links to the rest. Every other document is a layer, with its own
+    // skeleton, so a `.kmz` write gives each back (M3c); each feature records
+    // which it came from.
     let mut first = None;
+    let mut layers = Vec::new();
     let mut facts: Option<reader::Facts> = None;
-    for entry in &kml_entries {
+    for (index, (entry_at, entry)) in kml_entries.iter().enumerate() {
         let text = crate::xml::decode(&entry.data).map_err(|e| match e {
             Error::Convert(m) => Error::Convert(format!("kmz: entry \"{}\": {m}", entry.name)),
             other => other,
         })?;
-        let document = reader::read_document(&text, Format::Kmz)?;
+        let document = reader::read_document(&text, Format::Kmz, index)?;
         features.extend(document.features);
         facts = Some(match facts {
             Some(f) => f.merge(document.facts),
             None => document.facts,
         });
-        first.get_or_insert((document.native, document.skeleton));
+        if first.is_none() {
+            first = Some((document.native, document.skeleton));
+        } else {
+            layers.push(document::Layer {
+                entry: *entry_at,
+                version: document.native.version,
+                skeleton: Rc::new(document.skeleton),
+            });
+        }
     }
     let (mut native, skeleton) = first.expect("at least one .kml entry was read");
-    let skeleton = (kml_entries.len() == 1).then_some(skeleton);
     let facts = facts.expect("at least one .kml entry was read");
     drop(kml_entries);
+    native.layers = layers;
     native.archive = Some(Rc::new(archive_of(entries)));
-    Ok(reader::finish(features, native, skeleton, facts, Format::Kmz))
+    Ok(reader::finish(features, native, Some(skeleton), facts, Format::Kmz))
 }
 
 fn is_kml_entry(name: &str) -> bool {
@@ -160,41 +192,48 @@ fn is_kml_entry(name: &str) -> bool {
 }
 
 /// The archive as a `.kmz` write gives it back (M3c): every entry in order,
-/// the first `.kml` one standing for the document. The archive's other `.kml`
-/// documents are left out: their features are in the IR, and kept verbatim
-/// they would be written twice.
+/// each `.kml` one with no bytes of its own, since its document is written
+/// from the model — the first is the collection's document, the rest its
+/// layers.
 fn archive_of(entries: Vec<crate::zip::ZipEntry>) -> KmzArchive {
-    let mut out = Vec::with_capacity(entries.len());
-    let mut document = None;
-    for e in entries {
-        let data = if is_kml_entry(&e.name) {
-            if document.is_some() {
-                continue;
-            }
-            document = Some(out.len());
-            Vec::new()
-        } else {
-            e.data
-        };
-        out.push(KmzEntry { name: e.name, data, modified: e.modified });
-    }
-    KmzArchive { entries: out, document: document.expect("the archive has a .kml entry") }
+    let document = entries.iter().position(|e| is_kml_entry(&e.name)).expect("the archive has a .kml entry");
+    let entries = entries
+        .into_iter()
+        .map(|e| {
+            let data = if is_kml_entry(&e.name) { Vec::new() } else { e.data };
+            KmzEntry { name: e.name, data, modified: e.modified }
+        })
+        .collect();
+    KmzArchive { entries, document }
 }
 
-/// Feature IR -> `.kmz` bytes: the `.kml` writer's output, in the archive a
-/// `.kmz` read came from — every entry back in its place, the document under
-/// its own name — or else as one entry named `doc.kml`, the conventional
-/// name. Entries are stored, uncompressed (see `crate::zip`'s module doc).
+/// Feature IR -> `.kmz` bytes: the archive a `.kmz` read came from, every
+/// entry back in its place — each `.kml` one written from its own document
+/// with its own features, a layered archive's as much as a single one's — or
+/// else the `.kml` writer's output as one entry named `doc.kml`, the
+/// conventional name. Entries are stored, uncompressed (see `crate::zip`'s
+/// module doc).
 pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>) -> Vec<u8> {
-    let kml_bytes = write_kml(fc, version);
-    let Some(archive) = writer::source_document(fc).and_then(|s| s.archive.as_deref()) else {
-        return crate::zip::write(&[("doc.kml", &kml_bytes)]);
+    let source = writer::source_document(fc);
+    let Some(archive) = source.and_then(|s| s.archive.as_deref()).filter(|_| writer::carries_documents(fc, Format::Kmz))
+    else {
+        return crate::zip::write(&[("doc.kml", &write_kml(fc, version))]);
     };
+    let layers = &source.expect("an archive has a source").layers;
+    let written: Vec<Option<Vec<u8>>> = (0..archive.entries.len())
+        .map(|i| {
+            let index = match i {
+                _ if i == archive.document => 0,
+                _ => 1 + layers.iter().position(|l| l.entry == i)?,
+            };
+            Some(writer::write_document(fc, index, version))
+        })
+        .collect();
     let entries: Vec<(&str, &[u8], crate::zip::DosTime)> = archive
         .entries
         .iter()
-        .enumerate()
-        .map(|(i, e)| (e.name.as_str(), if i == archive.document { &kml_bytes[..] } else { &e.data[..] }, e.modified))
+        .zip(&written)
+        .map(|(e, w)| (e.name.as_str(), w.as_deref().unwrap_or(&e.data), e.modified))
         .collect();
     crate::zip::write_timed(&entries)
 }
@@ -202,18 +241,21 @@ pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::Feature;
 
     #[test]
-    fn a_layered_kmz_keeps_no_document_and_counts_its_losses_once() {
+    fn a_layered_kmz_carries_its_models_and_a_kml_write_says_what_it_cannot() {
         let layer = br#"<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Model/></Placemark></kml>"#;
         let kmz = crate::zip::write(&[("doc.kml", &layer[..]), ("layers/a.kml", &layer[..])]);
         let fc = read_kmz(&kmz, &mut Vec::new()).unwrap();
         assert_eq!(fc.features.len(), 2);
-        // Written back, the archive is one document: the models go with the
-        // layers, so even a KMZ write says so.
-        let warnings = drop_warnings(&fc, Format::Kmz);
-        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        // A .kmz holds both documents, models and all.
+        assert!(drop_warnings(&fc, Format::Kmz).is_empty());
+        // A .kml holds one, so it is built from the IR, and both say so.
+        let warnings = drop_warnings(&fc, Format::Kml);
+        assert_eq!(warnings.len(), 2, "{warnings:?}");
         assert!(warnings[0].starts_with("kml: 2 feature(s) hold <Model>"), "{warnings:?}");
+        assert!(warnings[1].starts_with("kmz: the archive holds 2 KML documents (doc.kml, layers/a.kml)"), "{warnings:?}");
     }
 
     #[test]
@@ -283,14 +325,59 @@ mod tests {
         assert_eq!(names, ["doc.kml"]);
     }
 
+    fn layer_doc(name: &str) -> Vec<u8> {
+        format!(
+            "<kml xmlns=\"http://www.opengis.net/kml/2.2\"><Document><Style id=\"s\"/><Folder><name>{name}</name>\
+             <Placemark><name>{name}</name><styleUrl>#s</styleUrl></Placemark></Folder></Document></kml>"
+        )
+        .into_bytes()
+    }
+
     #[test]
-    fn a_layered_kmzs_other_documents_are_not_carried_twice() {
-        let kmz = crate::zip::write(&[("doc.kml", DOC), ("layers/a.kml", DOC), ("icon.png", b"i")]);
+    fn a_layered_kmz_gives_each_document_back_with_its_own_features() {
+        let (a, b) = (layer_doc("a"), layer_doc("b"));
+        let kmz = crate::zip::write(&[("doc.kml", DOC), ("layers/a.kml", &a), ("icon.png", b"i"), ("layers/b.kml", &b)]);
         let fc = read_kmz(&kmz, &mut Vec::new()).unwrap();
-        assert_eq!(fc.features.len(), 2);
+        assert_eq!(fc.features.len(), 3);
         let back = crate::zip::read(&write_kmz(&fc, None)).unwrap();
         let names: Vec<_> = back.iter().map(|e| e.name.as_str()).collect();
-        assert_eq!(names, ["doc.kml", "icon.png"], "the layer's features are in doc.kml now");
+        assert_eq!(names, ["doc.kml", "layers/a.kml", "icon.png", "layers/b.kml"]);
+        // Unedited, each document is the one read.
+        for (i, source) in [(0, DOC), (1, &a[..]), (3, &b[..])] {
+            let written = crate::xml::parse_document(std::str::from_utf8(&back[i].data).unwrap()).unwrap();
+            assert_eq!(written, crate::xml::parse_document(std::str::from_utf8(source).unwrap()).unwrap(), "{}", back[i].name);
+        }
+        // An edit lands in its own document; a removed feature leaves only
+        // its own; a feature added since joins the first.
+        let mut edited = fc.clone();
+        edited.features[1].properties[0].1 = crate::json::JsonValue::String("a, renamed".into());
+        let added = edited.features.remove(2);
+        edited.features.push(Feature { native: None, ..added });
+        let back = crate::zip::read(&write_kmz(&edited, None)).unwrap();
+        let text = |i: usize| String::from_utf8(back[i].data.clone()).unwrap();
+        assert!(text(1).contains("<Folder><name>a</name><Placemark><name>a, renamed</name><styleUrl>#s</styleUrl>"), "{}", text(1));
+        assert!(!text(3).contains("<Placemark>"), "{}", text(3));
+        assert!(text(0).contains("<name>b</name>"), "{}", text(0));
+    }
+
+    #[test]
+    fn gdals_layered_kmz_round_trips_as_a_kmz() {
+        let source = include_bytes!("../../tests/fixtures/gdal_networklink.kmz");
+        let fc = read_kmz(source, &mut Vec::new()).unwrap();
+        let again = read_kmz(&write_kmz(&fc, None), &mut Vec::new()).unwrap();
+        assert_eq!(again.native, fc.native, "the archive, its documents and their layers");
+        assert_eq!(again.features, fc.features);
+        // Each document written is the one read, network links and all.
+        let (before, after) = (crate::zip::read(source).unwrap(), crate::zip::read(&write_kmz(&fc, None)).unwrap());
+        for (b, a) in before.iter().zip(&after).filter(|(b, _)| b.name.ends_with(".kml")) {
+            let parse = |bytes: &[u8]| crate::xml::parse_document(&crate::xml::decode(bytes).unwrap()).unwrap();
+            assert_eq!(parse(&a.data), parse(&b.data), "{}", b.name);
+        }
+        // And each document changes version on its own.
+        let raised = read_kmz(&write_kmz(&fc, Some(KmlVersion::V2_3)), &mut Vec::new()).unwrap();
+        let source = writer::source_document(&raised).unwrap();
+        assert_eq!((source.version, source.layers[0].version), (KmlVersion::V2_3, KmlVersion::V2_3));
+        assert_eq!(raised.features, fc.features);
     }
 
     #[test]

@@ -42,6 +42,18 @@ pub(crate) struct FeatureModel {
     pub leading: Vec<XmlMisc>,
 }
 
+/// One of a layered `.kmz`'s other documents (`plans/same-format-fidelity.org`
+/// M3c): which archive entry it is, the version it was read as, and its
+/// skeleton. The archive's first document is the collection's own
+/// (`KmlNative`'s `version` and `document`); these are the rest, in archive
+/// order, numbered from 1 in each feature's `document`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Layer {
+    pub entry: usize,
+    pub version: crate::format::KmlVersion,
+    pub skeleton: std::rc::Rc<Skeleton>,
+}
+
 /// A feature to put back: where it was read from (`None` for one added since),
 /// the comments before it, and its element.
 pub(crate) type Placed = (Option<Address>, Vec<XmlMisc>, Node);

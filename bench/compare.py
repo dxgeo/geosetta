@@ -34,8 +34,17 @@ Fairness notes (so the numbers aren't misread):
     which flatters geosetta and terrio on the fastest conversions; geosetta
     still wins clearly once startup is subtracted, and the small startup is
     itself a dependency-free advantage.
-  * DuckDB's vector I/O (GeoJSON / FlatGeobuf / GeoPackage) is GDAL-backed; only
-    its Parquet path is native, so its non-Parquet numbers track GDAL's.
+  * DuckDB's vector I/O (GeoJSON / FlatGeobuf / GeoPackage / KML) is
+    GDAL-backed; only its Parquet path is native, so its non-Parquet numbers
+    track GDAL's.
+  * KML: the four KML/KMZ cases use the points-only source, since GDAL's
+    LIBKML driver (used for ogr2ogr's output and the neutral read-inputs)
+    refuses a latitude past ±90, which the mixed source's lines and polygons
+    step just beyond. DuckDB has only GDAL's plain KML driver: it writes .kml
+    but not .kmz, and reads a Placemark's name but not its ExtendedData. The
+    read-back check maps a Placemark's <name> to `name`, ignores GDAL's KML
+    display fields and a Z of exactly 0 (LIBKML writes every position 3D), and
+    accepts an `id` held in the Placemark's own id attribute.
   * geosetta cannot yet read GDAL-written Parquet (a known level-encoding gap),
     so the parquet->geojson read input is DuckDB-written Parquet (which all
     three tools read).
@@ -200,15 +209,60 @@ def gen_points_geojson(n):
     return "".join(parts)
 
 
-def read_features(path):
-    """Features of any dataset, as GeoJSON dicts in the file's own CRS."""
+# GDAL's LIBKML driver maps a field named `id` to a Placemark's `id`
+# attribute, which must be an XML name: `0` is not one, so it writes `pts.1`
+# instead and the values are lost. Naming another field for it keeps `id` an
+# ordinary property, in the KML ogr2ogr writes and when any KML is read back.
+KML_ID = ["--config", "LIBKML_ID_FIELD", "kml_id"]
+
+
+# Fields GDAL's KML drivers read from a Placemark's own elements rather than
+# its data: the display state (`tessellate`, `visibility`, …), and the
+# Placemark `id` attribute (see `KML_ID`).
+KML_DISPLAY = {"description", "timestamp", "begin", "end", "altitudeMode", "tessellate",
+               "extrude", "visibility", "drawOrder", "icon", "snippet", "kml_id"}
+
+
+def is_kml(path):
+    return path.endswith((".kml", ".kmz"))
+
+
+def zero_z_dropped(c):
+    """Coordinates with a third ordinate of exactly 0 dropped: LIBKML writes
+    every position 3D, which adds nothing to a 2D one, so a KML input reads
+    back with a zero Z its GeoJSON outputs may or may not keep."""
+    if c and all(isinstance(x, (int, float)) for x in c):
+        return c[:2] if len(c) == 3 and c[2] == 0 else c
+    return [zero_z_dropped(part) for part in c]
+
+
+def read_features(path, from_kml=False):
+    """Features of any dataset, as GeoJSON dicts in the file's own CRS.
+
+    A KML file, or a conversion's output `from_kml`, has its Placemark fields
+    normalized: GDAL names a Placemark's <name> `Name`, and an ogr2ogr output
+    keeps that spelling and the display fields."""
     oo = ["-oo", "GEOM_POSSIBLE_NAMES=geometry,WKT"] if path.endswith(".csv") else []
+    oo += KML_ID if is_kml(path) else []
     r = subprocess.run(["ogr2ogr", "-f", "GeoJSONSeq", "-preserve_fid", "/vsistdout/", path, *oo],
                        capture_output=True)
     if r.returncode != 0:
         return None, r.stderr.decode()[:120]
     fts = [json.loads(l) for l in r.stdout.splitlines() if l.strip()]
     for ft in fts:
+        if is_kml(path) or from_kml:
+            # a Placemark's <name> reads back as GDAL's `Name` field; the
+            # display fields it adds (`tessellate`, `visibility`, …) are
+            # ignored, since only the input's properties are compared
+            props = ft["properties"]
+            if "Name" in props and "name" not in props:
+                props["name"] = props.pop("Name")
+            # an `id` written as the Placemark's own id attribute holds the
+            # same value as one written as data
+            if "id" not in props and props.get("kml_id") is not None:
+                props["id"] = props["kml_id"]
+            for k in KML_DISPLAY & props.keys():
+                del props[k]
         # an integer `id` stored as a GeoPackage/GDAL FID reads back as the
         # feature's own id, not a property: it's the same value
         # (the wide fixture has no id column; its FIDs are just row numbers)
@@ -248,7 +302,7 @@ def flat(c):
 def same_geometry(a, b):
     if not a or not b or a.get("type") != b.get("type"):
         return False
-    fa, fb = flat(a["coordinates"]), flat(b["coordinates"])
+    fa, fb = flat(zero_z_dropped(a["coordinates"])), flat(zero_z_dropped(b["coordinates"]))
     return len(fa) == len(fb) and all(abs(x - y) <= COORD_TOL for x, y in zip(fa, fb))
 
 
@@ -325,6 +379,18 @@ subprocess.run(ogr(in_gpkg, gj, "GPKG"), capture_output=True)
 subprocess.run(ogr(in_shp, gjp, "ESRI Shapefile"), capture_output=True)
 subprocess.run(duck(f"COPY (SELECT * EXCLUDE(geom), ST_AsText(geom) AS geometry FROM ST_Read('{gj}')) "
                      f"TO '{in_csv}' (FORMAT CSV, HEADER);"), capture_output=True)
+# KML/KMZ via GDAL's LIBKML driver, its full-featured one (typed ExtendedData
+# schemas, KMZ), from the points-only source: LIBKML refuses a latitude past
+# ±90, which the mixed source's lines and polygons step just beyond. DuckDB has
+# only GDAL's plain KML driver, which writes .kml but not .kmz.
+in_kml, in_kmz = p("in.kml"), p("in.kmz")
+gkml, gkmz, dkml = p("g.kml"), p("g.kmz"), p("d.kml")
+g6, g7, d6, d7 = p("g6.geojson"), p("g7.geojson"), p("d6.geojson"), p("d7.geojson")
+subprocess.run(ogr(in_kml, gjp, "LIBKML", *KML_ID), capture_output=True)
+subprocess.run(ogr(in_kmz, gjp, "LIBKML", *KML_ID), capture_output=True)
+# DuckDB's own warning: GDAL takes EPSG:4326 as latitude-first unless told
+# otherwise, which writes KML with its coordinates swapped.
+DUCK_XY = "SET geometry_always_xy = true;"
 
 # EPSG:3857-reprojected fixtures (points-only, shared across gpkg/shp/fgb): a
 # real projected CRS, unlike the WGS-84 default above, so these pair
@@ -377,6 +443,19 @@ cases = [
     ("shp->geojson", [BIN, in_shp, g5],
      ogr(p("o5.geojson"), in_shp, "GeoJSON"),
      duck(f"COPY (SELECT * FROM ST_Read('{in_shp}')) TO '{d5}' {GDAL_GJ};")),
+    ("geojson->kml", [BIN, gjp, gkml],
+     ogr(p("o.kml"), gjp, "LIBKML", *KML_ID),
+     duck(f"{DUCK_XY}COPY (SELECT * FROM ST_Read('{gjp}')) TO '{dkml}' "
+          f"WITH (FORMAT GDAL, DRIVER 'KML', SRS 'EPSG:4326');")),
+    ("kml->geojson", [BIN, in_kml, g6],
+     ogr(p("o6.geojson"), in_kml, "GeoJSON", *KML_ID),
+     duck(f"COPY (SELECT * FROM ST_Read('{in_kml}')) TO '{d6}' {GDAL_GJ};")),
+    ("geojson->kmz", [BIN, gjp, gkmz],
+     ogr(p("o.kmz"), gjp, "LIBKML", *KML_ID),
+     None),
+    ("kmz->geojson", [BIN, in_kmz, g7],
+     ogr(p("o7.geojson"), in_kmz, "GeoJSON", *KML_ID),
+     duck(f"COPY (SELECT * FROM ST_Read('{in_kmz}')) TO '{d7}' {GDAL_GJ};")),
     ("gpkg(3857)->parquet", [BIN, in_gpkg_3857, p("g_gpkg3857.parquet"), "--crs", crs_3857],
      ogr(p("o_gpkg3857.parquet"), in_gpkg_3857, "Parquet"),
      duck(f"COPY (SELECT * FROM ST_Read('{in_gpkg_3857}')) TO '{p('d_gpkg3857.parquet')}' (FORMAT PARQUET);")),
@@ -418,7 +497,7 @@ mems = []
 for label, gc, oc, dc in cases:
     gt, _, gm = run(gc)
     ot, oe, om = run(oc)
-    dt, de, dm = run(dc)
+    dt, de, dm = run(dc) if dc else (None, None, None)
     tc = terrio(gc[1], gc[2])
     tt, te, tm = run(tc)
     mems.append((label, gm, om, dm, tm))
@@ -429,7 +508,7 @@ for label, gc, oc, dc in cases:
         if err:
             print(f"    ! {tool} failed: {err.strip()[:120]}")
     outs[label] = (gc[1], {"geosetta": gc[2], "ogr2ogr": oc[3],
-                           "duckdb": re.search(r"TO '([^']+)'", dc[2]).group(1),
+                           "duckdb": re.search(r"TO '([^']+)'", dc[2]).group(1) if dc else None,
                            "terrio": tc[3]})
 
 print("\n(ratio = competitor_time / geosetta_time; >1 means geosetta is faster)")
@@ -460,7 +539,10 @@ if VERIFY:
         row = []
         for tool in tools:
             path = paths[tool]
-            got = read_features(path)[0] if os.path.exists(path) else None
+            if path is None:
+                row.append("n/a")  # the tool has no command for this case
+                continue
+            got = read_features(path, is_kml(src))[0] if os.path.exists(path) else None
             why = verify(expected[src], got)
             row.append("ok" if why is None else "FAIL")
             if why:

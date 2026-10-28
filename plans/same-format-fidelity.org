@@ -1645,7 +1645,8 @@ travels with D1's =name= modelling.
     intent so it is not "fixed" by stashing it.
   - The tree writer (=to_json=, test-only) had to change in lockstep with
     =to_geojson_string=, since one is the byte-for-byte reference model for the
-    other. Member order matters: natives sit after =type=/=name= and before
+    other (the compact form, since GeoJSON is indented by default from
+    2026-10-28). Member order matters: natives sit after =type=/=name= and before
     =features=/=geometry=, which is where GDAL puts =id= too.
 
   *The column-schema half, added after the above.* =crate::FieldDecl= on

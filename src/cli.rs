@@ -97,10 +97,21 @@ pub struct Args {
     /// output is KML or KMZ; without it the output is the source's own version
     /// after a KML read, and KML 2.2 otherwise (`plans/kml-standard.org` D-K2).
     pub kml_version: Option<KmlVersion>,
+    /// `--compact`: write a GeoJSON or KML output on one line, to save space,
+    /// rather than laid out (`plans/kml-layout.org` D-L8). Like `--rtree`, it
+    /// is ignored for an output with no layout.
+    pub compact: bool,
+}
+
+impl Args {
+    /// What the write takes from the flags.
+    pub fn write_options(&self) -> crate::convert::WriteOptions {
+        crate::convert::WriteOptions { kml_version: self.kml_version, compact: self.compact }
+    }
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--crs PATH] [--sort-hilbert] [--rtree] [--envelope] [--kml-version 2.2|2.3] [--progress] [--quiet]\n       geosetta <input> --print-crs-code [--from FMT] [--layer NAME]\n       geosetta <input> --print-crs [--escape] [--from FMT] [--layer NAME]\n  \"-\" for <input>/<output> means stdin/stdout (needs --from/--to; not for Shapefile)\n  --crs PATH reads WKT or PROJJSON text (\"-\" for stdin) and uses it as the output CRS\n  --print-crs-code prints the source's AUTHORITY:CODE; --print-crs prints the CRS\n  definition the source recorded, verbatim (PROJJSON when it carries both)\n  --escape renders control bytes visibly (cat -v style) for reading at a terminal;\n  it is not round-trip safe, so leave it off when piping";
+pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--crs PATH] [--sort-hilbert] [--rtree] [--envelope] [--kml-version 2.2|2.3] [--compact] [--progress] [--quiet]\n       geosetta <input> --print-crs-code [--from FMT] [--layer NAME]\n       geosetta <input> --print-crs [--escape] [--from FMT] [--layer NAME]\n  \"-\" for <input>/<output> means stdin/stdout (needs --from/--to; not for Shapefile)\n  --crs PATH reads WKT or PROJJSON text (\"-\" for stdin) and uses it as the output CRS\n  --print-crs-code prints the source's AUTHORITY:CODE; --print-crs prints the CRS\n  definition the source recorded, verbatim (PROJJSON when it carries both)\n  --escape renders control bytes visibly (cat -v style) for reading at a terminal;\n  it is not round-trip safe, so leave it off when piping\n  --compact writes GeoJSON and KML on one line, to save space, instead of indented";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -122,6 +133,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let mut print_crs = false;
     let mut escape = false;
     let mut kml_version: Option<KmlVersion> = None;
+    let mut compact = false;
 
     while let Some(arg) = iter.next() {
         match arg.as_str() {
@@ -134,6 +146,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
             "--print-crs-code" => print_crs_code = true,
             "--print-crs" => print_crs = true,
             "--escape" => escape = true,
+            "--compact" => compact = true,
             "--from" => {
                 let v = iter
                     .next()
@@ -288,6 +301,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         escape,
         crs,
         kml_version,
+        compact,
     })
 }
 
@@ -378,6 +392,8 @@ mod tests {
         // On by default warnings are suppressed only when asked; --no-warn is an
         // accepted alias.
         assert!(!args(&["geosetta", "in.gpkg", "out.geojson"]).unwrap().quiet);
+        assert!(args(&["geosetta", "in.gpkg", "out.geojson", "--compact"]).unwrap().write_options().compact);
+        assert!(!args(&["geosetta", "in.gpkg", "out.geojson"]).unwrap().write_options().compact);
         assert!(args(&["geosetta", "in.gpkg", "out.geojson", "--quiet"]).unwrap().quiet);
         assert!(args(&["geosetta", "in.gpkg", "out.geojson", "--no-warn"]).unwrap().quiet);
     }

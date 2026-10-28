@@ -15,8 +15,10 @@
 //! holds them within each place. Comments that sat immediately before a
 //! feature travel with it, so they are written back before it.
 
-use crate::kml::model::{KmlDocument, KmlElement, Node};
-use crate::xml::XmlMisc;
+use std::rc::Rc;
+
+use crate::kml::model::{KmlDocument, KmlElement, Layout, Node};
+use crate::xml::Content;
 
 /// The document with its projected features taken out.
 #[derive(Debug, Clone, PartialEq)]
@@ -39,7 +41,7 @@ pub(crate) struct FeatureModel {
     pub node: Node,
     pub address: Address,
     /// Comments and processing instructions immediately before it.
-    pub leading: Vec<XmlMisc>,
+    pub leading: Vec<Content>,
 }
 
 /// One of a layered `.kmz`'s other documents (`plans/same-format-fidelity.org`
@@ -56,11 +58,11 @@ pub(crate) struct Layer {
 
 /// A feature to put back: where it was read from (`None` for one added since),
 /// the comments before it, and its element.
-pub(crate) type Placed = (Option<Address>, Vec<XmlMisc>, Node);
+pub(crate) type Placed = (Option<Address>, Vec<Content>, Node);
 
 /// A feature bound for one container: its slot there, the comments before it,
 /// and its element.
-type Slotted = (usize, Vec<XmlMisc>, Node);
+type Slotted = (usize, Vec<Content>, Node);
 
 /// Whether a child of a container is a feature the IR projects: a Placemark,
 /// or an overlay with geography (D-K14).
@@ -81,10 +83,10 @@ pub(crate) fn split(mut doc: KmlDocument) -> (Skeleton, Vec<FeatureModel>) {
 
 fn split_container(container: &mut Node, path: &mut Vec<usize>, out: &mut Vec<FeatureModel>) {
     let children = std::mem::take(&mut container.children);
-    let mut misc = std::mem::take(&mut container.misc).into_iter().peekable();
+    let mut misc = std::mem::take(&mut container.content).into_iter().peekable();
     let len = children.len();
     let mut kept = Vec::with_capacity(len);
-    let mut kept_misc = Vec::new();
+    let mut kept_content = Vec::new();
     let mut children = children.into_iter();
     for i in 0..=len {
         let mut before = Vec::new();
@@ -92,7 +94,7 @@ fn split_container(container: &mut Node, path: &mut Vec<usize>, out: &mut Vec<Fe
             before.push(m);
         }
         let Some(mut child) = children.next() else {
-            kept_misc.extend(before.into_iter().map(|m| (kept.len(), m)));
+            kept_content.extend(before.into_iter().map(|m| (kept.len(), m)));
             break;
         };
         if is_projected(&child) {
@@ -103,7 +105,7 @@ fn split_container(container: &mut Node, path: &mut Vec<usize>, out: &mut Vec<Fe
             });
             continue;
         }
-        kept_misc.extend(before.into_iter().map(|m| (kept.len(), m)));
+        kept_content.extend(before.into_iter().map(|m| (kept.len(), m)));
         if child.element().is_some_and(KmlElement::is_container) {
             path.push(kept.len());
             split_container(&mut child, path, out);
@@ -114,7 +116,7 @@ fn split_container(container: &mut Node, path: &mut Vec<usize>, out: &mut Vec<Fe
     // Sized for every child the container had; most of them were features.
     kept.shrink_to_fit();
     container.children = kept;
-    container.misc = kept_misc;
+    container.content = kept_content;
 }
 
 /// The skeleton with `features` put back. Each feature goes to its address
@@ -148,9 +150,17 @@ pub(crate) fn assemble(skeleton: &Skeleton, features: Vec<Placed>) -> KmlDocumen
     doc
 }
 
+/// How a feature added since the read is indented at the end of the
+/// container it joins, and whether its inside is laid out
+/// ([`Node::lead_at`]).
+pub(crate) fn lead_for_new(skeleton: &Skeleton, layout: &Layout) -> Option<(Rc<str>, bool)> {
+    let container = container_at(&skeleton.doc.root, &default_container(&skeleton.doc.root))?;
+    container.lead_at(container.children.len(), layout)
+}
+
 /// Where a feature with nowhere else to go is written: the root's first
 /// container child (its `<Document>` or `<Folder>`), or the root itself.
-fn default_container(root: &Node) -> Vec<usize> {
+pub(crate) fn default_container(root: &Node) -> Vec<usize> {
     match root.children.iter().position(|c| c.element().is_some_and(KmlElement::is_container)) {
         Some(i) => vec![i],
         None => Vec::new(),
@@ -179,9 +189,9 @@ fn insert(container: &mut Node, mut features: Vec<Slotted>) {
     // A stable sort keeps the given order among features sharing a slot.
     features.sort_by_key(|(slot, _, _)| *slot);
     let kept = std::mem::take(&mut container.children);
-    let kept_misc = std::mem::take(&mut container.misc);
+    let kept_content = std::mem::take(&mut container.content);
     let mut features = features.into_iter().peekable();
-    let mut misc = kept_misc.into_iter().peekable();
+    let mut misc = kept_content.into_iter().peekable();
     let len = kept.len();
     let mut kept = kept.into_iter();
     for k in 0..=len {
@@ -189,11 +199,11 @@ fn insert(container: &mut Node, mut features: Vec<Slotted>) {
         // `leading`, so the container's own comments at this slot came after
         // any feature that sat here.
         while let Some((_, leading, node)) = features.next_if(|(slot, _, _)| *slot <= k || k == len) {
-            container.misc.extend(leading.into_iter().map(|m| (container.children.len(), m)));
+            container.content.extend(leading.into_iter().map(|m| (container.children.len(), m)));
             container.children.push(node);
         }
         while let Some((_, m)) = misc.next_if(|(at, _)| *at <= k) {
-            container.misc.push((container.children.len(), m));
+            container.content.push((container.children.len(), m));
         }
         if let Some(child) = kept.next() {
             container.children.push(child);
@@ -231,7 +241,7 @@ mod tests {
         let addresses: Vec<_> = features.iter().map(|f| (f.address.container.clone(), f.address.slot)).collect();
         // Document is root child 0; its kept children are name, Style, Folder.
         assert_eq!(addresses, [(vec![0], 2), (vec![0, 2], 1), (vec![0, 2], 2), (vec![0], 3)]);
-        assert_eq!(features[0].leading, vec![XmlMisc::Comment("before a".into())]);
+        assert_eq!(features[0].leading, vec![Content::Comment("before a".into())]);
         let document = &skeleton.doc.root.children[0];
         assert!(document.children.iter().all(|c| !is_projected(c)));
     }

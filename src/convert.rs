@@ -76,16 +76,48 @@ pub fn read_features(format: Format, input: &[u8], warnings: &mut Vec<String>) -
     }
 }
 
-/// Encode the Feature IR into a supported output format.
+/// How to write: what [`write_features_with`] takes beyond the format.
+/// `Default` is what [`write_features`] writes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct WriteOptions {
+    /// The KML version of a KML or KMZ output — `--kml-version`. `None` is
+    /// the source's own version when the collection came from a KML or KMZ
+    /// read, and KML 2.2 otherwise (`plans/kml-standard.org` D-K2).
+    pub kml_version: Option<KmlVersion>,
+    /// Write a GeoJSON or KML output on one line, with no whitespace between
+    /// its members or elements — `--compact`, to save space. A KML read
+    /// written back loses its own layout too, since that is what was asked
+    /// for. Laid out otherwise (`plans/kml-layout.org` D-L2, D-L8). The other
+    /// formats have no layout, and ignore it.
+    pub compact: bool,
+}
+
+/// Encode the Feature IR into a supported output format, laid out where the
+/// format has a layout.
 pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
+    write_features_with(format, fc, WriteOptions::default())
+}
+
+/// [`write_features`], as `options` say.
+///
+/// A KML version is a statement about the output's content, so asking for
+/// one is a usage error for any format but KML and KMZ rather than ignored.
+pub fn write_features_with(format: Format, fc: &FeatureCollection, options: WriteOptions) -> Result<Vec<u8>> {
+    if options.kml_version.is_some() && !matches!(format, Format::Kml | Format::Kmz) {
+        return Err(Error::Usage(format!(
+            "--kml-version chooses the KML version of the output, and the output here is {}",
+            format.display_name()
+        )));
+    }
+    let (version, compact) = (options.kml_version, options.compact);
     match format {
-        Format::GeoJson => Ok(geojson::to_geojson_string(fc).into_bytes()),
+        Format::GeoJson => Ok(geojson::to_geojson_string(fc, compact).into_bytes()),
         Format::Parquet => Ok(features_to_parquet(fc)),
         Format::FlatGeobuf => Ok(flatgeobuf::write(fc)),
         Format::Csv => Ok(csv::write(fc)),
         Format::Wkt => Ok(write_wkt_lines(fc)),
-        Format::Kml => Ok(kml::write_kml(fc, None)),
-        Format::Kmz => Ok(kml::write_kmz(fc, None)),
+        Format::Kml => Ok(kml::write_kml(fc, version, compact)),
+        Format::Kmz => Ok(kml::write_kmz(fc, version, compact)),
         // GeoPackage and Shapefile are handled outside this single-buffer path
         // (see read_features above) — GeoPackage via geopackage::write_layers,
         // Shapefile via shapefile::write, both called from main.rs.
@@ -106,14 +138,7 @@ pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>>
 /// A request for a version is a statement about the output's content, so it
 /// is a usage error for any other format rather than ignored.
 pub fn write_kml_features(format: Format, fc: &FeatureCollection, version: KmlVersion) -> Result<Vec<u8>> {
-    match format {
-        Format::Kml => Ok(kml::write_kml(fc, Some(version))),
-        Format::Kmz => Ok(kml::write_kmz(fc, Some(version))),
-        other => Err(Error::Usage(format!(
-            "--kml-version chooses the KML version of the output, and the output here is {}",
-            other.display_name()
-        ))),
-    }
+    write_features_with(format, fc, WriteOptions { kml_version: Some(version), ..WriteOptions::default() })
 }
 
 /// What a write of `fc` as `target` — in `kml_version` when the caller chose

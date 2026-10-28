@@ -1,0 +1,241 @@
+#+TITLE: Plan: KML Layout -- the source's where it is untouched, ours where we write
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* KML Layout
+
+** STATUS -- L1--L4 built 2026-10-28, and =--compact= (D-L8)
+/2026-10-28, later:/ ***Built.*** A same-version =kml -> kml= run of every
+KML fixture, and of a hand-laid-out document (tabs, CRLF, blank lines, a
+DOCTYPE, comments and a PI at every depth, CDATA, character references, a
+one-line placemark in an indented document), is the source in the house's
+lexical form and nothing else (D-L7's two tests, in =kml/mod.rs=). The KML
+and KMZ rows of =same_format_losses= now read only the encoding. =--compact=
+was asked for the same day and is D-L8; GeoJSON became indented by default
+with it. Every kind of write still validates against both versions' XSDs
+(=tests/kml_schemas.rs=, run with the schemas supplied).
+
+/Measured/ (release build, 200,000 placemarks, peak resident size, =kml ->
+kml=): a flat 48 MB document 1001 MB before, 984 MB after -- a node no longer
+carries a text string beside its content; an indented 66 MB document 1089 MB
+before, 1218 MB after, 0.65 s to 0.85 s, for the whitespace runs it now
+keeps (shared, so the cost is their positions, not their text). The
+indented document comes back byte-identical; before, one byte differed.
+
+The plan answers =todo.org='s "KML's XML-layer losses" item for everything
+but the encoding, which is [[file:encodings.org][encodings.org]] E6 (D-E7).
+
+The question it settles is a balance: *preserve the original* (a
+hand-indented file should not come back flattened) against *write well-formed,
+readable KML* (today a fresh document is one line). Neither wins outright;
+§ THE PRINCIPLE says which governs where.
+
+** WHERE IT STANDS TODAY
+/Measured 2026-10-28/ -- a one-feature GeoJSON written as KML:
+
+#+begin_src text
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2"><Document><Placemark><name>a</name><description>&lt;b&gt;x&lt;/b&gt;</description><Point><coordinates>1,2</coordinates></Point></Placemark></Document></kml>
+#+end_src
+
+And a =kml -> kml= run reports, in =Format::Kml='s =same_format_losses= row
+(=format.rs=): CDATA written as escaped text, a DOCTYPE dropped, the layout of
+whitespace between elements. All /code/, read 2026-10-28:
+
+- ***One text string per element.*** =xml::Parsed=, =XmlElement= and the KML
+  =Node= each hold =text: String=, every direct text run concatenated, beside
+  =misc: Vec<(usize, XmlMisc)>= -- comments and PIs tagged with the child they
+  precede. The writer emits the whole string straight after the start tag
+  (=kml/model.rs= =write_node=), so an indented element comes back with its
+  line breaks bunched before its first child.
+- ***CDATA joins that string*** (=xml.rs= =parse_content=), indistinguishable
+  from text once parsed.
+- ***The DOCTYPE is skipped*** (=xml.rs= =skip_doctype=), and so is whitespace
+  outside the root (=misc_outside_root=).
+- ***Line endings survive already*** -- the parser does not normalise =\r\n=.
+
+** THE PRINCIPLE -- who wrote the bytes owns their layout
+*** Tier 1 -- the source's, where geosetta did not touch it
+Whitespace between elements, inside and outside the root; the DOCTYPE;
+comments and PIs (already carried). These are choices an author made and a
+diff shows: a hand-indented file flattened is a change on every line.
+Whitespace in element content is also in the XML Infoset -- it is
+information, not lexical form.
+
+*** Tier 2 -- ours, where geosetta writes
+An inserted element, a rewritten value, a whole new document. Laid out in the
+*document's* style where it has one (D-L3), else the house style (D-L2).
+
+*** Tier 3 -- lexical form, always the house spelling, never carried
+Attribute quote style and spacing; =<a></a>= versus =<a/>=; character and
+entity references (=&#233;= versus =é=); *CDATA versus escaped text* (D-L1);
+the XML declaration's spelling, apart from its =encoding=, which is
+=encodings.org='s. No reader distinguishes any of them, carrying them would
+put state on every attribute and value in the model, and normalising them is
+most of what "well-formatted" means. ***None of it is a loss***, so none of it
+warns.
+
+** DECISIONS
+*** D-L1 -- text is written escaped, every time
+/Decided 2026-10-28./ Geosetta never writes a CDATA section -- not in a new
+document, not in an edited value, and not where the source had one. A source's
+=<![CDATA[<b>x</b>]]>= is written =&lt;b&gt;x&lt;/b&gt;=. CDATA and escaped
+text are the same characters to every reader (CDATA boundaries are not in the
+Infoset, and C14N removes them too), so this is tier 3, and "CDATA sections,
+written as escaped text" leaves =same_format_losses= rather than being carried.
+
+/Considered and declined:/ CDATA for markup-bearing text (Google Earth's
+habit, more readable HTML in =<description>=). Escaping always works --
+CDATA cannot hold =]]>= -- and is what GDAL writes, so outputs agree with the
+reference tool.
+
+*** D-L2 -- the house style, for every new document
+/Decided 2026-10-28./ Every =-> kml= run from another format writes:
+
+#+begin_src xml
+<?xml version="1.0" encoding="UTF-8"?>
+<kml xmlns="http://www.opengis.net/kml/2.2">
+  <Document>
+    <Placemark>
+      <name>a</name>
+      <description>&lt;b&gt;x&lt;/b&gt;</description>
+      <Point>
+        <coordinates>1,2</coordinates>
+      </Point>
+    </Placemark>
+  </Document>
+</kml>
+#+end_src
+
+Two-space indent; one element per line; a leaf's text inline with its tags;
+LF; a final newline; double-quoted attributes; =<a/>= for an empty element.
+Foreign content (=Kind::Foreign=) is its verbatim bytes, placed at the
+indentation its position calls for, never re-indented inside.
+
+This changes every existing KML output, so every test and fixture that
+compares KML bytes is regenerated with it -- once, in the milestone that
+introduces it.
+
+*** D-L3 -- an edit is laid out in the document's own style
+Inserting into a source document infers its style from where the insertion
+lands:
+- *Indentation:* the whitespace run before a sibling at the insertion point
+  is the new element's; the *indent unit* is a child's indentation less its
+  parent's, and the new element's subtree is laid out with it.
+- *Line ending:* the one the source's runs use.
+- *A minified document* has no runs, so its style is "no whitespace", and an
+  insertion stays compact. The same rule, not a special case.
+
+*** D-L4 -- removing an element takes its indentation with it
+=remove_child= removes the whitespace-only run immediately before the
+removed child, and keeps any comment there (which precedes the next child, as
+now). Otherwise every deleted feature leaves a blank line.
+
+*** D-L5 -- a rewritten leaf keeps its surrounding whitespace
+=<name>\n  Zürich\n</name>= edited to =Bern= becomes =<name>\n  Bern\n</name>=:
+the old value's leading and trailing whitespace is kept around the new one.
+*Except =<coordinates>=*, whose layout (one tuple per line, say) belongs to
+values that changed; a changed geometry is written in the house layout. And
+=set_coordinates= gains the unchanged check =set_leaf= already has, so an
+untouched geometry keeps its layout.
+
+*** D-L6 -- the DOCTYPE is carried verbatim, never interpreted
+Kept as its source bytes in the document's prolog, at its position among the
+comments, PIs and whitespace there, and written back as-is. *Still not
+processed*: no entity expansion, no external subset fetched -- the parser
+already refuses an entity it does not know, so carrying the bytes adds no
+attack surface. The scanner learns to skip quoted literals and comments in an
+internal subset, where a =]= or =>= does not end it today's way.
+
+*** D-L8 -- =--compact= writes GeoJSON and KML on one line; both are laid out by default
+/Decided 2026-10-28, asked for the same day./ The house layout costs space
+-- 37% on a 200,000-placemark KML (66 MB against 48 MB) -- so =--compact=
+(=WriteOptions::compact= in the library) writes no whitespace between
+elements or members. It applies to a carried KML document's own layout too:
+the flag is an explicit request, so the source's whitespace between elements
+is dropped, while a leaf's text -- a value -- and foreign content's bytes are
+not. It ignores an output with no layout, as =--rtree= does.
+
+*GeoJSON is laid out by default* with it, so the flag means one thing: the
+collection, each feature and each geometry one member per line, indented
+two spaces, and every value inside them -- coordinates, a property, a
+foreign member -- compact on its line, so a large polygon is one line rather
+than one per number. =--compact= is the one-line form GeoJSON had before.
+
+*** D-L7 -- the round-trip test is canonical equality, plus idempotence
+Byte equality is not the bar, since tier 3 normalises. For every KML fixture:
+- =write(parse(src)) == normalize(src)=, where =normalize= applies tier 3
+  only -- quotes, empty-element form, references, CDATA to escaped text, the
+  declaration's spelling -- and touches no whitespace;
+- =write(parse(write(parse(src)))) == write(parse(src))=, byte for byte, so
+  nothing drifts on a second run.
+
+=normalize= is test code, written over the XML layer independently of the
+writer, so the two cannot share a bug.
+
+** MILESTONES
+*** L1 -- positioned text runs
+/***Built 2026-10-28.***/ =misc: Vec<(usize, XmlMisc)>= became =content:
+Vec<(usize, Content)>= on =Parsed=, =XmlElement= and =Node=, with =Content= =
+=Text= | =Comment= | =Pi= | =Doctype=; =before=/=after= carry whitespace runs
+too. Adjacent text and CDATA are one run (D-L1). *An element with no child
+elements has one text run*, in the place of its first, so =text()= is a leaf's
+value: =<name>a<!--c-->b</name>= reads =ab= and is written =ab<!--c-->=, as
+it was before text had a position. Whitespace runs are interned per parse
+(=Parser::run=), so a document's indentation is a handful of strings.
+
+Every place that moves children already carries =misc= by position --
+=insert_child=/=remove_child=, =document::split_container=/=assemble=/=insert=,
+=lower::lower_children=, =FeatureModel::leading= -- so indentation travels with
+its element through all of them, the 2.2 reordering included, for free.
+
+Removes "the layout of whitespace between elements" and "CDATA sections,
+written as escaped text" from the KML and KMZ rows. D-L7's tests land here.
+
+*** L2 -- edits in the document's style
+/***Built 2026-10-28.***/ D-L3, D-L4, D-L5: =xml::lay_out= (shared with L3),
+=Layout::of= inferring the unit, =Node::insert_laid_out=/=replace_child=, the
+removal rule (in =remove_child= and in =lower.rs='s drops), and =set_text=.
+Three things the build found:
+- *The layout is the whole document's.* A document with no =<Document>= has
+  every element but the root's split out with its features, so the unit is
+  inferred from the features too when the skeleton has none.
+- *A feature added since the read copies its siblings' habit*, which are
+  split out too: indented as the last feature of the container it joins,
+  and kept on one line when that feature is.
+- *An element built empty and then filled* (=<Icon>=, =<ExtendedData>=,
+  =<LatLonBox>=) is laid out once filled, since an empty element has nothing
+  to infer its inside from.
+=set_coordinates='s unchanged check was not needed: it is reached only for a
+geometry that changed.
+
+*** L3 -- the house style for new documents
+/***Built 2026-10-28.***/ D-L2. The writer lays its tree out with L2's pass.
+One test pins the layout byte for byte; the writer's content tests compare
+with the layout squeezed out.
+
+*** L4 -- the DOCTYPE
+/***Built 2026-10-28, inside L1***/, since the prolog's whitespace and its
+DOCTYPE are read by the same loop. D-L6. "A DOCTYPE" left the rows with L1.
+
+** OPEN QUESTIONS
+1. ~~*A version change's respelled and reordered elements* keep their own
+   leading runs under L1. Is that enough?~~ /Yes (2026-10-28): K5 moves
+   elements between siblings, never between depths, and the lowered fixtures
+   come back laid out./
+2. ~~*Does a feature added to a source document follow D-L3 or D-L2?*~~
+   /D-L3, tested (=reconcile.rs=)./
+3. *Is the indented document's memory worth shrinking?* +12% peak on an
+   indented 200,000-placemark file. =Content='s largest variant is =Pi=, two
+   boxed strings; boxing it whole would take a run's entry from 48 bytes to
+   32. Not done: about 25 MB of the 129.
+
+** DEPENDS ON / RELATED
+- [[file:todo.org][todo.org]], "KML's XML-layer losses" -- what this plan
+  answers.
+- [[file:encodings.org][encodings.org]] E6 and D-E7 -- the encoding item, and
+  the declaration's =encoding= pseudo-attribute.
+- [[file:kml-standard.org][kml-standard.org]] D-K4, D-K5, K3 -- the model and
+  its round-trip invariant, which D-L7 restates for layout.
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] -- the rule the
+  KML and KMZ rows answer to.

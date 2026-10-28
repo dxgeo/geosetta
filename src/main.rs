@@ -50,7 +50,7 @@ use std::path::{Path, PathBuf};
 
 use geosetta::{cli, convert, geopackage, shapefile};
 use geosetta::Crs;
-use geosetta::{Error, FeatureCollection, Format, KmlVersion, Result};
+use geosetta::{Error, FeatureCollection, Format, Result, WriteOptions};
 
 /// Read `path`'s bytes, or all of stdin when `path` is `"-"`.
 fn read_bytes(path: &str) -> Result<Vec<u8>> {
@@ -153,7 +153,7 @@ fn run() -> Result<()> {
     if args.progress {
         eprintln!("writing {}...", out.format.extension());
     }
-    write_collection(out.format, out.path, &fc, args.quiet, args.kml_version)
+    write_collection(out.format, out.path, &fc, args.quiet, args.write_options())
 }
 
 /// Drop every native the target's writer will not read, once the warnings
@@ -514,14 +514,15 @@ fn read_input(args: &cli::Args) -> Result<FeatureCollection> {
 /// `"-"` — through [`convert::write_features`]. Shared by the plain
 /// single-collection path and GeoPackage's per-layer fan-out
 /// (`run_geopackage_read`), so a multi-layer `.gpkg` → Shapefile conversion
-/// gets one `layer.shp` sibling set per layer for free. `kml_version` is
-/// `--kml-version`, which the CLI only accepts for KML/KMZ output.
+/// gets one `layer.shp` sibling set per layer for free. `options` are
+/// `--kml-version`, which the CLI only accepts for KML/KMZ output, and
+/// `--compact`.
 fn write_collection(
     to: Format,
     output_path: &str,
     fc: &FeatureCollection,
     quiet: bool,
-    kml_version: Option<KmlVersion>,
+    options: WriteOptions,
 ) -> Result<()> {
     if to == Format::Shapefile {
         if output_path == "-" {
@@ -529,10 +530,7 @@ fn write_collection(
         }
         return write_shapefile_to_path(output_path, fc, quiet);
     }
-    let bytes = match kml_version {
-        Some(version) => convert::write_kml_features(to, fc, version)?,
-        None => convert::write_features(to, fc)?,
-    };
+    let bytes = convert::write_features_with(to, fc, options)?;
     write_bytes(output_path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", io_label(output_path, "stdout"), bytes.len());
     Ok(())
@@ -862,7 +860,7 @@ fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs
         && (out.path.ends_with('/') || std::path::Path::new(out.path).is_dir());
     if layers.len() == 1 && !as_dir {
         let (_, fc) = &layers[0];
-        return write_collection(out.format, out.path, fc, args.quiet, args.kml_version);
+        return write_collection(out.format, out.path, fc, args.quiet, args.write_options());
     }
     if !as_dir {
         return Err(Error::Usage(
@@ -874,7 +872,7 @@ fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs
     let dir = std::path::Path::new(out.path);
     for (name, fc) in &layers {
         let path = dir.join(format!("{name}.{}", out.format.extension()));
-        write_collection(out.format, &path.to_string_lossy(), fc, args.quiet, args.kml_version)?;
+        write_collection(out.format, &path.to_string_lossy(), fc, args.quiet, args.write_options())?;
     }
     Ok(())
 }

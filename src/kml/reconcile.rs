@@ -13,6 +13,7 @@
 //! parent puts it, which 2.3's unordered groups also accept.
 
 use std::fmt::Write as _;
+use std::rc::Rc;
 
 use crate::crs::Crs;
 use crate::feature::{Feature, FeatureCollection};
@@ -20,7 +21,7 @@ use crate::format::{Format, KmlVersion};
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
 use crate::kml::document::{self, FeatureModel, Skeleton};
-use crate::kml::model::{self, KmlDocument, KmlElement, Node};
+use crate::kml::model::{self, KmlDocument, KmlElement, Layout, Node};
 use crate::kml::place::{place, Placement, Time};
 use crate::kml::project::{
     self, can_carry, carriers, project, Context, LatLonBox, Vertical, ALTITUDE_MEMBERS,
@@ -30,7 +31,7 @@ use crate::kml::writer::{
 };
 use crate::native::NativePayload;
 use crate::tally::Tally;
-use crate::xml::XmlElement;
+use crate::xml::{Content, XmlElement};
 
 /// The stored element of a feature read from KML or KMZ, if it has one.
 pub(crate) fn feature_model(f: &Feature) -> Option<&FeatureModel> {
@@ -56,13 +57,37 @@ pub(crate) fn assemble<'f>(
     features: impl Iterator<Item = (&'f Feature, Option<&'f FeatureModel>)>,
     skeleton: &Skeleton,
     version: KmlVersion,
+    compact: bool,
 ) -> KmlDocument {
     let ctx = Context::of(&skeleton.doc.root);
-    let w = Writing { prefix: skeleton.doc.root.prefix.as_deref(), version, ctx: &ctx };
+    let features: Vec<_> = features.collect();
+    // The layout is the whole document's: with no `<Document>`, every element
+    // but the root's may have been split out with its feature.
+    let layout = Layout::of(&skeleton.doc.root)
+        .or_else(|| features.iter().find_map(|(_, m)| Layout::of(&(*m)?.node)))
+        .filter(|_| !compact);
+    let w = Writing { prefix: skeleton.doc.root.prefix.as_deref(), version, ctx: &ctx, layout: layout.as_ref() };
+    let lead_of = |m: &FeatureModel| m.leading.last().filter(|c| c.is_space()).and_then(Content::text).map(Rc::from);
+    // How a feature added since the read is indented, and whether its inside
+    // is laid out: as the last feature of the container it joins was, else
+    // as the container lays out what it kept.
+    let joins = document::default_container(&skeleton.doc.root);
+    let new_lead: Option<(Rc<str>, bool)> = layout.as_ref().and_then(|l| {
+        let sibling = features.iter().rev().filter_map(|(_, m)| *m).find(|m| m.address.container == joins);
+        match sibling.and_then(|m| Some((lead_of(m)?, m))) {
+            Some((lead, m)) => Some((lead, !m.node.keeps_inside_on_one_line())),
+            None => document::lead_for_new(skeleton, l),
+        }
+    });
     let features = features
+        .into_iter()
         .map(|(f, model)| match model {
-            Some(m) => (Some(m.address.clone()), m.leading.clone(), w.reconcile(&m.node, f)),
-            None => (None, Vec::new(), w.fresh(f)),
+            Some(m) => (Some(m.address.clone()), m.leading.clone(), w.reconcile(&m.node, f, lead_of(m).as_deref())),
+            None => {
+                let leading = new_lead.iter().map(|(l, _)| Content::Text(l.clone())).collect();
+                let inside = new_lead.as_ref().filter(|(_, inside)| *inside).map(|(l, _)| &**l);
+                (None, leading, w.fresh(f, inside))
+            }
         })
         .collect();
     document::assemble(skeleton, features)
@@ -75,13 +100,27 @@ struct Writing<'a> {
     prefix: Option<&'a str>,
     version: KmlVersion,
     ctx: &'a Context,
+    /// The document's layout, which what an edit adds is written in
+    /// (`plans/kml-layout.org` D-L3).
+    layout: Option<&'a Layout>,
 }
 
-/// A writer-built element as a model node, in `prefix`.
-fn built(el: &XmlElement, prefix: Option<&str>) -> Node {
-    let mut node = model::from_built(el);
-    node.set_prefix(prefix);
-    node
+/// What building a node into a feature's element needs: the feature's KML
+/// prefix, and the document's layout for placing it.
+#[derive(Clone, Copy)]
+struct Build<'a> {
+    prefix: Option<&'a str>,
+    layout: Option<&'a Layout>,
+}
+
+impl Build<'_> {
+    /// A writer-built element as a model node, in the feature's prefix. It is
+    /// laid out where it is inserted.
+    fn node(&self, el: &XmlElement) -> Node {
+        let mut node = model::from_built(el);
+        node.set_prefix(self.prefix);
+        node
+    }
 }
 
 /// An edit that leaves an overlay with geometry it cannot hold — a
@@ -91,68 +130,74 @@ fn built(el: &XmlElement, prefix: Option<&str>) -> Node {
 struct Unwritable;
 
 impl Writing<'_> {
-    /// A feature with no stored element, built from the IR. Its values go in
-    /// `<Data>`: the document's schemas were written for the features it held.
-    fn fresh(&self, f: &Feature) -> Node {
-        built(&feature_to_placemark(f, self.version, &Typed::default()), self.prefix)
+    /// A feature with no stored element, built from the IR and laid out for a
+    /// place indented by `lead`. Its values go in `<Data>`: the document's
+    /// schemas were written for the features it held.
+    fn fresh(&self, f: &Feature, lead: Option<&str>) -> Node {
+        let b = Build { prefix: self.prefix, layout: self.layout };
+        let mut node = b.node(&feature_to_placemark(f, self.version, &Typed::default()));
+        if let (Some(layout), Some(lead)) = (self.layout, lead) {
+            layout.lay_out_under(&mut node, lead);
+        }
+        node
     }
 
-    /// `stored` with `f`'s edits applied.
-    fn reconcile(&self, stored: &Node, f: &Feature) -> Node {
+    /// `stored`, indented by `lead`, with `f`'s edits applied.
+    fn reconcile(&self, stored: &Node, f: &Feature, lead: Option<&str>) -> Node {
         let Ok(projected) = project(stored, self.ctx) else {
             // It projected when it was read, so this cannot happen; if it did,
             // the IR is the only statement of the feature left.
-            return self.fresh(f);
+            return self.fresh(f, lead);
         };
         if projected.properties == f.properties && projected.geometry == f.geometry {
             return stored.clone();
         }
         let element = stored.element().expect("a projected feature is a KML element");
         let prefix = stored.prefix.clone();
-        let prefix = prefix.as_deref();
+        let b = Build { prefix: prefix.as_deref(), layout: self.layout };
         let mut node = stored.clone();
         // The geometry first, so the properties are placed against the
         // geometry that will be written.
-        if projected.geometry != f.geometry && reconcile_geometry(&mut node, f.geometry.as_ref(), self.version, prefix).is_err() {
+        if projected.geometry != f.geometry && reconcile_geometry(&mut node, f.geometry.as_ref(), self.version, b).is_err() {
             // What the overlay was is gone with its geometry; the feature is
             // a Placemark now, and `drop_warnings` says so.
-            return self.fresh(f);
+            return self.fresh(f, lead);
         }
         let placement = place(f, element, |member| {
             project::geometry_of(&node).is_some_and(|g| {
                 carriers(g).iter().any(|c| c.element().is_some_and(|k| can_carry(k, member)))
             })
         });
-        self.apply(&mut node, &placement, prefix);
+        self.apply(&mut node, &placement, b);
         node
     }
 
-    fn apply(&self, node: &mut Node, placement: &Placement, prefix: Option<&str>) {
-        set_leaf(node, KmlElement::Name, placement.name.as_deref(), prefix);
-        set_leaf(node, KmlElement::Description, placement.description.as_deref(), prefix);
-        reconcile_time(node, &placement.time, prefix);
+    fn apply(&self, node: &mut Node, placement: &Placement, b: Build<'_>) {
+        set_leaf(node, KmlElement::Name, placement.name.as_deref(), b);
+        set_leaf(node, KmlElement::Description, placement.description.as_deref(), b);
+        reconcile_time(node, &placement.time, b);
         if node.element().is_some_and(KmlElement::is_overlay) {
-            reconcile_icon(node, placement.icon.as_deref(), prefix);
+            reconcile_icon(node, placement.icon.as_deref(), b);
         }
-        reconcile_altitude(node, &placement.altitude, self.version, prefix);
-        reconcile_extended_data(node, &placement.extended, self.ctx, prefix);
+        reconcile_altitude(node, &placement.altitude, self.version, b);
+        reconcile_extended_data(node, &placement.extended, self.ctx, b);
     }
 }
 
 /// Make `parent`'s `element` child hold `want`: its text set, removed for
 /// `None`, or added where the schema puts it. A child already holding the text
 /// is left as it is.
-fn set_leaf(parent: &mut Node, element: KmlElement, want: Option<&str>, prefix: Option<&str>) {
+fn set_leaf(parent: &mut Node, element: KmlElement, want: Option<&str>, b: Build<'_>) {
     let at = parent.children.iter().position(|c| c.is(element));
     match (want, at) {
         (None, Some(i)) => parent.remove_child(i),
         (Some(v), Some(i)) => {
             if parent.children[i].text_trimmed() != v {
-                parent.children[i].text = v.to_string();
+                parent.children[i].set_text(v);
             }
         }
         (Some(v), None) => {
-            insert_in_order(parent, built(&XmlElement::leaf(element.name(), v), prefix));
+            insert_in_order(parent, b, b.node(&XmlElement::leaf(element.name(), v)));
         }
         (None, None) => {}
     }
@@ -160,7 +205,7 @@ fn set_leaf(parent: &mut Node, element: KmlElement, want: Option<&str>, prefix: 
 
 /// Bring the feature's time primitive in line with `want`, keeping the one
 /// it has — its `id`, its foreign content — when it is the same kind.
-fn reconcile_time(node: &mut Node, want: &Time, prefix: Option<&str>) {
+fn reconcile_time(node: &mut Node, want: &Time, b: Build<'_>) {
     if Time::of(&project::time_values(node)) == *want {
         return;
     }
@@ -170,19 +215,19 @@ fn reconcile_time(node: &mut Node, want: &Time, prefix: Option<&str>) {
         (Time::None, Some(i)) => node.remove_child(i),
         (Time::None, None) => {}
         (Time::Stamp(when), Some(i)) if kind == Some(KmlElement::TimeStamp) => {
-            set_leaf(&mut node.children[i], KmlElement::When, Some(when), prefix);
+            set_leaf(&mut node.children[i], KmlElement::When, Some(when), b);
         }
         (Time::Span(begin, end), Some(i)) if kind == Some(KmlElement::TimeSpan) => {
             let span = &mut node.children[i];
-            set_leaf(span, KmlElement::Begin, begin.as_deref(), prefix);
-            set_leaf(span, KmlElement::End, end.as_deref(), prefix);
+            set_leaf(span, KmlElement::Begin, begin.as_deref(), b);
+            set_leaf(span, KmlElement::End, end.as_deref(), b);
         }
         (want, at) => {
-            let fresh = built(&time_element(want).expect("a time to write"), prefix);
+            let fresh = b.node(&time_element(want).expect("a time to write"));
             match at {
-                Some(i) => node.children[i] = fresh,
+                Some(i) => node.replace_child(i, fresh, b.layout),
                 None => {
-                    insert_in_order(node, fresh);
+                    insert_in_order(node, b, fresh);
                 }
             }
         }
@@ -191,16 +236,20 @@ fn reconcile_time(node: &mut Node, want: &Time, prefix: Option<&str>) {
 
 /// Bring an overlay's `<Icon><href>` in line with `want`. Removing it leaves
 /// the rest of `<Icon>` — its refresh settings — where it was.
-fn reconcile_icon(node: &mut Node, want: Option<&str>, prefix: Option<&str>) {
+fn reconcile_icon(node: &mut Node, want: Option<&str>, b: Build<'_>) {
     if project::icon_href(node) == want {
         return;
     }
-    let at = match node.children.iter().position(|c| c.is(KmlElement::Icon)) {
+    let existing = node.children.iter().position(|c| c.is(KmlElement::Icon));
+    let at = match existing {
         Some(i) => i,
         None if want.is_none() => return,
-        None => insert_in_order(node, built(&XmlElement::with_children("Icon", Vec::new()), prefix)),
+        None => insert_in_order(node, b, b.node(&XmlElement::with_children("Icon", Vec::new()))),
     };
-    set_leaf(&mut node.children[at], KmlElement::Href, want, prefix);
+    set_leaf(&mut node.children[at], KmlElement::Href, want, b);
+    if existing.is_none() {
+        node.lay_out_child(at, b.layout);
+    }
 }
 
 /// Bring the geometry's altitude members in line with `want`. A member the
@@ -208,7 +257,7 @@ fn reconcile_icon(node: &mut Node, want: Option<&str>, prefix: Option<&str>) {
 /// is removed from every carrier; a member whose carriers disagree was never
 /// projected, so an edit elsewhere leaves it alone. Setting one altitude mode
 /// removes the other, which the schema makes the same choice.
-fn reconcile_altitude(node: &mut Node, want: &[(KmlElement, String)], version: KmlVersion, prefix: Option<&str>) {
+fn reconcile_altitude(node: &mut Node, want: &[(KmlElement, String)], version: KmlVersion, b: Build<'_>) {
     let have: Vec<(&str, String)> =
         project::altitude_values(node).into_iter().map(|(k, v)| (k, v.to_string())).collect();
     let Some(gi) = geometry_index(node) else { return };
@@ -228,7 +277,7 @@ fn reconcile_altitude(node: &mut Node, want: &[(KmlElement, String)], version: K
                 (None, None) => {}
                 (Some(v), Some(i)) => {
                     if carrier.children[i].text_trimmed() != v {
-                        carrier.children[i].text = v.to_string();
+                        carrier.children[i].set_text(v);
                     }
                 }
                 (Some(v), None) => {
@@ -240,7 +289,7 @@ fn reconcile_altitude(node: &mut Node, want: &[(KmlElement, String)], version: K
                     if let Some(j) = other.and_then(|o| carrier.children.iter().position(|c| c.is(o))) {
                         carrier.remove_child(j);
                     }
-                    insert_in_order(carrier, built(&altitude_element(member, v, version), prefix));
+                    insert_in_order(carrier, b, b.node(&altitude_element(member, v, version)));
                 }
             }
         });
@@ -272,7 +321,7 @@ fn for_each_carrier(geometry: &mut Node, f: &mut dyn FnMut(&mut Node)) {
 /// its place and is updated or removed, and a property it has no element for
 /// is appended as `<Data>`. Values are compared as the projection reads them,
 /// so a typed `<SimpleData>` whose value did not change keeps its spelling.
-fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &Context, prefix: Option<&str>) {
+fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &Context, b: Build<'_>) {
     let at = node.children.iter().position(|c| c.is(KmlElement::ExtendedData));
     let have = at.map(|i| project::extended_data_values(&node.children[i], ctx)).unwrap_or_default();
     if have.len() == want.len() && have.iter().zip(want).all(|((hk, hv), (wk, wv))| hk == wk && hv == *wv) {
@@ -280,7 +329,7 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
     }
     let i = match at {
         Some(i) => i,
-        None => insert_in_order(node, built(&XmlElement::with_children("ExtendedData", Vec::new()), prefix)),
+        None => insert_in_order(node, b, b.node(&XmlElement::with_children("ExtendedData", Vec::new()))),
     };
     let ed = &mut node.children[i];
     // Which of `want` an element already holds, so a repeated key goes to the
@@ -299,7 +348,7 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
             (Some(KmlElement::Data), Some(key)) => match claim(&key) {
                 Some(v) => {
                     if project::data_value(&ed.children[j]) != *v {
-                        set_data_value(&mut ed.children[j], &property_text(v), prefix);
+                        set_data_value(&mut ed.children[j], &property_text(v), b);
                     }
                     j += 1;
                 }
@@ -316,7 +365,7 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
                         (true, Some(key)) => match claim(&key) {
                             Some(v) => {
                                 if project::simple_data_value(simple, url.as_deref(), ctx) != *v {
-                                    schema_data.children[s].text = property_text(v);
+                                    schema_data.children[s].set_text(&property_text(v));
                                 }
                                 s += 1;
                             }
@@ -339,16 +388,18 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
                 Some(last) => last + 1,
                 None => ed.children.iter().position(|c| c.is(KmlElement::SchemaData)).unwrap_or(ed.children.len()),
             };
-            ed.insert_child(at, built(&data, prefix));
+            ed.insert_laid_out(at, b.node(&data), b.layout);
         }
     }
-    if ed.children.is_empty() && ed.misc.is_empty() {
+    if ed.children.is_empty() && ed.content.iter().all(|(_, c)| c.is_space()) {
         node.remove_child(i);
+    } else if at.is_none() {
+        node.lay_out_child(i, b.layout);
     }
 }
 
-fn set_data_value(data: &mut Node, value: &str, prefix: Option<&str>) {
-    set_leaf(data, KmlElement::Value, Some(value), prefix);
+fn set_data_value(data: &mut Node, value: &str, b: Build<'_>) {
+    set_leaf(data, KmlElement::Value, Some(value), b);
 }
 
 /// Replace the feature's geometry with the IR's.
@@ -363,11 +414,11 @@ fn reconcile_geometry(
     node: &mut Node,
     geometry: Option<&Geometry>,
     version: KmlVersion,
-    prefix: Option<&str>,
+    b: Build<'_>,
 ) -> Result<(), Unwritable> {
     match node.element() {
-        Some(KmlElement::GroundOverlay) => return reconcile_footprint(node, geometry, version, prefix),
-        Some(KmlElement::PhotoOverlay) => return reconcile_photo_point(node, geometry, prefix),
+        Some(KmlElement::GroundOverlay) => return reconcile_footprint(node, geometry, version, b),
+        Some(KmlElement::PhotoOverlay) => return reconcile_photo_point(node, geometry, b),
         _ => {}
     }
     let at = node.children.iter().position(|c| c.element().is_some_and(KmlElement::is_geometry));
@@ -382,11 +433,11 @@ fn reconcile_geometry(
     {
         return Ok(());
     }
-    let fresh = built(&geometry_to_element(geometry), prefix);
+    let fresh = b.node(&geometry_to_element(geometry));
     match at {
-        Some(i) => node.children[i] = fresh,
+        Some(i) => node.replace_child(i, fresh, b.layout),
         None => {
-            insert_in_order(node, fresh);
+            insert_in_order(node, b, fresh);
         }
     }
     Ok(())
@@ -401,7 +452,7 @@ fn reconcile_footprint(
     node: &mut Node,
     geometry: Option<&Geometry>,
     version: KmlVersion,
-    prefix: Option<&str>,
+    b: Build<'_>,
 ) -> Result<(), Unwritable> {
     let at_box = node.children.iter().position(|c| c.is(KmlElement::LatLonBox));
     let at_quad = node.children.iter().position(|c| c.is(KmlElement::LatLonQuad));
@@ -418,35 +469,38 @@ fn reconcile_footprint(
     if let Some(i) = at_quad {
         let quad = &mut node.children[i];
         if !set_coordinates(quad, &corners) {
-            set_leaf(quad, KmlElement::Coordinates, Some(&coordinates_text(&corners)), prefix);
+            set_leaf(quad, KmlElement::Coordinates, Some(&coordinates_text(&corners)), b);
         }
         return Ok(());
     }
-    if let Some(b) = LatLonBox::from_ring(&corners) {
+    if let Some(bounds) = LatLonBox::from_ring(&corners) {
         let i = match at_box {
             Some(i) => i,
-            None => insert_in_order(node, built(&XmlElement::with_children("LatLonBox", Vec::new()), prefix)),
+            None => insert_in_order(node, b, b.node(&XmlElement::with_children("LatLonBox", Vec::new()))),
         };
         let lat_lon_box = &mut node.children[i];
         let stored = LatLonBox::read(lat_lon_box).ok();
         for (element, value) in [
-            (KmlElement::North, b.north),
-            (KmlElement::South, b.south),
-            (KmlElement::East, b.east),
-            (KmlElement::West, b.west),
+            (KmlElement::North, bounds.north),
+            (KmlElement::South, bounds.south),
+            (KmlElement::East, bounds.east),
+            (KmlElement::West, bounds.west),
         ] {
             // An edge the edit did not move keeps its spelling.
             let unchanged = stored.is_some_and(|s| edge(&s, element) == value) && lat_lon_box.child(element).is_some();
             if !unchanged {
-                set_leaf(lat_lon_box, element, Some(&value.to_string()), prefix);
+                set_leaf(lat_lon_box, element, Some(&value.to_string()), b);
             }
         }
         let had_rotation = lat_lon_box.child(KmlElement::Rotation).is_some();
-        if b.rotation != 0.0 || had_rotation {
-            let unchanged = stored.is_some_and(|s| s.rotation == b.rotation) && had_rotation;
+        if bounds.rotation != 0.0 || had_rotation {
+            let unchanged = stored.is_some_and(|s| s.rotation == bounds.rotation) && had_rotation;
             if !unchanged {
-                set_leaf(lat_lon_box, KmlElement::Rotation, Some(&b.rotation.to_string()), prefix);
+                set_leaf(lat_lon_box, KmlElement::Rotation, Some(&bounds.rotation.to_string()), b);
             }
+        }
+        if at_box.is_none() {
+            node.lay_out_child(i, b.layout);
         }
         return Ok(());
     }
@@ -456,11 +510,11 @@ fn reconcile_footprint(
         quad.prefix = Some(model::GX_PREFIX.into());
         quad = quad.with_ns_decl(Some(model::GX_PREFIX), model::GX_NS);
     }
-    let quad = built(&quad, prefix);
+    let quad = b.node(&quad);
     match at_box {
-        Some(i) => node.children[i] = quad,
+        Some(i) => node.replace_child(i, quad, b.layout),
         None => {
-            insert_in_order(node, quad);
+            insert_in_order(node, b, quad);
         }
     }
     Ok(())
@@ -477,7 +531,7 @@ fn edge(b: &LatLonBox, element: KmlElement) -> f64 {
 
 /// A `<PhotoOverlay>`'s `<Point>` edited: its coordinates in place, keeping
 /// its altitude members. Anything but a point is no place for a photo.
-fn reconcile_photo_point(node: &mut Node, geometry: Option<&Geometry>, prefix: Option<&str>) -> Result<(), Unwritable> {
+fn reconcile_photo_point(node: &mut Node, geometry: Option<&Geometry>, b: Build<'_>) -> Result<(), Unwritable> {
     let at = node.children.iter().position(|c| c.is(KmlElement::Point));
     match (geometry, at) {
         (None, Some(i)) => node.remove_child(i),
@@ -485,11 +539,11 @@ fn reconcile_photo_point(node: &mut Node, geometry: Option<&Geometry>, prefix: O
         (Some(Geometry::Point(p)), Some(i)) => {
             let point = &mut node.children[i];
             if !set_coordinates(point, std::slice::from_ref(p)) {
-                set_leaf(point, KmlElement::Coordinates, Some(&coordinates_text(std::slice::from_ref(p))), prefix);
+                set_leaf(point, KmlElement::Coordinates, Some(&coordinates_text(std::slice::from_ref(p))), b);
             }
         }
         (Some(g @ Geometry::Point(_)), None) => {
-            insert_in_order(node, built(&geometry_to_element(g), prefix));
+            insert_in_order(node, b, b.node(&geometry_to_element(g)));
         }
         (Some(_), _) => return Err(Unwritable),
     }
@@ -511,7 +565,7 @@ fn update_in_place(existing: &mut Node, geometry: &Geometry) -> bool {
                 return false;
             }
             for (i, p) in coords.into_iter().zip(points) {
-                existing.children[i].text = track_coord(p);
+                existing.children[i].set_text(&track_coord(p));
             }
             true
         }
@@ -523,7 +577,7 @@ fn set_coordinates(existing: &mut Node, points: &[Position]) -> bool {
     let Some(i) = existing.children.iter().position(|c| c.is(KmlElement::Coordinates)) else {
         return false;
     };
-    existing.children[i].text = coordinates_text(points);
+    existing.children[i].replace_text(coordinates_text(points));
     true
 }
 
@@ -533,7 +587,7 @@ fn coordinates_text(points: &[Position]) -> String {
         .children
         .into_iter()
         .find(|c| c.name == "coordinates")
-        .map(|c| c.text)
+        .map(|c| c.text().to_string())
         .unwrap_or_default()
 }
 
@@ -607,16 +661,16 @@ fn rank(parent: KmlElement, child: KmlElement) -> Option<u8> {
     })
 }
 
-/// Insert `child` after every sibling the sequence puts at or before it, and
-/// return its index.
-fn insert_in_order(node: &mut Node, child: Node) -> usize {
+/// Insert `child` after every sibling the sequence puts at or before it, laid
+/// out as the document is, and return its index.
+fn insert_in_order(node: &mut Node, b: Build<'_>, child: Node) -> usize {
     let parent = node.element();
     let rank_of = |n: &Node| rank(parent?, n.element()?);
     let at = match rank_of(&child) {
         Some(r) => node.children.iter().rposition(|c| rank_of(c).is_some_and(|cr| cr <= r)).map_or(0, |i| i + 1),
         None => node.children.len(),
     };
-    node.insert_child(at, child);
+    node.insert_laid_out(at, child, b.layout);
     at
 }
 
@@ -720,7 +774,8 @@ fn overlay_edit_unwritable(stored: &Node, f: &Feature) -> bool {
         return false;
     };
     projected.geometry != f.geometry
-        && reconcile_geometry(&mut stored.clone(), f.geometry.as_ref(), KmlVersion::V2_3, None).is_err()
+        && reconcile_geometry(&mut stored.clone(), f.geometry.as_ref(), KmlVersion::V2_3, Build { prefix: None, layout: None })
+            .is_err()
 }
 
 #[cfg(test)]
@@ -746,7 +801,7 @@ mod tests {
     }
 
     fn write_back(fc: &FeatureCollection) -> String {
-        String::from_utf8(crate::kml::writer::write(fc, None)).unwrap()
+        String::from_utf8(crate::kml::writer::write(fc, None, false)).unwrap()
     }
 
     /// Set, add or remove a property, keeping its place when it had one.
@@ -872,7 +927,7 @@ mod tests {
     #[test]
     fn a_version_change_carries_the_document_and_reports_only_its_respellings() {
         let fc = read(DOC);
-        let written = String::from_utf8(crate::kml::writer::write(&fc, Some(KmlVersion::V2_3))).unwrap();
+        let written = String::from_utf8(crate::kml::writer::write(&fc, Some(KmlVersion::V2_3), false)).unwrap();
         assert!(written.contains(r#"<Style id="s">"#) && written.contains("<!-- keep me -->"), "{written}");
         assert!(crate::kml::version_change_warnings(&fc, Format::Kml, KmlVersion::V2_3).is_empty(), "nothing was respelled");
         // A track is respelled, and it carries its times into either version.
@@ -882,12 +937,12 @@ mod tests {
             ["kml: input is KML 2.2; written as KML 2.3 (gx:Track→Track, gx:coord→coord ×2)"]
         );
         assert!(crate::kml::drop_warnings(&fc, Format::Kml).is_empty());
-        let written = String::from_utf8(crate::kml::writer::write(&fc, Some(KmlVersion::V2_3))).unwrap();
+        let written = String::from_utf8(crate::kml::writer::write(&fc, Some(KmlVersion::V2_3), false)).unwrap();
         assert!(written.contains("<Track><when>t1</when><when>t2</when><coord>1 2 3</coord>"), "{written}");
     }
 
     fn write_as(fc: &FeatureCollection, version: KmlVersion) -> String {
-        String::from_utf8(crate::kml::writer::write(fc, Some(version))).unwrap()
+        String::from_utf8(crate::kml::writer::write(fc, Some(version), false)).unwrap()
     }
 
     fn edited(source: &str, edit: impl FnOnce(&mut Feature)) -> (FeatureCollection, String) {
@@ -1074,5 +1129,76 @@ mod tests {
         assert_eq!(again.features[0].properties, fc.features[0].properties);
         assert_eq!(again.schema, fc.schema);
         assert_eq!(again.crs, fc.crs);
+    }
+
+    const LAID_OUT: &str = "<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n  <Document>\n    <name>d</name>\n    \
+        <Placemark>\n      <name>a</name>\n      <description>gone</description>\n      <Point>\n        \
+        <coordinates>1,2</coordinates>\n      </Point>\n    </Placemark>\n    <Placemark>\n      <name>b</name>\n    \
+        </Placemark>\n  </Document>\n</kml>\n";
+
+    #[test]
+    fn what_an_edit_adds_is_laid_out_as_the_document_is_and_what_it_removes_leaves_no_line() {
+        let mut fc = read(LAID_OUT);
+        let mut added = Feature { native: None, ..fc.features[0].clone() };
+        added.properties.retain(|(k, _)| &**k == "name");
+        set(&mut added, "name", Some("c"));
+        set(&mut fc.features[0], "description", None);
+        set(&mut fc.features[0], "k", Some("v"));
+        fc.features[1] = added;
+        assert_eq!(
+            write_back(&fc),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+             <kml xmlns=\"http://www.opengis.net/kml/2.2\">\n  <Document>\n    <name>d</name>\n    <Placemark>\n      \
+             <name>a</name>\n      <ExtendedData>\n        <Data name=\"k\">\n          <value>v</value>\n        </Data>\n      \
+             </ExtendedData>\n      <Point>\n        <coordinates>1,2</coordinates>\n      </Point>\n    </Placemark>\n    \
+             <Placemark>\n      <name>c</name>\n      <Point>\n        <coordinates>1,2</coordinates>\n      </Point>\n    \
+             </Placemark>\n  </Document>\n</kml>\n"
+        );
+    }
+
+    #[test]
+    fn an_edit_keeps_the_documents_newline_and_indent() {
+        let (_, written) = edited("<kml>\r\n\t<Placemark>\r\n\t\t<name>a</name>\r\n\t</Placemark>\r\n</kml>", |f| {
+            set(f, "description", Some("d"));
+            set(f, "k", Some("v"));
+        });
+        assert!(
+            written.ends_with(
+                "<kml>\r\n\t<Placemark>\r\n\t\t<name>a</name>\r\n\t\t<description>d</description>\r\n\t\t<ExtendedData>\r\n\
+                 \t\t\t<Data name=\"k\">\r\n\t\t\t\t<value>v</value>\r\n\t\t\t</Data>\r\n\t\t</ExtendedData>\r\n\t</Placemark>\r\n</kml>"
+            ),
+            "{written:?}"
+        );
+    }
+
+    #[test]
+    fn a_compact_document_and_a_compact_sibling_keep_their_habit() {
+        let (_, written) = edited("<kml><Placemark><name>a</name></Placemark></kml>", |f| set(f, "k", Some("v")));
+        assert!(written.ends_with(r#"<Placemark><name>a</name><ExtendedData><Data name="k"><value>v</value></Data></ExtendedData></Placemark></kml>"#), "{written}");
+        let mut fc = read("<kml>\n  <Document>\n    <Placemark><name>a</name></Placemark>\n  </Document>\n</kml>");
+        let mut added = Feature { native: None, ..fc.features[0].clone() };
+        set(&mut added, "name", Some("c"));
+        fc.features.push(added);
+        let written = write_back(&fc);
+        assert!(written.ends_with("    <Placemark><name>a</name></Placemark>\n    <Placemark><name>c</name></Placemark>\n  </Document>\n</kml>"), "{written:?}");
+    }
+
+    #[test]
+    fn a_rewritten_leaf_keeps_the_whitespace_around_its_value() {
+        let (_, written) = edited("<kml><Placemark><name>\n  Zürich\n</name></Placemark></kml>", |f| set(f, "name", Some("Bern")));
+        assert!(written.contains("<name>\n  Bern\n</name>"), "{written}");
+    }
+
+    #[test]
+    fn what_lowering_drops_takes_its_line_with_it() {
+        let source = "<kml xmlns=\"http://www.opengis.net/kml/2.2\" version=\"2.3\">\n  <Placemark>\n    <Region>\n      \
+            <LatLonAltBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonAltBox>\n      \
+            <LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox>\n    </Region>\n  \
+            </Placemark>\n</kml>\n";
+        let written = write_as(&read(source), KmlVersion::V2_2);
+        assert!(
+            written.contains("<Region>\n      <LatLonAltBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonAltBox>\n    </Region>"),
+            "{written}"
+        );
     }
 }

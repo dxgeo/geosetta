@@ -303,6 +303,12 @@ writing whatever can be written rather than warning about it, and it is why
   /2026-10-28: **K5 is built** -- a version change lowers the document to 2.2
   or raises it to 2.3 (=kml/lower.rs=, =kml/raise.rs=), and every kind of
   write validates against its version's schema (=tests/kml_schemas.rs=)./
+  /2026-10-28, later: **the XML layer's losses are closed but the encoding**
+  ([[file:plans/kml-layout.org][plans/kml-layout.org]] L1--L4) -- whitespace,
+  comments and a DOCTYPE keep their places, edits are laid out as the
+  document is, and CDATA is written escaped as normalisation. New documents
+  are indented; =--compact= (D-L8) writes GeoJSON and KML on one line, and
+  GeoJSON is indented by default with it./
 - *M3c*, the KMZ container. =hand_hostile.kmz= already exists and carries the
   dangling =files/overlay.png= reference.
   /2026-10-28: the entries are carried/ -- a =.kmz= written back keeps every

@@ -426,85 +426,153 @@ fn stream_array<T>(p: &mut Parser, elem: fn(&mut Parser) -> Result<T>) -> Result
 
 // --- serialization ---------------------------------------------------------
 
-/// Serialize a [`FeatureCollection`] straight to GeoJSON text, byte-for-byte
-/// identical to [`to_json`] + [`JsonValue::to_json_string`] but without building
-/// the intermediate `JsonValue` tree (which allocates a `Vec`/`Object` per
-/// coordinate, ring, and feature). This is the writer the CLI uses.
-pub fn to_geojson_string(fc: &FeatureCollection) -> String {
-    // Rough guess: geometry + a little overhead per feature.
-    let mut out = String::with_capacity(fc.features.len() * 96 + 64);
-    out.push_str("{\"type\":\"FeatureCollection\"");
-    if let Some(name) = &fc.name {
-        out.push_str(",\"name\":");
-        json::escape_into(name, &mut out);
-    }
-    write_natives(&mut out, fc.native.as_ref());
-    out.push_str(",\"features\":[");
-    for (i, f) in fc.features.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
-        }
-        write_feature(&mut out, f);
-    }
-    out.push_str("]}");
-    out
-}
-
-/// Re-emit the members a GeoJSON source carried that the IR does not model.
+/// Serialize a [`FeatureCollection`] straight to GeoJSON text without
+/// building the intermediate `JsonValue` tree (which allocates a
+/// `Vec`/`Object` per coordinate, ring, and feature). This is the writer the
+/// CLI uses.
 ///
-/// Replays only when the native was produced by *this* format
-/// ([`Native::payload_for`]) — a FlatGeobuf-tagged payload is ignored here, and
-/// that is an ordinary cross-format conversion rather than an error. Emits
-/// nothing at all when there is no native, which is the common case.
-fn write_natives(out: &mut String, native: Option<&Native>) {
-    let Some(NativePayload::GeoJson(members)) =
-        native.and_then(|n| n.payload_for(Format::GeoJson))
-    else {
-        return;
-    };
-    for (k, v) in members {
-        out.push(',');
-        json::escape_into(k, out);
-        out.push(':');
-        v.write_json_to(out);
+/// *Laid out by default* (`plans/kml-layout.org` D-L8): the collection, each
+/// feature and each geometry one member per line, indented two spaces, and
+/// every value inside them — coordinates, a property, a foreign member —
+/// compact on its line, so a large polygon is one line rather than one per
+/// number. `compact` writes it all on one line, byte-for-byte identical to
+/// [`to_json`] + [`JsonValue::to_json_string`].
+pub fn to_geojson_string(fc: &FeatureCollection, compact: bool) -> String {
+    // Rough guess: geometry + a little overhead per feature.
+    let mut w = Writer { out: String::with_capacity(fc.features.len() * 96 + 64), compact, depth: 0 };
+    w.open('{');
+    w.member("type");
+    w.out.push_str("\"FeatureCollection\"");
+    if let Some(name) = &fc.name {
+        w.member("name");
+        json::escape_into(name, &mut w.out);
     }
+    w.natives(fc.native.as_ref());
+    w.member("features");
+    w.open('[');
+    for f in &fc.features {
+        w.item();
+        w.feature(f);
+    }
+    w.close(']');
+    w.close('}');
+    if !compact {
+        w.out.push('\n');
+    }
+    w.out
 }
 
-fn write_feature(out: &mut String, f: &Feature) {
-    out.push_str("{\"type\":\"Feature\"");
-    write_natives(out, f.native.as_ref());
-    out.push_str(",\"geometry\":");
-    match &f.geometry {
-        Some(g) => write_geometry(out, g),
-        None => out.push_str("null"),
+/// The GeoJSON writer's output and where it is in the layout.
+struct Writer {
+    out: String,
+    compact: bool,
+    depth: usize,
+}
+
+impl Writer {
+    fn open(&mut self, bracket: char) {
+        self.out.push(bracket);
+        self.depth += 1;
     }
-    out.push_str(",\"properties\":{");
-    for (i, (k, v)) in f.properties.iter().enumerate() {
-        if i > 0 {
-            out.push(',');
+
+    /// Close an object or array: on a line of its own when laid out and it
+    /// holds anything.
+    fn close(&mut self, bracket: char) {
+        self.depth -= 1;
+        let empty = self.out.ends_with(['{', '[']);
+        if !self.compact && !empty {
+            self.newline();
         }
-        json::escape_into(k, out);
-        out.push(':');
-        v.write_json_to(out);
+        self.out.push(bracket);
     }
-    out.push_str("}}");
-}
 
-fn write_geometry(out: &mut String, g: &Geometry) {
-    if let Geometry::GeometryCollection(geoms) = g {
-        out.push_str("{\"type\":\"GeometryCollection\",\"geometries\":[");
-        for (i, sub) in geoms.iter().enumerate() {
-            if i > 0 {
-                out.push(',');
+    fn newline(&mut self) {
+        self.out.push('\n');
+        for _ in 0..self.depth {
+            self.out.push_str("  ");
+        }
+    }
+
+    /// Start the next member or element: after a comma unless it is the
+    /// first, and on a line of its own when laid out.
+    fn item(&mut self) {
+        if !self.out.ends_with(['{', '[']) {
+            self.out.push(',');
+        }
+        if !self.compact {
+            self.newline();
+        }
+    }
+
+    /// Start a member: its key, and the colon.
+    fn member(&mut self, key: &str) {
+        self.item();
+        json::escape_into(key, &mut self.out);
+        self.out.push_str(if self.compact { ":" } else { ": " });
+    }
+
+    /// Re-emit the members a GeoJSON source carried that the IR does not
+    /// model.
+    ///
+    /// Replays only when the native was produced by *this* format
+    /// ([`Native::payload_for`]) — a FlatGeobuf-tagged payload is ignored
+    /// here, and that is an ordinary cross-format conversion rather than an
+    /// error. Emits nothing at all when there is no native, which is the
+    /// common case.
+    fn natives(&mut self, native: Option<&Native>) {
+        let Some(NativePayload::GeoJson(members)) = native.and_then(|n| n.payload_for(Format::GeoJson)) else {
+            return;
+        };
+        for (k, v) in members {
+            self.member(k);
+            v.write_json_to(&mut self.out);
+        }
+    }
+
+    fn feature(&mut self, f: &Feature) {
+        self.open('{');
+        self.member("type");
+        self.out.push_str("\"Feature\"");
+        self.natives(f.native.as_ref());
+        self.member("geometry");
+        match &f.geometry {
+            Some(g) => self.geometry(g),
+            None => self.out.push_str("null"),
+        }
+        self.member("properties");
+        self.open('{');
+        for (k, v) in &f.properties {
+            self.member(k);
+            v.write_json_to(&mut self.out);
+        }
+        self.close('}');
+        self.close('}');
+    }
+
+    fn geometry(&mut self, g: &Geometry) {
+        self.open('{');
+        self.member("type");
+        self.out.push('"');
+        self.out.push_str(g.type_name());
+        self.out.push('"');
+        if let Geometry::GeometryCollection(geoms) = g {
+            self.member("geometries");
+            self.open('[');
+            for sub in geoms {
+                self.item();
+                self.geometry(sub);
             }
-            write_geometry(out, sub);
+            self.close(']');
+        } else {
+            self.member("coordinates");
+            write_coordinates(&mut self.out, g);
         }
-        out.push_str("]}");
-        return;
+        self.close('}');
     }
-    out.push_str("{\"type\":\"");
-    out.push_str(g.type_name());
-    out.push_str("\",\"coordinates\":");
+}
+
+/// A geometry's `coordinates` value, compact.
+fn write_coordinates(out: &mut String, g: &Geometry) {
     match g {
         Geometry::Point(p) => write_position(out, *p),
         Geometry::LineString(ps) | Geometry::MultiPoint(ps) => write_positions(out, ps),
@@ -519,9 +587,8 @@ fn write_geometry(out: &mut String, g: &Geometry) {
             }
             out.push(']');
         }
-        Geometry::GeometryCollection(_) => unreachable!("handled above"),
+        Geometry::GeometryCollection(_) => unreachable!("a collection has geometries, not coordinates"),
     }
-    out.push('}');
 }
 
 fn write_position(out: &mut String, p: Position) {
@@ -812,7 +879,7 @@ mod tests {
         // Modelled, not stashed.
         assert_eq!(fc.name.as_deref(), Some("hostile"));
 
-        let out = to_geojson_string(&fc);
+        let out = to_geojson_string(&fc, true);
         // Collection-level foreign member.
         assert!(out.contains(r#""vendor:extension":{"produced_by":"hand","v":2}"#), "{out}");
         // Feature `id`, in both of the forms GeoJSON permits.
@@ -832,7 +899,7 @@ mod tests {
     #[test]
     fn a_foreign_native_is_ignored_rather_than_replayed() {
         let mut fc = from_geojson_str(HOSTILE).unwrap();
-        let with_natives = to_geojson_string(&fc);
+        let with_natives = to_geojson_string(&fc, true);
 
         // Re-tag every native as if some other spoke had produced it.
         let retag = |n: &mut Option<crate::native::Native>| {
@@ -844,7 +911,7 @@ mod tests {
         for f in &mut fc.features {
             retag(&mut f.native);
         }
-        let ignored = to_geojson_string(&fc);
+        let ignored = to_geojson_string(&fc, true);
 
         assert_ne!(with_natives, ignored);
         assert!(!ignored.contains("vendor:"), "{ignored}");
@@ -877,7 +944,7 @@ mod tests {
         let fc = from_geojson_str(with_bbox).unwrap();
         assert!(fc.native.is_none(), "collection bbox was stashed");
         assert!(fc.features[0].native.is_none(), "feature bbox was stashed");
-        assert!(!to_geojson_string(&fc).contains("bbox"));
+        assert!(!to_geojson_string(&fc, true).contains("bbox"));
     }
     use super::*;
     use crate::json::parse;
@@ -909,7 +976,7 @@ mod tests {
         assert_eq!(streamed, fc);
 
         // Round trip through the real writer: Z survives, re-parses back the same.
-        let written = to_geojson_string(&fc);
+        let written = to_geojson_string(&fc, true);
         let back = from_json(&parse(&written).unwrap()).unwrap();
         assert_eq!(back, fc);
         assert!(written.contains("[1,2,3]") || written.contains("[1.0,2.0,3.0]"), "unexpected coordinates rendering: {written}");
@@ -922,7 +989,7 @@ mod tests {
             properties: vec![],
             native: None,
         }]);
-        let written = to_geojson_string(&fc);
+        let written = to_geojson_string(&fc, true);
         assert!(written.contains("\"coordinates\":[1,2]}") || written.contains("\"coordinates\":[1.0,2.0]}"));
     }
 
@@ -1031,7 +1098,60 @@ mod tests {
             ]
         }"#;
         let fc = from_json(&parse(doc).unwrap()).unwrap();
-        assert_eq!(to_geojson_string(&fc), to_json(&fc).to_json_string());
+        assert_eq!(to_geojson_string(&fc, true), to_json(&fc).to_json_string());
+        // Laid out, it is the same JSON.
+        assert_eq!(parse(&to_geojson_string(&fc, false)).unwrap(), to_json(&fc));
+    }
+
+    #[test]
+    fn the_default_layout_puts_each_member_on_a_line_and_each_value_on_one() {
+        let doc = r#"{"type":"FeatureCollection","name":"n","x-extra":{"a":[1,2]},"features":[
+            {"type":"Feature","geometry":{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]},"properties":{"k":[1,2],"e":{}}},
+            {"type":"Feature","geometry":{"type":"GeometryCollection","geometries":[{"type":"Point","coordinates":[1,2]}]},"properties":{}},
+            {"type":"Feature","geometry":null,"properties":{}}]}"#;
+        let fc = from_geojson_str(doc).unwrap();
+        assert_eq!(
+            to_geojson_string(&fc, false),
+            r#"{
+  "type": "FeatureCollection",
+  "name": "n",
+  "x-extra": {"a":[1,2]},
+  "features": [
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [[[0.0,0.0],[1.0,0.0],[1.0,1.0],[0.0,0.0]]]
+      },
+      "properties": {
+        "k": [1,2],
+        "e": {}
+      }
+    },
+    {
+      "type": "Feature",
+      "geometry": {
+        "type": "GeometryCollection",
+        "geometries": [
+          {
+            "type": "Point",
+            "coordinates": [1.0,2.0]
+          }
+        ]
+      },
+      "properties": {}
+    },
+    {
+      "type": "Feature",
+      "geometry": null,
+      "properties": {}
+    }
+  ]
+}
+"#
+        );
+        let empty = FeatureCollection::new(vec![]);
+        assert_eq!(to_geojson_string(&empty, false), "{\n  \"type\": \"FeatureCollection\",\n  \"features\": []\n}\n");
     }
 
     #[test]

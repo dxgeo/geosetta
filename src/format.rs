@@ -272,18 +272,21 @@ impl Format {
             // Until then this row read "styles and styleUrls; folders,
             // overlays and models; timestamps and altitude modes".
             //
-            // What remains is what the XML layer normalises, measured the same
-            // day: CDATA comes back as escaped text, a UTF-16 document as
-            // UTF-8, a DOCTYPE is dropped, and whitespace between elements is
-            // moved. A *version change* carries the document too, respelled
-            // into the other version's terms (K5, 2026-10-28), and what it
-            // respells or drops is warned about only on a run that makes one
-            // (`convert::kml_write_warnings`).
-            Format::Kml => &[
-                "CDATA sections, written as escaped text",
-                "a non-UTF-8 encoding, written as UTF-8, and a DOCTYPE",
-                "the layout of whitespace between elements",
-            ],
+            // What remained was what the XML layer normalised: CDATA, a
+            // UTF-16 document, a DOCTYPE, whitespace between elements. *The
+            // layout and the DOCTYPE are carried since 2026-10-28*
+            // (`plans/kml-layout.org` L1): text runs keep their places, and
+            // the DOCTYPE its bytes. CDATA written as escaped text left the row
+            // the same day as normalisation rather than loss (D-L1), with the
+            // rest of lexical form — the declaration's spelling, quotes,
+            // `<a></a>` as `<a/>`, references. Until then this row also read
+            // "CDATA sections, written as escaped text", "a DOCTYPE" and "the
+            // layout of whitespace between elements". The encoding is
+            // `plans/encodings.org` E6's. A *version change* carries the
+            // document too, respelled into the other version's terms (K5,
+            // 2026-10-28), and what it respells or drops is warned about only
+            // on a run that makes one (`convert::kml_write_warnings`).
+            Format::Kml => &["a non-UTF-8 encoding, written as UTF-8"],
             // KML's row, plus the archive. *Its entries are carried since
             // 2026-10-28* (M3c of `plans/same-format-fidelity.org`): images,
             // icons and model files come back in their places, with their
@@ -297,9 +300,7 @@ impl Format {
             // several .kml documents are written as one, from the feature
             // model alone".
             Format::Kmz => &[
-                "CDATA sections, written as escaped text",
-                "a non-UTF-8 encoding, written as UTF-8, and a DOCTYPE",
-                "the layout of whitespace between elements",
+                "a non-UTF-8 encoding, written as UTF-8",
                 "each archive entry's compression (written stored), extra fields and attributes, and the archive \
                  comment",
             ],

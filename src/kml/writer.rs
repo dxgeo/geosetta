@@ -28,21 +28,33 @@ use crate::xml::{self, XmlElement};
 /// and comment, each feature in its place (`crate::kml::reconcile`). *A read
 /// written as the other version* is the same document lowered to 2.2
 /// (`crate::kml::lower`) or raised to 2.3 (`crate::kml::raise`).
-/// Any other write is built from the IR alone: placemarks with their name,
+/// Any other write is built from the IR alone, in the house layout:
+/// placemarks with their name,
 /// description, time, `ExtendedData` and geometry with its altitude members,
 /// and a `<Schema>` for the columns the collection declares a type for
 /// (D-K9).
-pub(crate) fn write(fc: &FeatureCollection, version: Option<KmlVersion>) -> Vec<u8> {
+///
+/// `compact` writes it on one line, with no whitespace between elements — a
+/// carried document's own layout included (`plans/kml-layout.org` D-L8).
+pub(crate) fn write(fc: &FeatureCollection, version: Option<KmlVersion>, compact: bool) -> Vec<u8> {
     if carries_documents(fc, Format::Kml) {
-        return write_document(fc, 0, version);
+        return write_document(fc, 0, version, compact);
     }
     let written = version.or(source_document(fc).map(|s| s.version)).unwrap_or(KmlVersion::V2_2);
     let typed = Typed::of(fc);
     let mut children: Vec<XmlElement> = typed.schema().into_iter().collect();
     children.extend(fc.features.iter().map(|f| feature_to_placemark(f, written, &typed)));
     let document = XmlElement::with_children("Document", children);
-    let root = root_element(source_document(fc), version, vec![document]);
-    xml::write(&root).into_bytes()
+    let mut root = root_element(source_document(fc), version, vec![document]);
+    if compact {
+        return xml::write(&root).into_bytes();
+    }
+    // The house style (`plans/kml-layout.org` D-L2): one element per line,
+    // indented two spaces, and a final newline.
+    xml::lay_out(&mut root, "\n", "", model::HOUSE_INDENT);
+    let mut out = xml::write(&root);
+    out.push('\n');
+    out.into_bytes()
 }
 
 /// The columns a document built from the IR types with a `<Schema>`: each
@@ -121,8 +133,9 @@ pub(crate) fn carries_documents(fc: &FeatureCollection, target: Format) -> bool 
 /// The source's document `index` — 0 for the first, `n` for layer `n - 1` —
 /// written back with its own features, in `version` when one is asked for.
 /// A feature added since the read, or holding an element of no document this
-/// collection keeps, joins the first document, built fresh.
-pub(crate) fn write_document(fc: &FeatureCollection, index: usize, version: Option<KmlVersion>) -> Vec<u8> {
+/// collection keeps, joins the first document, built fresh. `compact` as
+/// [`write`] takes it.
+pub(crate) fn write_document(fc: &FeatureCollection, index: usize, version: Option<KmlVersion>, compact: bool) -> Vec<u8> {
     let source = source_document(fc).expect("a carried document has a source");
     let (skeleton, own): (&Skeleton, KmlVersion) = match index {
         0 => (source.document.as_deref().expect("the first document is kept"), source.version),
@@ -133,7 +146,7 @@ pub(crate) fn write_document(fc: &FeatureCollection, index: usize, version: Opti
         Some((m, d)) if d < documents => (d == index).then_some((f, Some(m))),
         _ => (index == 0).then_some((f, None)),
     });
-    let mut doc = reconcile::assemble(features, skeleton, own);
+    let mut doc = reconcile::assemble(features, skeleton, own, compact);
     match (own, version) {
         (KmlVersion::V2_3, Some(KmlVersion::V2_2)) => {
             lower::lower(&mut doc);
@@ -142,6 +155,9 @@ pub(crate) fn write_document(fc: &FeatureCollection, index: usize, version: Opti
             raise::raise(&mut doc);
         }
         _ => {}
+    }
+    if compact {
+        model::flatten(&mut doc);
     }
     model::write(&doc).into_bytes()
 }
@@ -385,6 +401,39 @@ mod tests {
     use crate::kml::reader;
     use std::rc::Rc;
 
+    /// `bytes` with the house layout's whitespace between tags taken out, so
+    /// a test of what is written reads it on one line;
+    /// [`a_document_built_from_the_ir_is_in_the_house_layout`] pins the layout.
+    fn squeezed(bytes: &[u8]) -> String {
+        let text = std::str::from_utf8(bytes).unwrap();
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find('>') {
+            out.push_str(&rest[..=at]);
+            rest = &rest[at + 1..];
+            let space = rest.len() - rest.trim_start().len();
+            if rest[space..].starts_with('<') {
+                rest = &rest[space..];
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    #[test]
+    fn a_document_built_from_the_ir_is_in_the_house_layout() {
+        let fc = FeatureCollection::new(vec![feature(
+            Some(Geometry::Point(Position::new(1.0, 2.0))),
+            vec![("name", JsonValue::String("a".into())), ("description", JsonValue::String("<b>x</b>".into()))],
+        )]);
+        assert_eq!(
+            String::from_utf8(write(&fc, None, false)).unwrap(),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<kml xmlns=\"http://www.opengis.net/kml/2.2\">\n  <Document>\n    \
+             <Placemark>\n      <name>a</name>\n      <description>&lt;b&gt;x&lt;/b&gt;</description>\n      <Point>\n        \
+             <coordinates>1,2</coordinates>\n      </Point>\n    </Placemark>\n  </Document>\n</kml>\n"
+        );
+    }
+
     fn feature(geometry: Option<Geometry>, properties: Vec<(&str, JsonValue)>) -> Feature {
         Feature {
             geometry,
@@ -403,8 +452,7 @@ mod tests {
                 ("height_m", JsonValue::Int(381)),
             ],
         )]);
-        let bytes = write(&fc, None);
-        let text = std::str::from_utf8(&bytes).unwrap();
+        let text = squeezed(&write(&fc, None, false));
         assert!(text.contains("<name>A Point</name>"));
         assert!(text.contains("<description>desc</description>"));
         assert!(text.contains("<Data name=\"height_m\"><value>381</value></Data>"));
@@ -417,7 +465,7 @@ mod tests {
             Some(Geometry::Point(Position::with_z(-73.9857, 40.7484, 381.0))),
             vec![],
         )]);
-        let text = String::from_utf8(write(&fc, None)).unwrap();
+        let text = squeezed(&write(&fc, None, false));
         assert!(text.contains("<Point><coordinates>-73.9857,40.7484,381</coordinates></Point>"));
     }
 
@@ -430,7 +478,7 @@ mod tests {
             ])),
             vec![],
         )]);
-        let text = String::from_utf8(write(&fc, None)).unwrap();
+        let text = squeezed(&write(&fc, None, false));
         assert!(text.contains("<outerBoundaryIs><LinearRing><coordinates>0,0 4,0 4,4 0,4 0,0</coordinates></LinearRing></outerBoundaryIs>"));
         assert!(text.contains("<innerBoundaryIs><LinearRing><coordinates>1,1 2,1 2,2 1,2 1,1</coordinates></LinearRing></innerBoundaryIs>"));
     }
@@ -441,7 +489,7 @@ mod tests {
             Some(Geometry::MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])),
             vec![],
         )]);
-        let text = String::from_utf8(write(&fc, None)).unwrap();
+        let text = squeezed(&write(&fc, None, false));
         assert!(text.contains("<MultiGeometry><Point><coordinates>0,0</coordinates></Point><Point><coordinates>1,1</coordinates></Point></MultiGeometry>"));
     }
 
@@ -456,7 +504,7 @@ mod tests {
              "properties":{"name":"A Path"}}
         ]}"#;
         let original = geojson::from_json(&json::parse(src).unwrap()).unwrap();
-        let kml_bytes = write(&original, None);
+        let kml_bytes = write(&original, None, false);
         let back = reader::read(&kml_bytes, &mut Vec::new()).unwrap();
         assert_eq!(back.features.len(), original.features.len());
         for (a, b) in original.features.iter().zip(back.features.iter()) {
@@ -472,7 +520,7 @@ mod tests {
             None,
             vec![("name", JsonValue::String("Fish & Chips <Shop>".into()))],
         )]);
-        let text = String::from_utf8(write(&fc, None)).unwrap();
+        let text = squeezed(&write(&fc, None, false));
         assert!(text.contains("<name>Fish &amp; Chips &lt;Shop&gt;</name>"));
     }
 
@@ -484,20 +532,20 @@ mod tests {
 
     fn reread_and_write(kml: &str, version: Option<KmlVersion>) -> String {
         let fc = crate::kml::reader::read(kml.as_bytes(), &mut Vec::new()).unwrap();
-        root_tag(&write(&fc, version))
+        root_tag(&write(&fc, version, false))
     }
 
     const OGC_ROOT: &str = r#"<kml xmlns="http://www.opengis.net/kml/2.2">"#;
 
     #[test]
     fn a_collection_from_another_format_is_written_as_unstamped_ogc_2_2() {
-        assert_eq!(root_tag(&write(&FeatureCollection::new(vec![]), None)), OGC_ROOT);
+        assert_eq!(root_tag(&write(&FeatureCollection::new(vec![]), None, false)), OGC_ROOT);
     }
 
     #[test]
     fn asking_for_2_3_stamps_it() {
         assert_eq!(
-            root_tag(&write(&FeatureCollection::new(vec![]), Some(KmlVersion::V2_3))),
+            root_tag(&write(&FeatureCollection::new(vec![]), Some(KmlVersion::V2_3), false)),
             r#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3">"#
         );
     }
@@ -533,7 +581,7 @@ mod tests {
         let doc = br#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3"><Document/></kml>"#;
         let kmz = crate::zip::write(&[("doc.kml", &doc[..])]);
         let fc = crate::kml::read_kmz(&kmz, &mut Vec::new()).unwrap();
-        assert_eq!(root_tag(&write(&fc, None)), r#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3">"#);
+        assert_eq!(root_tag(&write(&fc, None, false)), r#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3">"#);
     }
 
     fn text(s: &str) -> JsonValue {
@@ -541,7 +589,7 @@ mod tests {
     }
 
     fn written(fc: &FeatureCollection, version: Option<KmlVersion>) -> String {
-        String::from_utf8(write(fc, version)).unwrap()
+        squeezed(&write(fc, version, false))
     }
 
     #[test]
@@ -601,7 +649,7 @@ mod tests {
         );
         assert!(written(&fc, Some(KmlVersion::V2_3)).contains("<seaFloorAltitudeMode>relativeToSeaFloor</seaFloorAltitudeMode>"));
         for version in [None, Some(KmlVersion::V2_3)] {
-            let back = reader::read(&write(&fc, version), &mut Vec::new()).unwrap();
+            let back = reader::read(&write(&fc, version, false), &mut Vec::new()).unwrap();
             assert_eq!(back.features[0].properties, fc.features[0].properties, "{version:?}");
         }
     }

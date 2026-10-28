@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 use crate::format::KmlVersion;
 use crate::kml::model::{Foreign, KmlDocument, KmlElement, Kind, Node, Spelling, GX_NS, GX_PREFIX, KML_NS};
-use crate::xml::{XmlAttr, XmlMisc, XMLNS_NS};
+use crate::xml::{XmlAttr, Content, XMLNS_NS};
 
 /// What a version change changed: each respelling, each element renamed for
 /// its successor, and each loss, counted, in the order first met. A lowering
@@ -271,10 +271,11 @@ fn lower_children(
     scope.extend(node.attrs.iter().filter(|a| is_decl(a) && a.prefix.is_some()).map(|a| (a.name.clone(), a.value.clone())));
     let ordered = !order_2_2(parent.0, parent.1).is_empty();
     let children = std::mem::take(&mut node.children);
-    let mut misc = std::mem::take(&mut node.misc).into_iter().peekable();
-    // Each child with its slot and the comments before it. A dropped child's
-    // comments go to the child after it.
-    let mut kept: Vec<(u8, Vec<XmlMisc>, Node)> = Vec::with_capacity(children.len());
+    let mut misc = std::mem::take(&mut node.content).into_iter().peekable();
+    // Each child with its slot and the comments and whitespace before it. A
+    // dropped child's comments go to the child after it; the whitespace that
+    // indented it goes with it (`plans/kml-layout.org` D-L4).
+    let mut kept: Vec<(u8, Vec<Content>, Node)> = Vec::with_capacity(children.len());
     let mut pending = Vec::new();
     let mut slot = 0;
     for (i, mut child) in children.into_iter().enumerate() {
@@ -290,6 +291,9 @@ fn lower_children(
             let to = match place(parent, element, spelling) {
                 Place::Nowhere => {
                     report.drop(Dropped::Element { parent: parent.0, child: element });
+                    if pending.last().is_some_and(Content::is_space) {
+                        pending.pop();
+                    }
                     continue;
                 }
                 Place::Slot(s, at) => {
@@ -324,11 +328,11 @@ fn lower_children(
     }
     node.children.reserve_exact(kept.len());
     for (_, leading, child) in kept {
-        node.misc.extend(leading.into_iter().map(|m| (node.children.len(), m)));
+        node.content.extend(leading.into_iter().map(|m| (node.children.len(), m)));
         node.children.push(child);
     }
     let end = node.children.len();
-    node.misc.extend(pending.into_iter().chain(misc.map(|(_, m)| m)).map(|m| (end, m)));
+    node.content.extend(pending.into_iter().chain(misc.map(|(_, m)| m)).map(|m| (end, m)));
     scope.truncate(depth);
 }
 

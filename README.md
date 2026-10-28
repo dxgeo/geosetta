@@ -32,7 +32,10 @@ every other automatically — no per-pair code. Any input converts to any output
 (CSV→GeoParquet, FlatGeobuf→GeoJSON, GeoPackage↔Shapefile, KMZ→GeoParquet, …),
 validated against DuckDB / GDAL.
 
--   **GeoJSON** (read + write)
+-   **GeoJSON** (read + write). Written indented — the collection, each
+    feature and each geometry one member per line, every value inside them
+    (coordinates, a property) compact on its line; `--compact` writes it all
+    on one line.
 -   **GeoParquet** (read + write; reads common foreign files — see below). The
     `geo` metadata's `bbox` is written in the spec's six-element 3D form
     (`[minx,miny,minz,maxx,maxy,maxz]`) whenever the data carries Z, and the 2D
@@ -113,7 +116,12 @@ validated against DuckDB / GDAL.
     `--kml-version 2.3` writes 2.3. A version rides in the in-process native, so a
     pipe through another format comes back as 2.2. The whole document rides there
     too, so a KML → KML run keeps everything the feature model does not hold, in
-    either version: a version change respells the document into the other
+    either version, laid out as it was — whitespace, comments and a DOCTYPE in
+    their places, and what an edit adds indented as the document indents; only
+    lexical form (quote style, `<a></a>` as `<a/>`, CDATA and character
+    references as escaped text) is written the house way. A document built from
+    another format is indented two spaces; `--compact` writes any KML on one
+    line, to save space. A version change respells the document into the other
     version's terms — the `gx:` extensions for 2.2, the KML namespace for 2.3 —
     puts it in 2.2's element order when lowering, and names on stderr what it
     respelled and the few 2.3 constructs 2.2 has no place for. What other formats
@@ -382,6 +390,7 @@ one row group, and property columns typed by scanning all features
     geosetta places.geojson places.kml      # GeoJSON    -> KML
     geosetta places.geojson places.kmz      # GeoJSON    -> KMZ (stored, uncompressed)
     geosetta places.geojson places.kml --kml-version 2.3  # …as OGC KML 2.3 (default 2.2)
+    geosetta places.geojson places.kml --compact          # …on one line, to save space
     # formats may also be given explicitly:
     geosetta in.txt out.bin --from geojson --to parquet
     # a CRS geosetta can't resolve (a bare authority code, no definition) is resolved
@@ -428,10 +437,9 @@ Where a same-format re-encode still loses something, the run says so on stderr
 rather than leaving you to find out. Today Shapefile is the only format that
 round-trips with nothing to report; GeoJSON drops both `bbox` members and
 reformats numbers, CSV re-renders its geometry column's coordinates,
-GeoParquet drops the covering-bbox column, and KML loses only what its XML
-layer normalises — CDATA comes back as escaped text, a UTF-16 document as UTF-8,
-a DOCTYPE is dropped, and whitespace between elements is moved — since a KML →
-KML run, in either version, gives back the document it read: styles, folders,
+GeoParquet drops the covering-bbox column, and KML loses only a non-UTF-8
+encoding, written back as UTF-8 — since a KML → KML run, in either version,
+gives back the document it read, laid out as it was: styles, folders,
 overlays, models and tracks' times, with any edit to the features applied — an
 overlay moved keeps its box and its turn. KMZ adds only what its zip writer does
 not reproduce: each entry's compression, extra fields and attributes, and the

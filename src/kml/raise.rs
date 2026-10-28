@@ -126,7 +126,7 @@ fn snippet_says_all(node: &Node) -> bool {
 /// `<SchemaData>`, and other namespaces' elements, with no text and no
 /// attribute in no namespace.
 fn is_extended_data(node: &Node) -> bool {
-    node.text.trim().is_empty()
+    !node.has_text()
         && node.attrs.iter().all(|a| a.ns.is_some())
         && node.children.iter().all(|c| match &c.kind {
             Kind::Kml { element, .. } => matches!(element, KmlElement::Data | KmlElement::SchemaData),

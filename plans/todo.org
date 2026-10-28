@@ -201,20 +201,19 @@ check it off and remove it once the item ships or is shelved.
   and carried as of 2026-10-28: its entries, and a layered archive's every
   document.
 
-- [ ] *KML's XML-layer losses* — =Format::Kml='s =same_format_losses= row, and
-  =native-inventory.org= § KML / KMZ: what a =kml -> kml= run still warns it
-  loses, now that the document itself is carried. Each is a carry in
-  =xml.rs= and the model, not a KML question.
-  - *Whitespace between elements*, the most visible: a node's text runs are
-    joined into one string written before its children, so an indented file
-    comes back with its line breaks bunched at the start of each element.
-    Keeping the runs by position, as comments already are, fixes the read;
-    the reconcile then needs a rule for indenting an element it inserts.
-  - *CDATA sections*, written back as escaped text.
-  - *A non-UTF-8 encoding*, written as UTF-8 — decoding is
-    [[file:encodings.org][encodings.org]]'s; writing back in the declared
-    encoding is what is owed.
-  - *A DOCTYPE*, dropped.
+- [ ] *KML's XML-layer losses* — [[file:kml-layout.org][kml-layout.org]].
+  =Format::Kml='s =same_format_losses= row, and =native-inventory.org=
+  § KML / KMZ: what a =kml -> kml= run still warns it loses, now that the
+  document itself is carried. *Only the encoding is left* (2026-10-28):
+  - [X] *Whitespace between elements* — L1 (positioned text runs) and L2
+    (edits in the document's style), built 2026-10-28.
+  - [X] *CDATA sections* — written escaped, every time (D-L1); normalisation,
+    not a loss, so it left the row with L1.
+  - [X] *A DOCTYPE* — carried verbatim, never interpreted (L4, built with L1).
+  - [ ] *A non-UTF-8 encoding* — [[file:encodings.org][encodings.org]] E6's
+    first half (D-E7), on E2/E3's encoders.
+  Built beside them: the house layout for new documents (L3), and
+  =--compact= (D-L8), with GeoJSON indented by default.
 - [ ] *Write a =<Region>='s =<LatLonBox>= as the =<LatLonAltBox>= it equals* —
   [[file:kml-standard.org][kml-standard.org]] K5. Lowering 2.3 to 2.2 drops a
   =<LatLonBox>= or =<LatLonQuad>= in a =<Region>= (and a =<LatLonAltBox>= on a

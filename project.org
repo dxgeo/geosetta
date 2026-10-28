@@ -39,7 +39,10 @@ every other automatically — no per-pair code. Any input converts to any output
 (CSV→GeoParquet, FlatGeobuf→GeoJSON, GeoPackage↔Shapefile, KMZ→GeoParquet, …),
 validated against DuckDB / GDAL.
 
-- *GeoJSON* (read + write)
+- *GeoJSON* (read + write). Written indented — the collection, each feature
+  and each geometry one member per line, every value inside them compact on
+  its line; =--compact= writes it all on one line
+  ([[file:plans/kml-layout.org][plans/kml-layout.org]] D-L8).
 - *GeoParquet* (read + write; reads common foreign files — see below). The
   =geo= metadata's =bbox= is written in the spec's six-element 3D form
   (=[minx,miny,minz,maxx,maxy,maxz]=) whenever the data carries Z, and the 2D
@@ -93,6 +96,12 @@ validated against DuckDB / GDAL.
   and the declared types as column declarations; =<GroundOverlay>= and
   =<PhotoOverlay>= are features, as a footprint polygon (=rotation= turned on
   the ground) and a point. See [[file:plans/kml-standard.org][plans/kml-standard.org]].
+  A KML → KML run keeps the document's layout — whitespace, comments and a
+  DOCTYPE in their places, what an edit adds indented as the document
+  indents — and writes only lexical form (quotes, =<a></a>=, CDATA and
+  character references) the house way; a document built from another format
+  is indented two spaces, and =--compact= writes any KML on one line. See
+  [[file:plans/kml-layout.org][plans/kml-layout.org]].
 
 *Z and M ordinates travel end to end.* =Position= carries optional =z= and =m=,
 so every spoke reads and writes Z, and M is supported everywhere a format can
@@ -278,6 +287,7 @@ geosetta places.kml    places.geojson   # KML        -> GeoJSON
 geosetta places.kmz    places.parquet   # KMZ        -> GeoParquet (reads every internal .kml)
 geosetta places.geojson places.kml      # GeoJSON    -> KML
 geosetta places.geojson places.kmz      # GeoJSON    -> KMZ (stored, uncompressed)
+geosetta places.geojson places.kml --compact  # …on one line, to save space
 # formats may also be given explicitly:
 geosetta in.txt out.bin --from geojson --to parquet
 # a CRS geosetta can't resolve (a bare authority code, no definition) is resolved

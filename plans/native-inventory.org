@@ -578,8 +578,9 @@ layer.
 K4): the reader now raises the whole document into the KML model, and a
 =kml -> kml= run in the source's version gives the document back with the IR's
 edits applied. Everything the trace below lists as dropped is carried. What
-remains lost is in =Format::same_format_losses='s KML row -- CDATA, a non-UTF-8
-encoding, a DOCTYPE, whitespace layout -- plus, for =.kmz=, what the zip
+remains lost is in =Format::same_format_losses='s KML row -- a non-UTF-8
+encoding; /CDATA, the DOCTYPE and the whitespace layout listed here until
+2026-10-28 are carried or normalised (=kml-layout.org=)/ -- plus, for =.kmz=, what the zip
 writer does not reproduce: each entry's compression, extra fields and
 attributes, and the archive comment. /The archive's other entries, listed
 here until 2026-10-28, are carried (M3c), and so is a layered archive's every

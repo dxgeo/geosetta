@@ -154,6 +154,15 @@ why, not to implement the spec's table from symmetry.
   =encodings.org=. *DONE 2026-10-28*: K1--K5 built, every question decided
   (D-K1 to D-K16), and every kind of write validated against its version's
   schema by =tests/kml_schemas.rs=.
+- [[file:kml-layout.org][kml-layout.org]] :: How a KML document is laid
+  out on write, balancing the source's layout against well-formatted output:
+  the source's whitespace and DOCTYPE are kept where geosetta did not touch
+  them; what geosetta writes follows the document's inferred style, or a
+  two-space house style for a new document; lexical form (quotes, references,
+  CDATA, which is always written escaped) is normalised and is not a loss.
+  =--compact= (D-L8) writes GeoJSON and KML on one line; both are indented
+  by default. Answers =todo.org='s "KML's XML-layer losses" but the
+  encoding, which is =encodings.org= E6. *Built 2026-10-28*: L1--L4.
 - [[file:projjson-to-wkt.org][projjson-to-wkt.org]] :: The reverse of
   =crs.org= milestone C — translate a PROJJSON CRS with no authority code
   into WKT1, so a GeoParquet source can still express its CRS when converted

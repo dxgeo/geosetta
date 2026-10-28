@@ -26,7 +26,7 @@ use std::borrow::Cow;
 use std::rc::Rc;
 
 use crate::error::Result;
-use crate::xml::{self, Builder, Parsed, XmlAttr, XmlElement, XmlMisc};
+use crate::xml::{self, Builder, Content, Parsed, Tree, XmlAttr, XmlElement};
 
 /// OGC KML 2.2's namespace, which 2.3 keeps.
 pub(crate) const KML_NS: &str = "http://www.opengis.net/kml/2.2";
@@ -160,20 +160,18 @@ pub(crate) struct Node {
     /// attributes alike, each with its own namespace.
     pub attrs: Vec<XmlAttr>,
     pub children: Vec<Node>,
-    /// Direct text, entity references decoded. KML has no mixed content of
-    /// its own, so the runs are concatenated, as [`XmlElement::text`] is.
-    pub text: String,
-    /// Comments and processing instructions, each tagged with the index of the
-    /// child it precedes, as [`XmlElement::misc`] is.
-    pub misc: Vec<(usize, XmlMisc)>,
+    /// Text runs, comments and processing instructions, each tagged with the
+    /// index of the child it precedes, as [`XmlElement::content`] is. The
+    /// whitespace runs are the document's layout (`plans/kml-layout.org`).
+    pub content: Vec<(usize, Content)>,
 }
 
 /// A raised document: the root `<kml>` and what surrounds it.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct KmlDocument {
-    pub before: Vec<XmlMisc>,
+    pub before: Vec<Content>,
     pub root: Node,
-    pub after: Vec<XmlMisc>,
+    pub after: Vec<Content>,
     /// The root element's namespace URI, which version detection reads. Not
     /// written: the root's declarations are among its attributes.
     pub root_ns: Option<Rc<str>>,
@@ -208,31 +206,147 @@ impl Node {
         self.attrs.iter().find(|a| a.ns.is_none() && a.name == name).map(|a| a.value.as_str())
     }
 
+    /// A leaf's text: its one text run ([`xml::merge_leaf_text`]).
+    pub fn text(&self) -> &str {
+        xml::first_text(&self.content)
+    }
+
     /// Direct text, trimmed — the form KML's leaf elements want.
     pub fn text_trimmed(&self) -> &str {
-        self.text.trim()
+        self.text().trim()
+    }
+
+    /// Whether this node has child elements and no whitespace between them:
+    /// its inside on one line, a habit an element inserted beside it copies.
+    pub fn keeps_inside_on_one_line(&self) -> bool {
+        !self.children.is_empty() && !self.content.iter().any(|(_, c)| c.is_space())
+    }
+
+    /// Whether any text run holds more than whitespace.
+    pub fn has_text(&self) -> bool {
+        self.content.iter().any(|(_, c)| matches!(c, Content::Text(_)) && !c.is_space())
+    }
+
+    /// Make a leaf's text `value`, keeping the whitespace around the old
+    /// value (`plans/kml-layout.org` D-L5): `<name>\n  Zürich\n</name>` set to
+    /// `Bern` is `<name>\n  Bern\n</name>`.
+    pub fn set_text(&mut self, value: &str) {
+        let old = self.text();
+        let trimmed = old.trim();
+        if trimmed.is_empty() {
+            return self.replace_text(value.to_string());
+        }
+        let lead = &old[..old.len() - old.trim_start().len()];
+        let trail = &old[old.trim_end().len()..];
+        self.replace_text(format!("{lead}{value}{trail}"));
+    }
+
+    /// Make a leaf's text exactly `text`, in the place of its old text.
+    pub fn replace_text(&mut self, text: String) {
+        let at = self.content.iter().position(|(_, c)| matches!(c, Content::Text(_)));
+        self.content.retain(|(_, c)| !matches!(c, Content::Text(_)));
+        if !text.is_empty() {
+            self.content.insert(at.unwrap_or(0), (0, Content::Text(Rc::from(text))));
+        }
     }
 
     /// Insert `child` at `at`, keeping each comment before the child it
     /// preceded.
     pub fn insert_child(&mut self, at: usize, child: Node) {
         self.children.insert(at, child);
-        for (i, _) in self.misc.iter_mut() {
+        for (i, _) in self.content.iter_mut() {
             if *i >= at {
                 *i += 1;
             }
         }
     }
 
-    /// Remove the child at `at`. A comment before it now precedes whatever
-    /// follows.
+    /// Remove the child at `at`, with the whitespace that indented it
+    /// (`plans/kml-layout.org` D-L4). A comment before it now precedes
+    /// whatever follows.
     pub fn remove_child(&mut self, at: usize) {
         self.children.remove(at);
-        for (i, _) in self.misc.iter_mut() {
+        if let Some(lead) = self.lead(at) {
+            self.content.remove(lead);
+        }
+        for (i, _) in self.content.iter_mut() {
             if *i > at {
                 *i -= 1;
             }
         }
+    }
+
+    /// Where in [`Node::content`] the whitespace run straight before child
+    /// `at` is — the one that indents it — if it has one.
+    fn lead(&self, at: usize) -> Option<usize> {
+        let end = self.content.partition_point(|(i, _)| *i <= at);
+        (end > 0 && self.content[end - 1].0 == at && self.content[end - 1].1.is_space()).then(|| end - 1)
+    }
+
+    /// The text run at `index` in [`Node::content`], shared.
+    fn run(&self, index: usize) -> &Rc<str> {
+        match &self.content[index].1 {
+            Content::Text(t) => t,
+            _ => unreachable!("a lead is a text run"),
+        }
+    }
+
+    /// Insert `child` at `at`, laid out as this node lays out its children
+    /// (`plans/kml-layout.org` D-L3): indented as a sibling is, or one unit
+    /// past this node's end tag when it has none, and its inside laid out
+    /// the same way — unless the sibling it copies keeps its own inside on
+    /// one line. A node with no whitespace runs, or a document with no
+    /// layout, takes it as it is.
+    pub fn insert_laid_out(&mut self, at: usize, mut child: Node, layout: Option<&Layout>) {
+        let lead = layout.and_then(|l| {
+            let (lead, inside) = self.lead_at(at, l)?;
+            if inside {
+                l.lay_out_under(&mut child, &lead);
+            }
+            Some(lead)
+        });
+        self.insert_child(at, child);
+        if let Some(lead) = lead {
+            let i = self.content.partition_point(|(i, _)| *i <= at);
+            self.content.insert(i, (at, Content::Text(lead)));
+        }
+    }
+
+    /// Replace child `at` with `child`, which keeps the place and the
+    /// indentation of the one it replaces and has its inside laid out to
+    /// match.
+    pub fn replace_child(&mut self, at: usize, mut child: Node, layout: Option<&Layout>) {
+        if let (Some(l), Some(lead)) = (layout, self.lead(at)) {
+            l.lay_out_under(&mut child, self.run(lead));
+        }
+        self.children[at] = child;
+    }
+
+    /// Lay out the inside of child `at`, which was inserted before it had
+    /// children to lay out.
+    pub fn lay_out_child(&mut self, at: usize, layout: Option<&Layout>) {
+        if let (Some(l), Some(lead)) = (layout, self.lead(at)) {
+            let lead = self.run(lead).clone();
+            l.lay_out_under(&mut self.children[at], &lead);
+        }
+    }
+
+    /// The run to indent a child inserted at `at` with, and whether its
+    /// inside is laid out too: a sibling's indentation, and its habit — a
+    /// sibling that keeps its inside on one line is copied in that — or,
+    /// with no sibling indented, one unit past this node's end tag.
+    pub fn lead_at(&self, at: usize, layout: &Layout) -> Option<(Rc<str>, bool)> {
+        let len = self.children.len();
+        let sibling = [at, at.wrapping_sub(1)]
+            .into_iter()
+            .filter(|&i| i < len)
+            .chain(0..len)
+            .find_map(|i| self.lead(i).map(|run| (i, run)));
+        if let Some((i, run)) = sibling {
+            return Some((self.run(run).clone(), !self.children[i].keeps_inside_on_one_line()));
+        }
+        let closing = self.content.last().filter(|(i, c)| *i == len && c.is_space())?.1.text()?;
+        closing.contains('\n').then(|| (Rc::from(format!("{closing}{}", layout.unit)), true))
     }
 
     /// Put this node and every KML node under it in `prefix` — for a node
@@ -261,6 +375,68 @@ impl Node {
             Kind::Foreign(_) => unreachable!("foreign content is written verbatim"),
         }
     }
+}
+
+impl Tree for Node {
+    fn parts(&mut self) -> (&mut [Self], &mut Vec<(usize, Content)>) {
+        (&mut self.children, &mut self.content)
+    }
+
+    fn opaque(&self) -> bool {
+        matches!(self.kind, Kind::Foreign(_))
+    }
+}
+
+/// The house indent, for a document built rather than read
+/// (`plans/kml-layout.org` D-L2).
+pub(crate) const HOUSE_INDENT: &str = "  ";
+
+/// How a document lays its elements out: the indent one level adds
+/// (`plans/kml-layout.org` D-L3). A document with none — one line, or
+/// whitespace that never nests — has no layout, and what an edit adds to it
+/// stays compact.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Layout {
+    unit: String,
+}
+
+impl Layout {
+    /// The layout `root`'s document is in: the first element found, depth
+    /// first, whose children and end tag each start a line, with the
+    /// children indented past the end tag, gives the unit.
+    pub fn of(root: &Node) -> Option<Layout> {
+        let closing = match root.content.last() {
+            Some((i, Content::Text(t))) if *i == root.children.len() && t.contains('\n') => Some(indentation(t)),
+            _ => None,
+        };
+        if let Some(closing) = closing {
+            for at in 0..root.children.len() {
+                if let Some(run) = root.lead(at)
+                    && let Some(unit) = indentation(root.run(run)).strip_prefix(closing)
+                    && !unit.is_empty()
+                    && root.run(run).contains('\n')
+                {
+                    return Some(Layout { unit: unit.to_string() });
+                }
+            }
+        }
+        root.children.iter().filter(|c| !c.opaque()).find_map(Layout::of)
+    }
+
+    /// Lay out `node`'s inside for a node indented by `lead`, a run from the
+    /// document: its newline and indentation are the document's own.
+    pub fn lay_out_under(&self, node: &mut Node, lead: &str) {
+        let Some(nl) = lead.rfind('\n') else { return };
+        let (newline, indent) = lead.split_at(nl + 1);
+        let newline = if newline.ends_with("\r\n") { "\r\n" } else { "\n" };
+        xml::lay_out(node, newline, indent, &self.unit);
+    }
+}
+
+/// The indentation a whitespace run ends with: what follows its last line
+/// break.
+fn indentation(run: &str) -> &str {
+    run.rfind('\n').map_or(run, |at| &run[at + 1..])
 }
 
 /// Parse `source` straight into the model. Each element is raised as the
@@ -304,8 +480,7 @@ impl Builder for Raiser<'_> {
                 prefix: None,
                 attrs: Vec::new(),
                 children: Vec::new(),
-                text: String::new(),
-                misc: Vec::new(),
+                content: Vec::new(),
             };
         };
         // A model outlives its parse — a feature's element until the write —
@@ -317,8 +492,7 @@ impl Builder for Raiser<'_> {
             prefix: el.prefix.map(str::to_string),
             attrs: el.attrs,
             children,
-            text: el.text,
-            misc: el.misc,
+            content: el.content,
         }
     }
 }
@@ -339,8 +513,27 @@ pub(crate) fn from_built(el: &XmlElement) -> Node {
         prefix: el.prefix.clone(),
         attrs: el.attrs.clone(),
         children: el.children.iter().map(from_built).collect(),
-        text: el.text.clone(),
-        misc: el.misc.clone(),
+        content: el.content.clone(),
+    }
+}
+
+/// Take every whitespace run between elements out of `doc` — before and
+/// after the root, and inside every element with child elements — leaving
+/// a leaf's text and foreign content's bytes as they are: `--compact`
+/// (`plans/kml-layout.org` D-L8).
+pub(crate) fn flatten(doc: &mut KmlDocument) {
+    doc.before.retain(|c| !c.is_space());
+    doc.after.retain(|c| !c.is_space());
+    flatten_node(&mut doc.root);
+}
+
+fn flatten_node(node: &mut Node) {
+    if node.children.is_empty() {
+        return;
+    }
+    node.content.retain(|(_, c)| !c.is_space());
+    for child in node.children.iter_mut().filter(|c| !c.opaque()) {
+        flatten_node(child);
     }
 }
 
@@ -350,12 +543,12 @@ pub(crate) fn from_built(el: &XmlElement) -> Node {
 /// level; `plans/kml-standard.org` K3).
 pub(crate) fn write(doc: &KmlDocument) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    for m in &doc.before {
-        xml::write_misc(m, &mut out);
+    for c in &doc.before {
+        xml::write_content(c, &mut out);
     }
     write_node(&doc.root, &mut out);
-    for m in &doc.after {
-        xml::write_misc(m, &mut out);
+    for c in &doc.after {
+        xml::write_content(c, &mut out);
     }
     out
 }
@@ -376,21 +569,20 @@ fn write_node(node: &Node, out: &mut String) {
         xml::escape_into(&a.value, out, true);
         out.push('"');
     }
-    if node.children.is_empty() && node.text.is_empty() && node.misc.is_empty() {
+    if node.children.is_empty() && node.content.is_empty() {
         out.push_str("/>");
         return;
     }
     out.push('>');
-    xml::escape_into(&node.text, out, false);
-    let mut misc = node.misc.iter().peekable();
+    let mut content = node.content.iter().peekable();
     for (i, child) in node.children.iter().enumerate() {
-        while let Some((_, m)) = misc.next_if(|(at, _)| *at <= i) {
-            xml::write_misc(m, out);
+        while let Some((_, c)) = content.next_if(|(at, _)| *at <= i) {
+            xml::write_content(c, out);
         }
         write_node(child, out);
     }
-    for (_, m) in misc {
-        xml::write_misc(m, out);
+    for (_, c) in content {
+        xml::write_content(c, out);
     }
     out.push_str("</");
     out.push_str(&name);

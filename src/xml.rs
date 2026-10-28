@@ -4,8 +4,8 @@
 //!
 //! Well-formed documents only: no DTD processing and no external entities (a
 //! deliberate non-goal — entity expansion is a well-known XML attack surface,
-//! and KML never needs either; a `<!DOCTYPE ...>`, if present, is skipped
-//! rather than interpreted).
+//! and KML never needs either; a `<!DOCTYPE ...>`, if present, is carried as
+//! its bytes rather than interpreted).
 //!
 //! *Namespaces are resolved*, per Namespaces in XML 1.0: every element and
 //! attribute carries its namespace URI beside its local name, with the prefix
@@ -16,9 +16,13 @@
 //! prefix and gets no namespace, and the caller decides what that means
 //! (libxml2 warns and carries on the same way).
 //!
-//! Comments and processing instructions are kept with their position among an
-//! element's children, and every parsed element records the byte span of its
-//! source text, so a caller can carry content it does not model as the
+//! Text runs, comments and processing instructions are kept with their
+//! position among an element's children, so the whitespace that lays a
+//! document out is written back where it was (`plans/kml-layout.org` L1);
+//! a CDATA section's characters join the text around it, since CDATA and
+//! escaped text are the same characters (D-L1). The DOCTYPE is kept verbatim
+//! and never interpreted (D-L6). Every parsed element records the byte span of
+//! its source text, so a caller can carry content it does not model as the
 //! source's own bytes (`plans/kml-standard.org` D-K4).
 //!
 //! Input decoding is [`decode`]'s job, ahead of parsing: a byte-order mark or
@@ -36,12 +40,9 @@ pub(crate) const XML_NS: &str = "http://www.w3.org/XML/1998/namespace";
 /// The namespace of every `xmlns` / `xmlns:p` declaration attribute.
 pub(crate) const XMLNS_NS: &str = "http://www.w3.org/2000/xmlns/";
 
-/// A parsed XML element: a name, its attributes, child elements, and the text
-/// found directly inside it. A child element's own text lives on the child,
-/// not here — mixed-content ordering between text runs and child elements
-/// isn't preserved (all direct text runs are concatenated in document order),
-/// since KML has no mixed content of its own and foreign content is carried
-/// by [`XmlElement::span`] instead.
+/// A parsed XML element: a name, its attributes, child elements, and the
+/// text runs, comments and processing instructions among them. A child
+/// element's own content lives on the child, not here.
 #[derive(Debug, Clone)]
 pub(crate) struct XmlElement {
     /// Local name, without any prefix.
@@ -55,10 +56,10 @@ pub(crate) struct XmlElement {
     /// [`XMLNS_NS`]), so a writer reproduces them where they were.
     pub attrs: Vec<XmlAttr>,
     pub children: Vec<XmlElement>,
-    pub text: String,
-    /// Comments and processing instructions, each tagged with the index of the
-    /// child it precedes (`children.len()` for after the last one).
-    pub misc: Vec<(usize, XmlMisc)>,
+    /// Text runs, comments and processing instructions, in document order,
+    /// each tagged with the index of the child it precedes
+    /// (`children.len()` for after the last one).
+    pub content: Vec<(usize, Content)>,
     /// The element's source text, `<` to the final `>`, as byte offsets into
     /// the parsed `&str`. `None` for an element built rather than parsed.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -75,8 +76,7 @@ impl PartialEq for XmlElement {
             && self.ns == other.ns
             && self.attrs == other.attrs
             && self.children == other.children
-            && self.text == other.text
-            && self.misc == other.misc
+            && self.content == other.content
     }
 }
 
@@ -91,23 +91,51 @@ pub(crate) struct XmlAttr {
     pub value: String,
 }
 
-/// A node that is neither an element nor text.
+/// A node that is not an element.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum XmlMisc {
+pub(crate) enum Content {
+    /// Character data, entity references decoded. Adjacent text and CDATA are
+    /// one run. Shared, because the whitespace runs that indent a document
+    /// repeat by the thousand (see [`Parser::run`]).
+    Text(Rc<str>),
     /// The text between `<!--` and `-->`, verbatim.
-    Comment(String),
+    Comment(Box<str>),
     /// `<?target data?>`; `data` has its leading whitespace removed.
-    Pi { target: String, data: String },
+    Pi { target: Box<str>, data: Box<str> },
+    /// A `<!DOCTYPE ...>` declaration, `<!` to `>`, verbatim and never
+    /// interpreted (`plans/kml-layout.org` D-L6). Only before the root.
+    Doctype(Box<str>),
 }
 
-/// A whole document: the root element plus the comments and processing
-/// instructions on either side of it. The XML declaration and any
-/// `<!DOCTYPE>` are not kept — the writer emits its own declaration.
+impl Content {
+    /// A text run that is all whitespace — the layout between elements.
+    pub fn is_space(&self) -> bool {
+        matches!(self, Content::Text(t) if t.bytes().all(is_space))
+    }
+
+    /// A text run's text.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Content::Text(t) => Some(t),
+            _ => None,
+        }
+    }
+}
+
+/// XML's whitespace (§2.3 `S`).
+pub(crate) fn is_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// A whole document: the root element plus the whitespace, comments,
+/// processing instructions and DOCTYPE on either side of it. The XML
+/// declaration is not kept — the writer emits its own, and the whitespace
+/// straight after it is the writer's too (`plans/kml-layout.org` tier 3).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct XmlDocument {
-    pub before: Vec<XmlMisc>,
+    pub before: Vec<Content>,
     pub root: XmlElement,
-    pub after: Vec<XmlMisc>,
+    pub after: Vec<Content>,
 }
 
 // The query half is what a parsed tree is read with — by the tests, since the
@@ -140,34 +168,33 @@ impl XmlElement {
         qualify(self.prefix.as_deref(), &self.name)
     }
 
+    /// A leaf's text: its first text run, which for an element with no
+    /// child elements is all of it ([`merge_leaf_text`]).
+    pub fn text(&self) -> &str {
+        first_text(&self.content)
+    }
+
     /// This element's direct text, trimmed of leading/trailing whitespace —
     /// the form KML's leaf text elements (`<name>`, `<coordinates>`, ...) want.
     #[cfg(test)]
     pub fn text_trimmed(&self) -> &str {
-        self.text.trim()
+        self.text().trim()
     }
 
     /// A leaf element with only text content, e.g. `<name>A Point</name>`.
     pub fn leaf(name: &str, text: impl Into<String>) -> XmlElement {
-        XmlElement::built(name, Vec::new(), text.into())
+        let text: String = text.into();
+        let content = if text.is_empty() { Vec::new() } else { vec![(0, Content::Text(Rc::from(text)))] };
+        XmlElement::built(name, Vec::new(), content)
     }
 
     /// An element made up of child elements, with no direct text of its own.
     pub fn with_children(name: &str, children: Vec<XmlElement>) -> XmlElement {
-        XmlElement::built(name, children, String::new())
+        XmlElement::built(name, children, Vec::new())
     }
 
-    fn built(name: &str, children: Vec<XmlElement>, text: String) -> XmlElement {
-        XmlElement {
-            name: name.to_string(),
-            prefix: None,
-            ns: None,
-            attrs: Vec::new(),
-            children,
-            text,
-            misc: Vec::new(),
-            span: None,
-        }
+    fn built(name: &str, children: Vec<XmlElement>, content: Vec<(usize, Content)>) -> XmlElement {
+        XmlElement { name: name.to_string(), prefix: None, ns: None, attrs: Vec::new(), children, content, span: None }
     }
 
     /// Append one unprefixed attribute (builder-style, for chaining onto
@@ -188,6 +215,90 @@ impl XmlElement {
         };
         self.attrs.push(XmlAttr { prefix: attr_prefix, name, ns: Some(Rc::from(XMLNS_NS)), value: uri.to_string() });
         self
+    }
+}
+
+/// The first text run in `content`, or `""`.
+pub(crate) fn first_text(content: &[(usize, Content)]) -> &str {
+    content
+        .iter()
+        .find_map(|(_, c)| match c {
+            Content::Text(t) => Some(&**t),
+            _ => None,
+        })
+        .unwrap_or("")
+}
+
+/// An element with no child elements has one text run, in the place of its
+/// first: a leaf's text is a value, and a comment splitting it
+/// (`<name>a<!--c-->b</name>`) does not split the value. The comment then
+/// follows the text, which is where the writer put it before text had a
+/// position.
+pub(crate) fn merge_leaf_text(content: &mut Vec<(usize, Content)>) {
+    if content.iter().filter(|(_, c)| matches!(c, Content::Text(_))).count() < 2 {
+        return;
+    }
+    let mut text = String::new();
+    let mut first = None;
+    let mut i = 0;
+    content.retain(|(_, c)| {
+        let keep = match c {
+            Content::Text(t) => {
+                text.push_str(t);
+                first.get_or_insert(i);
+                false
+            }
+            _ => true,
+        };
+        i += usize::from(keep);
+        keep
+    });
+    content.insert(first.unwrap_or(0), (0, Content::Text(Rc::from(text))));
+}
+
+/// A tree [`lay_out`] can indent: [`XmlElement`], and the KML model's node.
+pub(crate) trait Tree: Sized {
+    fn parts(&mut self) -> (&mut [Self], &mut Vec<(usize, Content)>);
+    /// Whether the node is source bytes, whose inside is never re-indented.
+    fn opaque(&self) -> bool {
+        false
+    }
+}
+
+impl Tree for XmlElement {
+    fn parts(&mut self) -> (&mut [Self], &mut Vec<(usize, Content)>) {
+        (&mut self.children, &mut self.content)
+    }
+}
+
+/// Lay out `node`'s inside, one child element per line: each child on a new
+/// line indented one `unit` past `indent`, and the end tag on a line of its
+/// own at `indent` (`plans/kml-layout.org` D-L2, D-L3). `newline` is the
+/// document's (`\n` or `\r\n`). An element with no child elements — a leaf —
+/// keeps its text inline, and a node already holding whitespace runs is laid
+/// out already and left as it is, so only what was built is touched.
+pub(crate) fn lay_out<T: Tree>(node: &mut T, newline: &str, indent: &str, unit: &str) {
+    if node.opaque() {
+        return;
+    }
+    let (children, content) = node.parts();
+    if children.is_empty() || content.iter().any(|(_, c)| c.is_space()) {
+        return;
+    }
+    let inner = format!("{indent}{unit}");
+    let lead: Rc<str> = Rc::from(format!("{newline}{inner}"));
+    let mut laid = Vec::with_capacity(content.len() + children.len() + 1);
+    let mut old = std::mem::take(content).into_iter().peekable();
+    for i in 0..=children.len() {
+        while let Some(c) = old.next_if(|(at, _)| *at <= i) {
+            laid.push(c);
+        }
+        let run = if i < children.len() { lead.clone() } else { Rc::from(format!("{newline}{indent}")) };
+        laid.push((i, Content::Text(run)));
+    }
+    *content = laid;
+    for child in children.iter_mut() {
+        lay_out(child, newline, &inner, unit);
     }
 }
 
@@ -281,10 +392,11 @@ pub(crate) fn parse(input: &str) -> Result<XmlElement> {
     parse_document(input).map(|doc| doc.root)
 }
 
-/// Parse a complete XML document. A leading BOM, the XML declaration and a
-/// `<!DOCTYPE ...>` are skipped; comments and processing instructions before
-/// and after the root element are kept; anything else trailing the root
-/// element is rejected. Spans index `input` as given, BOM included.
+/// Parse a complete XML document. A leading BOM, the XML declaration and the
+/// whitespace after it are skipped; the whitespace, comments, processing
+/// instructions and DOCTYPE before and after the root element are kept;
+/// anything else trailing the root element is rejected. Spans index `input`
+/// as given, BOM included.
 ///
 /// The KML reader builds its own tree through [`parse_document_with`]; this is
 /// the [`XmlElement`] form the tests and the schema oracle read.
@@ -302,8 +414,7 @@ pub(crate) struct Parsed<'a, N> {
     pub ns: Option<Rc<str>>,
     pub attrs: Vec<XmlAttr>,
     pub children: Vec<N>,
-    pub text: String,
-    pub misc: Vec<(usize, XmlMisc)>,
+    pub content: Vec<(usize, Content)>,
     pub span: Range<usize>,
 }
 
@@ -328,8 +439,7 @@ impl Builder for Elements {
             ns: el.ns,
             attrs: el.attrs,
             children: el.children,
-            text: el.text,
-            misc: el.misc,
+            content: el.content,
             span: Some(el.span),
         }
     }
@@ -340,10 +450,14 @@ impl Builder for Elements {
 pub(crate) fn parse_document_with<B: Builder>(
     input: &str,
     builder: &mut B,
-) -> Result<(Vec<XmlMisc>, B::Node, Vec<XmlMisc>)> {
+) -> Result<(Vec<Content>, B::Node, Vec<Content>)> {
     let mut p = Parser::new(input);
     if p.starts_with("\u{feff}") {
         p.pos += '\u{feff}'.len_utf8();
+    }
+    if p.starts_with("<?xml") && p.bytes.get(p.pos + 5).is_some_and(|&b| is_space(b) || b == b'?') {
+        p.parse_processing_instruction()?;
+        p.skip_ws();
     }
     let before = p.misc_outside_root()?;
     let root = p.parse_element(builder)?;
@@ -356,8 +470,8 @@ pub(crate) fn parse_document_with<B: Builder>(
 
 /// Serialize an element tree back to a complete XML document: an `<?xml?>`
 /// declaration followed by the element, with text and attribute content
-/// escaped. The inverse of [`parse`] (modulo what [`XmlElement`] doesn't keep
-/// — mixed-content ordering, CDATA sections as such, the DOCTYPE).
+/// escaped. The inverse of [`parse`], up to lexical form
+/// (`plans/kml-layout.org` tier 3).
 pub(crate) fn write(root: &XmlElement) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     write_element(root, &mut out);
@@ -370,11 +484,11 @@ pub(crate) fn write(root: &XmlElement) -> String {
 pub(crate) fn write_document(doc: &XmlDocument) -> String {
     let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     for m in &doc.before {
-        write_misc(m, &mut out);
+        write_content(m, &mut out);
     }
     write_element(&doc.root, &mut out);
     for m in &doc.after {
-        write_misc(m, &mut out);
+        write_content(m, &mut out);
     }
     out
 }
@@ -390,35 +504,36 @@ fn write_element(el: &XmlElement, out: &mut String) {
         escape_into(&a.value, out, true);
         out.push('"');
     }
-    if el.children.is_empty() && el.text.is_empty() && el.misc.is_empty() {
+    if el.children.is_empty() && el.content.is_empty() {
         out.push_str("/>");
         return;
     }
     out.push('>');
-    escape_into(&el.text, out, false);
-    let mut misc = el.misc.iter().peekable();
+    let mut content = el.content.iter().peekable();
     for (i, child) in el.children.iter().enumerate() {
-        while let Some((_, m)) = misc.next_if(|(at, _)| *at <= i) {
-            write_misc(m, out);
+        while let Some((_, c)) = content.next_if(|(at, _)| *at <= i) {
+            write_content(c, out);
         }
         write_element(child, out);
     }
-    for (_, m) in misc {
-        write_misc(m, out);
+    for (_, c) in content {
+        write_content(c, out);
     }
     out.push_str("</");
     out.push_str(&name);
     out.push('>');
 }
 
-pub(crate) fn write_misc(m: &XmlMisc, out: &mut String) {
-    match m {
-        XmlMisc::Comment(text) => {
+pub(crate) fn write_content(c: &Content, out: &mut String) {
+    match c {
+        Content::Text(text) => escape_into(text, out, false),
+        Content::Comment(text) => {
             out.push_str("<!--");
             out.push_str(text);
             out.push_str("-->");
         }
-        XmlMisc::Pi { target, data } => {
+        Content::Doctype(text) => out.push_str(text),
+        Content::Pi { target, data } => {
             out.push_str("<?");
             out.push_str(target);
             if !data.is_empty() {
@@ -468,6 +583,10 @@ struct Parser<'a> {
     scopes: Vec<(Option<String>, Option<Rc<str>>)>,
     xml_ns: Rc<str>,
     xmlns_ns: Rc<str>,
+    /// The whitespace runs read so far, shared ([`Parser::run`]).
+    spaces: Vec<Rc<str>>,
+    /// A spare buffer for the text run being read.
+    text: String,
 }
 
 impl<'a> Parser<'a> {
@@ -478,6 +597,8 @@ impl<'a> Parser<'a> {
             scopes: Vec::new(),
             xml_ns: Rc::from(XML_NS),
             xmlns_ns: Rc::from(XMLNS_NS),
+            spaces: Vec::new(),
+            text: String::new(),
         }
     }
 
@@ -502,11 +623,8 @@ impl<'a> Parser<'a> {
     }
 
     fn skip_ws(&mut self) {
-        while let Some(b) = self.peek() {
-            match b {
-                b' ' | b'\t' | b'\n' | b'\r' => self.pos += 1,
-                _ => break,
-            }
+        while self.peek().is_some_and(is_space) {
+            self.pos += 1;
         }
     }
 
@@ -516,12 +634,16 @@ impl<'a> Parser<'a> {
 
     /// Whitespace, processing instructions, comments and a `<!DOCTYPE ...>`
     /// — anything that can appear before or after the document's root
-    /// element. Comments and processing instructions are returned; the XML
-    /// declaration (a PI-shaped `<?xml ...?>`) and the DOCTYPE are not.
-    fn misc_outside_root(&mut self) -> Result<Vec<XmlMisc>> {
+    /// element, in order. An XML declaration found here is not returned.
+    fn misc_outside_root(&mut self) -> Result<Vec<Content>> {
         let mut out = Vec::new();
         loop {
+            let start = self.pos;
             self.skip_ws();
+            if self.pos > start {
+                let run = self.str_between(start, self.pos)?;
+                out.push(Content::Text(self.run(run)));
+            }
             if self.starts_with("<?") {
                 if let Some(pi) = self.parse_processing_instruction()? {
                     out.push(pi);
@@ -529,7 +651,7 @@ impl<'a> Parser<'a> {
             } else if self.starts_with("<!--") {
                 out.push(self.parse_comment()?);
             } else if self.starts_with("<!DOCTYPE") || self.starts_with("<!doctype") {
-                self.skip_doctype()?;
+                out.push(self.parse_doctype()?);
             } else {
                 break;
             }
@@ -537,8 +659,25 @@ impl<'a> Parser<'a> {
         Ok(out)
     }
 
+    /// A text run as stored: whitespace shared with every equal run before
+    /// it, so a document's indentation is a handful of strings however many
+    /// elements it lays out; anything else its own.
+    fn run(&mut self, text: &str) -> Rc<str> {
+        if text.len() > 128 || !text.bytes().all(is_space) {
+            return Rc::from(text);
+        }
+        if let Some(r) = self.spaces.iter().find(|r| ***r == *text) {
+            return r.clone();
+        }
+        let r: Rc<str> = Rc::from(text);
+        if self.spaces.len() < 64 {
+            self.spaces.push(r.clone());
+        }
+        r
+    }
+
     /// `<?target data?>`, or `None` for the XML declaration itself.
-    fn parse_processing_instruction(&mut self) -> Result<Option<XmlMisc>> {
+    fn parse_processing_instruction(&mut self) -> Result<Option<Content>> {
         self.pos += 2; // "<?"
         let end = self.find(b"?>").ok_or_else(|| self.err("unterminated processing instruction"))?;
         let body = self.str_between(self.pos, end)?;
@@ -550,33 +689,44 @@ impl<'a> Parser<'a> {
         if target == "xml" {
             return Ok(None);
         }
-        Ok(Some(XmlMisc::Pi { target: target.to_string(), data: data.to_string() }))
+        Ok(Some(Content::Pi { target: target.into(), data: data.into() }))
     }
 
-    fn parse_comment(&mut self) -> Result<XmlMisc> {
+    fn parse_comment(&mut self) -> Result<Content> {
         self.pos += 4; // "<!--"
         let end = self.find(b"-->").ok_or_else(|| self.err("unterminated comment"))?;
         let text = self.str_between(self.pos, end)?;
         self.pos = end + 3;
-        Ok(XmlMisc::Comment(text.to_string()))
+        Ok(Content::Comment(text.into()))
     }
 
     /// A `<!DOCTYPE ...>` declaration, with an optional bracketed internal
-    /// subset (`[ ... ]`). KML never carries one; skipped rather than
-    /// rejected in case some producer emits a harmless one anyway.
-    fn skip_doctype(&mut self) -> Result<()> {
+    /// subset (`[ ... ]`), as its source text. Read for its extent only: no
+    /// entity it declares is expanded and no external subset is fetched
+    /// (`plans/kml-layout.org` D-L6). A quoted literal or a comment in the
+    /// subset may hold `]` or `>` without ending anything.
+    fn parse_doctype(&mut self) -> Result<Content> {
+        let start = self.pos;
         self.pos += 2; // "<!"
-        let mut depth = 0i32;
+        let mut in_subset = false;
         loop {
+            if in_subset && self.starts_with("<!--") {
+                self.parse_comment()?;
+                continue;
+            }
             match self.bump() {
                 None => return Err(self.err("unterminated <!DOCTYPE ...>")),
-                Some(b'[') => depth += 1,
-                Some(b']') => depth -= 1,
-                Some(b'>') if depth <= 0 => break,
+                Some(quote @ (b'"' | b'\'')) => {
+                    let end = self.find(&[quote]).ok_or_else(|| self.err("unterminated literal in <!DOCTYPE ...>"))?;
+                    self.pos = end + 1;
+                }
+                Some(b'[') => in_subset = true,
+                Some(b']') => in_subset = false,
+                Some(b'>') if !in_subset => break,
                 _ => {}
             }
         }
-        Ok(())
+        Ok(Content::Doctype(self.str_between(start, self.pos)?.into()))
     }
 
     fn find(&self, needle: &[u8]) -> Option<usize> {
@@ -643,8 +793,7 @@ impl<'a> Parser<'a> {
             ns,
             attrs,
             children: Vec::new(),
-            text: String::new(),
-            misc: Vec::new(),
+            content: Vec::new(),
             span: start..start,
         };
 
@@ -668,8 +817,17 @@ impl<'a> Parser<'a> {
         el: &mut Parsed<'a, B::Node>,
         builder: &mut B,
     ) -> Result<()> {
+        // The run being read: text and CDATA up to the next node that is
+        // neither. Reused across elements; an element's content is complete
+        // before its first child's starts or after its last child's ends.
+        let mut text = std::mem::take(&mut self.text);
         loop {
-            self.read_text_into(&mut el.text)?;
+            self.read_text_into(&mut text)?;
+            if !self.starts_with("<![CDATA[") && !text.is_empty() {
+                let run = self.run(&text);
+                el.content.push((el.children.len(), Content::Text(run)));
+                text.clear();
+            }
             match self.peek() {
                 None => return Err(self.err("unexpected end of input inside element")),
                 Some(b'<') if self.starts_with("</") => {
@@ -680,27 +838,33 @@ impl<'a> Parser<'a> {
                     if raw_name != open_name {
                         return Err(self.err("mismatched closing tag"));
                     }
+                    if el.children.is_empty() {
+                        merge_leaf_text(&mut el.content);
+                    }
+                    self.text = text;
                     return Ok(());
                 }
                 Some(b'<') if self.starts_with("<!--") => {
                     let comment = self.parse_comment()?;
-                    el.misc.push((el.children.len(), comment));
+                    el.content.push((el.children.len(), comment));
                 }
                 Some(b'<') if self.starts_with("<![CDATA[") => {
                     self.pos += 9;
                     let end = self.find(b"]]>").ok_or_else(|| self.err("unterminated CDATA section"))?;
                     let s = std::str::from_utf8(&self.bytes[self.pos..end])
                         .map_err(|_| self.err("invalid utf-8 in CDATA section"))?;
-                    el.text.push_str(s);
+                    text.push_str(s);
                     self.pos = end + 3;
                 }
                 Some(b'<') if self.starts_with("<?") => {
                     if let Some(pi) = self.parse_processing_instruction()? {
-                        el.misc.push((el.children.len(), pi));
+                        el.content.push((el.children.len(), pi));
                     }
                 }
                 Some(b'<') => {
+                    self.text = std::mem::take(&mut text);
                     let child = self.parse_element(builder)?;
+                    text = std::mem::take(&mut self.text);
                     el.children.push(child);
                 }
                 Some(_) => unreachable!("read_text_into only stops at '<' or end of input"),
@@ -867,11 +1031,11 @@ mod tests {
         assert_eq!(root.attr("x"), Some("1"));
         assert_eq!(root.attr("y"), Some("2"));
         assert!(root.children.is_empty());
-        assert!(root.text.is_empty());
+        assert!(root.text().is_empty());
     }
 
     #[test]
-    fn skips_declaration_and_doctype_and_keeps_comments_and_pis() {
+    fn skips_the_declaration_and_keeps_the_doctype_comments_pis_and_whitespace() {
         let doc = parse_document(
             r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE kml [ <!ENTITY foo "bar"> ]>
@@ -881,27 +1045,57 @@ mod tests {
         .unwrap();
         assert_eq!(doc.root.name, "kml");
         assert_eq!(doc.root.children.len(), 1);
-        assert_eq!(doc.before, vec![XmlMisc::Comment(" a comment ".into())]);
-        assert_eq!(doc.root.misc, vec![(0, XmlMisc::Comment(" inner ".into()))]);
+        let nl = || Content::Text(Rc::from("\n"));
+        assert_eq!(
+            doc.before,
+            vec![Content::Doctype(r#"<!DOCTYPE kml [ <!ENTITY foo "bar"> ]>"#.into()), nl(), Content::Comment(" a comment ".into())]
+        );
+        assert_eq!(doc.root.content, vec![(0, Content::Comment(" inner ".into()))]);
         assert_eq!(
             doc.after,
-            vec![
-                XmlMisc::Comment(" trailing ".into()),
-                XmlMisc::Pi { target: "pi".into(), data: "trailing".into() },
-            ]
+            vec![nl(), Content::Comment(" trailing ".into()), Content::Pi { target: "pi".into(), data: "trailing".into() }]
         );
+    }
+
+    #[test]
+    fn a_doctype_ends_at_its_own_close_whatever_its_subset_quotes() {
+        let doctype = r#"<!DOCTYPE kml [ <!ENTITY a "]>"> <!-- ]> --> <!ENTITY b '>'> ]>"#;
+        let doc = parse_document(&format!("{doctype}<kml/>")).unwrap();
+        assert_eq!(doc.before, vec![Content::Doctype(doctype.into())]);
+        assert_eq!(write_document(&doc), format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{doctype}<kml/>"));
+    }
+
+    #[test]
+    fn keeps_whitespace_runs_where_they_were() {
+        let src = "<a>\n  <b>x</b>\n  <!--c-->\n  <d/>\n</a>";
+        let root = parse(src).unwrap();
+        let ws = |s: &str| Content::Text(Rc::from(s));
+        assert_eq!(
+            root.content,
+            vec![(0, ws("\n  ")), (1, ws("\n  ")), (1, Content::Comment("c".into())), (1, ws("\n  ")), (2, ws("\n"))]
+        );
+        assert_eq!(write(&root), format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{src}"));
+    }
+
+    #[test]
+    fn equal_whitespace_runs_are_one_string() {
+        let root = parse("<a>\n  <b/>\n  <c/>\n</a>").unwrap();
+        let (Content::Text(first), Content::Text(second)) = (&root.content[0].1, &root.content[1].1) else {
+            panic!("{:?}", root.content)
+        };
+        assert!(Rc::ptr_eq(first, second));
     }
 
     #[test]
     fn records_comment_positions_among_children() {
         let root = parse("<a><!--0--><b/><!--1--><?p x?><c/><!--2--></a>").unwrap();
         assert_eq!(
-            root.misc,
+            root.content,
             vec![
-                (0, XmlMisc::Comment("0".into())),
-                (1, XmlMisc::Comment("1".into())),
-                (1, XmlMisc::Pi { target: "p".into(), data: "x".into() }),
-                (2, XmlMisc::Comment("2".into())),
+                (0, Content::Comment("0".into())),
+                (1, Content::Comment("1".into())),
+                (1, Content::Pi { target: "p".into(), data: "x".into() }),
+                (2, Content::Comment("2".into())),
             ]
         );
     }
@@ -915,7 +1109,7 @@ mod tests {
     #[test]
     fn decodes_predefined_and_numeric_entities() {
         let root = parse("<a>&amp;&lt;&gt;&quot;&apos; &#65;&#x42;</a>").unwrap();
-        assert_eq!(root.text, "&<>\"' AB");
+        assert_eq!(root.text(), "&<>\"' AB");
     }
 
     #[test]
@@ -932,7 +1126,15 @@ mod tests {
     #[test]
     fn reads_cdata_verbatim() {
         let root = parse("<a><![CDATA[<b>not a tag</b> & neither is this]]></a>").unwrap();
-        assert_eq!(root.text, "<b>not a tag</b> & neither is this");
+        assert_eq!(root.text(), "<b>not a tag</b> & neither is this");
+    }
+
+    #[test]
+    fn cdata_joins_the_text_around_it_and_is_written_escaped() {
+        let root = parse("<a>x <![CDATA[<b>]]> y</a>").unwrap();
+        assert_eq!(root.content.len(), 1);
+        assert_eq!(root.text(), "x <b> y");
+        assert!(write(&root).ends_with("<a>x &lt;b&gt; y</a>"));
     }
 
     #[test]
@@ -1029,10 +1231,16 @@ mod tests {
     }
 
     #[test]
-    fn concatenates_mixed_text_and_child_elements() {
+    fn keeps_mixed_text_in_place_among_child_elements() {
         let root = parse("<a>one<b/>two<c/>three</a>").unwrap();
-        assert_eq!(root.text, "onetwothree");
         assert_eq!(root.children.len(), 2);
+        assert_eq!(write(&root), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<a>one<b/>two<c/>three</a>");
+    }
+
+    #[test]
+    fn a_leafs_text_split_by_a_comment_is_one_value() {
+        let root = parse("<a>one<!--c-->two</a>").unwrap();
+        assert_eq!(root.text(), "onetwo");
     }
 
     #[test]
@@ -1145,7 +1353,7 @@ mod tests {
                 let bytes = utf16_bytes(doc, le, bom);
                 let text = decode(&bytes).unwrap();
                 assert_eq!(text, doc, "le={le} bom={bom}");
-                assert_eq!(parse(&text).unwrap().text, "Zürich 𝄞");
+                assert_eq!(parse(&text).unwrap().text(), "Zürich 𝄞");
             }
         }
     }
@@ -1163,13 +1371,13 @@ mod tests {
     fn decode_honours_a_declared_iso_8859_1() {
         let bytes = b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><a>K\xF8benhavn</a>";
         let text = decode(bytes).unwrap();
-        assert_eq!(parse(&text).unwrap().text, "København");
+        assert_eq!(parse(&text).unwrap().text(), "København");
     }
 
     #[test]
     fn decode_accepts_any_declared_encoding_over_ascii_bytes_and_refuses_it_over_others() {
         let ascii = b"<?xml version='1.0' encoding='windows-1252'?><a>plain</a>";
-        assert_eq!(parse(&decode(ascii).unwrap()).unwrap().text, "plain");
+        assert_eq!(parse(&decode(ascii).unwrap()).unwrap().text(), "plain");
         let high = b"<?xml version='1.0' encoding='windows-1252'?><a>\x93quoted\x94</a>";
         let err = decode(high).unwrap_err().to_string();
         assert!(err.contains("windows-1252"), "{err}");

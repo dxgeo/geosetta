@@ -217,11 +217,11 @@ fn archive_of(entries: Vec<crate::zip::ZipEntry>) -> KmzArchive {
 /// else the `.kml` writer's output as one entry named `doc.kml`, the
 /// conventional name. Entries are stored, uncompressed (see `crate::zip`'s
 /// module doc).
-pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>) -> Vec<u8> {
+pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>, compact: bool) -> Vec<u8> {
     let source = writer::source_document(fc);
     let Some(archive) = source.and_then(|s| s.archive.as_deref()).filter(|_| writer::carries_documents(fc, Format::Kmz))
     else {
-        return crate::zip::write(&[("doc.kml", &write_kml(fc, version))]);
+        return crate::zip::write(&[("doc.kml", &write_kml(fc, version, compact))]);
     };
     let layers = &source.expect("an archive has a source").layers;
     let written: Vec<Option<Vec<u8>>> = (0..archive.entries.len())
@@ -230,7 +230,7 @@ pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>) -> 
                 _ if i == archive.document => 0,
                 _ => 1 + layers.iter().position(|l| l.entry == i)?,
             };
-            Some(writer::write_document(fc, index, version))
+            Some(writer::write_document(fc, index, version, compact))
         })
         .collect();
     let entries: Vec<(&str, &[u8], crate::zip::DosTime)> = archive
@@ -287,7 +287,7 @@ mod tests {
     #[test]
     fn a_kmz_written_back_keeps_every_entry_in_its_place() {
         let fc = read_kmz(&archive(), &mut Vec::new()).unwrap();
-        let back = crate::zip::read(&write_kmz(&fc, None)).unwrap();
+        let back = crate::zip::read(&write_kmz(&fc, None, false)).unwrap();
         let shape: Vec<_> = back.iter().map(|e| (e.name.as_str(), e.modified)).collect();
         assert_eq!(
             shape,
@@ -303,7 +303,7 @@ mod tests {
         // The document is written from the model, edits and all.
         let mut edited = fc.clone();
         edited.features[0].properties[0].1 = crate::json::JsonValue::String("renamed".into());
-        let back = crate::zip::read(&write_kmz(&edited, Some(KmlVersion::V2_3))).unwrap();
+        let back = crate::zip::read(&write_kmz(&edited, Some(KmlVersion::V2_3), false)).unwrap();
         let text = String::from_utf8(back[2].data.clone()).unwrap();
         assert!(text.contains("<name>renamed</name>") && text.contains(r#"version="2.3""#), "{text}");
         assert!(drop_warnings(&fc, Format::Kmz).is_empty());
@@ -325,7 +325,7 @@ mod tests {
         // A .kml read has no archive, and a .kml written as .kmz is one entry.
         let fc = crate::kml::read_kml(DOC, &mut Vec::new()).unwrap();
         assert!(drop_warnings(&fc, Format::Kml).is_empty());
-        let names: Vec<_> = crate::zip::read(&write_kmz(&fc, None)).unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<_> = crate::zip::read(&write_kmz(&fc, None, false)).unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["doc.kml"]);
     }
 
@@ -343,7 +343,7 @@ mod tests {
         let kmz = crate::zip::write(&[("doc.kml", DOC), ("layers/a.kml", &a), ("icon.png", b"i"), ("layers/b.kml", &b)]);
         let fc = read_kmz(&kmz, &mut Vec::new()).unwrap();
         assert_eq!(fc.features.len(), 3);
-        let back = crate::zip::read(&write_kmz(&fc, None)).unwrap();
+        let back = crate::zip::read(&write_kmz(&fc, None, false)).unwrap();
         let names: Vec<_> = back.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["doc.kml", "layers/a.kml", "icon.png", "layers/b.kml"]);
         // Unedited, each document is the one read.
@@ -357,7 +357,7 @@ mod tests {
         edited.features[1].properties[0].1 = crate::json::JsonValue::String("a, renamed".into());
         let added = edited.features.remove(2);
         edited.features.push(Feature { native: None, ..added });
-        let back = crate::zip::read(&write_kmz(&edited, None)).unwrap();
+        let back = crate::zip::read(&write_kmz(&edited, None, false)).unwrap();
         let text = |i: usize| String::from_utf8(back[i].data.clone()).unwrap();
         assert!(text(1).contains("<Folder><name>a</name><Placemark><name>a, renamed</name><styleUrl>#s</styleUrl>"), "{}", text(1));
         assert!(!text(3).contains("<Placemark>"), "{}", text(3));
@@ -368,20 +368,172 @@ mod tests {
     fn gdals_layered_kmz_round_trips_as_a_kmz() {
         let source = include_bytes!("../../tests/fixtures/gdal_networklink.kmz");
         let fc = read_kmz(source, &mut Vec::new()).unwrap();
-        let again = read_kmz(&write_kmz(&fc, None), &mut Vec::new()).unwrap();
+        let again = read_kmz(&write_kmz(&fc, None, false), &mut Vec::new()).unwrap();
         assert_eq!(again.native, fc.native, "the archive, its documents and their layers");
         assert_eq!(again.features, fc.features);
         // Each document written is the one read, network links and all.
-        let (before, after) = (crate::zip::read(source).unwrap(), crate::zip::read(&write_kmz(&fc, None)).unwrap());
+        let (before, after) = (crate::zip::read(source).unwrap(), crate::zip::read(&write_kmz(&fc, None, false)).unwrap());
         for (b, a) in before.iter().zip(&after).filter(|(b, _)| b.name.ends_with(".kml")) {
             let parse = |bytes: &[u8]| crate::xml::parse_document(&crate::xml::decode(bytes).unwrap()).unwrap();
             assert_eq!(parse(&a.data), parse(&b.data), "{}", b.name);
         }
         // And each document changes version on its own.
-        let raised = read_kmz(&write_kmz(&fc, Some(KmlVersion::V2_3)), &mut Vec::new()).unwrap();
+        let raised = read_kmz(&write_kmz(&fc, Some(KmlVersion::V2_3), false), &mut Vec::new()).unwrap();
         let source = writer::source_document(&raised).unwrap();
         assert_eq!((source.version, source.layers[0].version), (KmlVersion::V2_3, KmlVersion::V2_3));
         assert_eq!(raised.features, fc.features);
+    }
+
+    /// `source` in the house's lexical form (`plans/kml-layout.org` tier 3),
+    /// its whitespace untouched: the house declaration, CDATA as escaped
+    /// text, `&apos;`/`&quot;` and character references as their characters
+    /// in text, and `<a></a>` as `<a/>`. Written apart from `crate::xml` on
+    /// purpose (D-L7), so a bug the writer and parser share cannot hide here.
+    /// Enough XML for the fixtures it is run on; attributes are taken as
+    /// written, since none of them spell a value two ways.
+    fn normalize(source: &str) -> String {
+        let mut s = source.strip_prefix('\u{feff}').unwrap_or(source);
+        if s.starts_with("<?xml") {
+            s = s[s.find("?>").unwrap() + 2..].trim_start();
+        }
+        let mut out = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+        let mut rest = s;
+        while let Some(at) = rest.find(['<', '&']) {
+            out.push_str(&rest[..at]);
+            rest = &rest[at..];
+            if let Some(body) = rest.strip_prefix("<![CDATA[") {
+                let end = body.find("]]>").unwrap();
+                out.push_str(&body[..end].replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;"));
+                rest = &body[end + 3..];
+            } else if rest.starts_with("<!--") || rest.starts_with("<!") || rest.starts_with("<?") {
+                let close = if rest.starts_with("<!--") { "-->" } else { ">" };
+                let end = rest.find(close).unwrap() + close.len();
+                out.push_str(&rest[..end]);
+                rest = &rest[end..];
+            } else if rest.starts_with('&') {
+                let end = rest.find(';').unwrap();
+                let entity = &rest[1..end];
+                match entity {
+                    "apos" => out.push('\''),
+                    "quot" => out.push('"'),
+                    "amp" | "lt" | "gt" => out.push_str(&rest[..=end]),
+                    _ => {
+                        let code = match entity.strip_prefix("#x") {
+                            Some(hex) => u32::from_str_radix(hex, 16).unwrap(),
+                            None => entity[1..].parse().unwrap(),
+                        };
+                        match char::from_u32(code).unwrap() {
+                            '&' => out.push_str("&amp;"),
+                            '<' => out.push_str("&lt;"),
+                            '>' => out.push_str("&gt;"),
+                            c => out.push(c),
+                        }
+                    }
+                }
+                rest = &rest[end + 1..];
+            } else {
+                let end = rest.find('>').unwrap() + 1;
+                let tag = &rest[..end];
+                rest = &rest[end..];
+                let name = tag[1..].split(|c: char| c.is_whitespace() || c == '>' || c == '/').next().unwrap();
+                let close = format!("</{name}>");
+                if !tag.starts_with("</") && !tag.ends_with("/>") && rest.starts_with(&close) {
+                    out.push_str(tag[..tag.len() - 1].trim_end());
+                    out.push_str("/>");
+                    rest = &rest[close.len()..];
+                } else {
+                    out.push_str(tag);
+                }
+            }
+        }
+        out.push_str(rest);
+        out
+    }
+
+    /// A document laid out every way a hand or a tool lays one out: tabs and
+    /// spaces, CRLF, blank lines, a DOCTYPE, comments and a PI at every
+    /// depth, CDATA, character references, a placemark on one line inside an
+    /// indented document, and trailing whitespace after the root.
+    const HAND_LAID_OUT: &str = "<?xml version='1.0' encoding='UTF-8' standalone='yes'?>\r\n\
+        <!DOCTYPE kml>\r\n<!-- head -->\r\n\
+        <kml xmlns=\"http://www.opengis.net/kml/2.2\">\r\n\
+        \t<Document>\r\n\t\t<name>layout</name>\r\n\r\n\
+        \t\t<!-- a folder -->\r\n\
+        \t\t<Folder>\r\n\
+        \t\t\t<Placemark>\r\n\
+        \t\t\t\t<name>\r\n\t\t\t\t\tZ&#252;rich\r\n\t\t\t\t</name>\r\n\
+        \t\t\t\t<description><![CDATA[<b>bold</b> & more]]></description>\r\n\
+        \t\t\t\t<Point>\r\n\t\t\t\t\t<coordinates>8.5,47.4</coordinates>\r\n\t\t\t\t</Point>\r\n\
+        \t\t\t</Placemark>\r\n\
+        \t\t\t<Placemark><name>compact</name><Point><coordinates>1,2</coordinates></Point></Placemark>\r\n\
+        \t\t\t<?app keep?>\r\n\
+        \t\t</Folder>\r\n\
+        \t</Document>\r\n\
+        </kml>\r\n\r\n";
+
+    fn kml_sources() -> Vec<(String, String)> {
+        let mut sources: Vec<(String, String)> = ["sample.kml", "hand_hostile.kml", "hand_hostile_2_3.kml", "duckdb_geoms.kml"]
+            .iter()
+            .map(|n| (n.to_string(), std::fs::read_to_string(format!("tests/fixtures/{n}")).unwrap()))
+            .collect();
+        sources.push(("HAND_LAID_OUT".into(), HAND_LAID_OUT.into()));
+        sources
+    }
+
+    fn round_trip(source: &str) -> String {
+        let fc = read_kml(source.as_bytes(), &mut Vec::new()).unwrap();
+        String::from_utf8(write_kml(&fc, None, false)).unwrap()
+    }
+
+    #[test]
+    fn a_same_version_write_is_the_source_in_house_lexical_form() {
+        for (name, source) in kml_sources() {
+            assert_eq!(round_trip(&source), normalize(&source), "{name}");
+        }
+        for e in crate::zip::read(include_bytes!("../../tests/fixtures/gdal_networklink.kmz")).unwrap() {
+            if e.name.ends_with(".kml") {
+                let source = crate::xml::decode(&e.data).unwrap();
+                let back = read_kmz(&crate::zip::write(&[("doc.kml", &e.data[..])]), &mut Vec::new()).unwrap();
+                let written = crate::zip::read(&write_kmz(&back, None, false)).unwrap();
+                assert_eq!(String::from_utf8(written[0].data.clone()).unwrap(), normalize(&source), "{}", e.name);
+            }
+        }
+    }
+
+    /// Whether `text` has whitespace between two tags — any layout at all.
+    fn laid_out(text: &str) -> bool {
+        text.split('>').skip(1).any(|after| {
+            let space = after.len() - after.trim_start().len();
+            space > 0 && after[space..].starts_with('<')
+        })
+    }
+
+    #[test]
+    fn compact_writes_a_document_on_one_line_its_own_layout_included() {
+        let fc = read_kml(HAND_LAID_OUT.as_bytes(), &mut Vec::new()).unwrap();
+        let flat = String::from_utf8(write_kml(&fc, None, true)).unwrap();
+        let document = flat.split_once('\n').unwrap().1;
+        assert!(!laid_out(document), "{flat}");
+        assert!(flat.contains("<name>\r\n\t\t\t\t\tZürich\r\n\t\t\t\t</name>"), "a leaf's text is its value: {flat}");
+        assert!(document.starts_with("<!DOCTYPE kml><!-- head --><kml"), "{flat}");
+        assert!(!flat.ends_with('\n'));
+        let values = |fc: &FeatureCollection| -> Vec<_> { fc.features.iter().map(|f| (f.geometry.clone(), f.properties.clone())).collect() };
+        assert_eq!(values(&read_kml(flat.as_bytes(), &mut Vec::new()).unwrap()), values(&fc));
+        // Built from the IR, and as a .kmz, it is flat too.
+        let fresh = FeatureCollection::new(fc.features.iter().map(|f| Feature { native: None, ..f.clone() }).collect());
+        let flat = String::from_utf8(write_kml(&fresh, None, true)).unwrap();
+        assert!(!laid_out(flat.split_once('\n').unwrap().1), "{flat}");
+        assert!(laid_out(&String::from_utf8(write_kml(&fresh, None, false)).unwrap()));
+        let kmz = crate::zip::read(&write_kmz(&fc, None, true)).unwrap();
+        assert!(!laid_out(String::from_utf8(kmz[0].data.clone()).unwrap().split_once('\n').unwrap().1));
+    }
+
+    #[test]
+    fn a_second_run_changes_nothing() {
+        for (name, source) in kml_sources() {
+            let once = round_trip(&source);
+            assert_eq!(round_trip(&once), once, "{name}");
+        }
     }
 
     #[test]

@@ -56,7 +56,10 @@ feature, plus a temporary =String= per number. Replaced with
 =geojson::to_geojson_string=, which writes GeoJSON straight into the output
 buffer (numbers formatted in place via =fmt::Write=), reusing the existing value
 serializer only for property values. The old tree builder is kept =#[cfg(test)]=
-as the reference the direct writer is asserted byte-for-byte against.
+as the reference the direct writer is asserted byte-for-byte against -- its
+=--compact= form, since GeoJSON is indented by default from 2026-10-28
+(=kml-layout.org= D-L8); the indented form is asserted to parse to the same
+tree.
 
 Result (N=400k, best-of-3): every =* → geojson= path roughly *2× faster*.
 | conversion       | before      | after       |

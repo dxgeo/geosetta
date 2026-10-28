@@ -839,7 +839,9 @@ expressible; the mapping must key on (namespace, local name, parent).
   document; a =.kmz='s provenance is its first entry's, the one it is written
   back as. Resolution is D-K2's: =--kml-version= (a usage error for any other
   output, and with =--print-crs*=), else the native's version, else 2.2. The
-  library form is =convert::write_kml_features=. Every write validated:
+  library form is =convert::write_kml_features=, or =write_features_with= and
+  =WriteOptions::kml_version= since =--compact= joined it
+  (=kml-layout.org= D-L8). Every write validated:
   geosetta's 2.2 output against =ogckml22.xsd= under =xmllint=, its 2.3 output
   and a 2.3 round trip against =ogckml23.xsd= under =xmlschema='s XSD 1.1.
 

@@ -454,24 +454,22 @@ why, not to implement the spec's table from symmetry.
   =shapefile::writer::write=. The =Gpkg= arm's "not supported yet" wording,
   which invited exactly that misreading, is *fixed in 0.26.1*.
   See [[file:../../wasm-plan.org][wasm-plan.org]].
-- *Text encodings* (cross-spoke) :: Every spoke that reads or writes text, and
-  the picture is uneven in a way no single flag fixes: *four spokes refuse
-  non-UTF-8 input outright* (GeoJSON, CSV, WKT, KML -- with no remedy to offer,
-  which is what makes the refusal awkward rather than wrong), *one guesses*
-  (Shapefile's =.dbf= maps any unrecognised =.cpg= to Latin-1 **silently**, and
-  =CP1252= -- the common case -- differs from Latin-1 in exactly the bytes real
-  data uses), and *one throws away the declaration it needs* (=xml.rs= skips
-  KML's =<?xml encoding=…?>= prolog unread, then refuses the file for being
-  what it said it was). The write side is settled and UTF-8 everywhere,
-  declared in a =.cpg= since 2026-10-21.
+- *Text encodings* (cross-spoke) :: Every encoding in a closed, named set --
+  the whole WHATWG Encoding Standard (UTF-8/16, 28 single-byte, 7 multi-byte
+  including gb18030, Big5, Shift_JIS, EUC-JP, ISO-2022-JP, EUC-KR), the DOS
+  OEM codepages dBase and zip names use, true ISO-8859-1 and UTF-32 -- decoded
+  *and* encoded exactly, from tables generated out of the published mappings
+  committed as oracles. /Rescoped 2026-10-28/ from "single-byte, refuse
+  multi-byte": the old refusal was a warning standing in for a parser. Today
+  four spokes refuse non-UTF-8 input with no remedy, a =.dbf= approximates an
+  unrecognised =.cpg= as Latin-1 (warned since E1), and zip entry names are
+  refused on read and mis-declared on write.
 
-  Two measurements shape it. =ogr2ogr='s default output declares LDID =0x57=
+  One measurement shapes it: =ogr2ogr='s default output declares LDID =0x57=
   (Windows-1252) while writing UTF-8 bytes, so **honouring the in-band
-  declaration would mis-decode the reference tool's own files** -- the existing
-  UTF-8-probe is better than the declaration. And the dependency-free
-  constraint puts a sharp boundary between single-byte codepages (a 128-entry
-  table each, cheap, reversible for the write side) and multi-byte ones
-  (thousands of entries -- where the answer is *refusal*, not approximation).
-  Correctness first (E1 warn, E3 refuse), capability after (E2 tables, E4
-  =--encoding=). *Scoping only.*
+  declaration would mis-decode the reference tool's own files** (D-E2). A
+  same-format run writes the source's encoding back (D-E7), which is the
+  non-UTF-8 item of KML's XML-layer losses. E1 built; E5 partly. Next: E2
+  (shared module, single-byte tables), E3 (multi-byte), E4
+  (=--from-encoding=), E6 (writing).
   See [[file:encodings.org][encodings.org]].

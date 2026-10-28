@@ -466,6 +466,9 @@ next pass through this area doesn't have to rediscover them:
   128-entry table and no dependency, multi-byte ones (Shift-JIS, GBK, Big5) are
   where the answer should be a refusal rather than an approximation.
   **The warning is owed either way**, and owed first./
+  /2026-10-28: =encodings.org= was rescoped to every encoding; E3 now
+  *decodes* multi-byte codepages, and E2 retires the approximation -- and
+  with it this warning -- for every codepage in its set./
 
 ** AN OPEN CALL -- the mixed-number column, and whether it earns a warning
 /Raised 2026-08-21, deliberately not decided./

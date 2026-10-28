@@ -3,118 +3,174 @@
 #+DATE: {{{time(%Y-%m-%d)}}}
 
 * Text Encodings, Across Every Spoke
-** STATUS -- scoping only (2026-10-21)
-Nothing here is built. The *write* side's one settled question was answered the
-day this file was written -- Shapefile emits a =.cpg= declaring =UTF-8=, see
-[[file:shapefile.org][shapefile.org]] § THE SIDECAR POLICY -- and that is the
-whole of what exists.
+** STATUS -- rescoped 2026-10-28 to every encoding; E1 built, E5 partly
+/2026-10-28:/ ***Rescoped from "single-byte, refuse the rest" to every
+encoding in a closed, named set*** -- § WHAT "EVERY ENCODING" MEANS. The old
+scope stopped at single-byte codepages because multi-byte tables were judged
+too expensive for a dependency-free crate, and refused the rest (the old
+D-E3). That was a warning standing in for a parser, which is the trade this
+project does not make: the tables are published data, the algorithms are
+specified, and the cost is a few hundred KB of committed tables rather than
+an architecture. D-E3 is overturned; § WHAT THIS OVERTURNS has the list.
 
-This plan was asked for after [[file:native-inventory.org][native-inventory.org]]
-§ QUESTIONS item 3 turned up silent text corruption, and it is deliberately
-*not* a Shapefile plan. The encoding surface spans every spoke that reads or
-writes text, and the per-spoke picture is uneven in a way no single flag fixes.
+The rescope was asked for because KML's remaining same-format losses
+(=todo.org=, "KML's XML-layer losses") include writing a non-UTF-8 document
+back in its declared encoding, and that needs an *encoder* for whatever the
+declaration names -- not only a decoder for the few encodings someone guessed
+were common.
+
+Built so far:
+- *The =.cpg= write side* (2026-10-21): Shapefile emits a =.cpg= declaring
+  =UTF-8= -- [[file:shapefile.org][shapefile.org]] § THE SIDECAR POLICY.
+- *E1* (2026-10-23): an approximated =.cpg= codepage warns.
+- *E5, partly* (2026-10-23, with =kml-standard.org= K1): =xml::decode= takes
+  bytes and honours a BOM, UTF-16's first-bytes pattern and the declaration,
+  for UTF-8, UTF-16, US-ASCII and ISO-8859-1.
+
+This plan was first asked for after
+[[file:native-inventory.org][native-inventory.org]] § QUESTIONS item 3 turned
+up silent text corruption, and it is deliberately *not* a Shapefile plan. The
+encoding surface spans every spoke that reads or writes text.
 
 ** WHY THIS IS A PLAN AND NOT A FLAG
-=--encoding= is the obvious shape and it is about a fifth of the work. Three
+=--encoding= is the obvious shape and it is a small part of the work. Four
 things make this bigger than a flag:
 
 1. ***Half the spokes refuse non-UTF-8 input outright and half guess.*** Those
    are opposite failure modes needing opposite fixes -- a refusal needs a
-   *remedy*, a guess needs a *warning* -- and today the crate does each in
-   places nobody chose deliberately.
+   *remedy*, a guess needs a *declaration or a warning* -- and today the crate
+   does each in places nobody chose deliberately.
 2. ***One spoke declares its encoding in-band, and its declaration cannot be
    trusted.*** Shapefile's =.dbf= carries a language-driver byte that the
    reference implementation fills in *wrongly*; another carries the truth in a
-   sidecar. Honouring the obvious one corrupts correct files (measured below).
-3. ***The crate takes no dependencies.*** Which codepages are supportable is
-   therefore a real scoping question with a sharp cost boundary, not an
-   import. See § THE COST BOUNDARY.
+   sidecar. Honouring the obvious one corrupts correct files (D-E2).
+3. ***The crate takes no dependencies.*** Every table is data in this tree,
+   checked against its published source (D-E4), and every algorithm is ours.
+4. ***Same-format runs owe the source's encoding back.*** A =kml -> kml= or
+   =shp -> shp= run over a Shift_JIS source must write Shift_JIS, so every
+   decoder needs its encoder (D-E7).
 
 ** WHERE EVERY SPOKE STANDS TODAY
-All /code/, read 2026-10-21, with the two measurements marked.
+All /code/, re-read 2026-10-28.
 
 | spoke | input | output | notes |
 |-------+-------+--------+-------|
-| GeoJSON | **refused** unless UTF-8 (=convert.rs:44=) | UTF-8 | RFC 7946 § 11 *requires* UTF-8, so the refusal is conformant -- but a user's Windows-authored file is still unreadable |
+| GeoJSON | **refused** unless UTF-8 (=convert.rs:55=) | UTF-8 | RFC 7946 § 11 *requires* UTF-8, so the refusal is conformant -- but a user's Windows-authored file is still unreadable |
 | CSV | **refused** unless UTF-8 (=csv.rs:28=) | UTF-8 | /the sharpest gap:/ CSV has no encoding story at all, and a CP1252 export is the single most common real-world text file in this domain |
-| WKT | **refused** unless UTF-8 (=convert.rs:92=) | UTF-8 | ASCII in practice; lowest priority |
-| KML / KMZ | **refused** unless UTF-8 (=kml/mod.rs:30=) | UTF-8 | *and the declaration that would have helped is thrown away* -- see § THE THREE THINGS, item 3 |
-| Shapefile =.dbf= | =.cpg= honoured; **anything unrecognised silently becomes Latin-1** (=dbf.rs:52=) | UTF-8, declared in =.cpg= /(2026-10-21)/ | the only spoke with an in-band declaration, and the only one that can hold non-UTF-8 text |
+| WKT | **refused** unless UTF-8 (=convert.rs:140=) | UTF-8 | ASCII in practice; lowest priority |
+| KML | =xml::decode= (=xml.rs:211=): BOM, UTF-16 sniff, then the declaration. Exact for UTF-8, UTF-16, US-ASCII, ISO-8859-1; any other declared encoding read only over all-ASCII bytes, **refused** otherwise | UTF-8, declared as such | a =kml -> kml= run over a non-UTF-8 source changes its encoding, reported as a same-format loss |
+| KMZ entry names | **refused** unless UTF-8 (=zip.rs:140=) | UTF-8 bytes with general-purpose bit 11 **clear** (=zip.rs:184=, =:199=) | *both sides are wrong* -- see § WHAT IS WRONG TODAY item 4 |
+| Shapefile =.dbf= | =.cpg= UTF-8 or ISO-8859-1 exact; any other codepage decoded as Latin-1 **with a warning** (E1, =dbf.rs:56=); no =.cpg=: UTF-8 per field, else Latin-1 **silently** | UTF-8, declared in =.cpg= | the only spoke with an in-band sidecar declaration |
 | GeoPackage | **refused** unless the header says UTF-8 (=sqlite.rs:116=, =encoding != 1=) | UTF-8, stamped (=sqlite.rs:1940=) | SQLite allows UTF-16; a UTF-16 =.gpkg= is refused rather than decoded |
 | FlatGeobuf | UTF-8 by FlatBuffers | UTF-8 | no encoding surface |
 | GeoParquet | UTF-8 by the =UTF8= logical type | UTF-8 | no encoding surface |
 
-*A BOM is stripped for XML only* (=xml.rs:75=). CSV, WKT and GeoJSON do not
-strip one, so a BOM-prefixed CSV's first header name silently carries =U+FEFF=.
-/Unverified whether that is biting anyone; it is cheap to fix and belongs to
-E4./
+*A BOM is stripped for XML only.* CSV, WKT and GeoJSON do not strip one, so a
+BOM-prefixed CSV's first header name silently carries =U+FEFF=.
 
-** THE THREE THINGS THAT ARE ACTUALLY WRONG TODAY
+** WHAT IS WRONG TODAY
 Not "missing features" -- things that produce a wrong answer or no answer where
 a right one was available.
 
-*** 1. An unrecognised =.cpg= is approximated as Latin-1, silently
-=dbf::encoding_from_cpg= maps *every* codepage it does not recognise to
-=Encoding::Latin1=. =dbf.rs:42= documents this as "an approximation documented
-as a known gap" -- and documents it *in the source*, where no user reads it.
+*** 1. An unrecognised =.cpg= is approximated as Latin-1
+/Warned since 2026-10-23 (E1); still approximated./ =dbf::encoding_from_cpg=
+maps every codepage it does not recognise to =Encoding::Latin1Approximating=.
 
 ***The common real case is =CP1252=, which differs from ISO-8859-1 in exactly
 the 32 bytes =0x80=--=0x9F=*** -- where Windows-1252 keeps the curly quotes,
 en/em dashes, =€= and =…= that real attribute data is full of, and ISO-8859-1
 has C1 control characters. So the approximation is wrong precisely on the
-characters that distinguish the two encodings, which is the worst possible
-place for it to be wrong.
-
-It is also *not* an exotic input: =ogr2ogr= declares Windows-1252 by default
-(§ DECISIONS D-E2's measurement).
-
-**This is a live instance of the crate's own standing rule**, filed at
-[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]
-§ OPEN CANDIDATES. The warning is owed whether or not a table is ever written,
-and owed *first* -- it is E1.
+characters that distinguish the two encodings. It is also *not* an exotic
+input: =ogr2ogr= declares Windows-1252 by default (D-E2's measurement). The
+fix is E2's tables, which retire the approximation entirely.
 
 *** 2. Four spokes refuse non-UTF-8 input with no remedy to offer
-=csv.rs:28=, =convert.rs:44=/=:92= and =kml/mod.rs:30= all end in
-=Error::Convert("… is not valid utf-8")=. **The refusal itself is right** --
+=csv.rs:28=, =convert.rs:55=/=:140= all end in
+=Error::Convert("… is not valid utf-8")=, and =xml::decode= refuses any
+declared encoding it has no table for. **The refusal itself is right** --
 § A refusal honours the rule, in
 [[file:same-format-fidelity.org][same-format-fidelity.org]]: no silent loss,
 because no run. But a refusal is only honourable when the user has somewhere to
 go, and today there is nowhere: no flag, no fallback, no message naming one.
 
 /The asymmetry is the tell that nobody chose this:/ a Shapefile carrying
-Latin-1 text reads fine, and the *same bytes* in a CSV are refused. Same crate,
-same domain, opposite answers.
+Latin-1 text reads fine, and the *same bytes* in a CSV are refused.
 
-*** 3. For KML, the declaration we need is the one we discard
-=xml.rs='s =skip_processing_instruction= skips the whole =<?xml …?>= prolog
-unread, so a document declaring =encoding="ISO-8859-1"= has stated its encoding
-and had the statement thrown away -- and is then refused by =from_utf8= a layer
-further out, for being exactly what it said it was.
+*** 3. A =.dbf= with no =.cpg= is guessed at, silently
+With no =.cpg=, each field is tried as UTF-8 and, failing that, decoded as
+Latin-1. That is a guess rather than a declared encoding approximated, so E1
+left it open. Under this plan the guess has a better fallback (Windows-1252,
+which is a superset of Latin-1's printable range and what =ogr2ogr= declares)
+and is owed a warning either way -- D-E9.
 
-**Worse, the layering makes it unfixable in place**: =xml::parse= takes =&str=,
-so the bytes are already decoded before the parser could read a declaration
-about how to decode them. E5 is therefore a small *restructuring* (bytes in,
-prolog sniffed, then decode) rather than a table.
+*** 4. Zip entry names are refused on read and mis-declared on write
+/Found 2026-10-28, while rescoping./ APPNOTE 6.3.0 § 4.4.4 and Appendix D:
+an entry name with general-purpose bit 11 *clear* is IBM CP437, and with it
+*set* is UTF-8.
 
-** THE COST BOUNDARY -- single-byte is cheap, multi-byte is not
-The dependency-free constraint makes this the plan's real scoping axis, and it
-falls in a convenient place.
+- *Read:* =zip.rs:140= never reads the flag, and refuses any name that is not
+  valid UTF-8. An older =.kmz= with a non-ASCII entry name in CP437 is
+  refused; one whose CP437 bytes happen to be valid UTF-8 is mis-decoded.
+- *Write:* =write_local_header= and =write_central_header= write UTF-8 name
+  bytes with the flag *clear* -- declaring CP437. Since M3c carries a source
+  =.kmz='s entries, a non-ASCII entry name is now reachable, and a reader that
+  follows the spec gets mojibake.
 
-- ***Single-byte codepages: a 128-entry =char= table each.*** =0x00=--=0x7F= is
-  ASCII in every one of them, so only the high half needs mapping. Windows-1252,
-  CP437, CP850 and ISO-8859-15 cover nearly every real dBase file and nearly
-  every Windows-authored CSV. A few hundred lines of table, no architecture
-  change, and *reversible* -- a single-byte encoder is the same table inverted,
-  which is what makes E6's write side cheap once E2 exists.
-- ***Multi-byte codepages: thousands of entries each.*** Shift-JIS, GBK, Big5,
-  EUC-KR. Tens of KB of source per codepage, plus stateful decoding for some.
-  **This is where "support more encodings" stops being free**, and the answer
-  is *refusal rather than approximation* (E3) -- a silent mojibake answer is
-  worse than no answer, which is this crate's position everywhere else.
+The write side is a one-bit fix (set bit 11 when a name is not ASCII); the
+read side needs CP437, which E2 brings. This is E8.
 
-/UTF-16 sits oddly across that line: it is multi-byte but needs no table at
-all, just surrogate handling, and a BOM makes it detectable. It is the one
-multi-byte encoding E4 could plausibly include./
+** WHAT "EVERY ENCODING" MEANS
+"Every" has to be a closed, named set, or it is untestable. The set is:
+
+1. ***The WHATWG Encoding Standard*** (=encoding.spec.whatwg.org=), every
+   encoding in it:
+   - UTF-8, UTF-16LE, UTF-16BE.
+   - 28 single-byte encodings: IBM866; ISO-8859-2, -3, -4, -5, -6, -7, -8,
+     -8-I, -10, -13, -14, -15, -16; KOI8-R, KOI8-U; macintosh; windows-874;
+     windows-1250 through -1258; x-mac-cyrillic. (-8 and -8-I share a table.)
+   - 7 multi-byte encodings: GBK, gb18030, Big5, EUC-JP, ISO-2022-JP,
+     Shift_JIS, EUC-KR.
+   - =x-user-defined= (trivial: high bytes to =U+F780=--=U+F7FF=). The
+     =replacement= encoding is a WHATWG security device for the browser and
+     maps to a refusal here.
+
+   It is the right base because it is *what producers actually emit* -- it was
+   written by measuring the web -- and because it specifies every decoder and
+   encoder as an algorithm with error handling, not just a table.
+
+2. ***The DOS OEM codepages WHATWG leaves out*** -- CP437, CP737, CP775,
+   CP850, CP852, CP855, CP857, CP860, CP861, CP862, CP863, CP864, CP865,
+   CP869. dBase files and zip entry names use them, and WHATWG keeps only
+   IBM866. Sourced from Unicode's =MAPPINGS/VENDORS/MICSFT/PC/=.
+
+3. ***True ISO-8859-1 and US-ASCII***, kept distinct from windows-1252 -- see
+   D-E5 for why WHATWG's aliasing is not adopted.
+
+4. ***UTF-32LE/BE***, because XML 1.0 Appendix F names them in its detection
+   table and they need no table.
+
+***Out of the set, and refused by name:*** EBCDIC codepages, UTF-7, the
+ISO-2022 variants other than -JP, HZ, and anything else unlisted. Each refusal
+names the encoding and says it is outside the supported set -- a refusal the
+user can act on, not mojibake.
+
+/The set grows by adding a table and a fixture, never by approximating./
+
+** THE COST
+- ***Single-byte:*** a 128-entry high-half table each; =0x00=--=0x7F= is ASCII
+  in all of them. 27 WHATWG tables plus 14 OEM ones -- a few thousand lines
+  of generated data. The encoder is the table inverted.
+- ***Multi-byte:*** the WHATWG indexes -- =index-gb18030= (~24k entries) and
+  =index-gb18030-ranges= (207 ranges), =index-big5= (~19k),
+  =index-jis0208= (~7k), =index-jis0212= (~6k), =index-euc-kr= (~17k),
+  =index-iso-2022-jp-katakana= (63). /Estimated, not yet measured:/ on the
+  order of 200 KB as packed =u16=/=u32= arrays, and it lands in the wasm
+  build too ([[file:../../wasm-plan.org][wasm-plan.org]]).
+- ***Algorithms:*** most decoders are a lookup with a lead-byte state. The
+  three with real logic are gb18030's four-byte ranges, ISO-2022-JP's
+  escape-sequence state machine, and EUC-JP's JIS X 0212 path. Encoders need
+  a reverse index, built lazily on first use rather than committed twice.
+- ***UTF-16/UTF-32:*** no tables; surrogate handling only.
 
 ** DECISIONS
 *** D-E1 -- the IR is UTF-8 only; decoding happens at the spoke boundary
@@ -126,7 +182,8 @@ problem, not a value the IR should carry undecoded.
 
 **Consequence:** every encoding question is a question about one spoke's
 boundary, and no two spokes need to agree. That is what makes this plan
-incremental.
+incremental. The *source's encoding*, where a same-format write owes it back,
+travels beside the IR as the spoke's native state, not in it (D-E7).
 
 *** D-E2 -- the =.dbf= language-driver byte is never trusted
 /Decided 2026-10-21, on a measurement that reverses the obvious answer./
@@ -144,94 +201,141 @@ is a correct decision**, because:
 /All measured against GDAL 3.13.3./ ***So honouring LDID would decode the
 reference implementation's own default output wrongly*** -- every
 =ogr2ogr=-written UTF-8 shapefile would be mis-decoded as Windows-1252 by a
-reader that believed the byte. The current UTF-8-probe-then-fallback is
-*better* than the in-band declaration, which is not a sentence one expects to
-write.
+reader that believed the byte.
 
 **This does not generalise to =.cpg=**, which is written by tools that mean it,
 and is the channel Esri invented precisely because dBase has no UTF-8 LDID
 value to put in the header.
 
-*** D-E3 -- a refusal beats an approximation
-The project's existing position (§ A refusal honours the rule), applied here:
-E3 turns today's silent Latin-1 mojibake for a multi-byte codepage into a
-stated refusal. **E1 and E3 together are the whole correctness story**; E2 and
-E4 are capability on top of it, and could never land at all without this plan
-having made the crate honest first.
+*** D-E3 -- a refusal beats an approximation, outside the set
+/Rescoped 2026-10-28./ Originally: "a multi-byte codepage is refused rather
+than approximated", with multi-byte support out of scope. Now every encoding
+in § WHAT "EVERY ENCODING" MEANS is decoded exactly, and the rule applies
+only to what is outside the set: refuse, naming the encoding. **There is no
+approximating path left in the crate** once E2 retires
+=Latin1Approximating=.
 
 *** D-E4 -- no dependency, so tables are data in this tree
-A hand-written table is testable against a published mapping (§ TESTING), and a
+A table is generated from a published mapping committed as a fixture, and a
+test asserts the generated table reproduces its source entry for entry. A
 published mapping committed as a fixture is a real oracle rather than a second
 opinion. /This is the same shape as =tests/fixtures/esri_*_wkt1.tsv= and the
 registry TSVs: authoritative data in the tree, compared against./
 
+The generator is a script beside the =build_*_fixtures.sh= scripts, and its
+output is committed Rust source -- no =build.rs=, so a build never runs it.
+
+*** D-E5 -- WHATWG's labels and algorithms, but not its Latin-1 alias
+WHATWG maps the labels =iso-8859-1=, =latin1=, =us-ascii= and =ascii= to
+windows-1252, because that is what browsers did. **Geosetta does not adopt
+that alias.** XML 1.0 and a =.cpg= mean true ISO-8859-1 when they say it, and
+=dbf::Encoding= already keeps =Latin1= distinct from an approximation for
+exactly that reason. Every other WHATWG label maps as WHATWG says.
+
+The decoders and encoders follow WHATWG's algorithms, including its encoder
+exclusions (Big5 never encodes HKSCS pointers below =(0xA1 - 0x81) × 157=;
+Shift_JIS skips pointers 8272--8835; ISO-2022-JP encodes half-width katakana
+as full-width). Where WHATWG's single-byte index and Unicode's vendor mapping
+disagree -- windows-1252's =0x81=, =0x8D=, =0x8F=, =0x90=, =0x9D= are C1
+controls in WHATWG and UNDEFINED in =CP1252.TXT= -- WHATWG is followed, so
+every byte decodes.
+
+*** D-E6 -- one shared module, every spoke through it
+=src/encoding.rs= owns label lookup, decoding and encoding. =dbf::Encoding=
+and the encoding half of =xml::decode= move onto it; =xml::decode= keeps only
+XML's own detection (BOM, Appendix F's first bytes, the declaration) and
+hands the bytes to the shared decoder.
+
+#+begin_src rust
+  pub(crate) enum Encoding { Utf8, Utf16Le, Utf16Be, Utf32Le, Utf32Be,
+                             Latin1, Ascii, SingleByte(&'static Table), Gb18030, Gbk,
+                             Big5, EucJp, Iso2022Jp, ShiftJis, EucKr, UserDefined }
+  pub(crate) fn from_label(label: &str) -> Option<Encoding>;
+  pub(crate) fn decode(bytes: &[u8], enc: Encoding) -> Result<Cow<'_, str>>;
+  pub(crate) fn encode(text: &str, enc: Encoding) -> Result<Cow<'_, [u8]>, Unrepresentable>;
+#+end_src
+
+=decode= borrows when the input is already valid UTF-8 or ASCII under an
+ASCII-compatible encoding. =Unrepresentable= carries the character and its
+offset, so every spoke's refusal names both. =from_label= takes WHATWG labels
+plus the =.cpg= spellings seen in the wild (=CP1252=, =ANSI 1252=, =1252=,
+=65001=, =UTF8=, =OEM 437=), case- and separator-insensitively as
+=encoding_from_cpg= does today.
+
+*** D-E7 -- a same-format run writes the source's encoding back
+/Decided 2026-10-28./ A =kml -> kml= run over a Shift_JIS document writes
+Shift_JIS with the same declaration; a =shp -> shp= run over a CP1252 =.dbf=
+writes CP1252 and keeps its =.cpg=. That is the same-format invariant applied
+to bytes the document chose -- not a flag, and not a default the user has to
+know about. The source's encoding is native state, held where the KML document
+model and the =.dbf= reader already hold theirs.
+
+A same-format run *with* =--to-encoding= writes what was asked, and that is a
+conversion, not a loss: the text survives (old open question 4, answered).
+
+*** D-E8 -- an unrepresentable character on write is refused
+/Decided 2026-10-28, answering old open question 3./ A character the target
+encoding cannot hold refuses the run, naming the character, the encoding and
+where it was found (feature and property). The crate refuses a CRS it cannot
+express; a =?= in a place name is the same kind of silent corruption. XML has
+one more option, since a numeric character reference (=&#x4E2D;=) is valid in
+*text and attribute values* under any encoding -- so KML escapes rather than
+refuses there, which loses nothing. Element and attribute *names*, a =.dbf=,
+CSV and WKT have no such escape and refuse.
+
+*** D-E9 -- a =.dbf= with no =.cpg= falls back to windows-1252, warned
+/Decided 2026-10-28, closing the question E1 left open./ Per field, UTF-8
+first; a field that is not valid UTF-8 is decoded as windows-1252 rather than
+Latin-1 -- the encoding =ogr2ogr= declares by default and a superset of
+Latin-1's printable characters -- and the read warns, counted per cause, that
+an undeclared encoding was guessed. A =--from-encoding= replaces the guess.
+
+*** D-E10 -- two flags, one per side
+/Decided 2026-10-28, answering old open question 2./ =--from-encoding= and
+=--to-encoding=. A single =--encoding= is ambiguous exactly when both ends are
+text, which is the case that matters. =--from-encoding= overrides every
+in-band declaration (an XML declaration, a =.cpg=), because a user naming an
+encoding is correcting a file that lied. =--to-encoding= for a spoke whose
+format fixes UTF-8 (GeoJSON, FlatGeobuf, GeoParquet, GeoPackage) is refused,
+naming the format's rule.
+
 ** MILESTONES
-Ordered by what each one costs against what it fixes. E1 and E3 are
-*correctness*; everything after is capability.
+Ordered by what each unblocks. E1 is built; E2 is the foundation everything
+else stands on.
 
 *** E1 -- warn when a declared codepage is approximated
 /***Built 2026-10-23.***/ =Encoding::Latin1Approximating= is the unrecognised
 codepage, kept apart from a declared ISO-8859-1 (which is exact and silent).
 The warning counts only values holding a non-ASCII byte, since ASCII is exact
-under every codepage: an unrecognised =.cpg= over all-ASCII text says nothing.
-Beside it, the same pass found a =.cpg= declaring UTF-8 over invalid bytes
-replacing them with U+FFFD silently; that warns too. /Not warned, and still
-open: with no =.cpg= at all, a field that is not valid UTF-8 is decoded as
-Latin-1 -- a guess, not a declared encoding approximated, so it is a
-different question from E1's./
+under every codepage. Beside it, the same pass found a =.cpg= declaring UTF-8
+over invalid bytes replacing them with U+FFFD silently; that warns too.
 
-The smallest unit of work in this plan and the only one owed under an existing
-rule. =encoding_from_cpg= knows it is approximating; it must say so.
+/Retired by E2/, for every codepage in the set: an approximation that no
+longer happens has nothing to warn about. The U+FFFD warning stays.
 
-#+begin_src text
-  warning: shapefile: src.cpg declares CP1252, which this build approximates as
-    ISO-8859-1 — the bytes 0x80–0x9F decode differently (curly quotes, dashes,
-    €). (plans/encodings.org)
-#+end_src
+*** E2 -- the shared module and every single-byte table
+- =src/encoding.rs= per D-E6, with =from_label=, =decode=, =encode=.
+- The 27 WHATWG single-byte tables and the 14 OEM ones, generated per D-E4.
+- UTF-16 and UTF-32 move here from =xml.rs=; ISO-8859-1 and US-ASCII join them.
+- =dbf::Encoding= is replaced; =encoding_from_cpg= becomes =from_label=; a
+  =.cpg= outside the set is refused by name rather than approximated.
+- =xml::decode= hands off to the shared decoder after its own detection, so
+  every single-byte declaration reads. *Finishes E5 for single-byte.*
 
-*No tables, no flags, no new types.* It also makes E2 visible as a fix rather
-than a silent behaviour change, which matters for a crate whose output people
-diff.
+*** E3 -- every multi-byte decoder
+/Rescoped 2026-10-28; was "refuse a multi-byte codepage"./ GBK and gb18030,
+Big5, EUC-JP, ISO-2022-JP, Shift_JIS, EUC-KR, per WHATWG's decoder algorithms,
+with the indexes generated per D-E4. Each malformed sequence is an error naming
+the encoding and the byte offset -- WHATWG's "replacement" error mode is the
+browser's, and silently inserting U+FFFD is the loss this plan exists to stop.
+*Finishes E5.*
 
-***It does need somewhere to say it, and that does not exist yet*** /(noted
-2026-10-22)/. Both of this crate's warning mechanisms are write-side, and this
-loss happens on **read** -- =shapefile::read='s =cpg= argument is consumed
-there and the approximation is invisible by the time the IR holds the text.
-The channel is scoped at
-[[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][=lossy-conversion-warnings.org= § 2b]],
-where E1 is one of **two** owed instances -- the other being
-=native-inventory.org= § QUESTIONS item 6's unrecognised KML geometry. /So E1
-is still the smallest unit of work in this plan, and it is no longer the
-smallest unit of work *outright*: whichever of the two is built first pays for
-the sink, and =shapefile::read= is one of the three read entry points it has
-to reach./
-
-*** E2 -- single-byte codepage tables, read side
-Windows-1252 first, on the strength of § THE THREE THINGS item 1. Then CP437
-and CP850 (DOS-era dBase), and ISO-8859-15 if a fixture turns up. Each is a
-128-entry =[char; 128]= plus an arm in =encoding_from_cpg=; =Encoding= grows a
-variant per codepage and =decode_text= gains one lookup.
-
-/Retire the Latin-1 catch-all as each table lands -- not before, since Latin-1
-remains the right answer for a codepage with no table and E1 now says so./
-
-*** E3 -- refuse a multi-byte codepage rather than approximating it
-=.cpg= naming Shift-JIS, GBK, Big5, EUC-KR or any other multi-byte codepage
-errors instead of silently producing mojibake. **Pairs with E1 and should ship
-with or before E2**: once the crate distinguishes "approximated" from
-"supported", the multi-byte case is visibly in neither category.
-
-*** E4 -- =--encoding= on input, for the spokes that refuse today
-The capability users will actually ask for: read a CP1252 CSV, a Latin-1 KML, a
-Windows-authored GeoJSON. Decodes at the boundary into the UTF-8 IR (D-E1), so
-no spoke's internals change -- the flag replaces =std::str::from_utf8= with a
-decode step at four call sites.
-
-*Also the natural home for the BOM handling* that only XML does today, and for
-UTF-16 input, which needs no table.
-
-/Blocked on nothing but E2's tables, since the flag and the tables are the same
-lookup from opposite directions./
+*** E4 -- =--from-encoding=, and BOMs, for every text spoke
+=--from-encoding= per D-E10 at the four refusing call sites (=csv.rs:28=,
+=convert.rs:55=, =convert.rs:140=, =xml::decode=) and into the =.dbf=
+reader. A BOM is honoured by every text spoke, not only XML: stripped, and
+used to choose UTF-8/16/32 when no flag is given. D-E9's no-=.cpg= fallback
+and its warning land here.
 
 *** E5 -- honour KML's own XML declaration
 /***Partly built 2026-10-23, with =kml-standard.org= K1.*** =xml::decode=
@@ -239,98 +343,106 @@ takes bytes and decides by Appendix F: a BOM, then UTF-16's first-bytes
 pattern, then the declaration's =encoding=. It decodes UTF-8, UTF-16 (both
 byte orders, BOM or not), US-ASCII and ISO-8859-1 exactly. Any other declared
 encoding is accepted over all-ASCII bytes and refused otherwise, naming the
-encoding -- so a declared Windows-1252 file with curly quotes is refused rather
-than guessed at. What remains is E2's tables, which turn those refusals into
-reads./
+encoding./ Finished by E2 (single-byte) and E3 (multi-byte); nothing else is
+owed here. Appendix F's UTF-32 patterns join the sniff with E2.
 
-Requires =xml.rs= to take bytes rather than =&str=, sniff the prolog it
-currently discards, decode, and *then* parse -- a small restructuring of the
-layering described in § THE THREE THINGS item 3. Worth doing after E4 because
-it then reuses E4's decoder, and because an explicit =--encoding= should
-override a declaration either way.
+*** E6 -- writing in an encoding other than UTF-8
+Two halves:
 
-/Note that =skip_processing_instruction= must keep skipping the prolog for
-*parsing* purposes; E5 reads it before parsing begins, not during./
+1. ***Same-format write-back*** (D-E7). The KML document model already records
+   spelling provenance (=kml-standard.org= D-K5); the declared encoding joins
+   it, and =xml::write= encodes the document in it and writes the matching
+   declaration. =shp -> shp= keeps the source =.cpg='s codepage. **This is the
+   non-UTF-8 item of KML's XML-layer losses**, and removes it from
+   =Format::Kml='s =same_format_losses= row.
+2. ***=--to-encoding=*** (D-E10) for =.dbf= (declared in the =.cpg= this
+   writer already emits), KML (declared in the XML declaration -- KML *does*
+   have an in-band place, contrary to this plan's first draft), CSV and WKT
+   (no declaration anywhere, so only ever written on request).
 
-*** E6 -- =--encoding= on output
-Write a =.dbf=, CSV, WKT or KML in a target codepage. A single-byte encoder is
-E2's table inverted, so the mechanism is nearly free; **the design question is
-the lossiness story**, and it is not optional. A character the target codepage
-cannot hold must warn or refuse under
-[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] -- and
-unlike most of that plan's cases, this one is *per value*, which is the shape
-its § 2 post-write mechanism exists for.
-
-Shapefile already has somewhere to declare the result: the =.cpg= this writer
-now emits. CSV, WKT and KML have *nowhere* -- no in-band declaration and no
-sidecar convention -- so output in a non-UTF-8 codepage is undeclarable for
-three of the four targets, which is an argument for keeping E6 behind an
-explicit flag and never inferring it.
+Unrepresentable characters per D-E8. =.dbf= truncation is measured in *bytes
+of the target encoding*, so a multi-byte target changes where a value is cut,
+and that warning has to count the encoded length.
 
 *** E7 -- UTF-16 GeoPackage input
 =sqlite.rs:116= refuses any database whose header text encoding is not 1
-(UTF-8). SQLite permits 2 and 3 (UTF-16le/be), so such a file is refused rather
-than decoded. /Last in the order: no observed producer writes one, and the
-refusal is honest. Listed so it is not rediscovered as a bug./
+(UTF-8). SQLite permits 2 and 3 (UTF-16le/be). With E2's UTF-16 decoder this
+is a per-column decode in the record reader rather than a refusal. /Still last
+by evidence: no observed producer writes one./ Output stays UTF-8, which the
+GeoPackage spec requires.
+
+*** E8 -- zip entry names by their flag
+/Added 2026-10-28; § WHAT IS WRONG TODAY item 4./
+- *Write, first and alone:* set general-purpose bit 11 in both headers when a
+  name is not ASCII. No table needed; it should not wait for E2.
+- *Read:* bit 11 set means UTF-8 (refused if invalid, as now); clear means
+  CP437, from E2. Info-ZIP's Unicode Path extra field (=0x7075=), when
+  present and its CRC matches the header name, takes precedence -- it is
+  how producers that never set bit 11 carry a UTF-8 name.
+- A carried entry's name keeps its original bytes and flag, so a =.kmz=
+  written back is byte-faithful in its names (=same-format-fidelity.org= M3c).
+
+** WHAT THIS OVERTURNS
+- *The old D-E3* ("refuse a multi-byte codepage") and *the old E3* (its
+  milestone) -- now decoded. =lossy-conversion-warnings.org= § OPEN
+  CANDIDATES and =shapefile.org= § OPEN QUESTIONS cite E3 as a refusal.
+- *The old § THE COST BOUNDARY*'s conclusion that multi-byte is where
+  "support more encodings stops being free" and the answer is refusal. The
+  cost is real and stated in § THE COST; the answer is the tables.
+- *The old E6's claim* that KML has no in-band place to declare an output
+  encoding. The XML declaration is exactly that.
+- *Old open questions 2, 3 and 4* -- answered as D-E10, D-E8 and D-E7.
 
 ** OPEN QUESTIONS
-1. *Which codepages earn a table?* Windows-1252 is settled by the evidence.
-   CP437/CP850 are plausible-but-unmeasured -- **source a real fixture before
-   writing either table**, per § THE ORACLE RULE's spirit: a table written for
-   a codepage nobody emits is untested code that looks tested.
-2. *One =--encoding= flag, or one per side?* A pipeline has two ends, and
-   =--crs= already set a precedent for an input-side-only flag with an explicit
-   name. =--from-encoding= / =--to-encoding= is the honest spelling if E6 lands;
-   a single =--encoding= is friendlier and ambiguous exactly when both sides are
-   text.
-3. *On output, does an unrepresentable character warn or refuse?* The crate
-   warns for =.dbf= truncation and refuses for a CRS it cannot express. A
-   character has a cheap lossy rendering (=?=) and an expensive honest one (a
-   refusal naming the character and the codepage). /Lean refusal: a =?= in a
-   place name is the kind of silent corruption this whole body of work exists
-   to stop./
-4. *Does an =--encoding= on input interact with the same-format invariant?*
-   Reading CP1252 and writing UTF-8 is a *conversion* of the text, not a loss
-   of it -- the information survives. But =shp -> shp= with a CP1252 source
-   would come out UTF-8 with a different =.cpg=, which is a byte-level change
-   to a same-format run that loses nothing. /Probably fine; stated because the
-   invariant's wording says "information", and this is the case that tests
-   whether the wording means it./
-5. *Is a BOM-prefixed CSV biting anyone?* Only XML strips one today. Cheap to
-   fix in E4; unverified whether it has ever mattered.
+1. *Does the table size need a Cargo feature?* /Lean no./ The crate has no
+   features, and a dependency-free feature is allowed but would be the first.
+   Measure the wasm build's size with E3's tables in it before deciding; ship
+   unconditionally unless that number is a problem.
+2. *Is a BOM-prefixed CSV biting anyone?* Unverified; E4 fixes it either way,
+   and the fixture is cheap.
+3. *Does a CSV or WKT source's guessed encoding travel to a same-format
+   write?* With no declaration, =--from-encoding cp1252= on =csv -> csv=
+   could mean "write it back in CP1252" (D-E7's spirit) or "I fixed the input,
+   give me UTF-8" (D-E1's). /Lean: back in CP1252 -- the flag named the
+   source's encoding, and D-E7 says a same-format run keeps it./
 
 ** TESTING
-- ***A committed mapping file per codepage, as an oracle.*** The Unicode
-  Consortium publishes authoritative =CP1252.TXT=-style mappings; commit the
-  one for each table and assert the in-tree table reproduces it entry for
-  entry. That makes the table *checked against its source* rather than against
-  someone's reading of it -- the =esri_*_wkt1.tsv= pattern applied to
-  encodings.
-- *A fixture per codepage*, round-tripped through the spoke that can hold it:
-  a =.dbf= + =.cpg= pair carrying the bytes that distinguish the codepage from
-  Latin-1 (the =0x80=--=0x9F= range for CP1252, not just accented ASCII --
-  **a fixture using only =é= would pass under both encodings and prove
-  nothing**).
+- ***A committed mapping per table, as an oracle*** (D-E4): the WHATWG
+  =index-*.txt= files and Unicode's =VENDORS/MICSFT/PC/*.TXT=. Each generated
+  table is asserted against its source entry for entry, both directions where
+  WHATWG's encoder uses the whole index.
+- ***Round trip, every encoding:*** decode then encode every byte sequence the
+  index maps, and require the original bytes back -- except where WHATWG's
+  encoder exclusions (D-E5) say otherwise, which are asserted as exclusions.
+- *A fixture per encoding family*, through the spoke that can hold it: a
+  =.dbf= + =.cpg= pair carrying bytes that distinguish the codepage (the
+  =0x80=--=0x9F= range for CP1252 -- **a fixture using only =é= would pass
+  under both encodings and prove nothing**), a Shift_JIS and a Big5 KML, an
+  ISO-2022-JP KML (the stateful one), a CP437-named =.kmz= entry.
 - *GDAL differential*: write a =.dbf= in a codepage, have =ogrinfo= read it,
   and require the text to match what =ogr2ogr= produces for the same input.
-  Per § THE ORACLE RULE, that is evidence about what a consumer accepts, not
-  about what the standard requires -- which is the right bar for an encoding.
-- *The refusal cases are tests too* (E3, E7): assert the error *names the
-  codepage*, since an unnamed refusal leaves the user with nothing to act on.
-- *E1's warning needs a mutation check.* A warning nothing asserts is a warning
-  that quietly stops firing -- see =handoff.org= on the =last_change= sentinel
-  that had no test behind it.
+  Per § THE ORACLE RULE, evidence about what a consumer accepts, which is the
+  right bar for an encoding. =xmllint --encode= is the same check for KML.
+- *The refusal cases are tests too*: an encoding outside the set, malformed
+  multi-byte input, an unrepresentable character on write. Each asserts the
+  error *names the encoding*, and the last names the character.
+- *Every new warning needs a mutation check* (D-E9's guess, the U+FFFD case).
+  A warning nothing asserts quietly stops firing -- see =handoff.org= on the
+  =last_change= sentinel that had no test behind it.
 
 ** DEPENDS ON / RELATED
 - [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]
-  § OPEN CANDIDATES -- owns E1's warning as a filed candidate, and E6's
-  per-value warning fits its § 2 post-write mechanism.
+  § OPEN CANDIDATES -- owned E1's warning; § 2b's read-time sink carries
+  D-E9's.
+- [[file:kml-standard.org][kml-standard.org]] D-K5 -- spelling provenance,
+  which the declared encoding joins for E6's write-back.
+- [[file:todo.org][todo.org]], "KML's XML-layer losses" -- the non-UTF-8 item
+  is E6's first half.
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] M3c -- KMZ's
+  carried entries, whose names E8 makes faithful; § A refusal honours the rule
+  and § THE ORACLE RULE.
 - [[file:shapefile.org][shapefile.org]] § THE SIDECAR POLICY -- the =.cpg=
-  write side, already built, and § OPEN QUESTIONS, where this plan's E2 was
-  first sized.
+  write side E6 extends.
 - [[file:native-inventory.org][native-inventory.org]] § Shapefile and
   § QUESTIONS item 3 -- where the silent approximation was found, and the
   =ogr2ogr= LDID measurement D-E2 rests on.
-- [[file:same-format-fidelity.org][same-format-fidelity.org]] § A refusal
-  honours the rule -- why four spokes refusing non-UTF-8 input is defensible
-  today, and § THE ORACLE RULE for the differential tests above.

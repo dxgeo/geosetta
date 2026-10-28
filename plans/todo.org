@@ -134,16 +134,17 @@ check it off and remove it once the item ships or is shelved.
 
 - [ ] [[file:encodings.org][encodings.org]] — text encodings across every
   spoke, not just Shapefile. Written 2026-10-21 out of
-  =native-inventory.org= § QUESTIONS item 3. Two of its milestones are
-  *correctness* rather than capability and should go first: E1 warns when an
-  unrecognised =.cpg= is approximated as Latin-1 -- ***built 2026-10-23*** --
-  and E3 refuses a multi-byte codepage instead of producing mojibake. E5
-  (KML's own declaration) is partly built with =kml-standard.org= K1: what it
-  lacks is E2's tables. E2's single-byte tables
-  and E4's =--encoding= for the four spokes that currently refuse non-UTF-8
-  input are the capability half. /Records why the =.dbf= language-driver byte
-  must **not** be trusted: =ogr2ogr= declares Windows-1252 by default while
-  writing UTF-8./
+  =native-inventory.org= § QUESTIONS item 3; *rescoped 2026-10-28 to every
+  encoding* in a closed set (all of WHATWG's, the DOS OEM codepages, true
+  ISO-8859-1, UTF-32), decoded and encoded exactly -- multi-byte is now
+  decoded, not refused. E1 (warn on an approximated =.cpg=) is ***built
+  2026-10-23***; E5 (KML's own declaration) is partly built with
+  =kml-standard.org= K1. Order: E8's one-bit zip-name write fix, then E2
+  (shared =src/encoding.rs= and every single-byte table), E3 (multi-byte
+  decoders), E4 (=--from-encoding=, BOMs), E6 (same-format write-back, which
+  is the non-UTF-8 item of KML's XML-layer losses, then =--to-encoding=).
+  /Records why the =.dbf= language-driver byte must **not** be trusted:
+  =ogr2ogr= declares Windows-1252 by default while writing UTF-8./
 
 - [X] [[file:kml-standard.org][kml-standard.org]] — M3's KML spoke, rescoped
   2026-10-22 to *the standard*: OGC KML 2.3 as a typed model in the KML native,

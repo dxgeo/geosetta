@@ -579,7 +579,7 @@ mod tests {
     #[test]
     fn a_kmz_read_keeps_its_version_into_a_kml_write() {
         let doc = br#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3"><Document/></kml>"#;
-        let kmz = crate::zip::write(&[("doc.kml", &doc[..])]);
+        let kmz = crate::zip::write(&[("doc.kml", &doc[..])]).unwrap();
         let fc = crate::kml::read_kmz(&kmz, &mut Vec::new()).unwrap();
         assert_eq!(root_tag(&write(&fc, None, false)), r#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3">"#);
     }

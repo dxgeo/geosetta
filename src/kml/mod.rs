@@ -217,7 +217,7 @@ fn archive_of(entries: Vec<crate::zip::ZipEntry>) -> KmzArchive {
 /// else the `.kml` writer's output as one entry named `doc.kml`, the
 /// conventional name. Entries are stored, uncompressed (see `crate::zip`'s
 /// module doc).
-pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>, compact: bool) -> Vec<u8> {
+pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>, compact: bool) -> Result<Vec<u8>> {
     let source = writer::source_document(fc);
     let Some(archive) = source.and_then(|s| s.archive.as_deref()).filter(|_| writer::carries_documents(fc, Format::Kmz))
     else {
@@ -250,7 +250,7 @@ mod tests {
     #[test]
     fn a_layered_kmz_carries_its_models_and_a_kml_write_says_what_it_cannot() {
         let layer = br#"<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Model/></Placemark></kml>"#;
-        let kmz = crate::zip::write(&[("doc.kml", &layer[..]), ("layers/a.kml", &layer[..])]);
+        let kmz = crate::zip::write(&[("doc.kml", &layer[..]), ("layers/a.kml", &layer[..])]).unwrap();
         let fc = read_kmz(&kmz, &mut Vec::new()).unwrap();
         assert_eq!(fc.features.len(), 2);
         // A .kmz holds both documents, models and all.
@@ -265,7 +265,7 @@ mod tests {
     #[test]
     fn a_single_document_kmz_carries_its_models() {
         let doc = br#"<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Model/></Placemark></kml>"#;
-        let fc = read_kmz(&crate::zip::write(&[("doc.kml", &doc[..])]), &mut Vec::new()).unwrap();
+        let fc = read_kmz(&crate::zip::write(&[("doc.kml", &doc[..])]).unwrap(), &mut Vec::new()).unwrap();
         assert!(drop_warnings(&fc, Format::Kmz).is_empty());
         assert!(drop_warnings(&fc, Format::Kml).is_empty(), "a .kml write gives the same document back");
     }
@@ -281,13 +281,13 @@ mod tests {
             ("files/overlay.png", b"\x89PNG\r\n", 0x5B5C_6421),
             ("places.kml", DOC, 0x5B5C_6422),
             ("files/notes.txt", b"notes", 0x5B5C_6423),
-        ])
+        ]).unwrap()
     }
 
     #[test]
     fn a_kmz_written_back_keeps_every_entry_in_its_place() {
         let fc = read_kmz(&archive(), &mut Vec::new()).unwrap();
-        let back = crate::zip::read(&write_kmz(&fc, None, false)).unwrap();
+        let back = crate::zip::read(&write_kmz(&fc, None, false).unwrap()).unwrap();
         let shape: Vec<_> = back.iter().map(|e| (e.name.as_str(), e.modified)).collect();
         assert_eq!(
             shape,
@@ -303,7 +303,7 @@ mod tests {
         // The document is written from the model, edits and all.
         let mut edited = fc.clone();
         edited.features[0].properties[0].1 = crate::json::JsonValue::String("renamed".into());
-        let back = crate::zip::read(&write_kmz(&edited, Some(KmlVersion::V2_3), false)).unwrap();
+        let back = crate::zip::read(&write_kmz(&edited, Some(KmlVersion::V2_3), false).unwrap()).unwrap();
         let text = String::from_utf8(back[2].data.clone()).unwrap();
         assert!(text.contains("<name>renamed</name>") && text.contains(r#"version="2.3""#), "{text}");
         assert!(drop_warnings(&fc, Format::Kmz).is_empty());
@@ -325,7 +325,7 @@ mod tests {
         // A .kml read has no archive, and a .kml written as .kmz is one entry.
         let fc = crate::kml::read_kml(DOC, &mut Vec::new()).unwrap();
         assert!(drop_warnings(&fc, Format::Kml).is_empty());
-        let names: Vec<_> = crate::zip::read(&write_kmz(&fc, None, false)).unwrap().into_iter().map(|e| e.name).collect();
+        let names: Vec<_> = crate::zip::read(&write_kmz(&fc, None, false).unwrap()).unwrap().into_iter().map(|e| e.name).collect();
         assert_eq!(names, ["doc.kml"]);
     }
 
@@ -340,10 +340,10 @@ mod tests {
     #[test]
     fn a_layered_kmz_gives_each_document_back_with_its_own_features() {
         let (a, b) = (layer_doc("a"), layer_doc("b"));
-        let kmz = crate::zip::write(&[("doc.kml", DOC), ("layers/a.kml", &a), ("icon.png", b"i"), ("layers/b.kml", &b)]);
+        let kmz = crate::zip::write(&[("doc.kml", DOC), ("layers/a.kml", &a), ("icon.png", b"i"), ("layers/b.kml", &b)]).unwrap();
         let fc = read_kmz(&kmz, &mut Vec::new()).unwrap();
         assert_eq!(fc.features.len(), 3);
-        let back = crate::zip::read(&write_kmz(&fc, None, false)).unwrap();
+        let back = crate::zip::read(&write_kmz(&fc, None, false).unwrap()).unwrap();
         let names: Vec<_> = back.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["doc.kml", "layers/a.kml", "icon.png", "layers/b.kml"]);
         // Unedited, each document is the one read.
@@ -357,7 +357,7 @@ mod tests {
         edited.features[1].properties[0].1 = crate::json::JsonValue::String("a, renamed".into());
         let added = edited.features.remove(2);
         edited.features.push(Feature { native: None, ..added });
-        let back = crate::zip::read(&write_kmz(&edited, None, false)).unwrap();
+        let back = crate::zip::read(&write_kmz(&edited, None, false).unwrap()).unwrap();
         let text = |i: usize| String::from_utf8(back[i].data.clone()).unwrap();
         assert!(text(1).contains("<Folder><name>a</name><Placemark><name>a, renamed</name><styleUrl>#s</styleUrl>"), "{}", text(1));
         assert!(!text(3).contains("<Placemark>"), "{}", text(3));
@@ -368,17 +368,17 @@ mod tests {
     fn gdals_layered_kmz_round_trips_as_a_kmz() {
         let source = include_bytes!("../../tests/fixtures/gdal_networklink.kmz");
         let fc = read_kmz(source, &mut Vec::new()).unwrap();
-        let again = read_kmz(&write_kmz(&fc, None, false), &mut Vec::new()).unwrap();
+        let again = read_kmz(&write_kmz(&fc, None, false).unwrap(), &mut Vec::new()).unwrap();
         assert_eq!(again.native, fc.native, "the archive, its documents and their layers");
         assert_eq!(again.features, fc.features);
         // Each document written is the one read, network links and all.
-        let (before, after) = (crate::zip::read(source).unwrap(), crate::zip::read(&write_kmz(&fc, None, false)).unwrap());
+        let (before, after) = (crate::zip::read(source).unwrap(), crate::zip::read(&write_kmz(&fc, None, false).unwrap()).unwrap());
         for (b, a) in before.iter().zip(&after).filter(|(b, _)| b.name.ends_with(".kml")) {
             let parse = |bytes: &[u8]| crate::xml::parse_document(&crate::xml::decode(bytes).unwrap()).unwrap();
             assert_eq!(parse(&a.data), parse(&b.data), "{}", b.name);
         }
         // And each document changes version on its own.
-        let raised = read_kmz(&write_kmz(&fc, Some(KmlVersion::V2_3), false), &mut Vec::new()).unwrap();
+        let raised = read_kmz(&write_kmz(&fc, Some(KmlVersion::V2_3), false).unwrap(), &mut Vec::new()).unwrap();
         let source = writer::source_document(&raised).unwrap();
         assert_eq!((source.version, source.layers[0].version), (KmlVersion::V2_3, KmlVersion::V2_3));
         assert_eq!(raised.features, fc.features);
@@ -493,8 +493,8 @@ mod tests {
         for e in crate::zip::read(include_bytes!("../../tests/fixtures/gdal_networklink.kmz")).unwrap() {
             if e.name.ends_with(".kml") {
                 let source = crate::xml::decode(&e.data).unwrap();
-                let back = read_kmz(&crate::zip::write(&[("doc.kml", &e.data[..])]), &mut Vec::new()).unwrap();
-                let written = crate::zip::read(&write_kmz(&back, None, false)).unwrap();
+                let back = read_kmz(&crate::zip::write(&[("doc.kml", &e.data[..])]).unwrap(), &mut Vec::new()).unwrap();
+                let written = crate::zip::read(&write_kmz(&back, None, false).unwrap()).unwrap();
                 assert_eq!(String::from_utf8(written[0].data.clone()).unwrap(), normalize(&source), "{}", e.name);
             }
         }
@@ -524,7 +524,7 @@ mod tests {
         let flat = String::from_utf8(write_kml(&fresh, None, true)).unwrap();
         assert!(!laid_out(flat.split_once('\n').unwrap().1), "{flat}");
         assert!(laid_out(&String::from_utf8(write_kml(&fresh, None, false)).unwrap()));
-        let kmz = crate::zip::read(&write_kmz(&fc, None, true)).unwrap();
+        let kmz = crate::zip::read(&write_kmz(&fc, None, true).unwrap()).unwrap();
         assert!(!laid_out(String::from_utf8(kmz[0].data.clone()).unwrap().split_once('\n').unwrap().1));
     }
 
@@ -538,7 +538,7 @@ mod tests {
 
     #[test]
     fn a_kmz_entry_that_cannot_be_decoded_is_named() {
-        let kmz = crate::zip::write(&[("doc.kml", &b"<kml>\xFF</kml>"[..])]);
+        let kmz = crate::zip::write(&[("doc.kml", &b"<kml>\xFF</kml>"[..])]).unwrap();
         let err = read_kmz(&kmz, &mut Vec::new()).unwrap_err().to_string();
         assert!(err.contains("\"doc.kml\""), "{err}");
     }

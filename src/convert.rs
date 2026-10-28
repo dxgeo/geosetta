@@ -117,7 +117,7 @@ pub fn write_features_with(format: Format, fc: &FeatureCollection, options: Writ
         Format::Csv => Ok(csv::write(fc)),
         Format::Wkt => Ok(write_wkt_lines(fc)),
         Format::Kml => Ok(kml::write_kml(fc, version, compact)),
-        Format::Kmz => Ok(kml::write_kmz(fc, version, compact)),
+        Format::Kmz => kml::write_kmz(fc, version, compact),
         // GeoPackage and Shapefile are handled outside this single-buffer path
         // (see read_features above) — GeoPackage via geopackage::write_layers,
         // Shapefile via shapefile::write, both called from main.rs.

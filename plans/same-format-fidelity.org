@@ -1813,6 +1813,21 @@ travels with D1's =name= modelling.
   /What is left/ is =Format::Kmz='s loss row: the zip writer stores every
   entry and writes no extra fields, attributes or archive comment. M3c is
   otherwise done.
+  /Zip64, deferred 2026-10-28./ =zip.rs= reads and writes none of zip64's
+  records, and did so silently: a central directory past 65,535 entries was
+  read in part (Python's =zipfile= at 65,536 entries leaves a legacy end
+  record of 65,535 with true offsets, so the last entry vanished), and a
+  write past 65,535 entries or 4 GiB truncated its fields. *Now refused,
+  both ways*: a read that meets the zip64 locator, a =0xFFFF…= placeholder
+  in the end record or a central header, or more central headers than the
+  end record counts (what a writer wrapping the 16-bit count leaves) is
+  refused by name, and a write past the limits is refused rather than
+  written. A zip64 field in a /local/ header alone -- Python's
+  =force_zip64= -- is read, the sizes coming from the central directory
+  (=tests/fixtures/local_zip64.kmz=). Zip64 itself waits for an archive
+  that needs it: a =.kmz= that large is an imagery super-overlay, and
+  =zip::read= takes the whole archive as one slice, so the memory, not the
+  records, is the real limit (=streaming-progress.org=).
   /Under the schema oracle, 2026-10-28/: =tests/kml_schemas.rs= validates
   every =.kml= entry of seven =.kmz= writes -- =gdal_networklink.kmz= as
   itself, raised and edited, both its documents each time;

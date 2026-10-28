@@ -164,34 +164,61 @@ fn hostile_kml_fixture(version: KmlVersion) -> &'static str {
     }
 }
 
-/// Every KML version written as 2.2, the default output (D-K2), comes back as
-/// the features it was read as: a 2.2 source in its own version, a 2.3 source
-/// lowered (K5) — tracks with their times, angles and arrays, tours, a quad,
-/// a sea-floor mode — with nothing reported lost. That the lowered document is
-/// valid 2.2 is the schema oracle's to say, outside the tree.
-#[test]
-fn every_kml_version_written_as_2_2_keeps_its_features() {
-    for version in [KmlVersion::V2_2, KmlVersion::V2_3] {
-        let fixture = hostile_kml_fixture(version);
-        let dst = tmp_dir().join(format!("{}.kml", version.as_str()));
-        let (ok, stderr) = run(&[fixture, dst.to_str().unwrap(), "--kml-version", "2.2"]);
-        assert!(ok, "{fixture}: {stderr}");
-        for lost in ["dropped", "cannot carry", "no place"] {
-            assert!(!stderr.contains(lost), "{fixture}: {stderr}");
-        }
-        let read = |path: &std::path::Path| {
-            geosetta::read_features(Format::Kml, &std::fs::read(path).unwrap(), &mut Vec::new()).unwrap()
-        };
-        let (before, after) = (read(fixture.as_ref()), read(&dst));
-        assert!(!before.features.is_empty(), "{fixture} read as nothing");
-        assert_eq!(before.features.len(), after.features.len(), "{fixture}");
-        for (i, (b, a)) in before.features.iter().zip(&after.features).enumerate() {
-            assert_eq!(b.properties, a.properties, "{fixture} feature {i}");
-            assert_eq!(b.geometry, a.geometry, "{fixture} feature {i}");
-        }
-        assert_eq!(before.schema, after.schema, "{fixture}");
-        assert_eq!(before.crs, after.crs, "{fixture}");
+fn read_kml(path: &std::path::Path) -> FeatureCollection {
+    geosetta::read_features(Format::Kml, &std::fs::read(path).unwrap(), &mut Vec::new()).unwrap()
+}
+
+/// `geosetta src dst --kml-version version`, which must report nothing lost.
+fn write_kml_as(src: &std::path::Path, dst: &std::path::Path, version: KmlVersion) {
+    let (ok, stderr) = run(&[src.to_str().unwrap(), dst.to_str().unwrap(), "--kml-version", version.as_str()]);
+    assert!(ok, "{}: {stderr}", src.display());
+    for lost in ["dropped", "cannot carry", "no place"] {
+        assert!(!stderr.contains(lost), "{} as {}: {stderr}", src.display(), version.as_str());
     }
+}
+
+fn assert_same_features(before: &FeatureCollection, after: &FeatureCollection, what: &str) {
+    assert!(!before.features.is_empty(), "{what}: read as nothing");
+    assert_eq!(before.features.len(), after.features.len(), "{what}");
+    for (i, (b, a)) in before.features.iter().zip(&after.features).enumerate() {
+        assert_eq!(b.properties, a.properties, "{what}: feature {i}");
+        assert_eq!(b.geometry, a.geometry, "{what}: feature {i}");
+    }
+    assert_eq!(before.schema, after.schema, "{what}");
+    assert_eq!(before.crs, after.crs, "{what}");
+}
+
+/// Every KML version written as either comes back as the features it was read
+/// as, with nothing reported lost: in its own version, lowered to 2.2 or
+/// raised to 2.3 (K5) — tracks with their times, angles and arrays, tours, a
+/// quad, a sea-floor mode. That each output is valid in its version is the
+/// schema oracle's to say (`kml_schemas.rs`).
+#[test]
+fn every_kml_version_written_as_either_keeps_its_features() {
+    for source in [KmlVersion::V2_2, KmlVersion::V2_3] {
+        let fixture = std::path::Path::new(hostile_kml_fixture(source));
+        for target in [KmlVersion::V2_2, KmlVersion::V2_3] {
+            let dst = tmp_dir().join(format!("{}-as-{}.kml", source.as_str(), target.as_str()));
+            write_kml_as(fixture, &dst, target);
+            let what = format!("{} as {}", fixture.display(), target.as_str());
+            assert_same_features(&read_kml(fixture), &read_kml(&dst), &what);
+        }
+    }
+}
+
+/// 2.3 lowered to 2.2 and raised back is 2.3 again: the same features, and
+/// every adopted element in the KML namespace, as the fixture spells them.
+#[test]
+fn a_2_3_document_lowered_and_raised_is_2_3_again() {
+    let fixture = std::path::Path::new(hostile_kml_fixture(KmlVersion::V2_3));
+    let dir = tmp_dir();
+    let (lowered, raised) = (dir.join("lowered.kml"), dir.join("raised.kml"));
+    write_kml_as(fixture, &lowered, KmlVersion::V2_2);
+    write_kml_as(&lowered, &raised, KmlVersion::V2_3);
+    assert_same_features(&read_kml(fixture), &read_kml(&raised), "2.3 -> 2.2 -> 2.3");
+    let text = std::fs::read_to_string(&raised).unwrap();
+    assert!(text.contains(r#" version="2.3""#), "{text}");
+    assert!(!text.contains("<gx:"), "an adopted element stayed gx:\n{text}");
 }
 
 /// One read/write/read cycle in the format's own on-disk shape, returning the

@@ -21,8 +21,9 @@
 //!
 //! *What is not validated*: a same-version write of a source that is itself
 //! invalid. D-K5 gives such a document back as it was read, so
-//! `hand_hostile.kml` — valid 2.3, invalid 2.2 in its order, and read as 2.2
-//! — is written back invalid on purpose. And a `.kmz`'s `doc.kml` is the same
+//! `hand_hostile.kml` — invalid 2.2 in its order, and read as 2.2 — is
+//! written back invalid on purpose. Raised to 2.3, which orders nothing, it
+//! is valid, and is checked. And a `.kmz`'s `doc.kml` is the same
 //! bytes as the `.kml` write, stored, so the `.kml` stands for it.
 
 use std::path::{Path, PathBuf};
@@ -184,9 +185,17 @@ fn writes() -> Vec<(String, KmlVersion, Vec<u8>)> {
     let mut sorted = source;
     geosetta::reorder_hilbert(&mut sorted);
     add("hand_hostile_2_3.kml sorted and lowered".into(), &sorted, v22);
-    // A 2.2 source as 2.3, built from the feature model until the raising
-    // exists.
-    add("sample.kml as 2.3".into(), &read(Format::Kml, "tests/fixtures/sample.kml"), v23);
+    // The raising (K5): valid 2.2 sources, and hand_hostile.kml, invalid
+    // 2.2 only in its order, which 2.3 does not fix; as read and edited.
+    add("sample.kml raised".into(), &read(Format::Kml, "tests/fixtures/sample.kml"), v23);
+    add("duckdb_geoms.kml raised".into(), &read(Format::Kml, "tests/fixtures/duckdb_geoms.kml"), v23);
+    let hostile = read(Format::Kml, "tests/fixtures/hand_hostile.kml");
+    add("hand_hostile.kml raised".into(), &hostile, v23);
+    add("hand_hostile.kml edited and raised".into(), &edited(hostile, extra), v23);
+    // A gx:-heavy 2.2 source: the 2.3 fixture lowered, read, and raised.
+    let lowered = write_kml_features(Format::Kml, &read(Format::Kml, "tests/fixtures/hand_hostile_2_3.kml"), v22).unwrap();
+    let lowered = geosetta::read_features(Format::Kml, &lowered, &mut Vec::new()).unwrap();
+    add("hand_hostile_2_3.kml lowered and raised".into(), &lowered, v23);
     out
 }
 
@@ -254,5 +263,5 @@ fn every_kml_write_is_valid_in_its_version() {
         failures = failures.replace(&*path.to_string_lossy(), label);
     }
     assert!(failures.is_empty(), "writes the schemas reject:\n{failures}");
-    assert_eq!((v22.len(), v23.len()), (9, 5), "the write list changed: update this count with it");
+    assert_eq!((v22.len(), v23.len()), (9, 9), "the write list changed: update this count with it");
 }

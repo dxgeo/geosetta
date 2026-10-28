@@ -423,7 +423,7 @@ mod tests {
         let mut read_warnings = Vec::new();
         let fc = super::read(kml.as_bytes(), &mut read_warnings).unwrap();
         assert!(read_warnings.is_empty(), "a KML read reports nothing: {read_warnings:?}");
-        let warnings = crate::kml::drop_warnings(&fc, Format::GeoJson, None);
+        let warnings = crate::kml::drop_warnings(&fc, Format::GeoJson);
         (fc, warnings)
     }
 
@@ -458,7 +458,7 @@ mod tests {
         );
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("kml: 1 track(s) carry per-vertex data"), "{warnings:?}");
-        assert!(crate::kml::drop_warnings(&fc, Format::Kml, None).is_empty(), "a KML write carries them");
+        assert!(crate::kml::drop_warnings(&fc, Format::Kml).is_empty(), "a KML write carries them");
     }
 
     #[test]
@@ -510,7 +510,7 @@ mod tests {
             warnings,
             vec!["kml: 2 feature(s) hold <Model>, which this GeoJSON write cannot carry; written without that geometry"]
         );
-        assert!(crate::kml::drop_warnings(&fc, Format::Kml, None).is_empty(), "a KML write carries them");
+        assert!(crate::kml::drop_warnings(&fc, Format::Kml).is_empty(), "a KML write carries them");
     }
 
     #[test]

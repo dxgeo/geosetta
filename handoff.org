@@ -300,6 +300,9 @@ writing whatever can be written rather than warning about it, and it is why
   altitude modes. KML's native is no longer unbuilt; what is left of the spoke
   is K5, writing a version other than the source's from the model rather than
   from the IR./
+  /2026-10-28: **K5 is built** -- a version change lowers the document to 2.2
+  or raises it to 2.3 (=kml/lower.rs=, =kml/raise.rs=), and every kind of
+  write validates against its version's schema (=tests/kml_schemas.rs=)./
 - *M3c*, the KMZ container. =hand_hostile.kmz= already exists and carries the
   dangling =files/overlay.png= reference.
 - *=gpkg_crs_wkt_1_1=*, the last of defect 3 -- a capability, not a carry.

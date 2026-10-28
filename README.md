@@ -108,9 +108,12 @@ validated against DuckDB / GDAL.
     from anything else, since 2.2 is what Google Earth, GDAL and CesiumJS read;
     `--kml-version 2.3` writes 2.3. A version rides in the in-process native, so a
     pipe through another format comes back as 2.2. The whole document rides there
-    too, so a KML → KML run in the source's version keeps everything the feature
-    model does not hold; a version change is built from the features alone and
-    says so. What other formats see of a feature: its `name` and `description`;
+    too, so a KML → KML run keeps everything the feature model does not hold, in
+    either version: a version change respells the document into the other
+    version's terms — the `gx:` extensions for 2.2, the KML namespace for 2.3 —
+    puts it in 2.2's element order when lowering, and names on stderr what it
+    respelled and the few 2.3 constructs 2.2 has no place for. What other formats
+    see of a feature: its `name` and `description`;
     its time as `timestamp` or `begin`/`end`, GDAL's names, as written; its
     geometry's `altitudeMode`, `seaFloorAltitudeMode`, `extrude` and
     `tessellate` where the source has them; and its `<ExtendedData>`, typed by

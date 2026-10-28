@@ -187,8 +187,13 @@ check it off and remove it once the item ships or is shelved.
   the same document lowered (=kml/lower.rs=): adopted elements back to =gx:=
   by parent, children in =ogckml22.xsd='s sequence from a table generated
   from the two schemas, and the five things 2.2 has no place for dropped and
-  reported. A 2.3 hostile fixture lowers to valid 2.2. What remains is the
-  2.3 writer, raising a 2.2 document.
+  reported. A 2.3 hostile fixture lowers to valid 2.2.
+
+  /2026-10-28, later:/ ***K5 is built.*** A 2.2 document written as 2.3 is
+  raised (=kml/raise.rs=), so every version change carries the document. The
+  schema oracle (=tests/kml_schemas.rs=) validates eighteen kinds of write,
+  nine per version. Open: =kml-standard.org= questions 10 (the rotation plane)
+  and 11 (whether the document model is public).
 
 - [X] [[file:lossy-conversion-warnings.org::*2b. The read side -- OWED, and owed twice][lossy-conversion-warnings.org — the read-time warning channel]] —
   *SHIPPED 2026-10-23.* =read_features= and =shapefile::read= take a

@@ -4,7 +4,15 @@
 
 * KML to the Standard
 
-** STATUS -- K1--K4 built, K5's 2.2 writer built (2026-10-28); 2.3 writer next
+** STATUS -- K1--K5 built (K5 finished 2026-10-28); open questions 10 and 11 remain
+/2026-10-28, later:/ ***K5 is built.*** A 2.2 document written as 2.3 is
+raised (=kml/raise.rs=): adopted =gx:= elements into the KML namespace where
+2.3 admits them there, =<Snippet>= to =<snippet>= and =<Metadata>= to
+=<ExtendedData>= when nothing is lost, OGC's namespace and the =2.3= stamp on
+the root. Every version change now carries the document, so a version-changing
+run is as faithful as a same-version one. =tests/kml_schemas.rs= validates
+eighteen kinds of write, nine per version. See § MILESTONES, K5.
+
 /2026-10-28:/ ***K5's first half is built*** -- a 2.3 document written as 2.2
 is lowered, not rebuilt from the IR: =kml/lower.rs= respells each adopted
 element back to =gx:= where 2.2 has it only there, puts every element's
@@ -998,9 +1006,48 @@ expressible; the mapping must key on (namespace, local name, parent).
     property to a feature whose values are in =<SchemaData>= appended the new
     =<Data>= after it, which 2.2 rejects; it now goes after the last =<Data>=,
     else before the first =<SchemaData>=.
-  - /Left as they were/: a 2.3 document holding both =<Metadata>= and
+  - /Not a gap after all/: a document holding both =<Metadata>= and
     =<ExtendedData>=, or both =<Snippet>= and =<snippet>=, is invalid 2.2,
-    where each pair is one choice; neither is merged.
+    where each pair is one choice -- and invalid 2.3 too, where each pair
+    substitutes for one =AbstractExtendedDataGroup= or =AbstractSnippetGroup=.
+    No valid source holds both, so neither transform merges them.
+  ***The raising to 2.3 is built, 2026-10-28.*** A 2.2 read written with
+  =--kml-version 2.3= is reconciled into its own document and raised
+  (=kml/raise.rs=). Nothing is reordered: 2.3's 79 content models are all
+  =<all>= groups, and the generator asserts the schema has no =<sequence>=.
+  - *Adopted =gx:= elements move into the KML namespace* (D-K10) where 2.3
+    admits that element in that parent, from a table
+    =tests/fixtures/gen_kml23_children.py= generates from =ogckml23.xsd=. Where
+    it does not, the element stays =gx:=, which 2.3's =defaultOpenContent=
+    admits anywhere: the =gx:= schema puts =altitudeOffset= on every geometry
+    and 2.3 on line strings and rings only, so a =gx:altitudeOffset= on a
+    Point is carried rather than respelled into something invalid.
+    =every_2_2_placement_is_a_2_3_placement= checks the rest: every other
+    child 2.2 admits, 2.3 admits too, so a raise never drops.
+  - *=<Snippet>= → =<snippet>=, =<Metadata>= → =<ExtendedData>=* (§ VERSION
+    TRANSFORMS), each only when nothing is lost: =<snippet>= is a plain
+    string, so a =<Snippet>= with a =maxLines= other than its default, or any
+    other attribute, stays; =<Metadata>= becomes =<ExtendedData>= when it
+    holds only =<Data>=, =<SchemaData>= and other namespaces' elements. What
+    stays is deprecated and still 2.3. Neither is projected, so the IR does not
+    see the rename.
+  - *The root*: =version="2.3"=, OGC's namespace -- Google's pre-OGC
+    namespace rebound to it wherever declared, keeping each element's prefix
+    -- and 2.3's schema where =xsi:schemaLocation= named 2.2's.
+  - *Warning 1 (D-K7)* counts each respelling and rename:
+    =kml: input is KML 2.2; written as KML 2.3 (gx:Track→Track, gx:coord→coord ×2)=.
+    D-K7's warning 2 has nothing to report on the way up.
+  - *What it retired*: =version_change_warnings='s "built from the feature
+    model alone" message, and =drop_warnings='s version parameter -- every
+    version change gives the model back, so a =<Model>= or a track's
+    per-vertex data is never lost to one.
+  - *Measured*: =tests/same_format.rs= writes each version's hostile fixture as
+    each version and compares the features, and lowers the 2.3 fixture and
+    raises it back to a document with no =gx:= left in it. Under the schema
+    oracle, =sample.kml=, =duckdb_geoms.kml=, =hand_hostile.kml= (as read and
+    edited) and the lowered 2.3 fixture all raise to valid 2.3.
+    =hand_hostile.kml= is invalid 2.2 only in its order, which 2.3 does not
+    fix, so raising it repairs it.
 - *KMZ* stays =same-format-fidelity.org= M3c, separately -- an archive, not a
   document.
 
@@ -1072,6 +1119,12 @@ expressible; the mapping must key on (namespace, local name, parent).
     on the probe -- 1.7 km at the corners of a 222 km box. A probe spanning tens
     of degrees of latitude would separate them. Low priority: only an overlay
     that large tells them apart.
+11. *Is the document model public?* /Opened 2026-10-23, due now K5 is built./
+    =KmlNative='s =document= and =KmlFeatureNative='s contents are
+    crate-private, where every other spoke's native contents are public. The
+    model's shape is settled -- an identified node tree, two transforms over
+    it -- so the question is only whether a library caller should read or
+    build it.
 
 ** DEPENDS ON / RELATED
 - [[file:kml.org][kml.org]] -- the spoke as built, and § GEOMETRY ELEMENT

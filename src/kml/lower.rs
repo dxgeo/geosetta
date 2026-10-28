@@ -1,4 +1,4 @@
-//! Lowering a raised KML 2.3 document to KML 2.2 (`plans/kml-standard.org`
+//! Changes a raised KML 2.3 document to KML 2.2 (`plans/kml-standard.org`
 //! K5, D-K7, D-K10).
 //!
 //! *A respelling and a reorder.* Each element 2.3 adopted from `gx:` goes
@@ -31,14 +31,17 @@
 
 use std::rc::Rc;
 
+use crate::format::KmlVersion;
 use crate::kml::model::{Foreign, KmlDocument, KmlElement, Kind, Node, Spelling, GX_NS, GX_PREFIX, KML_NS};
 use crate::xml::{XmlAttr, XmlMisc, XMLNS_NS};
 
-/// What a lowering changed: each respelling and each loss, counted, in the
-/// order first met.
+/// What a version change changed: each respelling, each element renamed for
+/// its successor, and each loss, counted, in the order first met. A lowering
+/// and a raising (`crate::kml::raise`) both report in it.
 #[derive(Debug, Default, PartialEq)]
-pub(crate) struct Lowering {
+pub(crate) struct Changes {
     pub respelled: Vec<(KmlElement, Spelling, usize)>,
+    pub renamed: Vec<(KmlElement, KmlElement, usize)>,
     pub dropped: Vec<(Dropped, usize)>,
 }
 
@@ -51,8 +54,15 @@ pub(crate) enum Dropped {
     Attr { element: KmlElement, attr: &'static str },
 }
 
-impl Lowering {
-    fn respell(&mut self, element: KmlElement, to: Spelling) {
+impl Changes {
+    pub(crate) fn rename(&mut self, from: KmlElement, to: KmlElement) {
+        match self.renamed.iter_mut().find(|(f, t, _)| *f == from && *t == to) {
+            Some((_, _, n)) => *n += 1,
+            None => self.renamed.push((from, to, 1)),
+        }
+    }
+
+    pub(crate) fn respell(&mut self, element: KmlElement, to: Spelling) {
         match self.respelled.iter_mut().find(|(e, s, _)| *e == element && *s == to) {
             Some((_, _, n)) => *n += 1,
             None => self.respelled.push((element, to, 1)),
@@ -66,21 +76,20 @@ impl Lowering {
         }
     }
 
-    /// D-K7's warning 1, when anything was respelled: the version change,
-    /// with each respelling counted.
-    pub fn respelled_warning(&self) -> Option<String> {
-        if self.respelled.is_empty() {
+    /// D-K7's warning 1, when anything was respelled or renamed: the version
+    /// change, with each counted. A change of the version stamp alone is
+    /// silent.
+    pub fn respelled_warning(&self, from: KmlVersion, to: KmlVersion) -> Option<String> {
+        if self.respelled.is_empty() && self.renamed.is_empty() {
             return None;
         }
-        let list: Vec<String> = self
-            .respelled
-            .iter()
-            .map(|&(element, to, n)| {
-                let from = if to == Spelling::Gx { Spelling::Kml } else { Spelling::Gx };
-                format!("{}→{}{}", spelled(element, from), spelled(element, to), count(n))
-            })
-            .collect();
-        Some(format!("kml: input is KML 2.3; written as KML 2.2 ({})", list.join(", ")))
+        let respelled = self.respelled.iter().map(|&(element, to, n)| {
+            let from = if to == Spelling::Gx { Spelling::Kml } else { Spelling::Gx };
+            format!("{}→{}{}", spelled(element, from), spelled(element, to), count(n))
+        });
+        let renamed = self.renamed.iter().map(|&(f, t, n)| format!("{}→{}{}", f.name(), t.name(), count(n)));
+        let list: Vec<String> = respelled.chain(renamed).collect();
+        Some(format!("kml: input is KML {}; written as KML {} ({})", from.as_str(), to.as_str(), list.join(", ")))
     }
 
     /// D-K7's warning 2, when anything was dropped.
@@ -107,7 +116,7 @@ fn spelled(element: KmlElement, spelling: Spelling) -> String {
     }
 }
 
-fn count(n: usize) -> String {
+pub(crate) fn count(n: usize) -> String {
     if n > 1 { format!(" ×{n}") } else { String::new() }
 }
 
@@ -152,13 +161,13 @@ fn attr_2_3_only(element: KmlElement, attr: &XmlAttr) -> Option<&'static str> {
 }
 
 /// OGC's published schema locations, 2.3's and 2.2's.
-const SCHEMA_2_3: &str = "http://schemas.opengis.net/kml/2.3/ogckml23.xsd";
-const SCHEMA_2_2: &str = "http://schemas.opengis.net/kml/2.2.0/ogckml22.xsd";
-const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
+pub(crate) const SCHEMA_2_3: &str = "http://schemas.opengis.net/kml/2.3/ogckml23.xsd";
+pub(crate) const SCHEMA_2_2: &str = "http://schemas.opengis.net/kml/2.2.0/ogckml22.xsd";
+pub(crate) const XSI_NS: &str = "http://www.w3.org/2001/XMLSchema-instance";
 
 /// Lower `doc`, a 2.3 document, to 2.2 in place.
-pub(crate) fn lower(doc: &mut KmlDocument) -> Lowering {
-    let mut report = Lowering::default();
+pub(crate) fn lower(doc: &mut KmlDocument) -> Changes {
+    let mut report = Changes::default();
     let root = &mut doc.root;
     // The root: OGC's namespace, declared when the source declared none; no
     // version stamp, which 2.2's schema has no attribute for; and 2.2's
@@ -186,7 +195,7 @@ pub(crate) fn lower(doc: &mut KmlDocument) -> Lowering {
 
 /// What [`lower`] would report for `node`, read as a child of `parent`,
 /// without changing it — for a warning given before the write.
-pub(crate) fn survey(node: &Node, parent: (KmlElement, Spelling), report: &mut Lowering) {
+pub(crate) fn survey(node: &Node, parent: (KmlElement, Spelling), report: &mut Changes) {
     let Kind::Kml { element, spelling } = node.kind else { return };
     let spelling = match place(parent, element, spelling) {
         Place::Nowhere => {
@@ -222,7 +231,7 @@ impl Prefixes {
     }
 }
 
-fn is_decl(a: &XmlAttr) -> bool {
+pub(crate) fn is_decl(a: &XmlAttr) -> bool {
     a.ns.as_deref() == Some(XMLNS_NS)
 }
 
@@ -240,7 +249,7 @@ fn gx_prefix(attrs: &[XmlAttr]) -> String {
     prefix
 }
 
-fn ns_decl(prefix: Option<&str>, uri: &str) -> XmlAttr {
+pub(crate) fn ns_decl(prefix: Option<&str>, uri: &str) -> XmlAttr {
     let (prefix, name) = match prefix {
         None => (None, "xmlns".to_string()),
         Some(p) => (Some("xmlns".to_string()), p.to_string()),
@@ -256,7 +265,7 @@ fn lower_children(
     parent: (KmlElement, Spelling),
     prefixes: &Prefixes,
     scope: &mut Vec<(String, String)>,
-    report: &mut Lowering,
+    report: &mut Changes,
 ) {
     let depth = scope.len();
     scope.extend(node.attrs.iter().filter(|a| is_decl(a) && a.prefix.is_some()).map(|a| (a.name.clone(), a.value.clone())));
@@ -1241,7 +1250,7 @@ mod tests {
 
     const NS: &str = r#"xmlns="http://www.opengis.net/kml/2.2""#;
 
-    fn lowered(source: &str) -> (String, Lowering) {
+    fn lowered(source: &str) -> (String, Changes) {
         let mut doc = model::parse(source).unwrap();
         let report = lower(&mut doc);
         (model::write(&doc), report)
@@ -1261,7 +1270,7 @@ mod tests {
             r#"<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2"><Placemark><gx:Track><when>a</when><gx:coord>1 2 3</gx:coord></gx:Track></Placemark></kml>"#
         );
         assert_eq!(
-            report.respelled_warning().unwrap(),
+            report.respelled_warning(KmlVersion::V2_3, KmlVersion::V2_2).unwrap(),
             "kml: input is KML 2.3; written as KML 2.2 (Track→gx:Track, coord→gx:coord)"
         );
     }
@@ -1339,7 +1348,7 @@ mod tests {
     fn a_document_with_no_namespace_gains_ogcs() {
         let (out, report) = lowered("<kml version=\"2.3\"><Document><name>n</name></Document></kml>");
         assert_eq!(body(&out), r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document><name>n</name></Document></kml>"#);
-        assert_eq!(report, Lowering::default(), "a version stamp alone is not reported");
+        assert_eq!(report, Changes::default(), "a version stamp alone is not reported");
     }
 
     #[test]
@@ -1360,7 +1369,7 @@ mod tests {
              <ExtendedData><Data name=\"d\" uom=\"m\"><value>1</value></Data></ExtendedData></Placemark></kml>"
         );
         let doc = model::parse(&source).unwrap();
-        let mut surveyed = Lowering::default();
+        let mut surveyed = Changes::default();
         for child in &doc.root.children {
             survey(child, (KmlElement::Kml, Spelling::Kml), &mut surveyed);
         }

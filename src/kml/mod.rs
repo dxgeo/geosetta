@@ -13,6 +13,7 @@ mod lower;
 mod project;
 mod reader;
 mod place;
+mod raise;
 mod reconcile;
 mod writer;
 
@@ -30,21 +31,19 @@ pub(crate) fn field_type_recast(ty: crate::schema::DeclType) -> crate::schema::D
     project::FieldType::for_decl(ty).decl()
 }
 
-/// What writing `fc` as `target`, in `version` when the caller chose one,
-/// cannot carry of its KML features' elements: a `<Model>` or a track's
-/// per-vertex data when the model is not given back, and a track whose
-/// vertex count an edit changed when it is.
-pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format, version: Option<KmlVersion>) -> Vec<String> {
-    let carried = matches!(target, Format::Kml | Format::Kmz) && writer::carried_skeleton(fc, version).is_some();
+/// What writing `fc` as `target` cannot carry of its KML features' elements:
+/// a `<Model>` or a track's per-vertex data when the model is not given back,
+/// and a track whose vertex count an edit changed when it is. Either KML
+/// version gives the model back.
+pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format) -> Vec<String> {
+    let carried = matches!(target, Format::Kml | Format::Kmz) && writer::carried_skeleton(fc).is_some();
     reconcile::drop_warnings(fc, target, carried)
 }
 
 /// The warnings a write of `fc` as `version` owes for changing its version
-/// (`plans/kml-standard.org` D-K7). Lowering 2.3 to 2.2 reports what it
-/// respells and what 2.2 has no place for, each counted over the document as
-/// read; changing only the version stamp says nothing. A 2.2 source written
-/// as 2.3 is built from the IR alone until the raising exists, and says what
-/// that leaves behind.
+/// (`plans/kml-standard.org` D-K7): what the change respells or renames and,
+/// lowering to 2.2, what 2.2 has no place for, each counted over the document
+/// as read. Changing only the version stamp says nothing.
 pub(crate) fn version_change_warnings(fc: &FeatureCollection, version: KmlVersion) -> Vec<String> {
     let Some(source) = writer::source_document(fc) else {
         return Vec::new();
@@ -52,25 +51,29 @@ pub(crate) fn version_change_warnings(fc: &FeatureCollection, version: KmlVersio
     let Some(skeleton) = source.document.as_deref().filter(|_| source.version != version) else {
         return Vec::new();
     };
-    if writer::lowers(source.version, Some(version)) {
-        use model::{KmlElement, Spelling};
-        let mut report = lower::Lowering::default();
-        for child in &skeleton.doc.root.children {
-            lower::survey(child, (KmlElement::Kml, Spelling::Kml), &mut report);
+    use model::{KmlElement, Spelling};
+    let mut report = lower::Changes::default();
+    // A feature sits in a container; every container admits it alike.
+    let features = || fc.features.iter().filter_map(reconcile::feature_model).map(|m| &m.node);
+    match version {
+        KmlVersion::V2_2 => {
+            for node in skeleton.doc.root.children.iter() {
+                lower::survey(node, (KmlElement::Kml, Spelling::Kml), &mut report);
+            }
+            for node in features() {
+                lower::survey(node, (KmlElement::Document, Spelling::Kml), &mut report);
+            }
         }
-        // A feature sits in a container; every container admits it alike.
-        for m in fc.features.iter().filter_map(reconcile::feature_model) {
-            lower::survey(&m.node, (KmlElement::Document, Spelling::Kml), &mut report);
+        KmlVersion::V2_3 => {
+            for node in skeleton.doc.root.children.iter() {
+                raise::survey(node, KmlElement::Kml, &mut report);
+            }
+            for node in features() {
+                raise::survey(node, KmlElement::Document, &mut report);
+            }
         }
-        return report.respelled_warning().into_iter().chain(report.dropped_warning()).collect();
     }
-    vec![format!(
-        "kml: the source is KML {} and the output KML {}; a version change is written from the feature model \
-         alone, so it does not preserve the source's styles, folders, network links, views or screen overlays, \
-         and writes its ground and photo overlays as Placemarks",
-        source.version.as_str(),
-        version.as_str()
-    )]
+    report.respelled_warning(source.version, version).into_iter().chain(report.dropped_warning()).collect()
 }
 
 /// `.kmz` bytes -> Feature IR: unwrap the zip container and flatten every
@@ -134,7 +137,7 @@ mod tests {
         assert_eq!(fc.features.len(), 2);
         // Written back, the archive is one document: the models go with the
         // layers, so even a KMZ write says so.
-        let warnings = drop_warnings(&fc, Format::Kmz, None);
+        let warnings = drop_warnings(&fc, Format::Kmz);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].starts_with("kml: 2 feature(s) hold <Model>"), "{warnings:?}");
     }
@@ -143,8 +146,8 @@ mod tests {
     fn a_single_document_kmz_carries_its_models() {
         let doc = br#"<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Model/></Placemark></kml>"#;
         let fc = read_kmz(&crate::zip::write(&[("doc.kml", &doc[..])]), &mut Vec::new()).unwrap();
-        assert!(drop_warnings(&fc, Format::Kmz, None).is_empty());
-        assert!(drop_warnings(&fc, Format::Kml, None).is_empty(), "a .kml write gives the same document back");
+        assert!(drop_warnings(&fc, Format::Kmz).is_empty());
+        assert!(drop_warnings(&fc, Format::Kml).is_empty(), "a .kml write gives the same document back");
     }
 
     #[test]

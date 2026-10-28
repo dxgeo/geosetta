@@ -275,8 +275,9 @@ impl Format {
             // What remains is what the XML layer normalises, measured the same
             // day: CDATA comes back as escaped text, a UTF-16 document as
             // UTF-8, a DOCTYPE is dropped, and whitespace between elements is
-            // moved. A *version change* is a different, larger loss, and is
-            // warned about only on a run that makes one
+            // moved. A *version change* carries the document too, respelled
+            // into the other version's terms (K5, 2026-10-28), and what it
+            // respells or drops is warned about only on a run that makes one
             // (`convert::kml_write_warnings`).
             Format::Kml => &[
                 "CDATA sections, written as escaped text",

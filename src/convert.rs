@@ -131,7 +131,7 @@ pub fn kml_write_warnings(fc: &FeatureCollection, target: Format, kml_version: O
     {
         out.extend(kml::version_change_warnings(fc, version));
     }
-    out.extend(kml::drop_warnings(fc, target, kml_version));
+    out.extend(kml::drop_warnings(fc, target));
     out
 }
 

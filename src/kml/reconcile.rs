@@ -613,9 +613,9 @@ fn insert_in_order(node: &mut Node, child: Node) -> usize {
 /// What writing `fc` as `target` cannot carry of its KML features' elements —
 /// pre-write, in `plans/lossy-conversion-warnings.org` § 1's shape.
 ///
-/// `carried` is whether this write gives the model back: a KML or KMZ write
-/// of the source's own version with its document intact. When it does not —
-/// another format, a version change, a layered `.kmz` — a `<Model>` and a
+/// `carried` is whether this write gives the model back: a KML or KMZ write,
+/// in either version, with its document intact. When it does not — another
+/// format, a layered `.kmz` — a `<Model>` and a
 /// track's per-vertex data have nowhere to go (D-K11), and on another format
 /// a Z that is no EGM96 height has no CRS to say what it is (D-K12). When it
 /// does, only an edit loses something: a track whose vertex count changed can
@@ -860,17 +860,20 @@ mod tests {
     }
 
     #[test]
-    fn a_version_change_is_built_from_the_ir_and_warns() {
+    fn a_version_change_carries_the_document_and_reports_only_its_respellings() {
         let fc = read(DOC);
         let written = String::from_utf8(crate::kml::writer::write(&fc, Some(KmlVersion::V2_3))).unwrap();
-        assert!(!written.contains("<Style"), "{written}");
-        let warnings = crate::kml::version_change_warnings(&fc, KmlVersion::V2_3);
-        assert!(warnings[0].contains("KML 2.2") && warnings[0].contains("KML 2.3"), "{warnings:?}");
-        assert!(crate::kml::version_change_warnings(&fc, KmlVersion::V2_2).is_empty(), "the same version");
-        // And the model goes with it, so the version change owes the drops too.
+        assert!(written.contains(r#"<Style id="s">"#) && written.contains("<!-- keep me -->"), "{written}");
+        assert!(crate::kml::version_change_warnings(&fc, KmlVersion::V2_3).is_empty(), "nothing was respelled");
+        // A track is respelled, and it carries its times into either version.
         let fc = read(TRACK);
-        assert_eq!(crate::kml::drop_warnings(&fc, Format::Kml, Some(KmlVersion::V2_3)).len(), 1);
-        assert!(crate::kml::drop_warnings(&fc, Format::Kml, Some(KmlVersion::V2_2)).is_empty());
+        assert_eq!(
+            crate::kml::version_change_warnings(&fc, KmlVersion::V2_3),
+            ["kml: input is KML 2.2; written as KML 2.3 (gx:Track→Track, gx:coord→coord ×2)"]
+        );
+        assert!(crate::kml::drop_warnings(&fc, Format::Kml).is_empty());
+        let written = String::from_utf8(crate::kml::writer::write(&fc, Some(KmlVersion::V2_3))).unwrap();
+        assert!(written.contains("<Track><when>t1</when><when>t2</when><coord>1 2 3</coord>"), "{written}");
     }
 
     fn write_as(fc: &FeatureCollection, version: KmlVersion) -> String {
@@ -1055,7 +1058,7 @@ mod tests {
         let fc = read(source);
         let written = write_as(&fc, KmlVersion::V2_3);
         assert!(written.contains("<TimeStamp><when>2026-01-01T00:00:00Z</when></TimeStamp>"), "{written}");
-        assert!(written.contains(r#"<Schema id="schema"><SimpleField type="int" name="n"/></Schema>"#), "{written}");
+        assert!(written.contains(r#"<Schema id="s"><SimpleField name="n" type="int"/></Schema>"#), "{written}");
         assert!(written.contains("<Point><altitudeMode>absolute</altitudeMode>"), "{written}");
         let again = read(&written);
         assert_eq!(again.features[0].properties, fc.features[0].properties);

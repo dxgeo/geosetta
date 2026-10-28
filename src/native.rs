@@ -159,9 +159,9 @@ pub struct KmlNative {
     /// and network link, the root's declarations, the comments. `None` when
     /// there is no single document to give back — a `.kmz` holding several.
     ///
-    /// Crate-private for now: whether the model is public like the other
-    /// natives' contents is decided once K5 has settled its shape
-    /// (2026-10-23).
+    /// Crate-private: whether the model is public like the other natives'
+    /// contents was left until K5 settled its shape (2026-10-23), and K5 is
+    /// built (`plans/kml-standard.org` open question 11).
     pub(crate) document: Option<Rc<crate::kml::document::Skeleton>>,
 }
 

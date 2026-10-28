@@ -10,7 +10,7 @@ use crate::format::{Format, KmlVersion};
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
 use crate::kml::document::Skeleton;
-use crate::kml::lower;
+use crate::kml::{lower, raise};
 use crate::kml::model::{self, KmlElement, GX_NS, GX_PREFIX, KML_NS};
 use crate::kml::place::{place, Time};
 use crate::kml::project::{self, can_carry, FieldType};
@@ -25,18 +25,25 @@ use crate::xml::{self, XmlElement};
 ///
 /// *A KML read written back as its own version* gives back the document it
 /// was read from, with the IR's edits applied: every folder, style, overlay
-/// and comment, each feature in its place (`crate::kml::reconcile`). *A 2.3
-/// read written as 2.2* is the same document lowered (`crate::kml::lower`).
+/// and comment, each feature in its place (`crate::kml::reconcile`). *A read
+/// written as the other version* is the same document lowered to 2.2
+/// (`crate::kml::lower`) or raised to 2.3 (`crate::kml::raise`).
 /// Any other write is built from the IR alone: placemarks with their name,
 /// description, time, `ExtendedData` and geometry with its altitude members,
 /// and a `<Schema>` for the columns the collection declares a type for
 /// (D-K9).
 pub(crate) fn write(fc: &FeatureCollection, version: Option<KmlVersion>) -> Vec<u8> {
-    if let Some(skeleton) = carried_skeleton(fc, version) {
+    if let Some(skeleton) = carried_skeleton(fc) {
         let source = source_document(fc).expect("a carried skeleton has a source");
         let mut doc = reconcile::assemble(fc, skeleton, source.version);
-        if lowers(source.version, version) {
-            lower::lower(&mut doc);
+        match (source.version, version) {
+            (KmlVersion::V2_3, Some(KmlVersion::V2_2)) => {
+                lower::lower(&mut doc);
+            }
+            (KmlVersion::V2_2, Some(KmlVersion::V2_3)) => {
+                raise::raise(&mut doc);
+            }
+            _ => {}
         }
         return model::write(&doc).into_bytes();
     }
@@ -107,21 +114,11 @@ fn is_ncname(s: &str) -> bool {
 }
 
 /// The document to write `fc` back into, when this write gives the model
-/// back: the source was KML or KMZ with one document, and the output version
-/// is the one it was read as or one it lowers to. A 2.2 source written as 2.3
-/// is built from the IR until the raising exists (`plans/kml-standard.org`
-/// K5).
-pub(crate) fn carried_skeleton(fc: &FeatureCollection, version: Option<KmlVersion>) -> Option<&Skeleton> {
-    let source = source_document(fc)?;
-    if version.is_some_and(|v| v != source.version) && !lowers(source.version, version) {
-        return None;
-    }
-    source.document.as_deref()
-}
-
-/// Whether a write of a `source` document as `version` is a lowering to 2.2.
-pub(crate) fn lowers(source: KmlVersion, version: Option<KmlVersion>) -> bool {
-    source == KmlVersion::V2_3 && version == Some(KmlVersion::V2_2)
+/// back: the source was KML or KMZ with one document. Either output version
+/// takes it, since a version change lowers or raises the document
+/// (`plans/kml-standard.org` K5).
+pub(crate) fn carried_skeleton(fc: &FeatureCollection) -> Option<&Skeleton> {
+    source_document(fc)?.document.as_deref()
 }
 
 /// The provenance a KML or KMZ read recorded. Both writers read either tag:

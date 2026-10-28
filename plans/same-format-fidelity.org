@@ -49,7 +49,7 @@ M3c and the *rest* of M3b. Four readers still pass =native: None=.
 and each feature -- so three readers pass =native: None= now, CSV among them
 by design. The KML spoke's remaining work is K5's version transforms: K4's
 projections -- overlays, time, =Schema=, altitude modes -- are built as of
-2026-10-24./
+2026-10-24, and K5's version transforms as of 2026-10-28./
 ***The exhaustive-match fixture registry (M5/D6) is built as of 2026-10-21***
 -- see D6 → BUILT.
 

@@ -400,7 +400,8 @@ Also seen, not yet acted on:
   a node tree for the whole document before serializing it: 455 MB of scratch
   and 81 allocations a feature for 38 MB of output. Writing straight to the
   buffer, as the GeoJSON writer does, and keeping the read's tree only when
-  the target is KML or KMZ, are the obvious first moves.
+  the target is KML or KMZ, are the obvious first moves. /The write is done:/
+  Mem5 below.
 
 *** DONE Mem1. Box =Feature::native=
 =Option<Native>= was stored inline in every =Feature= — 176 of its 248 bytes —
@@ -529,3 +530,91 @@ the pre-Mem1 build on 143 conversions (every Parquet fixture to every format);
 wall time unchanged (wide =parquet→geojson= 790 → 769 ms). Its peak is now the
 write: the IR plus the 240 MB output buffer, which streaming output would
 remove.
+
+*** DONE Mem5. KML written straight into its text
+A KML write from the IR (any source but a KML document carried back) built
+every =<Placemark>= as an =XmlElement=, wrapped them in one document tree,
+laid it out and serialized it. Now an =Emitter= writes each element straight
+into the output in the same house layout — child elements a line each, text
+inline, an empty element self-closed — mirroring =xml::lay_out= and
+=xml::write=. The tree writer stays, =#[cfg(test)]=, as the reference: a test
+asserts the two byte-identical on every fixture any reader takes and a
+hand-built collection covering times, every altitude member (2.2's =gx:=
+spelling included), nested and empty collections, escaping and typed
+=<SchemaData>=, indented and compact, in each version. Two injected mutations
+(altitude order, a repeated typed key) both fail it. The tree builders
+themselves (=feature_to_placemark= and its helpers) stay too: reconcile adds a
+new feature to a carried document with them.
+
+The emitter keeps its open elements' names end to end in one buffer and
+indents in place, so a tag allocates nothing: 36 allocations a feature fell
+to 8, the rest being =place='s and =property_text='s, which reconcile shares.
+| =points.geojson→kml= (100 000 points) | before   | after   |
+|---------------------------------------+----------+---------|
+| write peak (probe)                    | 522.7 MB | 68.1 MB |
+| write scratch beyond IR + output      | 455.1 MB | 0.5 MB  |
+| peak RSS                              | 600 MB   | 85 MB   |
+Wall time, old and new interleaved, median of 7:
+| conversion                    | before   | after    | change |
+|-------------------------------+----------+----------+--------|
+| points geojson→kml            | 435.7 ms | 157.2 ms | −63.9% |
+| points geojson→kml --compact  | 280.5    | 146.8    | −47.6% |
+| points geojson→kmz            | 516.7    | 235.9    | −54.4% |
+| narrow (mixed) geojson→kml    | 452.2    | 162.0    | −64.2% |
+Byte-identical against the build before Mem1 on 432 CLI conversions: every
+fixture and bench input to =.kml= and =.kmz=, plain, =--compact= and with each
+=--kml-version=, outputs, stderr and exit status. A KML document carried back
+to KML (=write_document=, reconcile) still goes through its tree; that, and
+the read, are what remain of KML's cost.
+
+*** KML's read, and KML carried back to KML
+What remains of KML's cost, in three steps — Mem5 was the first:
+1. /Done (Mem5):/ the direct writer.
+2. *A KML reader that keeps a feature's element only when the target is
+   KML or KMZ.* =kml→geojson= peaks at 586 MB on 100 000 points because every
+   feature keeps its whole element (5.7 KB a point) until
+   =release_foreign_natives= drops it after the read. Instead the reader
+   would project each feature element as the parser finishes it and drop the
+   element then and there, unless told to keep it. Expected: about the IR
+   plus the input, ~80 MB.
+3. *KML carried back to KML*, which still holds every element and goes
+   through the document tree. Undecided between keeping KML's same-format
+   promise — each feature stores its byte span in the kept source text and
+   is re-parsed for reconcile at write time, which amends D-K4's choice of
+   what a native holds — and GeoJSON's weaker one, where a feature keeps
+   only what the IR does not project and an unedited feature no longer comes
+   back byte for byte (a new =same_format_losses= entry). The first is the
+   fidelity-over-warning answer.
+
+*Constraints on step 2, from a middle stage that edits geometry.* A pipe
+(=geosetta a.kml - --to X | tool | geosetta - out.kml=) loses natives at the
+first =|= whatever is done (=same-format-fidelity.org= D5, restated in
+=kml-standard.org= D-K3), so dropping the element early costs a pipe nothing.
+A library caller (=read_features= → edit → =write_features(Kml)=) is the case
+the element exists for: reconcile compares it with the edited feature and
+rewrites only what changed. Hence:
+- *The reader does not decide.* =read_features= does not know the target.
+  Dropping must be a read option the CLI sets, since it knows the output;
+  the library's default stays "keep".
+- *The drop warnings must still fire.* =kml::drop_warnings= reads the kept
+  elements to report what a non-KML target loses (styles, tracks, overlays).
+  A reader that drops an element tallies what it would have reported first.
+- *A streaming write reconciles a feature at a time.* Reconcile is already
+  per feature, so step 3's writer need not hold the document either.
+
+*Precedent.* Nothing in geosetta streams end to end: every conversion holds
+its whole input, collection and output. But each part of step 2 has a
+precedent:
+- =kml::model::parse= already builds the model through =xml::Builder= as the
+  parser finishes each element, so no =XmlElement= tree exists beside it;
+  step 2 extends that builder.
+- The GeoJSON reader parses straight into the IR with no =JsonValue= tree.
+- Mem3 and Mem4 hold one intermediate at a time and drop it.
+- =release_foreign_natives= already drops a non-target native; step 2 moves
+  that drop earlier.
+New: a read option naming the target (=read_features= takes none today), and
+the warnings' tally made during the read rather than after. =plans/kml.org=
+chose a whole tree over a streaming cursor "unless profiling says otherwise
+(this format is not on the performance-critical path)". The probe now says
+otherwise, though step 2 keeps the tree per element and only stops keeping
+all of them; worth recording in =kml.org= when it is built.

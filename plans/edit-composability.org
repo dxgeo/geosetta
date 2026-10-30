@@ -172,6 +172,9 @@ wrote stdout (36 bytes)          # every property gone; no warning
   notes the writer "would drop every property it were handed."
 - *KML/KMZ* coerces every property to a string: =7= → ="7"=, =true= →
   ="true"=, =null= → ="="=. Types are not recoverable on the way back.
+  /Since: a declared column's type is (kml-standard.org D-K9), and a null is
+  left out of =<ExtendedData>= and warned, reading back absent rather than
+  =""= (D-K17, 2026-10-29)./
 - *FlatGeobuf* drops a null-valued property on the way back in. *The wire is
   innocent:* FGB encodes properties as sparse =[u16 col_index][value]= pairs
   (=flatgeobuf/writer.rs:343=), so a null is encoded by omission *and the

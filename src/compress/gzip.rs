@@ -16,7 +16,8 @@ fn err<T>(msg: &str) -> Result<T> {
 /// known output length from the Parquet page header and bounds the output.
 pub fn decompress(input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
     let deflate = strip_container(input)?;
-    let mut out = Vec::with_capacity(expected_size);
+    // DEFLATE's best case is 258 bytes per length/distance pair, about 1032:1.
+    let mut out = Vec::with_capacity(super::reserve(expected_size, deflate.len(), 1032));
     Inflater::new(deflate, &mut out).run()?;
     if out.len() != expected_size {
         return err("inflated size does not match the page header");

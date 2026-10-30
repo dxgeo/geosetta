@@ -851,6 +851,15 @@ fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs
         print_warnings(&apply_crs_override(&mut layers, crs), args.quiet);
     }
     print_warnings(&collect_layer_warnings(&layers, out.format), args.quiet);
+    // And what a KML or KMZ write leaves out of each layer -- its nulls
+    // (`plans/kml-standard.org` D-K17) -- once per distinct message, as above.
+    let mut seen = std::collections::BTreeSet::new();
+    let kml: Vec<String> = layers
+        .iter()
+        .flat_map(|(_, fc)| convert::kml_write_warnings(fc, out.format, args.kml_version))
+        .filter(|w| seen.insert(w.clone()))
+        .collect();
+    print_warnings(&kml, args.quiet);
 
     // "-" (stdout) is never a directory, regardless of what happens to exist
     // in the current directory — a multi-layer .gpkg piped out is rejected

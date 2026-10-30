@@ -5,6 +5,8 @@
 * KML to the Standard
 
 ** STATUS -- K1--K5 built (K5 finished 2026-10-28); every question decided
+/2026-10-29:/ D-K17 built -- a null is left out of =<ExtendedData>= and
+warned, after GDAL was measured reading the empty spelling as 0.
 /2026-10-28, later:/ ***K5 is built.*** A 2.2 document written as 2.3 is
 raised (=kml/raise.rs=): adopted =gx:= elements into the KML namespace where
 2.3 admits them there, =<Snippet>= to =<snippet>= and =<Metadata>= to
@@ -529,6 +531,85 @@ network links -- the additive step is a read-only accessor returning the
 skeleton as KML text: no new types, no invariants exposed, stable however the
 model changes. Making the tree itself public stays the last resort, and would
 need =#[non_exhaustive]= on the vocabulary.
+
+*** D-K17 -- a null is left out of =<ExtendedData>=, and warned
+/Decided 2026-10-29./ KML has no null. The writer spelled one as empty text
+-- =<SimpleData name="n"/>= in a typed column, =<Data name="n"><value/></Data>=
+otherwise -- and an empty string the same way. Measured against GDAL 3.13.3,
+both its drivers (Google Earth is not measured: none was installed, and
+Google's KML reference says Earth does not use =<Schema>= types and nothing
+about an empty or missing value):
+| a null, written by      | is spelled                                                               |
+|-------------------------+--------------------------------------------------------------------------|
+| GDAL =KML= and =LIBKML= | left out; a feature with only nulls has no =<ExtendedData>=              |
+| geosetta, until now     | =<SimpleData name="n"/>= typed, =<Data name="n"><value/></Data>= untyped |
+And read back:
+| KML                             | GDAL =LIBKML= reads | geosetta reads (D-K9) |
+|---------------------------------+---------------------+-----------------------|
+| =<SimpleData/>=, a typed number | *0*                 | null                  |
+| =<SimpleData/>=, a typed string | =""=                | =""=                  |
+| =<Data><value/></Data>=         | =""=                | =""=                  |
+| =<Data>= holding no =<value>=   | unset               | =""=                  |
+| left out                        | unset               | absent                |
+GDAL's plain =KML= driver read no =<SimpleData>= or =<Data>= at all from
+these documents, its own output included, so it decides nothing here.
+
+So the empty spelling made a typed null *0* in anything reading through
+=LIBKML= (QGIS among them), and made every other null indistinguishable from
+an empty string, in both readers. A typed source with many columns also
+spelled out every null of every row: the equivalence corpus's sparse fixture,
+2 000 declared columns and five values a row, came to 1.5 GB of KML for 1.5
+MB of GeoParquet (=performance.org= item 11).
+
+*Decision.* A null in =<ExtendedData>= is left out, as GDAL writes it: no
+=<SimpleData>=, no =<Data>=, and no =<ExtendedData>= when nothing else is in
+it. An empty string is still written as an empty value, and reads back as
+one. Every reader measured then agrees on every case: a null reads back
+absent. The cost is geosetta's own typed-number round trip, where an empty
+=<SimpleData/>= read back null (D-K9) and a left-out one reads back absent;
+KML cannot say null, so absent is the nearest it has, and the loss is
+warned:
+#+begin_src text
+  warning: kml: 3 null properties (n, s, f) left out of <ExtendedData>, since KML has no null; they read back absent
+#+end_src
+counted over the features the write builds from the IR -- every feature,
+or, writing a KML read back as KML, those with no stored element.
+- *The reader does not change.* An empty typed =<SimpleData/>= still reads as
+  null (D-K9): documents other writers made keep reading as they did.
+- *A carried document keeps its spelling.* A KML read written back as KML
+  reconciles each feature against its stored element (D-K4), and a null
+  that was read from an empty =<SimpleData/>= is written back as it was. Only
+  a feature with no stored element, built from the IR, leaves its nulls out.
+- *=name= and =description= are not =<ExtendedData>=.* A null there is still
+  written as an empty element, as before; this decision does not reach the
+  feature's own members.
+- *One case is rebuilt but not counted*: an overlay a carried document's edit
+  turns into a Placemark (its geometry no longer fits the overlay, which
+  =drop_warnings= already reports) is rebuilt from the IR, and its nulls are
+  left out without being counted.
+
+/Built 2026-10-29./ Both writers -- the direct one and =feature_to_placemark=,
+which reconcile builds a new feature with -- skip a null in
+=<ExtendedData>=; =writer::null_keys= names what a Placemark leaves out,
+from the same =place= call the writer makes, and =kml::null_warning= counts
+it over the features built from the IR, through =convert::kml_write_warnings=.
+The CLI's GeoPackage-source path had never asked for the KML spoke's
+warnings, so a =.gpkg= written as KML now does, once per distinct message
+across its layers. Checked:
+- Two tests: a null left out typed and untyped, an empty string kept, no
+  =<ExtendedData>= for nulls alone, the read back, the warning's count and
+  names; and a carried document keeping its =<SimpleData/>= uncounted while a
+  feature added to it leaves its null out, counted. Putting the null back in
+  the direct writer fails two tests, in both writers two.
+- =bench/equiv.py= against =HEAD=: 2 787 of 2 997 conversions byte-identical;
+  the 210 that differ are all KML and KMZ, and each was checked to differ
+  only by this -- stderr by exactly the one warning, the document by removed
+  empty entries (and the wrappers left empty), as many as the warning
+  counts. 90 848 060 nulls in all, most of them the sparse fixture's.
+- GDAL =LIBKML= reads the new output's nulls as unset, not 0. The sparse
+  fixture at 20 000 features as GeoParquet to KML: 1 544 MB in 5.5 s before,
+  10.1 MB in 2.0 s after. The wide write, with no nulls, is unchanged (1 491
+  against 1 477 ms, median of 5).
 
 ** VERSION DETECTION
 | input                     | namespace                          | detected by |

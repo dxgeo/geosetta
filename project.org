@@ -99,7 +99,9 @@ validated against DuckDB / GDAL.
   members and its =<Schema>=-typed =<ExtendedData>= project as properties,
   and the declared types as column declarations; =<GroundOverlay>= and
   =<PhotoOverlay>= are features, as a footprint polygon (=rotation= turned on
-  the ground) and a point. See [[file:plans/kml-standard.org][plans/kml-standard.org]].
+  the ground) and a point. KML has no null, so a null property is left out of
+  =<ExtendedData>=, as GDAL writes it, and reads back absent; the write says
+  how many. See [[file:plans/kml-standard.org][plans/kml-standard.org]].
   A KML → KML run keeps the document's layout — whitespace, comments and a
   DOCTYPE in their places, what an edit adds indented as the document
   indents — and writes only lexical form (quotes, =<a></a>=, CDATA and

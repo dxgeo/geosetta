@@ -225,7 +225,11 @@ fn write_uvarint(out: &mut Vec<u8>, mut v: u64) {
 /// Decode a raw Snappy block. Returns `None` on malformed input.
 pub fn decompress(input: &[u8]) -> Option<Vec<u8>> {
     let (expected_len, mut pos) = read_uvarint(input)?;
-    let mut out = Vec::with_capacity(expected_len as usize);
+    // A 3-byte copy emits at most 64 bytes, so about 22:1 at best. The
+    // length is 64-bit: one past `usize` (on wasm32, past 4 GiB) cannot be
+    // produced at all.
+    let expected = usize::try_from(expected_len).ok()?;
+    let mut out = Vec::with_capacity(super::reserve(expected, input.len(), 22));
 
     while pos < input.len() {
         let tag = input[pos];

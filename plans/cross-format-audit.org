@@ -1,0 +1,234 @@
+#+TITLE: Plan: Cross-Format Audit
+#+AUTHOR: Daniel Okuniewicz Jr.
+
+* Cross-Format Audit -- what a write loses without saying
+
+** STATUS -- measured 2026-10-29; nothing built
+The findings below were measured by a scratch script against the working tree
+of 2026-10-29 (=performance.org= items 8, 9 and 11 and =kml-standard.org=
+D-K17 applied). The script is not in the repo; A2 puts it there.
+
+** WHY
+[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] is the
+rule: a conversion that drops or degrades what the source carries says so on
+stderr. It has no way to find where the rule is broken. Its gaps have been
+found by accident -- a fixture that happened to exercise one, a reading of the
+code -- and the last one was found that way too: a KML or KMZ source written to
+GeoPackage prints none of the KML spoke's warnings, while every other target
+prints them all (F1). Three fixtures in =tests/fixtures= trigger those
+warnings, and =bench/equiv.py= converts each of them to GeoPackage on every
+run; it cannot see the gap, because it compares two builds that share it --
+byte-identical says unchanged, not right -- and no test asserts what a
+GeoPackage write warns.
+
+=same-format-fidelity.org= holds a same-format run to giving back what it
+read. This plan is its cross-format counterpart: not that nothing is lost --
+a target may lack a place for something -- but that nothing is lost /silently/.
+
+** METHOD -- the round-trip audit
+For each input X and target T:
+1. read X and write it as GeoJSON, =--compact= (/a/);
+2. write X as T, keeping stderr's =warning:= lines (/W/);
+3. read the T file back and write it as GeoJSON (/b/);
+4. classify every way /b/ differs from /a/ -- a feature count, a geometry, a
+   key dropped or added, a value's type or value, key order, a feature's =id=
+   or =bbox=, and (by =--print-crs=) the CRS text -- and file each under
+   /silent/ when /W/ is empty, /warned/ otherwise.
+
+Run 2026-10-29 over 88 inputs: every fixture in =tests/fixtures= a reader takes
+(GeoPackage sources aside), =bench/equiv.py='s generated GeoJSON and their
+GeoParquet, FlatGeobuf, CSV and KML forms (the sparse fixture's tabular forms
+aside, for size), and two hand-made KML sources holding a =<Model>=, a
+=gx:Track= with =<when>= and, in a =.kmz=, an image beside the document.
+Targets GeoPackage, FlatGeobuf and GeoParquet.
+
+/The control is what makes it work./ A loss every tabular target shares is a
+fact about tables, or about the crate; a loss one target has and another does
+not is a defect of that target's path. GeoPackage and FlatGeobuf differed on
+exactly three inputs -- the KML sources -- which is F1.
+
+/What it cannot see./ The comparison goes through GeoJSON, so a loss GeoJSON
+cannot show is invisible (a KML style, a GeoPackage container member); the
+input shapes are only as varied as the corpus; and a /warned/ difference is
+not checked against what the warning says, so a warning that names the wrong
+loss passes.
+
+** FINDINGS
+Counts are inputs with the difference and no warning, written to GeoPackage;
+FlatGeobuf's are the same except F1, and GeoParquet's in brackets where they
+differ (it warns for F2's three list columns, which GeoPackage does not).
+| #  | what changes, silently                         | inputs | tracked in                              |
+|----+------------------------------------------------+--------+-----------------------------------------|
+| F1 | a KML source's drops, writing GeoPackage only  | 3      | nowhere: a defect                       |
+| F2 | a nested object or array becomes JSON text     | 5      | nowhere                                 |
+| F3 | a string in a number column makes it text      | 3      | nowhere                                 |
+| F4 | a column mixing =1= and =1.0= makes all floats | 5      | lossy-conversion-warnings.org, in part  |
+| F5 | a duplicate key's second value is dropped      | 2      | nowhere                                 |
+| F6 | a GeoJSON feature's =id= is dropped            | 1      | same-format-output.org, as out of scope |
+| F7 | the CRS text changes dialect                   | 1 (3)  | lossy-conversion-warnings.org, in part  |
+| F8 | an absent key comes back null                  | 7      | nowhere                                 |
+| F9 | a feature's key order becomes the column order | 5      | nowhere                                 |
+F1 is a defect, the only one specific to a target. F2--F9 are the same for
+every tabular target and come from schemaless sources (GeoJSON, KML, and CSV
+for F3/F4); the inputs are named in § EVIDENCE.
+
+** DECISIONS (proposed)
+*** D-A1 -- fidelity first, then a warning, then a deliberate silence
+Each finding is decided on its own, in that order, as the crate's standing
+preference has it: carry the thing where the target has somewhere to put it;
+warn where it has not; stay silent only where § THE RULE's noise test says a
+warning would fire on nearly every run and tell the user nothing they did not
+choose. A finding's fix goes in the plan of the spoke it changes, a warning in
+=lossy-conversion-warnings.org=; this plan keeps the finding, the decision and
+the link, and does not re-decide what another plan already owns (F4, F6, F7).
+
+*** D-A2 -- the audit is a standing check, run like the corpus
+A script beside =bench/equiv.py=, reusing its corpus, that runs § METHOD for
+every tabular target and prints the silent differences. Not pass/fail: some
+silences are decided (D-A1), so its output is compared against a recorded
+list, and a new line is a new finding. It is the check =equiv.py= cannot be:
+=equiv.py= says a build did not change what it writes, this says what a
+build writes is not losing anything unsaid.
+
+*** D-A3 -- every write path asks for every warning
+F1's cause is structural: =main.rs= has three conversion paths -- the shared
+one, =run_geopackage_read= and =run_geopackage_write= -- and each assembles its
+own warnings. The fix for F1 should leave one place that names every
+pre-write check, as =collect_conversion_warnings= was meant to be, rather
+than a third copy of the list.
+
+** EACH FINDING
+*** F1 -- GeoPackage writes print none of the KML spoke's warnings  [defect]
+=run_geopackage_write= (=src/main.rs=) prints =collect_layer_warnings= -- the
+general checks, per layer -- and never =convert::kml_write_warnings=, the only
+source of the KML spoke's drop warnings; nor does it call
+=release_foreign_natives=, so a large KML → GeoPackage run holds every
+feature's stored element through the write (memory only: no output changes).
+=run_geopackage_read= had the same omission until D-K17 needed it, and now
+asks for the KML warnings per layer. Measured on the fixtures:
+=hand_hostile.kml= (=<Model>=, Z's meaning) and =hand_hostile_2_3.kml=
+(tracks' per-vertex data, Z's meaning) print two warnings each writing
+FlatGeobuf, =hand_hostile.kmz= three (and its archive's two files); all three
+print none writing GeoPackage.
+/Fix (A1):/ one helper both GeoPackage paths call, per D-A3.
+
+*** F2 -- nested values become JSON text
+A property holding an object or array is written as its JSON text in a
+tabular column, and reads back a string. GeoParquet warns for the list columns
+it reads from a DuckDB or GDAL file; GeoPackage and FlatGeobuf say nothing.
+/Fidelity candidates/, each to be verified against a real tool before
+designing (=plans/README.org= § Sourcing a fixture from a real tool):
+GeoParquet has list and struct types; FlatGeobuf's column types include
+=Json=; GDAL marks a GeoPackage text column as JSON through
+=gpkg_data_columns=. Where none holds, a warning.
+
+*** F3 -- a string in a number column makes the column text
+A column whose values are mostly numbers and one string is declared text, and
+every number in it reads back a string. One column has one type in every
+tabular target, so it cannot be carried; the question is a warning, naming the
+column and how many values changed type.
+
+*** F4 -- a column mixing =1= and =1.0= makes every integer a float
+=lossy-conversion-warnings.org= § AN OPEN CALL holds the case where an integer
+past 2^53 loses its low bits, deliberately undecided. The audit finds the
+wider loss that call does not name: every integer in such a column reads back
+a float, =1= as =1.0=, with no precision lost. That widening belongs in the
+same call, not a second one; this plan only records that the call is wider than
+it says.
+
+*** F5 -- a duplicate key keeps its first value
+A feature holding a key twice (the JSON model keeps both;
+=schema.rs='s =duplicate_key_in_one_row_keeps_the_first_value=) is written with
+the first, and the second is gone. No tabular target has two cells of one
+column in a row. A warning candidate, naming the key and the count.
+
+*** F6 -- a GeoJSON feature's =id= is dropped
+The GeoJSON reader keeps =id= as a native (=same-format-fidelity.org= M1),
+which only a GeoJSON write replays; every other target drops it, unsaid.
+=same-format-output.org= § SCOPE puts =id= out of its scope, and no plan owns
+it cross-format. GeoPackage's feature id is an integer key and could hold an
+integer =id=; whether another target has a slot needs checking. Decide here
+whether this plan owns it.
+
+*** F7 -- the CRS text changes dialect
+Into GeoParquet a WKT definition becomes PROJJSON: =lossy-conversion-warnings.org=
+§ OWED WARNING, decided and not built, and the audit confirms it is still
+silent (three inputs). Out of GeoParquet into FlatGeobuf or GeoPackage,
+PROJJSON becomes WKT1 by =projjson-to-wkt.org='s deliberate choice, and
+nothing records whether that direction warns (one input). The owed warning is
+built where it is owed; the reverse direction is a decision for that plan.
+
+*** F8 -- an absent key reads back null
+A table has no absent: every row holds every column. A GeoJSON source whose
+features hold different keys reads back with a null wherever a feature had
+none. Inherent; and a warning would fire on almost every schemaless source.
+Proposed: silent, and said once in =README.md= -- a tabular format holds
+every column in every row -- rather than per run.
+
+*** F9 -- each feature's key order becomes the column order
+A table has one column order. Inherent, and nothing reads a feature's
+member order as meaning (=columnar.org= keeps it for GeoJSON → GeoJSON, not
+across formats). Proposed: silent, documented with F8.
+
+** EVIDENCE
+Inputs per finding, GeoPackage target, 2026-10-29:
+- F1: =hand_hostile.kml=, =hand_hostile.kmz=, =hand_hostile_2_3.kml=, and the
+  two hand-made sources, which show nothing the fixtures do not
+- F2: =hand_hostile.geojson=, =ragged.geojson= (objects);
+  =duckdb_list_column.parquet=, =duckdb_list_column_dict.parquet=,
+  =gdal_list_column.parquet= (lists)
+- F3: =ragged.geojson=, =ragged.csv=, =sparse.geojson=
+- F4: =hand_mixed_number.geojson=, =narrow.csv=, =ragged.csv=,
+  =ragged.geojson= and one more
+- F5: =ragged.geojson=, =ragged.kml=
+- F6: =hand_hostile.geojson=
+- F7: =gdal_native_geometry_3857.parquet=; into GeoParquet, =duckdb_crs_pt.shp=,
+  =gdal_hostile.shp=, =gdal_linestring_z.fgb=
+- F8: =overlap.geojson=, =ragged.geojson= and the other ragged and stretch forms
+- F9: =ownorder.geojson=, =ownorder.kml=, =ragged.geojson=, =ragged.kml=
+  and one more
+The audit's comparison parses JSON with Python, which keeps the /last/ of two
+duplicate keys; F5's count is therefore of features whose kept value differs,
+not of every duplicate.
+
+** MILESTONES
+*** A1 -- F1: GeoPackage writes ask for the KML warnings
+One helper, called by both GeoPackage paths, that gathers
+=convert::kml_write_warnings= per layer, de-duplicated as
+=collect_layer_warnings= does; =release_foreign_natives= per layer before the
+write. A CLI test that =hand_hostile.kml= and =hand_hostile.kmz=, written to
+=.gpkg=, print the warnings a =.fgb= write prints. Check: =bench/equiv.py=
+against the build before it differs only in the stderr of KML and KMZ →
+GeoPackage runs, by the added
+=kml:= and =kmz:= lines, every output file byte-identical. Recorded in
+=lossy-conversion-warnings.org= § KNOWN GAPS THIS RULE HAS ALREADY CLOSED.
+
+*** A2 -- the audit in the repo
+=bench/audit.py= (D-A2), reading =bench/equiv.py='s corpus, with its recorded
+list of decided silences.
+
+*** A3 -- a decision per finding
+F2 to F9 in turn, under D-A1. F4, F6 and F7 are decided where they are
+tracked; the rest here.
+
+** OPEN QUESTIONS
+- Does this plan own F6, a GeoJSON =id= cross-format, or does it belong
+  beside =same-format-output.org='s =id=/=bbox= scope?
+- F8 and F9 as documented silences: is a line in =README.md= enough, or does
+  =--quiet='s absence imply the user wants to hear it once per run?
+- Should the audit cover CSV, Shapefile and KML as targets as well? Each has
+  losses of its own (Shapefile's field names, KML's types) that some warning
+  already names; the audit would check those warnings say what was lost.
+
+** DEPENDS ON / RELATED
+- [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] --
+  the rule this audits, and the home of every warning it decides on.
+- [[file:same-format-fidelity.org][same-format-fidelity.org]] -- the
+  same-format invariant; this is the cross-format counterpart.
+- [[file:same-format-output.org][same-format-output.org]] -- owns the =id=/=bbox=
+  scope (F6).
+- [[file:projjson-to-wkt.org][projjson-to-wkt.org]] -- the WKT1 output dialect (F7).
+- [[file:kml-standard.org][kml-standard.org]] -- D-K7's KML warnings (F1) and
+  D-K17, whose GeoPackage-read wiring is half of F1's fix.
+- [[file:columnar.org][columnar.org]] -- C0's =bench/equiv.py=, whose corpus
+  the audit reads.

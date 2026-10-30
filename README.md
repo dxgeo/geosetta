@@ -247,6 +247,9 @@ written as UTF-8. Writing never deletes a file it did not write; a leftover
     `<ExtendedData>`, typed by the document's `<Schema>`. A `<GroundOverlay>`
     becomes the polygon its image covers and a `<PhotoOverlay>` a point.
     Written back to KML, those properties become elements again.
+-   KML has no null, so a null property is left out of `<ExtendedData>`, as
+    GDAL writes it, and reads back absent; stderr says how many were. An
+    empty string is still written, and reads back as one.
 -   A document whose heights are all `absolute` reads as EPSG:9707 (WGS 84 +
     EGM96 height).
 -   A `.kmz` written back from a `.kmz` keeps every file in the archive with

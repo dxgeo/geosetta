@@ -622,7 +622,8 @@ impl<'a> FrameDecoder<'a> {
         FrameDecoder {
             input,
             pos: 0,
-            out: Vec::with_capacity(expected),
+            // An RLE block turns 4 bytes into up to 128 KiB, so 32768:1.
+            out: Vec::with_capacity(super::reserve(expected, input.len(), 32768)),
             expected,
             huf: None,
             prev: None,

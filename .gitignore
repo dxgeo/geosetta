@@ -1,4 +1,5 @@
 /target
+/bench/memprobe/target
 **/*.rs.bk
 # macOS Finder metadata
 .DS_Store

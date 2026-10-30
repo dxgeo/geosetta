@@ -92,7 +92,17 @@ pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool, losses: &mut Te
     let fields = read_fields(data)?;
     let keys: Vec<Rc<str>> = fields.iter().map(|f| Rc::from(f.name.as_str())).collect();
 
-    let mut records = Vec::with_capacity(num_records);
+    // Every record starts with its deletion-flag byte; a zero size would
+    // index an empty record below.
+    if record_size == 0 {
+        return Err(Error::Convert("shapefile: dbf header declares a zero record size".into()));
+    }
+    // Truncated files are read up to where their data ends (the loop below),
+    // so the declared count is not rejected -- but it only sizes the `Vec` up
+    // to what the bytes can hold. Trusting it let a 65-byte file request
+    // `u32::MAX` records: a "capacity overflow" panic on wasm32.
+    let capacity = num_records.min(data.len().saturating_sub(header_size) / record_size);
+    let mut records = Vec::with_capacity(capacity);
     let mut pos = header_size;
     for _ in 0..num_records {
         if pos >= data.len() || data[pos] == FILE_TERMINATOR {
@@ -892,5 +902,41 @@ mod tests {
         assert!(warnings.is_empty());
         let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(records[0].properties[0].1.as_f64(), Some(123_456_789_012.5));
+    }
+
+    /// A header with one one-byte text field and the given counts, followed
+    /// by `records` records of "x".
+    fn dbf_with(num_records: u32, record_size: u16, records: usize) -> Vec<u8> {
+        let mut dbf = vec![0u8; 32];
+        dbf[0] = 0x03;
+        dbf[4..8].copy_from_slice(&num_records.to_le_bytes());
+        dbf[8..10].copy_from_slice(&65u16.to_le_bytes());
+        dbf[10..12].copy_from_slice(&record_size.to_le_bytes());
+        let mut field = [0u8; 32];
+        field[0] = b'A';
+        field[11] = b'C';
+        field[16] = 1;
+        dbf.extend_from_slice(&field);
+        dbf.push(0x0D);
+        for _ in 0..records {
+            dbf.extend_from_slice(b" x");
+        }
+        dbf
+    }
+
+    #[test]
+    fn huge_declared_record_count_reads_what_the_bytes_hold() {
+        // Declares u32::MAX records but holds two. The count used to size
+        // the `Vec` first: a "capacity overflow" panic on wasm32.
+        let dbf = dbf_with(u32::MAX, 2, 2);
+        let records = read(&dbf, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(records.capacity() <= 2, "capacity {}", records.capacity());
+    }
+
+    #[test]
+    fn zero_record_size_is_an_error_not_a_panic() {
+        let dbf = dbf_with(1, 0, 0);
+        assert!(read(&dbf, Encoding::Utf8, false, &mut TextLosses::default()).is_err());
     }
 }

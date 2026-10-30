@@ -291,7 +291,29 @@ impl Reader<'_> {
         self.pos += 8;
         Ok(f64::from_le_bytes(s.try_into().unwrap()))
     }
+
+    /// An element count, rejected as truncated when the bytes left could not
+    /// hold that many elements of at least `min_size` bytes each. The count
+    /// sizes a `Vec` before any element is read, so trusting it let 9 bytes
+    /// of malformed WKB request `u32::MAX` positions -- a "capacity overflow"
+    /// panic on wasm32, and a ~200 GB reservation natively.
+    fn count(&mut self, min_size: usize) -> Result<usize> {
+        let n = self.u32()? as usize;
+        let remaining = self.buf.len() - self.pos;
+        match n.checked_mul(min_size) {
+            Some(need) if need <= remaining => Ok(n),
+            _ => Err(truncated()),
+        }
+    }
 }
+
+// The fewest bytes any embedded WKB geometry can take: byte order (1), type
+// code (4), and then at least a 4-byte count (an empty line, polygon or
+// collection) -- a point needs more.
+const MIN_GEOMETRY_SIZE: usize = 9;
+
+// The fewest bytes a polygon ring can take: its 4-byte point count.
+const MIN_RING_SIZE: usize = 4;
 
 fn truncated() -> Error {
     Error::Convert("truncated WKB geometry".into())
@@ -312,7 +334,7 @@ fn read_geometry(r: &mut Reader) -> Result<Geometry> {
         WKB_LINESTRING => Geometry::LineString(read_line(r, dim)?),
         WKB_POLYGON => Geometry::Polygon(read_polygon(r, dim)?),
         WKB_MULTIPOINT => {
-            let n = r.u32()? as usize;
+            let n = r.count(MIN_GEOMETRY_SIZE)?;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 match read_geometry(r)? {
@@ -323,7 +345,7 @@ fn read_geometry(r: &mut Reader) -> Result<Geometry> {
             Geometry::MultiPoint(v)
         }
         WKB_MULTILINESTRING => {
-            let n = r.u32()? as usize;
+            let n = r.count(MIN_GEOMETRY_SIZE)?;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 match read_geometry(r)? {
@@ -334,7 +356,7 @@ fn read_geometry(r: &mut Reader) -> Result<Geometry> {
             Geometry::MultiLineString(v)
         }
         WKB_MULTIPOLYGON => {
-            let n = r.u32()? as usize;
+            let n = r.count(MIN_GEOMETRY_SIZE)?;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 match read_geometry(r)? {
@@ -345,7 +367,7 @@ fn read_geometry(r: &mut Reader) -> Result<Geometry> {
             Geometry::MultiPolygon(v)
         }
         WKB_GEOMETRYCOLLECTION => {
-            let n = r.u32()? as usize;
+            let n = r.count(MIN_GEOMETRY_SIZE)?;
             let mut v = Vec::with_capacity(n);
             for _ in 0..n {
                 v.push(read_geometry(r)?);
@@ -370,7 +392,7 @@ fn read_point(r: &mut Reader, dim: Dim) -> Result<Position> {
 }
 
 fn read_line(r: &mut Reader, dim: Dim) -> Result<Vec<Position>> {
-    let n = r.u32()? as usize;
+    let n = r.count(dim.coord_size())?;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(read_point(r, dim)?);
@@ -379,7 +401,7 @@ fn read_line(r: &mut Reader, dim: Dim) -> Result<Vec<Position>> {
 }
 
 fn read_polygon(r: &mut Reader, dim: Dim) -> Result<Vec<Vec<Position>>> {
-    let n = r.u32()? as usize;
+    let n = r.count(MIN_RING_SIZE)?;
     let mut v = Vec::with_capacity(n);
     for _ in 0..n {
         v.push(read_line(r, dim)?);
@@ -662,5 +684,28 @@ mod tests {
         let mut bytes = vec![0x01];
         bytes.extend_from_slice(&0x80000001u32.to_le_bytes());
         assert!(decode(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_counts_the_bytes_cannot_hold_before_allocating() {
+        // A header plus a count of u32::MAX and nothing after it, for every
+        // type that carries a count. Before the fix each one sized a `Vec`
+        // from the count first: a "capacity overflow" panic on wasm32.
+        for base_type in [WKB_LINESTRING, WKB_POLYGON, WKB_MULTIPOINT, WKB_MULTILINESTRING, WKB_MULTIPOLYGON, WKB_GEOMETRYCOLLECTION] {
+            for offset in [0, 1000, 2000, 3000] {
+                let mut bytes = vec![LE];
+                bytes.extend_from_slice(&(base_type + offset).to_le_bytes());
+                bytes.extend_from_slice(&u32::MAX.to_le_bytes());
+                assert!(decode(&bytes).is_err(), "type code {}", base_type + offset);
+            }
+        }
+        // A count one more than the bytes hold is rejected; the exact count
+        // still decodes.
+        let line = Geometry::LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)]);
+        let mut bytes = encode(&line);
+        bytes[5..9].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode(&bytes).is_err());
+        bytes[5..9].copy_from_slice(&2u32.to_le_bytes());
+        assert_eq!(decode(&bytes).unwrap(), line);
     }
 }

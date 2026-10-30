@@ -260,7 +260,19 @@ check it off and remove it once the item ships or is shelved.
   byte span re-parsed at write time, or accept GeoJSON's weaker promise.
 - [ ] [[file:columnar.org][columnar.org]] — the hub as a table rather than
   rows, keeping every same-format guarantee the row IR gives. Milestones
-  C0--C6. Scoping only.
+  C0--C6. C0 is built (=bench/equiv.py=, =bench/memprobe/=, 2026-10-29), and
+  the smoke test chose the hybrid (D-C13). Next: C1, which first needs its
+  on-demand conversion decided -- interior mutability, or both forms held.
+- [ ] [[file:cross-format-audit.org][cross-format-audit.org]] — what a
+  write loses without saying, found by round trip. Next: A1, F1's fix -- a
+  KML or KMZ source written to GeoPackage prints none of the KML spoke's
+  warnings; then A2 (=bench/audit.py=) and a decision for each of F2--F9.
+- [ ] [[file:hostile-input.org::*H1 -- OPEN: Parquet counts that are legitimately unbacked][hostile-input.org — H1, unbacked Parquet counts]] —
+  a file declaring a huge row or value count can still exhaust memory through
+  the two sites that create every declared value (a run of nulls makes such a
+  count valid, so it cannot simply be rejected). Needs a policy decision: a
+  row cap, a size budget, or =try_reserve=. The rest of the audit shipped
+  2026-10-29.
 - [ ] [[file:edit-composability.org][edit-composability.org]] — let an
   external program modify the feature collection between a geosetta read and a
   geosetta write. The loop already runs; what is missing is fidelity — no

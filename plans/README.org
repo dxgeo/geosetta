@@ -87,8 +87,13 @@ why, not to implement the spec's table from symmetry.
   and GeoJSON properties sized exactly (Mem1--2), property columns borrowing
   the features' cells (Mem3, which also removed a quadratic FlatGeobuf write),
   Parquet decoded a column at a time (Mem4), and KML written straight into its
-  text with no element tree (Mem5: 600 → 85 MB on 100 000 points). What is
-  left is KML's read, and KML carried back to KML. *Remaining:* a hand-rolled float formatter
+  text with no element tree (Mem5: 600 → 85 MB on 100 000 points). *Write
+  speed* (2026-10-29): a whole float formatted without Rust's exact-precision
+  path (item 8, −32% on a wide GeoJSON write), KML's =<Data>= written in one
+  step (item 9, with 8 −55% on a wide KML write), and KML's typed columns
+  made linear in the column count (item 11, minutes to seconds on 2 000
+  columns). What is left is KML's read, and KML carried back to KML.
+  *Remaining:* a hand-rolled float formatter
   (dtoa/Ryū) is parked — correctness-risk and effort not worth it yet against
   =std='s formatter; the compression codecs are untuned but unlikely to be the
   bottleneck; full streaming (vs. whole-file-in-RAM) is tracked separately in
@@ -98,7 +103,8 @@ why, not to implement the spec's table from symmetry.
   order recorded only where it deviates, and a =Number= column that keeps =1=
   and =1.0= apart, so every same-format guarantee holds. Every format fits;
   GeoJSON and KML need the exceptions. Milestones C0--C6, from an in-repo
-  equivalence harness to geometry buffers. /Scoping only./
+  equivalence harness to geometry buffers. /C0 built (=bench/equiv.py=,
+  =bench/memprobe/=); the IR itself not started./
 - [[file:crs.org][crs.org]] :: CRS pass-through across all formats — warnings when
   a CRS-degrading target (GeoJSON/CSV/WKT) can't express the source CRS (those
   formats stay as-is), making authority+code universal among the rich formats,
@@ -165,7 +171,8 @@ why, not to implement the spec's table from symmetry.
   =kml.org=. Depends on =lossy-conversion-warnings.org= § 2b and
   =encodings.org=. *DONE 2026-10-28*: K1--K5 built, every question decided
   (D-K1 to D-K16), and every kind of write validated against its version's
-  schema by =tests/kml_schemas.rs=.
+  schema by =tests/kml_schemas.rs=. D-K17 (2026-10-29): a null is left out of
+  =<ExtendedData>=, as GDAL writes it, and warned.
 - [[file:kml-layout.org][kml-layout.org]] :: How a KML document is laid
   out on write, balancing the source's layout against well-formatted output:
   the source's whitespace and DOCTYPE are kept where geosetta did not touch
@@ -257,6 +264,19 @@ why, not to implement the spec's table from symmetry.
   =collect_layer_warnings=/=print_warnings= now do the collecting/de-duping/
   printing for every check in one place — adding a new check is one line,
   not a new function pair plus three call sites.
+- [[file:cross-format-audit.org][cross-format-audit.org]] :: What a write
+  loses without saying: a round trip through each tabular target, against
+  FlatGeobuf as the control, filing every unwarned difference. Found one
+  defect -- a KML source written to GeoPackage prints none of the KML spoke's
+  warnings (F1) -- and eight losses every tabular target shares (F2--F9),
+  each to be carried, warned or left silent on purpose. /Measured
+  2026-10-29; nothing built./
+- [[file:hostile-input.org][hostile-input.org]] :: Allocations the readers
+  sized from counts the file states, before reading the data behind them. Ten
+  sites confirmed by reproduction and fixed, among them a FlatGeobuf header
+  that silently read as empty, a Snappy prefix that aborted natively, and
+  negative Parquet counts that panicked natively. /Fixed 2026-10-29; H1
+  (Parquet counts a run of nulls legitimately leaves unbacked) open./
 - [[file:multi-geometry-columns.org][multi-geometry-columns.org]] :: Let a
   source with more than one geometry column per feature — in practice, only
   GeoParquet, and today only DuckDB actually writes it — survive a

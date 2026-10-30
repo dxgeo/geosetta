@@ -54,6 +54,42 @@ pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format) -> Vec<Strin
     out
 }
 
+/// The warning a write of `fc` as `target` owes for the nulls it leaves out of
+/// `<ExtendedData>` (`plans/kml-standard.org` D-K17): KML has no null, so one
+/// reads back absent. Counted over the features the write builds from the IR
+/// -- every one, or writing a KML read back as KML, those with no stored
+/// element, since a stored one keeps its own spelling.
+pub(crate) fn null_warning(fc: &FeatureCollection, target: Format) -> Option<String> {
+    if !matches!(target, Format::Kml | Format::Kmz) {
+        return None;
+    }
+    let carried = writer::carries_documents(fc, target);
+    let mut count = 0;
+    let mut seen = std::collections::HashSet::new();
+    let mut names: Vec<&str> = Vec::new();
+    for f in fc.features.iter().filter(|f| !(carried && reconcile::feature_model(f).is_some())) {
+        for key in writer::null_keys(f) {
+            count += 1;
+            if seen.insert(key) {
+                names.push(key);
+            }
+        }
+    }
+    if count == 0 {
+        return None;
+    }
+    const SHOWN: usize = 3;
+    let mut shown = names.iter().take(SHOWN).copied().collect::<Vec<_>>().join(", ");
+    if names.len() > SHOWN {
+        shown.push_str(&format!(", and {} more", names.len() - SHOWN));
+    }
+    Some(format!(
+        "kml: {count} null propert{} ({shown}) left out of <ExtendedData>, since KML has no null; {} back absent",
+        if count == 1 { "y" } else { "ies" },
+        if count == 1 { "it reads" } else { "they read" }
+    ))
+}
+
 /// The warning a layered `.kmz` read written as one `.kml` owes: a `.kml`
 /// holds one document, so the archive's are built into one from the IR.
 fn layers_warning(fc: &FeatureCollection) -> Option<String> {

@@ -288,6 +288,188 @@ extended with a =WIDE_N=/=WIDE_COLS= wide-column case to actually exercise this;
 at 200 cols geosetta's margin over ogr2ogr/duckdb *widens* to 8–10× (vs 5–9× on
 the narrow cases) — both external tools scale worse with column count too.
 
+*** DONE 8. Whole floats went through the exact-precision formatter  [every JSON-text write]
+/Applied 2026-10-29; § Items 8 and 9 applied, below, has the check./
+=write_json_f64= (=src/json/value.rs=) prints a whole float with ={v:.1}= to keep its =.0=. A precision makes Rust
+format exactly, and the exact path falls back to Dragon4 bignum arithmetic:
+12% of the wide KML write's samples sat in =dragon::format_exact= and a
+further 3% in its =Big32x40= helpers. Printing ={v}= and pushing =".0"=
+gives the same bytes on the path's whole domain (finite, =fract() == 0=,
+=|v| < 1e16=, where =Display= never uses an exponent): checked on 42 million
+values -- every integer to ±10^7, each power of two and its neighbours, the
+million values below 10^16, random whole values at every magnitude, and
+±0 -- with none differing.
+
+Measured in a patched copy of the crate (§ The prototype, below), whole
+=write_features=, best of 3, every output byte-identical to the unpatched
+writer's:
+| conversion (=write_features=)    | today  | with the fix |
+|----------------------------------+--------+--------------|
+| wide → GeoJSON                   | 344 ms | −32%         |
+| wide → GeoJSON =--compact=       | 335    | −35%         |
+| narrow → GeoJSON                 | 43     | −14%         |
+| ragged → GeoJSON                 | 7      | −16%         |
+| wide → KML                       | 970    | −10%         |
+| wide → KML =--compact=           | 976    | −17%         |
+| narrow → KML                     | 72     | −9%          |
+The fixtures with no floats (stretch, sparse) are unchanged within noise.
+Every writer that serializes a float through =JsonValue= takes it: GeoJSON
+and KML's =<Data>= text. CSV writes a typed float column with =Display=
+(=csv.rs='s =Cell::Double=), so only its JSON-text cells do; =wide → csv=
+is unchanged end to end. The cheapest change on this list
+for its payoff. *Memory is unchanged*: the same write peak and allocation
+count to the byte, since both spellings format straight into the output.
+
+*** DONE 9. KML =<Data>= written in one step  [KML write]
+/Applied 2026-10-29, without the key cache; § Items 8 and 9 applied, below,
+has the check./ After Mem5 the wide KML write is still
+891 ms against GeoJSON's 329, and 99% of it is properties (12 ms with them
+removed). A profile of the write: =Emitter::start=, =end= and =write= 27%,
+=memmove= 19% (most of it from those three), =xml::escape_into= 8%, malloc
+and free ~10%, the float formatting of item 8 ~15%. Each property is three
+elements -- =<Data name="k"><value>v</value></Data>= -- each pushing and
+popping its name on the emitter's stack, and =property_text= allocates a
+=String= per value.
+
+The prototype adds =Emitter::data=, which writes the three elements in one
+step with exactly the bytes =start= / =attr= / =leaf= / =end= would --
+indentation, self-closing an empty =<value/>=, =--compact= -- and writes the
+value's text straight into the output instead of through =property_text='s
+=String=; =<Data>= entries keep their =&JsonValue= until written. It also
+caches the =name= attribute's escaped text by the interned key's address.
+| conversion (=write_features=)    | today  | <Data> | with item 8 |
+|----------------------------------+--------+--------+-------------|
+| wide → KML                       | 970 ms | −43%   | −57%        |
+| wide → KML =--compact=           | 976    | −38%   | −55%        |
+| narrow → KML                     | 72     | −21%   | −25%        |
+| stretch → KML                    | 105    | −36%   | −36%        |
+| sparse (2 000 keys) → KML        | 76     | −11%   | −13%        |
+| ragged → KML                     | 16     | −23%   | −30%        |
+| wide, keys not interned → KML    | 1 053  | −37%   | −50%        |
+Byte-identical to the unpatched writer on every row, indented and compact.
+The last row is a library caller's collection with a fresh key allocation in
+every row, where the cache stops at its cap (65 536 entries) and every name
+is escaped as today: the saving barely moves, so it is the one-step write
+and the unallocated value, not the key cache. The change is worth taking
+without the cache, which is the part that carries risk (pointer-keyed, and
+a cost on sparse input in item 10). =<SimpleData>= and =place='s element
+members (=name=, time, altitude) are unchanged; =place= builds a
+=Vec<&str>= of element keys and scans the properties once per member, a
+smaller cost the profile put at ~2%.
+
+*Memory is unchanged; allocations fall.* The write peak is the same to
+within 0.2 MB (1 308.6 MB on wide, 81.8 on narrow and sparse), and
+allocations fall from 10.2 million to 0.2 million on wide (0.8 → 0.5 million
+narrow, 0.9 → 0.4 sparse): the per-value =String=s were freed as soon as
+written, so they cost time, never peak. The key cache is the only addition,
++0.2 MB on sparse and +5.4 MB on non-interned keys at its cap. What does set
+the peak is the output buffer: 1 308.6 MB for 755.8 MB of KML, the =String=
+having doubled past what it holds -- a separate cost, untouched here.
+
+*** 10. Caching GeoJSON key text  [measured, not worth it]
+=member= (=src/geojson/mod.rs=) escapes every property key on every feature,
+and the reader interns keys, so the escaped text could be cached by
+address. The columnar smoke test (=columnar.org= § SMOKE TEST) predicted
+5--13%; in the real writer it is not there:
+| conversion (=write_features=)    | today  | key cache |
+|----------------------------------+--------+-----------|
+| wide → GeoJSON                   | 344 ms | −1%       |
+| wide → GeoJSON =--compact=       | 335    | −5%       |
+| narrow → GeoJSON                 | 43     | −2%       |
+| sparse (2 000 keys) → GeoJSON    | 30     | +31%      |
+| wide, keys not interned          | 374    | +19%      |
+The prediction was an artefact: the smoke test's escape went a =char= at a
+time, as this crate's did before item 4, and item 4's bulk escape already
+makes a short clean key nearly free. What a cache adds is a lookup per key,
+which costs more than it saves wherever keys do not repeat in place. Not
+worth taking.
+
+*** DONE 11. KML's typed columns were O(features × columns²)  [KML write]
+/Found and fixed 2026-10-29, building =bench/equiv.py=./ A collection whose source
+declares its columns -- GeoParquet, FlatGeobuf, GeoPackage -- carries every
+declared column in every feature, null where the row had none, and the KML
+writer puts a declared column in =<SchemaData>=. For each property it asks
+=Typed::types= (=src/kml/writer.rs=), a linear scan of every declared field,
+and then whether the feature already wrote that key, a linear scan of its
+=<SimpleData>= so far: both O(columns) per property, so O(columns²) per
+feature. The equivalence corpus's sparse fixture -- 2 000 distinct keys,
+five a feature -- as GeoParquet, to KML:
+| features | columns (expected) | parquet → KML       | geojson → KML |
+|----------+--------------------+---------------------+---------------|
+| 250      | ~930               | 0.37 s              | 0.00 s        |
+| 500      | ~1 430             | 1.79 s              | 0.00 s        |
+| 1 000    | ~1 840             | 6.21 s              | 0.00 s        |
+| 20 000   | 2 000              | > 7 min, unfinished | not run       |
+The GeoJSON source declares nothing, so its KML write never enters the
+path. It is the same shape as Mem3's quadratic FlatGeobuf write.
+
+The fix: =Typed= keeps its declared names in a =HashSet= beside the ordered
+=fields= its =<Schema>= is written from, and each feature tracks the keys it
+has put in =<SimpleData>= in a set of its own, which allocates nothing until
+a typed key arrives -- in the direct writer and in =feature_to_placemark=,
+the tree writer reconcile also uses. =seen.insert(key)= is false exactly
+when the scan it replaces found the key, so the output cannot change.
+Best of 3, the same inputs:
+| features | before              | after  | output   |
+|----------+---------------------+--------+----------|
+| 250      | 0.37 s              | 0.02 s | 8 MB     |
+| 500      | 1.79 s              | 0.07 s | 27 MB    |
+| 1 000    | 6.21 s              | 0.21 s | 71 MB    |
+| 20 000   | > 7 min, unfinished | 5.51 s | 1 544 MB |
+Linear now, at ~280 MB/s of output. What remained was the output itself:
+every feature wrote a =<SimpleData>= for every declared column, null ones
+included -- ~2 000 a feature here. That was settled as a question of what
+KML carries, not of speed: =kml-standard.org= D-K17 leaves a null out, as
+GDAL does, and the 20 000-feature case is now 10.1 MB in 2.0 s.
+Byte-identical on all four, the test suite passes (812), and
+=bench/equiv.py= against =HEAD= finds every conversion identical. Its sparse
+fixture stays at 1 000 features: at 20 000 a single KML of it is 1.5 GB.
+
+*** Items 8 and 9 applied
+Item 8 as prototyped; item 9 as =Emitter::data= (=src/kml/writer.rs=)
+without the key cache, its =<Data>= entries held as =&JsonValue= until
+written. Checked three ways against the build before them:
+- *The test suite* passes: 812 tests, among them Mem5's assertion that the
+  emitter is byte-identical to the reference tree writer on every fixture
+  and the hand-built collection, which now covers =Emitter::data=.
+- *Equivalence:* 1 412 CLI conversions byte-identical -- outputs, stderr and
+  exit status -- every readable fixture in =tests/fixtures= and the smoke
+  test's narrow, ragged, stretch, sparse and overlap inputs, each to GeoJSON,
+  KML, KMZ, CSV, WKT, FlatGeobuf, GeoParquet, GeoPackage and Shapefile, with
+  =--compact=, =--sort-hilbert= and =--kml-version 2.3= where they apply,
+  and the wide input to GeoJSON, KML, KMZ and CSV. Both binaries were built
+  from clean exports of the crate with its own release profile.
+- *End to end,* both binaries alternated, median of 7, peak RSS the
+  smallest of the 7:
+| conversion (CLI)             | before   | after    | change | peak RSS before → after |
+|------------------------------+----------+----------+--------+-------------------------|
+| wide → GeoJSON               | 1 123 ms | 990 ms   | −11.9% | 1 000 → 1 000 MB        |
+| wide → KML                   | 2 063    | 1 495    | −27.5% | 1 505 → 1 505           |
+| wide → KML =--compact=       | 1 860    | 1 254    | −32.6% | 1 213 → 1 213           |
+| wide → CSV                   | 1 341    | 1 348    | +0.5%  | 822 → 809               |
+| narrow → GeoJSON             | 114      | 108      | −5.4%  | 83 → 83                 |
+| narrow → KML                 | 159      | 136      | −13.9% | 96 → 96                 |
+| narrow → KMZ                 | 241      | 222      | −7.8%  | 138 → 138               |
+| stretch → KML                | 240      | 202      | −15.7% | 165 → 165               |
+| narrow → Parquet (control)   | 92       | 93       | +0.6%  | 77 → 77                 |
+The saving holds at the size the prototype measured on the write alone --
+133 ms on =wide → GeoJSON= against ~120 predicted, 568 ms on =wide → KML=
+against ~553 -- and reads smaller as a share only because the CLI's figure
+includes the read and the file. Peak memory is unchanged, as measured.
+
+*** The prototype
+A scratch copy of the crate at 0.27.0, outside the repo, with each change
+behind a runtime switch, linked by a probe beside the unpatched crate: one
+build times every combination of switches on the same collection, and
+compares every output against the unpatched =write_features_with=, indented
+and =--compact=. Inputs are =compare.py='s narrow (100 000 features) and
+wide (50 000 × 200) generators and the columnar smoke test's fixtures:
+/sparse/ (2 000 distinct keys, 5 a feature), /ragged/ (shuffled key order,
+duplicates, nulls, nesting) and /stretch/ (two differently-keyed exports
+concatenated). Best of 3; runs drift ~10% between invocations, so read each
+change against its own row's /today/. The profile is macOS =sample= on the
+wide KML write alone.
+
 *** Deferred / profile-first
 - =get()= on JSON objects is a linear scan; fine for small feature/geometry
   objects, but a feature with very many properties re-scans per lookup.
@@ -313,7 +495,8 @@ wide (200-column) ones, where it also used more than ogr2ogr and terrio:
 | parquet→geojson (wide, 200 cols)    | 1108.2   | 662.0   | 130.4  | 666.1   |
 
 *** The probe
-RSS says how much, not where. A small crate outside the repo links geosetta as
+RSS says how much, not where. A small crate -- outside the repo when these
+measurements were taken, =bench/memprobe/= since 2026-10-29 -- links geosetta as
 a library under a counting =#[global_allocator]= (live bytes, high-water mark,
 allocation count) and splits a conversion into phases: the input bytes, the
 read (=read_features=), the IR left resident once the input is dropped, and the

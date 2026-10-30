@@ -1,0 +1,17 @@
+[package]
+name = "memprobe"
+version = "0.0.0"
+edition = "2024"
+description = "Where a geosetta conversion's bytes go: the input, the read, the IR left resident, and the write, under a counting allocator."
+publish = false
+
+[dependencies]
+geosetta = { path = "../.." }
+
+# Its own workspace, so it builds without joining ../../../Cargo.toml's, and
+# with the crate's release profile rather than a debug one.
+[workspace]
+
+[profile.release]
+lto = true
+codegen-units = 1

@@ -20,7 +20,8 @@ const MIN_MATCH: usize = 4;
 /// Decompress one raw LZ4 block. `expected_size` is the known output length
 /// from the Parquet page header and bounds the output.
 pub fn decompress(input: &[u8], expected_size: usize) -> Result<Vec<u8>> {
-    let mut out = Vec::with_capacity(expected_size);
+    // Each 0xFF length byte adds 255 bytes of match, so about 255:1 at best.
+    let mut out = Vec::with_capacity(super::reserve(expected_size, input.len(), 255));
     let mut ip = 0usize;
 
     while ip < input.len() {

@@ -3,11 +3,11 @@
 
 * A Columnar IR
 
-** STATUS -- scoping only
-Nothing here is built. Written 2026-10-28, after =performance.org='s
-/Memory/ section measured where the hub's bytes go and Mem1--Mem5 took the
-contained wins. What remains is the shape of the IR itself, and that is this
-plan.
+** STATUS -- C0 done, the IR itself not started
+The IR is not built; the harness is (C0). Written 2026-10-28, after
+=performance.org='s /Memory/ section measured where the hub's bytes go and
+Mem1--Mem5 took the contained wins. What remains is the shape of the IR
+itself, and that is this plan.
 
 Revised the same day, after weighing what the row IR gives that a table
 does not (§ ALTERNATIVES CONSIDERED) and how duckdb and polars handle
@@ -15,6 +15,17 @@ row-shaped work. The first draft's one dense table was never worse than
 today per cell but could be far worse per collection on sparse input. The
 collection is now a sequence of blocks, each its own small table (D-C10),
 with filters and sorts carried as selection vectors (D-C11).
+
+Revised 2026-10-29: edits go through an overlay, with column-sized and
+per-block edits first-class (D-C12), compared against today's row edits in
+§ IN-FLIGHT EDITS. Then the same day: a block is columns or shaped rows,
+chosen by the reader as it seals (D-C13), and =--layout= lets the user force
+one form (D-C14). The hybrid is the first form of the design to try.
+
+Smoke-tested 2026-10-29 with a scratch prototype outside the crate (§ SMOKE
+TEST): the memory estimates hold, a block's column order changed from
+first-seen to modal (D-C4), and pure columns turned out worse than today on
+ragged GeoJSON, which only the hybrid avoids.
 
 ** WHY
 The hub stores a collection as rows: =FeatureCollection { features:
@@ -41,8 +52,9 @@ properties fall from ~200 bytes a row to ~25, leaving geometry as most of
 what is left.
 
 ** THE GOAL
-The hub is a table. Every reader builds one, every writer reads one, and
-nothing in between turns it into rows -- with *every same-format guarantee
+The hub is a table of blocks, each columns or shaped rows as its data
+suits (D-C13). Every reader builds one, every writer reads one, and nothing
+in between materializes =Feature=s -- with *every same-format guarantee
 the row IR gives today kept exactly*. The equivalence corpus (C0) is
 byte-identical before and after every milestone; this is a change of
 representation, not of behaviour.
@@ -71,7 +83,7 @@ loses one has changed behaviour, so each needs a home in the design:
 pub struct FeatureCollection {
     len: usize,
     geometry: GeometryColumn,       // one Option<Geometry> per row (D-C6)
-    columns: Vec<Column>,           // first-seen order
+    columns: Vec<Column>,           // in a block, its modal key order (D-C4)
     shapes: RowShapes,              // D-C4: rows that deviate from column order
     natives: RowNatives,            // D-C7: sparse, row -> Box<Native>
     pub crs: Option<Crs>,           // unchanged
@@ -129,6 +141,16 @@ JsonValue)= pair itself. Guarantees 2 and 3 live here, and a regular file
 pays nothing for them. =RowShapes= is a sorted =Vec<(row, Box<Shape>)>= or
 a map; profiling decides.
 
+*A block's column order is its most common key order*, then any other keys
+in first-seen order. First-seen was the first draft's rule, and § SMOKE TEST
+measured what it costs: on the ragged fixture, row 0 was one of the shuffled
+rows, so every ordinary row deviated from it -- 94% of rows irregular where
+38% are, and 350 bytes a row against the modal order's 216. The order is
+free to choose because nothing outside the block sees it: views give each
+row its own order, and the collection's first-seen key order, which
+tabular writers declare today (=infer_columns=), is kept beside the blocks
+as metadata for D-C10's schema merge, so their output does not change.
+
 *** D-C5 -- writers read columns, and =infer_columns= goes away
 =schema::Column= (Mem3's borrowing column) was the table, reconstructed for
 every write. With the table in the hub, a tabular writer reads the hub's
@@ -160,7 +182,8 @@ explicit:
   with =Feature= kept as the owned row type it is today, so a caller building
   a collection by hand changes one line.
 - *Edit:* =set(row, key, JsonValue)=, =remove(row, key)=,
-  =set_geometry(row, ..)=, =retain(|row| ..)=, =permute(&order)=.
+  =set_geometry(row, ..)=, =retain(|row| ..)=, =permute(&order)=, and the
+  column-sized and per-block edits of D-C12.
 - =Value<'_>= is a borrowed cell (=Null=, =Bool=, =Int=, =Float=, =Str(&str)=,
   =Binary(&[u8])=, =Json(&JsonValue)=) with =to_owned() -> JsonValue=.
 
@@ -220,7 +243,8 @@ What it costs:
 - Writers that declare one schema up front (FlatGeobuf's header, Shapefile's
   DBF, GeoPackage's DDL) need one for the collection: a merge of the blocks'
   column sets and types, metadata only, which replaces =infer_columns=
-  (D-C5).
+  (D-C5). Its order is the collection's first-seen key order, kept as
+  metadata, not any block's column order (D-C4).
 - Each block repeats its column names and headers; on a wide table with
   small blocks that overhead dominates. Block size is a tuning knob, with a
   few thousand to ~64k rows the usual range.
@@ -235,6 +259,119 @@ gathers once and drops it. This is duckdb's =SelectionVector= and polars'
 whose shapes can be wider than the originals: a sorted ragged file keeps
 less of its saving than an unsorted one (§ RISKS).
 
+*** D-C12 -- edits go through an overlay; column-sized edits are first-class
+A table makes the edit rows find cheap -- one cell -- the expensive one, and
+the edit rows find expensive -- a whole column -- the cheap one. The edit API
+leans into that rather than hiding it (§ IN-FLIGHT EDITS compares the two):
+- *Cell edits are an overlay.* =set= and =remove= record =(row, key) →
+  Some(JsonValue) | None= in a sparse per-block patch, sorted by row like
+  =RowShapes=, which views read through. It is folded into the block when the
+  block is next gathered or written, so a column promotes at most once per
+  block however many edits reach it. This is duckdb's update segments. A row
+  block (D-C13) needs none: it takes a cell edit in place, as today.
+- *Column-sized edits skip the overlay.* =set_column(name, values)=,
+  =map_column(name, |row, value| ..)= and =drop_column(name)= build or
+  replace each block's buffer directly. This is polars' =with_columns=, and
+  what a caller doing bulk attribute work should reach for.
+- *Appends go to a tail block.* =push= fills an open block and seals it at
+  the block size (D-C10), like duckdb's Appender.
+- *Rows are addressed logically.* Row =i= is the i-th row after =retain= and
+  =permute=. The overlay is keyed by physical row, and a logical index goes
+  through the selection vector (D-C11) first; folding an overlay and
+  gathering a selection are one pass.
+- *Blocks can be edited one at a time.* =map_blocks(|block| ..)= runs over a
+  collection already read. It is also the hook a streamed pipeline (D-C9)
+  would run between reader and writer, with memory bounded by the block
+  size; this plan builds no such pipeline.
+
+Every edit gives the output the row IR gives after the same edit. A =set= of
+a key the row has keeps its position; a new key goes last in that row's own
+order, with a =RowShapes= entry when that is not its block's column order;
+=remove= from a column with no =present= bitmap creates one; and =1= written
+into a column of floats stays an integer. C1's dual storage is what tests it.
+
+*** D-C13 -- a block is columns or shaped rows, chosen as it seals
+#+begin_src rust
+enum Block { Columns(ColumnBlock), Rows(RowBlock) }
+struct RowBlock {
+    len: u32,
+    geometry: GeometryColumn,
+    shapes: Vec<Shape>,         // interned: a key list in order, repeats kept
+    row_shape: Vec<u32>,        // row -> its shape
+    starts: Vec<u32>,           // row -> its first value
+    values: Vec<JsonValue>,     // every row's values, back to back
+    natives: RowNatives,
+}
+#+end_src
+=ColumnBlock= is D-C10's =Block=. A =RowBlock= is § ALTERNATIVES
+CONSIDERED's shaped rows: every guarantee holds by existing, as it does
+today; a cell is 32 bytes rather than 48; sparse and ragged input costs what
+it holds; and a cell edit is local.
+
+*Who chooses.* A reader that knows its types (Parquet, FlatGeobuf,
+Shapefile, GeoPackage, CSV) fills column blocks and never seals rows. A
+schemaless reader (GeoJSON, KML) fills a row block -- interning shapes is
+natural while streaming -- and decides at seal: it transposes to columns
+when the block is dense (present cells over rows × columns), regular (few
+rows needing =RowShapes=) and narrow (few columns that would be =Mixed=), and
+keeps rows otherwise. The transpose costs one block's worth of memory, once.
+The thresholds come from profiling the C0 corpus. A gather (D-C11) builds
+new blocks and chooses again for each.
+
+What § SMOKE TEST settled about the mechanics:
+- *A starting rule.* Columns when the block's density is at least 0.25 and
+  at most a quarter of its rows deviate from its modal order; both are read
+  off the row block's interned shapes, not its cells. On every fixture it
+  picked the form an oracle (build both, keep the smaller) picked.
+- *Transpose from shapes, never by cell.* Each shape maps once to its
+  columns, so the transpose does no per-cell key lookup. The first
+  prototype hashed every key and ran 3--9× slower.
+- *Intern cheaply, and stop when shapes do not repeat.* A row whose keys
+  match the previous row's reuses its shape without hashing, which made
+  shaped rows cheaper to build than today's rows on regular input. On the
+  sparse fixture every row's keys are its own, so interning bought 2%
+  memory for 4× the build time; a block whose new-shape rate stays high
+  should keep each row's keys inline instead.
+
+*Who sees it.* No one outside the table. Views (D-C8) hide the form as they
+hide block boundaries (D-C9). A tabular writer reads a column block directly
+and transposes a row block a block at a time -- today's =infer_columns=,
+bounded to one block; a row-shaped writer reads a row block as today and a
+column block through per-column encoders chosen once per block (§
+ALTERNATIVES CONSIDERED, duckdb and polars), with each column's key text
+built once per block, a tile of 64 rows at a time (§ SMOKE TEST). A row
+block's writer builds key text once per shape, for shapes that repeat. The
+schema merge for writers that declare one up front (D-C10) takes both forms.
+
+This is the "columns for tabular sources, rows for schemaless ones"
+alternative made permanent at the block, behind views, where its objection
+-- every consumer handling two forms -- does not reach. It also makes C3 and
+C4 optional: GeoJSON and KML can read into row blocks and stop there until
+profiling says columns pay.
+
+*** D-C14 -- =--layout= lets the user force a form
+=auto= (the default, D-C13's choice), =rows= or =columns= forces every block
+a reader seals, and every block a gather builds, into one form. Output is
+byte-identical under every setting: it is a memory and time setting only, and
+is documented as one, so that no one reaches for =rows= to "preserve more".
+- *Library first.* =read_features= takes no options today; the layout is a
+  =ReadOptions= beside =WriteOptions=, landing in C1, where the equivalence
+  runs need it.
+- *Then the CLI.* =--layout= lands with C2, the first milestone in which a
+  real conversion's layout changes.
+- *Forcing can be far worse than =auto=,* and the flag's documentation names
+  both cases: =columns= on many-keyed sparse input brings back the dense
+  slot per key per row that D-C10 exists to avoid, and =rows= on a wide
+  tabular file brings back today's peak.
+- *It does not change the editing API.* A caller forcing =rows= still edits
+  through views and methods (D-C8, D-C12); =to_features= is the way to plain
+  data. Two public APIs depending on a read option would be worse than either.
+
+This follows duckdb and polars, which expose tuning settings
+(=map_inference_threshold=, =sample_size=, =infer_schema_length=, the
+streaming engine) rather than a layout switch; geosetta's finer knobs, the
+D-C13 thresholds and the block size, stay internal until someone needs them.
+
 ** HOW EACH FORMAT FITS
 | format      | fit                | notes                                                                                                                                           |
 |-------------+--------------------+-------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -244,41 +381,234 @@ less of its saving than an unsorted one (§ RISKS).
 | CSV         | natural            | Rectangular. Types are inferred per value (=csv.rs='s =unwidened= gate), so a disagreeing column is =Mixed=.                                    |
 | GeoPackage  | mostly             | Declared types, but SQLite stores any type in any column (=sqlite_altered.gpkg=), so a column meeting one is promoted. Row-shaped writes stay row-shaped (the =sqlite= encoder takes rows), built a row at a time from the table. |
 | WKT         | trivial            | Geometry only.                                                                                                                                  |
-| GeoJSON     | needs D-C3/D-C4    | Schemaless. Regular files get the whole saving; a ragged one pays for its exceptions in =RowShapes= and =Mixed= columns, never more than today. |
+| GeoJSON     | needs D-C3/D-C4    | Schemaless. Regular files get the whole saving; a ragged one keeps row blocks (D-C13), since columns alone can cost more than today (§ SMOKE TEST). |
 | KML         | needs D-C3/D-C4    | Like GeoJSON: =<ExtendedData>= is per Placemark. Projection (=project.rs=) appends to columns; =place.rs= and reconcile read a row view. A KML feature's element is a per-row native (D-C7), and is its own cost (=performance.org=, KML steps 2--3). |
 
-So *every format can be columnar*, and none falls back to worse than
-today. The schemaless two are where the work is. Two notes from D-C10: a
-GeoParquet row group is a block, so the reader seals one per row group and
-the writer emits one per block; and the "never more than today" for GeoJSON
-and KML holds only because a sparse key costs nothing outside its blocks --
-a single dense table would break it on many-keyed input.
+So *every format can be columnar*, but the schemaless two stay no worse
+than today only through the hybrid. Two notes from D-C10: a GeoParquet row
+group is a block, so the reader seals one per row group and the writer emits
+one per block; and a sparse key costs nothing outside its blocks, where a
+single dense table would cost a slot per key per row. Blocks are not enough
+alone: § SMOKE TEST measured column blocks at 350 bytes a row on ragged
+GeoJSON against today's 288, and at 64 KB a row on the many-keyed one.
+Under D-C13 the schemaless two read into row blocks first, and a stretch
+keeps columns only where it is regular enough to pay for them.
+
+** IN-FLIGHT EDITS, ROWS AGAINST A TABLE
+An edit between read and write is one of two things
+(=edit-composability.org=). Through a pipe (route (b), =geosetta | jq |
+geosetta=) the IR never sees it: the edit happens in the transit's text, and
+the layout changes only how fast that text is read and written -- a
+same-format tabular transit gains from C2, the GeoJSON transit =jq= needs
+waits on C3, where the gain is smallest. A caller linking the crate (route
+(a)) edits the IR itself, and there the layouts differ:
+| edit                    | row IR today                         | table (D-C12)                                                |
+|-------------------------+--------------------------------------+--------------------------------------------------------------|
+| set an existing key     | overwrite in place                   | overlay entry; folded at write                               |
+| add a key to a row      | =push=; order is the row's own       | overlay; at fold a new column, =RowShapes= if out of order   |
+| remove a key            | =Vec::remove=                        | overlay tombstone; at fold clears =present= (creating it)    |
+| retype a value          | free                                 | overlay holds a =JsonValue=; fold promotes one block         |
+| add or replace a column | loop every row, a heap string each   | =set_column=: one buffer a block, no overlay                 |
+| delete features         | =Vec::retain= moves features         | selection vector (D-C11)                                     |
+| add features            | =Vec::push=                          | tail block                                                   |
+| reorder                 | moves =Feature= structs              | selection vector, gathered at write                          |
+| edit every feature      | =&mut= over the whole collection     | =map_blocks=, one block at a time                            |
+| read after editing      | direct                               | through the overlay until folded                             |
+| API                     | plain data: =&mut=, =match=, =clone= | methods and views; no =&mut= to a cell                       |
+| guarantees under edit   | free by construction                 | each one code, tested against rows (C1)                      |
+| memory while editing    | whole collection, 48 B a cell        | whole collection, columnar; bounded by a block once streamed |
+Under D-C13 a row block edits as the middle column does, behind the same
+methods. Rows win on scattered single-cell edits and on ergonomics: an edit is
+ordinary Rust, and nothing it does can break a guarantee. The table wins on
+edits the size of a column or of the collection, and is the only layout in
+which an edit over every feature could run in bounded memory. Neither changes
+route (b), which is the route a sibling crate has.
+
+** SMOKE TEST -- 2026-10-29
+A scratch crate outside the repo, linking geosetta 0.27.0 as a library,
+read each fixture with =read_features=, took the properties out of every
+feature, and rebuilt them as today's rows, shaped-row blocks, column blocks
+and the hybrid, 8 192 rows a block, under a counting allocator. Fixtures:
+=compare.py='s narrow and wide generators, and four new ones -- /sparse/
+(2 000 distinct keys, 5 a feature, types mixed per key), /ragged/ (every
+guarantee at once: shuffled key order in one row in four, absent and null,
+=1= beside =1.0=, duplicate keys, an integer past 2^53, nested values, a
+string in an integer column, a late column), /stretch/ (two
+differently-keyed 50 000-row exports concatenated) and /overlap/ (the same,
+overlapping in space, so a Hilbert sort interleaves them).
+
+*Every layout rebuilt every row exactly* on every fixture, sorted and not,
+and every layout's GeoJSON properties output was byte-identical to the
+rows'.
+
+Property bytes a row:
+| fixture                      |  today | shaped rows | columns, first-seen | columns, modal |              hybrid |
+|------------------------------+--------+-------------+---------------------+----------------+---------------------|
+| narrow (100 000 × 4)         |    224 |         142 |                  27 |             27 |    27 (all columns) |
+| wide (50 000 × 200)          | 10 087 |       6 870 |               1 509 |          1 509 | 1 509 (all columns) |
+| sparse (2 000 keys, 5 a row) |    288 |         282 |              64 558 |         64 558 |      282 (all rows) |
+| ragged                       |    288 |         183 |                 350 |            216 |      183 (all rows) |
+| stretch                      |    488 |         320 |                  88 |             88 |    88 (all columns) |
+| overlap, Hilbert-sorted      |    488 |         320 |                 142 |            142 |   142 (all columns) |
+- *The estimates hold.* Wide properties fall from 504 MB to 75.5 MB (§ WHY
+  estimated ~80); narrow from 22.4 MB to 2.7 MB, taking the whole narrow IR
+  from 34.8 MB to about 15 -- past ACCEPTANCE's "roughly halved". Shaped
+  rows save the third § ALTERNATIVES CONSIDERED expected.
+- *One dense table fails on sparse input*, by 6.4 GB against 29 MB: the
+  case D-C10 and D-C13 exist for.
+- *Columns alone fail on ragged input*, at 350 bytes a row against today's
+  288. Most of that was first-seen column order (corrected in D-C4); even
+  modal, columns lose to shaped rows there. This is what makes the hybrid
+  necessary rather than an option.
+- *A sort that mixes blocks costs columns*, 88 → 142 bytes a row on the
+  overlap fixture, and they still win 3.4×.
+- The hybrid here kept the smaller form of each block, measured; D-C13's
+  starting rule, applied from shapes alone, chose the same form every time.
+
+Speed, best of three, ms. /read/ and /GeoJSON write/ are today's whole
+=read_features= and =write_features=; /build/ is constructing the property
+storage from parsed values (today's rows as a clone; the hybrid as shaped
+rows, then D-C13's transpose where its rule says); /props/ is a GeoJSON
+properties pass written from each layout, the columns through an encoder
+per column per block:
+| fixture | read | build: rows | shaped | hybrid | GeoJSON write | props: rows | shaped | columns | hybrid |
+|---------+------+-------------+--------+--------+---------------+-------------+--------+---------+--------|
+| narrow  |   54 |           2 |      2 |      4 |            35 |          10 |     10 |      10 |     10 |
+| wide    |  597 |          43 |     34 |    127 |           366 |         242 |    243 |     277 |    276 |
+| sparse  |   71 |           5 |     22 |     36 |            30 |          12 |     13 |   1 004 |     13 |
+| ragged  |   13 |           1 |      2 |      2 |             6 |           2 |      2 |       2 |      2 |
+| stretch |   89 |           7 |      5 |     15 |            35 |          15 |     15 |      16 |     16 |
+| overlap |   86 |           8 |      6 |     14 |            37 |          15 |     15 |      17 |     16 |
+- *Shaped rows cost nothing in speed* where shapes repeat: built as fast as
+  today's rows or faster, written at the same speed.
+- *Narrow and stretched inputs are within noise* on the write, and a few
+  milliseconds on the build.
+- *Wide is the gap.* The hybrid build is +84 ms against a 597 ms read
+  (+14%), in § RISKS. The write from columns was +35 ms against a 366 ms
+  write (+10%) until the tiled writer below.
+- *Sparse interning is slow* (+31 ms against a 71 ms read) for a 2% saving;
+  D-C13 now says to stop interning when shapes do not repeat.
+- *Three prototype mistakes, each worth a rule.* Hashing every key to find
+  its column made the build 3--9× slower, hence D-C13's transpose from
+  shapes; building a =JsonValue= for each cell before writing it was 40%
+  slower than writing from the buffer, hence encoders that read buffers
+  directly; and escaping a column's key for every cell was the whole of the
+  wide write gap, below.
+
+The tiled writer, best of five, ms, for the same GeoJSON properties pass
+(two runs of the wide case, to show the noise). /columns/ is the writer
+above; /lean/ the same with each column's key text built once per block;
+/tile-rows/ writes a tile of T rows column by column into one buffer per
+row, then emits the rows; /tile-cols/ encodes each column's T cells into a
+small scratch and assembles rows from the scratches:
+| fixture      | rows | columns | lean | tile-rows/16 | tile-rows/64 | tile-rows/256 | tile-cols/64 |
+|--------------+------+---------+------+--------------+--------------+---------------+--------------|
+| wide         |  216 |     253 |  219 |          202 |          200 |           203 |          237 |
+| wide (again) |  230 |     269 |  231 |          215 |          209 |           210 |          248 |
+| narrow       |   10 |      11 |    8 |            8 |            8 |             9 |           10 |
+| stretch      |   14 |      16 |   14 |           14 |           13 |            14 |           17 |
+| ragged       |    2 |       2 |    2 |            3 |            2 |             2 |            3 |
+Every variant's output was byte-identical to the rows'. So the earlier
+explanation -- 200 buffers at once outrunning the prefetcher -- was wrong:
+/lean/ is level with rows untiled, and the key was the gap. Tiling into row
+buffers is then a real 7--9% on the wide table, flat from 16 to 256 rows; 64
+is the pick. Assembling from column scratches is slower, its second copy
+costing more than it saves. Sparse blocks, which D-C13 keeps as rows, are
+~1 s by every column writer, which is why they must stay rows.
+
+*The lead is the key cache, not the layout.* Today's row writer re-escapes
+every key too (=geojson/mod.rs='s =member=), and the reader interns keys
+(one =Rc<str>= per distinct key on every fixture), so a row writer can
+cache key text by pointer. Measured the same way, as change against rows
+within a run (the wide case run twice; absolute times drifted ~10% between
+runs):
+| writer                                        | wide | wide (again) | narrow | sparse |
+|-----------------------------------------------+------+--------------+--------+--------|
+| rows, as today (ms)                           |  218 |          238 |     10 |     12 |
+| rows, key text by pointer map                 |  -7% |          -5% |   -20% |   +17% |
+| rows, previous row's key text by position     | -10% |         -13% |   -20% |   +83% |
+| columns, tiled, key text once a block         |  -9% |         -10% |   -20% |    n/a |
+| shaped rows, key text once a shape            | -15% |         -15% |   -20% |  +183% |
+Byte-identical throughout. So a row-shaped write is *layout-neutral* once
+every layout caches its keys: tiled columns land level with cached rows,
+and shaped rows, whose shapes are the cache, are fastest. The payoff of
+columns stays memory and the tabular paths, not row-shaped write speed.
+
+*Corrected the same day: the probe's key costs were inflated.* Its escape
+went a =char= at a time, as the crate's did before =performance.org='s item
+4; the crate's bulk escape makes a short clean key nearly free. Tried in the
+real writer, the key cache was −1 to −5% on wide and +31% on sparse
+(=performance.org= item 10), so the gaps and gains above that came from
+key text -- the column writer's first 14%, and every cache -- are overstated
+by the probe, and the layout-neutral conclusion is if anything stronger.
+Two consequences stand:
+- *A key cache is not worth it for today's GeoJSON writer* (item 10). KML is
+  different: its =<Data>= wrapper, not the key, is the cost, and writing it
+  in one step is 38--43% of the wide KML write (item 9).
+- *Shape caches need the same stop rule as interning* (D-C13): on sparse
+  input every shape is new, and escaping each shape's keys once costs 3×
+  writing them inline. A shape seen once should be written as a row is.
+
+The same work found the largest write-side cost was neither layout nor key:
+whole floats formatted through Rust's exact-precision path, 32--35% of the
+wide GeoJSON write and fixed without changing the IR (=performance.org=
+item 8). Every probe write above used =Debug= formatting for floats, not the
+crate's, so none of it saw that cost.
+- Not measured: any tabular reader or writer (the =infer_columns= saving,
+  Parquet's transpose on read), a sort's gather, KML, and geometry. The
+  build figures copy values a real reader would move, so they are an upper
+  bound.
 
 ** MILESTONES
 Each one lands with the equivalence corpus byte-identical and =compare.py=
 no slower on any case.
 
-*** C0 -- the harness, in the repo
+*** DONE C0 -- the harness, in the repo
+/Done 2026-10-29./ Both halves are in =bench/= (=bench/README.md=):
 - =bench/memprobe/=: the counting-allocator probe from =performance.org=,
-  moved in from a scratch directory, excluded from the published crate like
-  =bench/=.
-- An equivalence corpus and runner: every fixture, =compare.py='s inputs, a
-  sparse/ragged GeoJSON (shuffled key order, missing and late columns, mixed
-  types, duplicate keys, =1= beside =1.0=, integers past 2^53, nested
-  values), a many-keyed sparse GeoJSON (thousands of distinct keys, a few
-  per feature -- the D-C10 case), a GeoJSON ragged in stretches (two
-  differently-keyed exports concatenated), and the ragged fixture sorted by
-  =--sort-hilbert=, each converted to every format with each option that
-  changes output, compared against a pinned binary: outputs, stderr and exit
-  status.
-  This is the check Mem1--Mem5 ran by hand.
+  rebuilt as its own crate -- its own workspace, so the published crate's
+  =exclude = ["bench/"]= keeps it out -- splitting a conversion into input,
+  read peak, IR resident, write peak and scratch, and output, with
+  allocation counts and times. It reproduces =performance.org='s baseline:
+  348 B a feature on the narrow input, 10 168 on the wide.
+- =bench/equiv.py=: the equivalence corpus and runner. A pinned binary,
+  built from a clean =git archive= of =PIN= (default =HEAD=) with the crate's
+  own profile and cached by commit, against the working tree's. Inputs: every
+  fixture in =tests/fixtures= a reader takes; generated GeoJSON -- narrow and
+  wide from =compare.py='s own generators, and sparse, ragged, /ownorder/
+  (every feature's keys in an order of its own: § RISKS' GeoJSON worst
+  case), stretch and overlap from § SMOKE TEST; and each generated file
+  converted by the pinned binary to GeoParquet, FlatGeobuf, GeoPackage, CSV
+  and KML, so the tabular and KML readers meet the same shapes. Each goes to
+  all nine output formats, plain and =--sort-hilbert=, with =--compact=,
+  =--kml-version 2.3= and =--rtree= / =--envelope= where they change output.
+  Outputs, stderr and exit status compared byte for byte; a run past
+  =TIMEOUT= is reported as unchecked, never as passing.
+
+First run, the working tree (with =performance.org= items 8 and 9) against
+=HEAD=: 111 inputs, 2 997 conversions, all identical, in 206 s. Pinned
+instead to a binary from August, it flagged 2 575 of 2 970, so it does
+detect a change. Building it found =performance.org= item 11, since fixed:
+from a typed tabular source the KML writer was O(features × columns²),
+minutes a run on the sparse fixture's 2 000 columns. The fixture stays at
+1 000 features rather than § SMOKE TEST's 100 000, because a typed source
+writes every declared column into every KML feature: at 20 000 features one
+run's output is 1.5 GB.
+
+Not carried over: § SMOKE TEST's layout prototypes, which are throwaway code
+that C1's =Table= replaces, and its Hilbert note stands -- the overlap fixture
+is the one a sort mixes. The corpus holds GeoJSON-shaped sources; a Parquet
+or GeoPackage file whose blocks disagree in type, which § RISKS asks for, is
+only as varied as the stretch fixture converted.
 
 *** C1 -- the table type, behind the old API
-=Table= (a =Vec<Block>=, D-C10), =Block=, =Column=, =RowShapes=,
-=RowNatives=, selection vectors (D-C11) and the views, with
+=Table= (a =Vec<Block>=, D-C10), both block forms (D-C13), =Column=,
+=RowShapes=, =RowNatives=, selection vectors (D-C11), the views, and the
+library's =ReadOptions= layout (D-C14), with
 =from_features= / =to_features= converting both ways and a property test
 that =to_features(from_features(x)) == x= for arbitrary collections,
-including every guarantee above. =FeatureCollection= holds
+including every guarantee above, and a second that random edit sequences
+(D-C12) applied to both forms give equal =to_features=. =FeatureCollection= holds
 =enum Storage { Rows(Vec<Feature>), Table(Table) }=, converting on demand,
 so every spoke keeps working untouched. A migration device; C5 removes it.
 Converting on demand from =&self= either needs interior mutability or holds
@@ -291,22 +621,27 @@ Parquet, FlatGeobuf, Shapefile, CSV and GeoPackage read into =Table= and
 write from it. A tabular-to-tabular conversion (=parquet → fgb=, the wide
 cases) never builds a row. Expected: the wide =geojson→parquet= peak moves
 only partly (its GeoJSON read is still rows until C3); =parquet→fgb= wide
-should fall to roughly input + table + output.
+should fall to roughly input + table + output. The =--layout= flag lands
+here (D-C14).
 
-*** C3 -- GeoJSON goes columnar
-The streaming reader appends to columns, recording =RowShapes= for
-irregular rows and promoting columns as D-C3 says. The direct writer reads
-row views. This is the milestone the guarantees above exist for; the ragged
-fixture in C0 is its test.
+*** C3 -- GeoJSON reads into blocks
+Two steps, each shippable. First, the streaming reader fills row blocks
+(D-C13) and seals them as rows: shaped rows' saving, with every guarantee
+held by existing. Second, the seal-time choice: a block regular and dense
+enough is transposed to columns, recording =RowShapes= for its irregular
+rows and promoting as D-C3 says. The direct writer reads row views. The
+second step is taken only if C2's numbers and a profile of the first say it
+pays; the ragged and stretch-ragged fixtures in C0 are its test.
 
-*** C4 -- KML goes columnar
-=project= appends to the table; =place=, the direct writer and reconcile
-read row views; =drop_warnings= and the read-time tally (=performance.org=,
-KML step 2) read the table. Best done after KML step 2, which changes the
-same reader.
+*** C4 -- KML reads into blocks
+The same two steps. =project= appends to a row block; =place=, the direct
+writer and reconcile read row views; =drop_warnings= and the read-time tally
+(=performance.org=, KML step 2) read the table. Best done after KML step 2,
+which changes the same reader.
 
-*** C5 -- the hub is only a table
-=Storage::Rows= goes, and with it =Vec<Feature>= in the hub. The rest of the
+*** C5 -- the hub is only blocks
+=Storage::Rows= goes, and with it =Vec<Feature>= in the hub; shaped rows
+stay, as a block form (D-C13). The rest of the
 crate moves onto views: =reorder_hilbert= becomes =permute=, the CRS
 override, =collect_conversion_warnings= and =m_downgrade_warning=, the
 GeoPackage layer fan-out, =release_foreign_natives=, the same-format
@@ -319,11 +654,13 @@ D-C6: flat coordinate buffers with offsets, dimension-aware, replacing
 milestones above leave geometry untouched.
 
 ** ACCEPTANCE
-- The equivalence corpus is byte-identical at every milestone.
+- The equivalence corpus is byte-identical at every milestone, under each
+  of =--layout auto=, =rows= and =columns= (D-C14).
 - No =compare.py= case slower than before C1, by more than noise.
 - Wide =geojson→parquet= and =parquet→geojson= IR within 2× of the
   ~80 MB estimate; narrow IR roughly halved before C6.
-- Every guarantee in § WHAT A ROW IR GIVES has a named test.
+- Every guarantee in § WHAT A ROW IR GIVES has a named test, and holds
+  after every kind of edit in D-C12.
 
 ** RISKS
 - *Scope.* 79 uses of =.features= in =convert.rs= alone, every spoke's
@@ -347,10 +684,40 @@ milestones above leave geometry untouched.
   profiling the C0 corpus, and retunable later without callers noticing
   (D-C9).
 - *GeoJSON's worst case.* A file with every feature's keys in a different
-  order records a shape per row. Still no worse than today, but the saving
-  goes; the benchmark should include one.
+  order records a shape per row. As columns that is worse than today (§
+  SMOKE TEST); as rows (D-C13) it is no worse, but the saving goes. The
+  benchmark should include one.
+- *Speed on wide GeoJSON.* § SMOKE TEST puts the hybrid's build at about
+  +85 ms against a 600 ms wide read (+14%), which breaks the "no slower" bar
+  as it stands. The figure is an upper bound -- the prototype copies parsed
+  values a reader would move -- and =parquet→geojson= also loses today's
+  transpose on read, so its net is unmeasured. The write side, first
+  measured 10% slower, is closed in the probe: the tiled writer is level
+  with a row writer that caches its keys. The probe escaped a =char= at a
+  time, slower than the crate's writer, so how either compares with today's
+  real writer is unmeasured until C3 builds one.
 - *Editing ergonomics.* A caller used to =fc.features[i].properties.push(..)=
   writes =fc.set(i, key, value)=. Worth a migration note in the release.
+- *Streaming ends the in-place accident.* A pipe-form in-place run
+  (=geosetta a.fgb - | tool | geosetta - a.fgb=) is safe today only because
+  every reader buffers its whole input before any writer opens
+  (=edit-composability.org= § THE IN-PLACE HAZARD). Blocks are the seam a
+  streamed pipeline would use (D-C9, D-C12's =map_blocks=); once a writer
+  emits block 1 while block 2 is still being read, the final stage can
+  truncate the file the first is reading. Atomic write-and-rename
+  (=edit-composability.org= D4) must land before any streaming built on
+  blocks does.
+- *Two block forms, for good.* Every view, writer path and schema merge
+  handles both (D-C13), and a per-row feature added later -- a new native, a
+  new guarantee -- is built twice. The row form is the simpler of the two,
+  and the three-way equivalence run (D-C14) catches a form that drifts.
+- *The seal-time choice can be wrong.* Thresholds tuned on the corpus can
+  pick columns for a block that promotes to =Mixed= throughout, or rows for
+  one that would have paid. Either is no worse than the other form's cost,
+  and =--layout= is the user's override.
+- *A heavily edited collection reads through its overlay.* Every view of an
+  edited block checks the patch first until it is folded (D-C12). Folding on
+  a size threshold, not only at write, bounds it if profiling says to.
 - *Row-shaped formats pay a conversion per row.* GeoPackage's SQLite writer
   and the GeoJSON and KML writers walk rows. That walk is over borrowed views,
   not materialized rows, so it costs time, not memory.
@@ -365,10 +732,15 @@ milestones above leave geometry untouched.
 - Do blocks alone handle sparse input, or does a column also need a sparse
   form (=rows: Vec<u32>= beside its values) for a key that is rare /within/
   its blocks? Decide on the C0 many-keyed fixture.
-- May a block too irregular to be worth columns hold shaped rows instead
-  (§ ALTERNATIVES CONSIDERED)? That keeps the worst ragged GeoJSON at a
-  shaped row's cost, at the price of two kinds of block behind every view.
+- D-C13's seal-time measures and thresholds: density, the share of
+  irregular rows, the share of =Mixed= columns, or a combination. Decide on
+  the C0 ragged, stretch-ragged and many-keyed fixtures.
+- Should D-C13's thresholds or the block size ever be user settings beside
+  =--layout=, as duckdb's and polars' are? D-C14 assumes not until asked.
 - The block size, and whether it is a row count, a byte budget, or both.
+  § SMOKE TEST saw little between 8 192 and 65 536 rows except at a stretch
+  boundary, where the smaller block wasted less (88 bytes a row against
+  113 on the stretch fixture).
 - Does =Value<'_>= replace =JsonValue= in the public API anywhere, or only
   sit beside it? D-C8 assumes beside.
 - Should =FieldDecl= move onto =Column= (a column's declaration is a fact
@@ -410,6 +782,56 @@ duplicates and widens =1= beside =1.0= to =DOUBLE=; past
 (D-C11), and the threshold idea (§ OPEN QUESTIONS, sparse form). Not
 borrowed: the normalization, which geosetta cannot do.
 
+Where rows are still needed, what they do that geosetta can take (defaults
+recalled, not re-checked against either engine's source):
+- *Dispatch once per batch, not per cell.* Both choose a column's code path
+  once per vector or chunk and run a loop that knows its type. Polars' NDJSON
+  writer builds a serializer per column and steps them in lockstep. The
+  GeoJSON, KML and SQLite writers can choose an encoder per column per block
+  the same way, and § SMOKE TEST found that is not enough on its own: the
+  first column writer was 14% slower than rows over 200 columns. The cause
+  was not locality but the key: it escaped a column's name again for every
+  cell. Building each column's key text once per block brought it level with
+  rows, and writing a tile of 64 rows column by column, into one buffer per
+  row, made it 7--9% faster than rows on the wide table and ~20% on the
+  narrow one -- a lead a row writer caching its keys matches, so
+  row-shaped writes are layout-neutral, not a columnar win.
+- *A row layout where rows win.* duckdb's sort, hash join and hash aggregate
+  convert columns to a row format (=TupleDataCollection=), work there, and
+  convert back: storage is columnar, operators hybrid by design.
+  =--sort-hilbert= is the same shape -- sort a compact key and row index,
+  then gather once (D-C11).
+- *A threshold past which columns stop.* =read_json='s =MAP= / =JSON=
+  fallback, for too many keys or keys too rare, is the precedent for a block
+  too irregular to be worth columns holding shaped rows (D-C13).
+- *Immutable buffers, edits as new data.* Polars shares buffers by =Arc= and
+  copies on write, and =with_columns= replaces a whole column; duckdb keeps
+  updates as versioned segments beside the data. Neither makes a one-cell
+  edit cheap, and both discourage it. A slow, correct =set= is the same
+  trade (D-C8).
+- *Types decided up front.* duckdb samples the first ~20k records, polars
+  the first N rows, and a later disagreement is an error or a cast. Geosetta
+  can do neither, but a seekable input can afford a first pass that fixes
+  each column's type and so never promotes; stdin cannot.
+
+What they get by dropping guarantees, which geosetta cannot borrow:
+- *The normalization* above: one key order, no duplicates, absent read as
+  null, =1= beside =1.0= widened. Much of their JSON speed is here, and it
+  is what D-C2's two bitmaps, D-C3's =is_int= and D-C4's =RowShapes= pay
+  for instead.
+- *Sparse keys.* Polars pays a null slot per row; duckdb's =MAP= changes the
+  output's type. Geosetta's answer has to be invisible -- shaped rows or a
+  sparse column inside the IR, output unchanged.
+- *Geometry.* Neither is a model: polars has no geometry type, and duckdb
+  spatial has stored one serialized value per row, much like
+  =Option<Geometry>=. GeoArrow (C6) is the columnar answer, and few engines
+  hold it in memory yet.
+
+So per-batch dispatch, sort-then-gather and a fallback threshold make the
+hybrid defensible. Their speed on schemaless input is mostly the guarantees
+they drop, so C3 and C4 should not be expected to reach it, and are better
+decided after C2's numbers than before.
+
 *** Shaped rows
 Each feature keeps its own row, but its keys move into an interned /shape/
 -- an ordered key list, duplicates included -- shared by every row with the
@@ -418,11 +840,13 @@ to 32 and the key pointers go; every guarantee stays as free as today,
 edits stay local, sparse input costs what it holds. But values stay 32-byte
 =JsonValue=s, so the wide table shrinks by about a third, not the ~6× of
 columns. The cheapest real step, and a shape is exactly D-C4's regular row,
-so it survives as the candidate for an irregular block (§ OPEN QUESTIONS).
+so it survives as D-C13's row block.
 
 *** Columns for tabular sources, rows for schemaless ones, permanently
 C1's =Storage= enum kept forever. Cheap for the tabular wins, but every
-consumer of the hub handles both forms for good. Only as a migration step.
+consumer of the hub handles both forms for good. Only as a migration step
+at the collection level; D-C13 keeps the idea at the block, behind views,
+where consumers see one form.
 
 *** Compact values within rows
 A smaller =JsonValue= (inline short strings, a boxed nested case) under the

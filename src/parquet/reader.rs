@@ -266,7 +266,7 @@ impl GeoParquetFile<'_> {
         if self.geometry.iter().all(Vec::is_empty) {
             return Ok(vec![None; self.num_rows()]);
         }
-        let mut out = Vec::with_capacity(self.num_rows());
+        let mut out = Vec::with_capacity(capacity_hint(self.num_rows(), self.bytes));
         for (rg, at) in self.meta.row_groups.iter().zip(&self.geometry) {
             for &i in at {
                 match decode_column(self.bytes, &rg.columns[i], rg.num_rows as usize, true)? {
@@ -281,7 +281,7 @@ impl GeoParquetFile<'_> {
     /// Property `i`, decoded across every row group.
     pub fn property(&self, i: usize) -> Result<PropertyColumn> {
         let first = &self.meta.row_groups[0].columns[self.properties[i][0]];
-        let mut values = Vec::with_capacity(self.num_rows());
+        let mut values = Vec::with_capacity(capacity_hint(self.num_rows(), self.bytes));
         for (rg, &at) in self.meta.row_groups.iter().zip(&self.properties[i]) {
             match decode_column(self.bytes, &rg.columns[at], rg.num_rows as usize, false)? {
                 ColumnSink::Json { out, .. } => values.extend(out),
@@ -419,7 +419,10 @@ fn parse_file_metadata(footer: &[u8]) -> Result<Meta> {
                         schema.push(parse_schema_element(&mut r)?);
                     }
                 }
-                3 => num_rows = r.read_i64()?,
+                3 => {
+                    num_rows = r.read_i64()?;
+                    non_negative(num_rows, "file num_rows")?;
+                }
                 4 => {
                     let (_elem, len) = r.read_list_header()?;
                     for _ in 0..len {
@@ -796,7 +799,10 @@ fn parse_row_group(r: &mut CompactReader) -> Result<RowGroup> {
                         columns.push(parse_column_chunk(r)?);
                     }
                 }
-                3 => num_rows = r.read_i64()?,
+                3 => {
+                    num_rows = r.read_i64()?;
+                    non_negative(num_rows, "row group num_rows")?;
+                }
                 _ => r.skip(ty)?,
             },
         }
@@ -1061,10 +1067,10 @@ fn decode_column(
         .unwrap_or(col.data_page_offset) as usize;
 
     let mut out = if is_geometry {
-        ColumnSink::Wkb(Vec::with_capacity(rg_rows))
+        ColumnSink::Wkb(Vec::with_capacity(capacity_hint(rg_rows, file)))
     } else {
         ColumnSink::Json {
-            out: Vec::with_capacity(rg_rows),
+            out: Vec::with_capacity(capacity_hint(rg_rows, file)),
             converted: col.converted_type,
         }
     };
@@ -1132,9 +1138,10 @@ fn decode_list_column(file: &[u8], col: &ColumnMeta) -> Result<Vec<JsonValue>> {
     let mut dict: Option<Dict> = None;
     let mut pos = start;
     let mut occurrences_done = 0usize;
-    let mut rep_levels: Vec<u64> = Vec::with_capacity(total_occurrences);
-    let mut def_levels: Vec<u64> = Vec::with_capacity(total_occurrences);
-    let mut flat_values: Vec<JsonValue> = Vec::with_capacity(total_occurrences);
+    let hint = capacity_hint(total_occurrences, file);
+    let mut rep_levels: Vec<u64> = Vec::with_capacity(hint);
+    let mut def_levels: Vec<u64> = Vec::with_capacity(hint);
+    let mut flat_values: Vec<JsonValue> = Vec::with_capacity(hint);
 
     while occurrences_done < total_occurrences {
         let PageSlice { header: ph, comp } = next_page(file, &mut pos)?;
@@ -1266,6 +1273,23 @@ fn decode_data_page_v2_body(
     body.extend_from_slice(def_bytes);
     body.extend_from_slice(&values);
     Ok(body)
+}
+
+/// A metadata count, rejected when negative. Counts are read as signed thrift
+/// integers and used as `usize`, so a negative one used to become a value
+/// near `usize::MAX` and size a `Vec`: a "capacity overflow" panic natively
+/// as well as on wasm32.
+fn non_negative(v: i64, what: &str) -> Result<usize> {
+    usize::try_from(v).map_err(|_| Error::Parquet(format!("{what} is out of range ({v})")))
+}
+
+/// How many items to reserve up front for a count the metadata declares: the
+/// count, capped at the file's size in bytes. Declared counts are not backed
+/// by the bytes until decoding proves them (a run of nulls can legitimately
+/// stand for many rows), so a reservation only takes them as a hint; the
+/// `Vec` still grows to whatever the pages actually hold.
+fn capacity_hint(declared: usize, file: &[u8]) -> usize {
+    declared.min(file.len())
 }
 
 /// Decompress a page body and check it against the header's expected size.
@@ -1810,6 +1834,7 @@ fn parse_page_header(r: &mut CompactReader) -> Result<PageHeader> {
     if compressed < 0 || uncompressed < 0 || page_type < 0 {
         return Err(Error::Parquet("incomplete page header".into()));
     }
+    non_negative(num_values.into(), "page num_values")?;
     Ok(PageHeader {
         page_type,
         compressed_size: compressed as usize,
@@ -2947,5 +2972,58 @@ mod tests {
 
         assert_eq!(parsed.geometry.len(), 3);
         assert!(parsed.geometry.iter().all(Option::is_some));
+    }
+
+    /// A 3-row GeoParquet written by this crate, with every byte pair
+    /// `find` inside `range(file)` patched to `replace`.
+    fn patched_geoparquet(range: fn(&[u8]) -> std::ops::Range<usize>, find: &[u8], replace: &[u8]) -> (Vec<u8>, usize) {
+        let fc = crate::read_features(
+            crate::Format::GeoJson,
+            br#"{"type":"FeatureCollection","features":[
+                {"type":"Feature","properties":{"a":1},"geometry":{"type":"Point","coordinates":[1,2]}},
+                {"type":"Feature","properties":{"a":2},"geometry":{"type":"Point","coordinates":[3,4]}},
+                {"type":"Feature","properties":{"a":3},"geometry":{"type":"Point","coordinates":[5,6]}}]}"#,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut b = crate::write_features(crate::Format::Parquet, &fc).unwrap();
+        let r = range(&b);
+        let hits: Vec<usize> = (r.start..r.end - find.len()).filter(|&i| b[i..i + find.len()] == *find).collect();
+        for &h in &hits {
+            b[h..h + replace.len()].copy_from_slice(replace);
+        }
+        (b, hits.len())
+    }
+
+    fn footer(b: &[u8]) -> std::ops::Range<usize> {
+        let len = u32::from_le_bytes(b[b.len() - 8..b.len() - 4].try_into().unwrap()) as usize;
+        b.len() - 8 - len..b.len() - 8
+    }
+
+    #[test]
+    fn negative_counts_are_errors_not_capacity_overflows() {
+        // num_rows (FileMetaData and RowGroup field 3, i64 zigzag): 3 is
+        // 0x06, -1 is 0x01. It used to become usize::MAX and size a `Vec`:
+        // a "capacity overflow" panic, natively too.
+        let (b, n) = patched_geoparquet(footer, &[0x16, 0x06], &[0x16, 0x01]);
+        assert!(n >= 2, "file and row-group num_rows");
+        let e = crate::read_features(crate::Format::Parquet, &b, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("num_rows is out of range"), "{e}");
+
+        // A data page's num_values (data_page_header field 1, i32 zigzag).
+        let (b, n) = patched_geoparquet(|b| 0..b.len(), &[0x2C, 0x15, 0x06], &[0x2C, 0x15, 0x01]);
+        assert!(n >= 1, "data page headers");
+        let e = crate::read_features(crate::Format::Parquet, &b, &mut Vec::new()).unwrap_err().to_string();
+        assert!(e.contains("page num_values is out of range"), "{e}");
+
+        // Unpatched, the same file reads.
+        let (b, _) = patched_geoparquet(footer, &[], &[]);
+        assert_eq!(crate::read_features(crate::Format::Parquet, &b, &mut Vec::new()).unwrap().features.len(), 3);
+    }
+
+    #[test]
+    fn capacity_hints_are_capped_at_the_file_size() {
+        assert_eq!(capacity_hint(3, &[0; 100]), 3);
+        assert_eq!(capacity_hint(usize::MAX, &[0; 100]), 100);
     }
 }

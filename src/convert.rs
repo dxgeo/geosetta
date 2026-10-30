@@ -157,6 +157,7 @@ pub fn kml_write_warnings(fc: &FeatureCollection, target: Format, kml_version: O
         out.extend(kml::version_change_warnings(fc, target, version));
     }
     out.extend(kml::drop_warnings(fc, target));
+    out.extend(kml::null_warning(fc, target));
     out
 }
 
@@ -291,7 +292,8 @@ fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
 
     // Seed one feature per row with its geometry and an empty property vec,
     // freeing each row's WKB once it is decoded.
-    let mut features = Vec::with_capacity(file.num_rows());
+    // `num_rows` is the file's own claim; reserve no more than its bytes.
+    let mut features = Vec::with_capacity(file.num_rows().min(bytes.len()));
     let mut wkbs = file.geometry()?.into_iter();
     for _ in 0..file.num_rows() {
         let geometry = match wkbs.next() {

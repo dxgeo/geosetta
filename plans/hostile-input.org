@@ -1,0 +1,102 @@
+#+TITLE: Plan: Hostile Input
+#+AUTHOR: Daniel Okuniewicz Jr.
+
+* Hostile Input -- declared sizes the bytes do not back
+
+** STATUS -- audited and fixed 2026-10-29; one open item (H1)
+An audit of every allocation the readers size from a number the file states.
+Ten sites were confirmed and fixed, each with a regression test. One class is
+left open on purpose, because closing it is a policy decision rather than a
+bounds check: H1.
+
+** WHY
+A reader that sizes a =Vec= from a count in the file, before any of the data
+behind the count has been read, lets a few bytes request gigabytes. What that
+costs depends on the target:
+- *wasm32*: =usize= is 32 bits and memory tops out at 4 GiB, so the request
+  fails -- a "capacity overflow" panic, or an allocation-failure abort.
+- *native*: the same request usually "succeeds" (macOS and default Linux
+  reserve memory lazily) and the reader errors out before touching it, so the
+  bug is invisible natively. Under strict overcommit it aborts.
+- *Either*: a *negative* count cast with =as usize= becomes a value near
+  =usize::MAX=, which panics natively too.
+
+It was found from =nazca=: writing nazca's own WKB reader (which allocates
+nothing) meant reading this crate's, whose =decode= trusted every count.
+
+** METHOD
+Every =Vec::with_capacity=, =vec![x; n]=, =reserve= and =resize= in the
+readers was traced to where its size comes from. A site was *confirmed* only
+by a reproduction:
+- end to end through the public API, by writing a valid file with this crate
+  (or building a minimal one by hand) and patching one declared count, where
+  possible -- usually as a same-length edit (zigzag =3= is =0x06=, =-1= is
+  =0x01=);
+- at function level, in a scratch copy of the crate, where no file this crate
+  writes can reach the site (the Parquet codecs it never writes).
+Each ran natively and under =wasmtime= (=wasm32-wasip1=), debug and release.
+Sites sized from data already parsed (GeoJSON width, KML children,
+=schema.rs=) and writer-side sites were set aside.
+
+** FINDINGS -- all fixed 2026-10-29
+| # | Site | Declared value | Failure | Fix |
+|---+------+----------------+---------+-----|
+| 1 | =geometry/wkb.rs= =decode= | point, ring, member counts | wasm panic | =Reader::count= rejects a count the remaining bytes cannot hold |
+| 2 | =flatgeobuf/reader.rs= index skip | =features_count= | *silent empty read*, any target; debug overflow panic | checked =index_size=; the index must fit in the file |
+| 3 | =compress/snappy.rs= | Snappy's 64-bit length prefix | *native abort* | must fit =usize=; reservation capped |
+| 4 | =compress/{gzip,lz4,zstd}.rs= | Parquet =uncompressed_page_size=, zip entry size | wasm allocation failure | =compress::reserve=: the declaration, capped at the codec's best ratio over its input |
+| 5 | =parquet/reader.rs= | file and row-group =num_rows= (i64) | native panic when negative | =non_negative= |
+| 6 | =parquet/reader.rs= | page =num_values= (i32) | native panic when negative | =non_negative= |
+| 7 | =parquet/reader.rs=, =convert.rs= | row and occurrence counts as =Vec= hints | wasm allocation failure | =capacity_hint=: capped at the file's size |
+| 8 | =shapefile/geometry.rs= | =numParts=, =numPoints= | wasm panic | =backed_len=: the count must fit in its record |
+| 9 | =shapefile/dbf.rs= | =num_records= | wasm panic | reservation capped at what the bytes hold; truncated files still read |
+| 10 | =shapefile/dbf.rs= | =record_size= of 0 | native panic (=rec[0]= on an empty record) | rejected |
+
+Finding 2 is the worst: no crash, no error, every feature dropped -- the
+silent loss [[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]
+exists to rule out. Any =features_count= whose index would run past the end of
+the file did it, not only one large enough to overflow.
+
+The codec ratios in =compress::reserve= (DEFLATE 1032:1, LZ4 255:1, Snappy
+22:1, zstd 32768:1) only bound a reservation: past them the output still
+grows with the data actually decoded, and every codec checks its final length
+against the declaration.
+
+/The bounded sites, for the record:/ the zip entry count is a =u16= (Zip64 is
+rejected), zstd's internal tables have a capped accuracy log and literals of
+at most 1 MiB, and FlatGeobuf's coordinate vectors are sized from the buffer.
+
+=geoscribe/src/zstd.rs=, the copy of the zstd decoder, got the same cap.
+Its expected size is a compile-time constant, so it was never exposed; the
+change keeps the two copies alike.
+
+** REGRESSION TESTS -- what each guards natively
+Most of these failures were wasm-only, so a native test cannot see them
+directly:
+- DBF asserts the =Vec='s capacity, shapefile, FlatGeobuf and Parquet assert
+  the new up-front errors, and Snappy aborted the native test process before
+  the fix: all guard natively.
+- gzip, LZ4, zstd and WKB guard only under =wasmtime=
+  ([[file:../../wasm-plan.org][../../wasm-plan.org]] § HOW THIS WAS VERIFIED).
+
+** H1 -- OPEN: Parquet counts that are legitimately unbacked
+A Parquet count is not always backed by bytes: a run-length-encoded run of
+nulls can stand for billions of rows in a few bytes, and that is a valid file.
+So these two sites, which *create* every declared value rather than reserve
+room for them, were not changed:
+- =GeoParquetFile::geometry= -- =vec![None; num_rows]= when the file has no
+  geometry column.
+- =decode_levels= -- =vec![0; count]= at bit width 0, =count= being a page's
+  =num_values= (up to =i32::MAX=).
+
+A file declaring, say, 2^40 rows can still exhaust memory through them, as a
+decompression bomb does. Closing it means choosing a policy, for instance:
+1. a maximum row count, with an error naming it (and perhaps a flag to raise
+   it);
+2. a budget relative to the file's size, refusing a file whose declared rows
+   exceed it by some factor -- simple, but it rejects valid all-null files;
+3. =try_reserve= at each site, turning an allocation failure into an error --
+   catches the wasm32 case, but natively lazy reservation means the memory is
+   only exhausted later, while filling.
+
+No decision yet.

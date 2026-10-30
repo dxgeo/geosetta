@@ -133,13 +133,13 @@ fn decode_shape(content: &[u8]) -> Result<Option<Geometry>> {
             Some(Geometry::Point(Position { x, y, z: Some(z), m }))
         }
         gtype::MULTIPOINT | gtype::MULTIPOINT_M => {
-            let n = as_len(i32_le(content, 36)?, "MultiPoint numPoints")?;
+            let n = backed_len(content, 36, 40, 16, "MultiPoint numPoints")?;
             let xy_off = 40;
             let points = apply_m_if_present(read_points(content, xy_off, n)?, content, xy_off + 16 * n, n)?;
             Some(Geometry::MultiPoint(points))
         }
         gtype::MULTIPOINT_Z => {
-            let n = as_len(i32_le(content, 36)?, "MultiPointZ numPoints")?;
+            let n = backed_len(content, 36, 40, 16, "MultiPointZ numPoints")?;
             let xy_off = 40;
             let points = apply_z(read_points(content, xy_off, n)?, content, xy_off + 16 * n)?;
             let after_z = xy_off + 16 * n + 16 + 8 * n;
@@ -177,9 +177,9 @@ fn decode_shape(content: &[u8]) -> Result<Option<Geometry>> {
 /// tail shape minus the Z section) is detected purely by remaining content
 /// length, not by the declared shape type — see `apply_m_if_present`.
 fn read_parts(content: &[u8], has_z: bool) -> Result<Vec<Vec<Position>>> {
-    let num_parts = as_len(i32_le(content, 36)?, "numParts")?;
-    let num_points = as_len(i32_le(content, 40)?, "numPoints")?;
+    let num_parts = backed_len(content, 36, 44, 4, "numParts")?;
     let parts_off = 44;
+    let num_points = backed_len(content, 40, parts_off + 4 * num_parts, 16, "numPoints")?;
     let mut starts = Vec::with_capacity(num_parts);
     for i in 0..num_parts {
         starts.push(as_len(i32_le(content, parts_off + 4 * i)?, "part start index")?);
@@ -712,6 +712,18 @@ fn as_len(v: i32, what: &str) -> Result<usize> {
     Ok(v as usize)
 }
 
+/// The count stored at `count_at`, rejected unless the record holds that
+/// many `size`-byte items starting at `items_at`. Checked before anything is
+/// sized from it: trusting `numParts`/`numPoints` let one 52-byte record
+/// request `i32::MAX` of each -- a "capacity overflow" panic on wasm32.
+fn backed_len(content: &[u8], count_at: usize, items_at: usize, size: usize, what: &str) -> Result<usize> {
+    let n = as_len(i32_le(content, count_at)?, what)?;
+    match n.checked_mul(size).and_then(|bytes| bytes.checked_add(items_at)) {
+        Some(end) if end <= content.len() => Ok(n),
+        _ => Err(Error::Convert(format!("shapefile: {what} ({n}) runs past the end of its .shp record"))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -987,5 +999,44 @@ mod tests {
         let mut bytes = vec![0u8; 100];
         bytes[0..4].copy_from_slice(&0i32.to_be_bytes());
         assert!(read(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_counts_the_record_cannot_hold_before_allocating() {
+        // One record with a valid header, then a count claiming i32::MAX
+        // items and no items behind it. Each used to size a `Vec` from the
+        // count first: a "capacity overflow" panic on wasm32.
+        fn shp(shape_type: i32, body: &[u8]) -> Vec<u8> {
+            let mut content = shape_type.to_le_bytes().to_vec();
+            content.extend_from_slice(body);
+            let mut out = vec![0u8; 100];
+            out[0..4].copy_from_slice(&9994i32.to_be_bytes());
+            out.extend_from_slice(&1i32.to_be_bytes());
+            out.extend_from_slice(&((content.len() / 2) as i32).to_be_bytes());
+            out.extend_from_slice(&content);
+            out
+        }
+        // Natively the old code also errored, but only after the allocation,
+        // so check for the up-front check's own error.
+        fn assert_rejected_up_front(r: Result<Vec<Option<Geometry>>>, what: &str) {
+            let e = r.unwrap_err().to_string();
+            assert!(e.contains(what) && e.contains("runs past the end"), "{e}");
+        }
+        let max = i32::MAX.to_le_bytes();
+        let bbox = [0u8; 32];
+        let parts_and_points = |parts: &[u8; 4], points: &[u8; 4]| [&bbox[..], parts, points].concat();
+        for shape_type in [gtype::POLYLINE, gtype::POLYGON, gtype::POLYGON_Z] {
+            let huge_parts = shp(shape_type, &parts_and_points(&max, &0i32.to_le_bytes()));
+            assert_rejected_up_front(read(&huge_parts), "numParts");
+            let huge_points = shp(shape_type, &[parts_and_points(&1i32.to_le_bytes(), &max), vec![0; 4]].concat());
+            assert_rejected_up_front(read(&huge_points), "numPoints");
+        }
+        for shape_type in [gtype::MULTIPOINT, gtype::MULTIPOINT_Z] {
+            let huge = shp(shape_type, &[&bbox[..], &max].concat());
+            assert_rejected_up_front(read(&huge), "numPoints");
+        }
+        // A count the record does hold still reads.
+        let one_part = shp(gtype::POLYLINE, &[parts_and_points(&1i32.to_le_bytes(), &2i32.to_le_bytes()), vec![0; 4 + 32]].concat());
+        assert_eq!(read(&one_part).unwrap().len(), 1);
     }
 }

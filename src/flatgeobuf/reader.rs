@@ -143,9 +143,22 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
     // Intern each column's key once so every feature shares one `Rc`.
     let keys: Vec<Rc<str>> = columns.iter().map(|c| Rc::from(c.name.as_str())).collect();
 
-    // Skip the packed R-tree spatial index, if present.
-    let index_bytes = index_size(features_count as usize, index_node_size as usize);
-    let mut pos = header_start + header_len + index_bytes;
+    // Skip the packed R-tree spatial index, if present. The size comes from
+    // the declared feature count, so it must still land inside the file:
+    // unchecked, an oversized count skipped past every feature and read the
+    // file as empty, with no error (or overflowed: a debug-build panic).
+    let index_bytes = usize::try_from(features_count)
+        .ok()
+        .and_then(|n| index_size(n, index_node_size as usize))
+        .ok_or_else(|| Error::FlatGeobuf(format!("features_count {features_count} is too large for any index")))?;
+    let mut pos = (header_start + header_len)
+        .checked_add(index_bytes)
+        .filter(|&end| end <= data.len())
+        .ok_or_else(|| {
+            Error::FlatGeobuf(format!(
+                "the spatial index for {features_count} features ({index_bytes} bytes) runs past the end of the file"
+            ))
+        })?;
 
     let mut features = Vec::new();
     while pos < data.len() {
@@ -339,22 +352,23 @@ fn decl_type(ty: u8) -> Option<DeclType> {
     })
 }
 
-/// Byte size of the packed Hilbert R-tree, so we can skip it.
-fn index_size(num_items: usize, node_size: usize) -> usize {
+/// Byte size of the packed Hilbert R-tree, so we can skip it, or `None` if
+/// it overflows `usize`.
+fn index_size(num_items: usize, node_size: usize) -> Option<usize> {
     if num_items == 0 || node_size == 0 {
-        return 0;
+        return Some(0);
     }
     let node_size = node_size.max(2);
     let mut n = num_items;
     let mut num_nodes = n;
     loop {
         n = n.div_ceil(node_size);
-        num_nodes += n;
+        num_nodes = num_nodes.checked_add(n)?;
         if n == 1 {
             break;
         }
     }
-    num_nodes * NODE_ITEM_SIZE
+    num_nodes.checked_mul(NODE_ITEM_SIZE)
 }
 
 // --- geometry --------------------------------------------------------------
@@ -601,5 +615,40 @@ mod tests {
         // fidelity the value side did not keep. `JsonValue::Binary` made the
         // value side keep it.
         assert_eq!(decl_type(200), None, "an unknown code must not be guessed at");
+    }
+
+    /// A 3-point file written by this crate, with its header's
+    /// `features_count` replaced.
+    fn with_features_count(count: u64) -> Vec<u8> {
+        let fc = crate::read_features(
+            crate::Format::GeoJson,
+            br#"{"type":"FeatureCollection","features":[
+                {"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[1,2]}},
+                {"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[3,4]}},
+                {"type":"Feature","properties":{},"geometry":{"type":"Point","coordinates":[5,6]}}]}"#,
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let mut b = crate::write_features(crate::Format::FlatGeobuf, &fc).unwrap();
+        let header_len = u32::from_le_bytes(b[8..12].try_into().unwrap()) as usize;
+        let header = 12..12 + header_len;
+        let three = 3u64.to_le_bytes();
+        let at: Vec<usize> = (header.start..header.end - 8).filter(|&i| b[i..i + 8] == three).collect();
+        assert_eq!(at.len(), 1, "features_count must be the header's only u64 equal to 3");
+        b[at[0]..at[0] + 8].copy_from_slice(&count.to_le_bytes());
+        b
+    }
+
+    #[test]
+    fn an_index_running_past_the_file_is_an_error_not_an_empty_read() {
+        assert_eq!(read(&with_features_count(3)).unwrap().features.len(), 3);
+        // Too large to fit: this used to skip every feature and return an
+        // empty collection with no error.
+        let e = read(&with_features_count(1_000_000)).unwrap_err().to_string();
+        assert!(e.contains("runs past the end of the file"), "{e}");
+        // Too large for the size arithmetic: a debug-build overflow panic,
+        // and in release the same silent empty read.
+        let e = read(&with_features_count(u64::MAX)).unwrap_err().to_string();
+        assert!(e.contains("too large") || e.contains("runs past"), "{e}");
     }
 }

@@ -1,6 +1,38 @@
 # Benchmarks
 
-Two complementary benchmarks:
+Two checks that a change keeps what geosetta writes and shows where its bytes
+go:
+
+- **`bench/equiv.py`** — the equivalence corpus. Every fixture in
+  `tests/fixtures`, generated GeoJSON shaped to stress a columnar IR (wide,
+  sparse, ragged, every feature in its own key order, two exports
+  concatenated), and those converted to GeoParquet, FlatGeobuf, GeoPackage,
+  CSV and KML, each converted to every format with each option that changes
+  output, through a pinned binary and a candidate. Output files, stderr and
+  exit status must be byte-identical. The pinned binary is built from a clean
+  `git archive` of `PIN` (default `HEAD`) and cached; the candidate is the
+  working tree. Needs only Python and cargo.
+
+  ```sh
+  python3 bench/equiv.py                 # the working tree against HEAD
+  PIN=v0.27.0 python3 bench/equiv.py     # against another revision
+  WIDE=1 python3 bench/equiv.py          # the wide table at 50 000 rows
+  ```
+
+  Exit status 1 means a conversion differed, 2 that one ran past `TIMEOUT`
+  in either binary; the differing runs are kept and their paths printed.
+
+- **`bench/memprobe/`** — links geosetta under a counting allocator and splits
+  one conversion into its phases: input, read peak, the IR left resident,
+  write peak and scratch, output, with allocation counts and times. Its own
+  crate, so it is not part of the published one.
+
+  ```sh
+  cargo run --release --manifest-path bench/memprobe/Cargo.toml -- in.geojson kml
+  cargo run --release --manifest-path bench/memprobe/Cargo.toml -- in.parquet geojson --compact
+  ```
+
+And two complementary benchmarks:
 
 - **`tests/perf.rs`** — geosetta-only throughput (read/write per format), driving
   the real binary end-to-end. Run with:

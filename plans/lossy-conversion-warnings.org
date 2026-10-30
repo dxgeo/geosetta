@@ -407,8 +407,23 @@ own naturally-typed functions; only the boilerplate around them is shared.
   neither is wired up, so both warn today and must move when M3/M3b lands. The
   doc comment says so, so the two reasons a target can appear in that list do
   not blur together.
+- *A KML/KMZ write leaving a null out of =<ExtendedData>=*, added 2026-10-29
+  with the change that made it a loss to report
+  ([[file:kml-standard.org][kml-standard.org]] D-K17). KML has no null; it
+  had been written as an empty value, which GDAL's =LIBKML= reads back as 0
+  in a typed number column and both readers read back as =""= otherwise --
+  silent, and wrong. Left out, as GDAL writes it, it reads back absent in
+  every reader measured, and the one thing lost, null as against absent, is
+  counted and named. Mechanism 1, in =convert::kml_write_warnings= beside the
+  KML spoke's other pre-write warnings, since it depends on whether the write
+  carries a KML document back (whose stored nulls keep their spelling).
 
 ** OPEN CANDIDATES -- known, not yet warned, lower priority
+/See also/ [[file:cross-format-audit.org][cross-format-audit.org]], which
+looks for this rule's gaps by round trip rather than by accident, and holds
+the candidates it found (F2--F9) until each is carried, warned or decided
+silent; a warning it decides on is recorded here once built.
+
 Found while scoping this doc; not fixed in this pass because each is a
 narrower or lower-real-world-impact case than the two above. Listed so the
 next pass through this area doesn't have to rediscover them:

@@ -208,12 +208,19 @@ pub fn escape_into(s: &str, out: &mut String) {
 ///
 /// A non-finite value has no JSON spelling; `null` is what a reader would have
 /// to produce anyway.
+///
+/// The whole case appends `.0` to `Display` rather than asking for `{v:.1}`:
+/// a precision sends the number through Rust's exact formatter, whose bignum
+/// fallback was a third of a wide GeoJSON write (`plans/performance.org` item
+/// 8). Below 1e16 `Display` never uses an exponent, so the two are the same
+/// bytes.
 pub(crate) fn write_json_f64(v: f64, out: &mut String) {
     use std::fmt::Write;
     if !v.is_finite() {
         out.push_str("null");
     } else if v.fract() == 0.0 && v.abs() < 1e16 {
-        let _ = write!(out, "{v:.1}");
+        let _ = write!(out, "{v}");
+        out.push_str(".0");
     } else {
         let _ = write!(out, "{v}");
     }

@@ -1,6 +1,8 @@
 /target
 /bench/memprobe/target
 **/*.rs.bk
+# Python bytecode from the bench/ scripts
+__pycache__/
 # macOS Finder metadata
 .DS_Store
 *.parquet

@@ -15,6 +15,7 @@ use crate::shapefile::{dbf, geometry};
 /// WKT (see [`crate::crs::Crs::downgrade_warning`]'s `Format::Shapefile` arm)
 /// — `.prj` is Shapefile's only CRS slot, so an inexpressible CRS is omitted
 /// rather than guessed, matching the project's never-guess convention.
+#[derive(Debug)]
 pub struct Encoded {
     pub shp: Vec<u8>,
     pub shx: Vec<u8>,

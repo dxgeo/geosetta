@@ -3,7 +3,11 @@
 
 * Cross-Format Audit -- what a write loses without saying
 
-** STATUS -- measured 2026-10-29; nothing built
+** STATUS -- measured 2026-10-29; A1 built 2026-10-31
+A1 (F1) landed with [[file:library-warnings.org][library-warnings.org]] L1,
+which made D-A3's one list of checks public as =convert::conversion_warnings=.
+A2 and A3 are not built.
+
 The findings below were measured by a scratch script against the working tree
 of 2026-10-29 (=performance.org= items 8, 9 and 11 and =kml-standard.org=
 D-K17 applied). The script is not in the repo; A2 puts it there.
@@ -110,7 +114,9 @@ asks for the KML warnings per layer. Measured on the fixtures:
 (tracks' per-vertex data, Z's meaning) print two warnings each writing
 FlatGeobuf, =hand_hostile.kmz= three (and its archive's two files); all three
 print none writing GeoPackage.
-/Fix (A1):/ one helper both GeoPackage paths call, per D-A3.
+/Fix (A1), built 2026-10-31:/ both GeoPackage paths call
+=collect_layer_warnings=, which runs =convert::conversion_warnings= -- the
+KML checks included -- per layer, per D-A3.
 
 *** F2 -- nested values become JSON text
 A property holding an object or array is written as its JSON text in a
@@ -192,7 +198,10 @@ duplicate keys; F5's count is therefore of features whose kept value differs,
 not of every duplicate.
 
 ** MILESTONES
-*** A1 -- F1: GeoPackage writes ask for the KML warnings
+*** A1 -- F1: GeoPackage writes ask for the KML warnings  [DONE 2026-10-31]
+Built as [[file:library-warnings.org][library-warnings.org]] L1; the CLI test
+is =tests/library_warnings.rs='s =a_geopackage_write_prints_the_kml_warnings=.
+
 One helper, called by both GeoPackage paths, that gathers
 =convert::kml_write_warnings= per layer, de-duplicated as
 =collect_layer_warnings= does; =release_foreign_natives= per layer before the

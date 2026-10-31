@@ -1,0 +1,208 @@
+#+TITLE: Plan: One Conversion Pipeline, in the Library
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* One Conversion Pipeline, in the Library
+
+** STATUS -- P1--P7 DONE 2026-10-31
+Supersedes [[file:library-warnings.org][library-warnings.org]] L4 and L5,
+which recorded the GeoPackage/Shapefile entry points and the enforced ordering
+as deferred. Both are built here, as one change, because they turned out to be
+the same change.
+
+** THE PROBLEM
+=main.rs='s header said "all conversion logic lives in the library crate; this
+binary is a thin CLI wrapper." Each *format* operation was a library call, but
+the *pipeline* -- which calls, in what order, with what between them -- was
+=main.rs='s, and the library had a second, smaller pipeline of its own
+(=convert_with=) that the binary did not use. Every parity gap found on
+2026-10-31 sat between those two:
+
+- *A =--crs= override* was installed by =main.rs= before the checks. The
+  library had no step for it, so a caller wanting one had to know the order
+  ([[file:library-warnings.org][library-warnings.org]] D5).
+- *The multi-layer relabel warning* (one =--crs= replacing several per-layer
+  CRSes) was =main.rs='s private =apply_crs_override=.
+- *Releasing natives the target will not read* was =main.rs='s private
+  =release_foreign_natives=.
+- *The GeoPackage write* -- carry the source's container, survey what it
+  cannot carry, reconcile against the destination's, survey that, survey the
+  metadata, write -- was ~130 lines of =run_geopackage_write=, all of it on
+  bytes and none of it about the terminal or the filesystem.
+- *Layer selection and the per-layer check fan-out* (=--layer=,
+  =collect_layer_warnings=) were =main.rs='s.
+
+The F1 bug ([[file:cross-format-audit.org][cross-format-audit.org]]) was
+exactly this shape: one pipeline asked for a check the other did not.
+
+*The rule this plan adopts:* the binary is a wrapper. It parses arguments,
+moves bytes between the filesystem (or stdio) and the library, and presents
+what the library reports. Anything a caller with bytes in hand would also need
+is the library's. A parity gap is then impossible by construction rather than
+by audit, since there is one pipeline to have it.
+
+** WHAT STAYS IN THE BINARY, AND WHY
+Each of these touches a path, a stream or a terminal, which the library never
+sees:
+- argument parsing (=cli.rs=, already library-side for reuse) and reading the
+  =--crs= file or stdin;
+- reading the input and writing the output, including locating a Shapefile's
+  siblings and writing its file set;
+- =refuse_same_file= -- a comparison of canonicalised paths;
+- =stale_sidecar_warnings= -- a survey of files already on disk beside a
+  written =.shp=;
+- choosing between one output file and a directory of them for a multi-layer
+  source, which depends on whether the output path is a directory;
+- the =--print-crs*= diagnostics' stdout contract;
+- presentation: the =warning: = prefix, =--quiet=, and =--progress= lines.
+
+** P1. =pipeline::prepare= runs everything up to the encode
+#+begin_src rust
+pub enum Source<'a> {
+    Bytes(&'a [u8]),
+    Shapefile { shp: &'a [u8], dbf: &'a [u8], prj: Option<&'a str>, cpg: Option<&'a str> },
+}
+pub fn prepare(from: Format, to: Format, source: Source<'_>, options: ConvertOptions,
+               events: &mut dyn FnMut(Event<'_>)) -> Result<Prepared>
+#+end_src
+In order: decode (GeoPackage into its layers, Shapefile from its siblings,
+anything else through =read_features=); select =layer=; for a GeoPackage to
+GeoPackage run, read the source container and survey it; sort by Hilbert order;
+install the CRS override; run =conversion_warnings= on every layer,
+de-duplicated; release foreign natives. That is the order the binary used, so
+no run's warnings change order.
+
+*The ordering is now enforced by the type*, which is what
+[[file:library-warnings.org][library-warnings.org]] L5 asked for without the
+type-state machinery it rejected: the only way to encode is through a
+=Prepared=, and the only way to get one is =prepare=, which has already run the
+checks on what will be written.
+
+** P2. =ConvertOptions= holds what a conversion does beyond the write
+#+begin_src rust
+pub struct ConvertOptions {
+    pub write: WriteOptions,
+    pub crs: Option<Crs>,
+    pub sort_hilbert: bool,
+    pub layer: Option<String>,
+    pub default_layer_name: Option<String>,
+    pub rtree: bool,
+    pub envelope: bool,
+    pub source_label: Option<String>,
+    pub destination_label: Option<String>,
+}
+#+end_src
+A new struct rather than new fields on =WriteOptions=, which is =Copy= and is
+what =write_features_with= takes: a CRS is not =Copy=, and none of these is a
+property of a single-buffer encode.
+
+- =layer= selects a GeoPackage source's layer, and names the layer a
+  single-collection source becomes in a GeoPackage output -- the =--layer=
+  flag's two meanings, kept as one field because the flag is one.
+- =default_layer_name= is the third choice for that name, after =layer= and
+  the collection's own =name= (=plans/edit-composability.org= D4). The binary
+  passes the input file's stem; a library caller has no path to draw one from,
+  and gets =layer=.
+- The two labels name the containers in the GeoPackage survey messages -- the
+  binary passes a path or =stdin=/=stdout=. They default to "the source" and
+  "the destination".
+
+** P3. Events carry warnings and progress, in the order they happen
+#+begin_src rust
+#[non_exhaustive]
+pub enum Event<'a> {
+    Warning(String),
+    Read { layers: &'a [(String, FeatureCollection)] },
+    Selected { layers: &'a [(String, FeatureCollection)] },
+    Sorted { features: usize },
+    Encoding,
+}
+#+end_src
+A callback, not a returned =Vec=, because the binary interleaves =--progress=
+lines with warnings and a returned list would lose the interleaving -- the
+reason L5 gave for =main.rs= not being able to use =convert_with=. The library
+formats no progress text; the binary decides what each event says.
+
+=Warning= carries the message body, as everywhere else. A caller that wants
+only the warnings collects =Event::Warning= and ignores the rest, which is what
+=convert_with= now does.
+
+** P4. A =Prepared= encodes into whatever shape the target has
+#+begin_src rust
+impl Prepared {
+    pub fn layers(&self) -> &[(String, FeatureCollection)];
+    pub fn encode(&self, index: usize, events: &mut dyn FnMut(Event<'_>)) -> Result<Output>;
+    pub fn into_geopackage(self, existing: Option<&[u8]>, events: &mut dyn FnMut(Event<'_>)) -> Result<Vec<u8>>;
+}
+pub enum Output { Bytes(Vec<u8>), Shapefile(shapefile::Encoded) }
+#+end_src
+- =encode= writes one layer to any non-GeoPackage target. For Shapefile it
+  reports =Encoded.warnings= as events, so the caller does not also have to
+  remember the field.
+- =into_geopackage= takes the destination's existing bytes, if there are
+  any, and does the reconcile, the destination survey and the metadata survey
+  before writing. It consumes the =Prepared= because a container is written
+  once.
+- Either one is a usage error on the other's target.
+
+Encoding one layer at a time keeps the binary's per-layer write loop (each
+file written before the next layer encodes), so a multi-layer fan-out does not
+hold every output in memory at once.
+
+** P5. =convert_with= is built on the pipeline, and =main.rs= is a wrapper
+=convert_with= is =prepare= plus =encode=, collecting warnings, so it cannot
+drift from the binary either. It now also accepts a single-layer GeoPackage
+source, which falls out of the pipeline rather than being added.
+
+=main.rs= keeps only what § WHAT STAYS IN THE BINARY lists. Its header now says
+what is true.
+
+** P6. Parity is tested exhaustively, and every future addition joins the sweep
+=tests/library_pipeline.rs='s =every_conversion_says_the_same_through_both=
+runs every source format into every target format under every option set,
+through the binary and through the pipeline, and requires the two to say the
+same thing: the same warnings in the same order, and -- when either fails --
+the same error. 243 cases today.
+
+*The standing rule:* a new format, option, warning or error is not done
+until this sweep covers it, and the sweep is built so that it does by
+construction:
+- =fixture(format)= is an exhaustive =match= on =Format=, so a new format
+  does not compile until it has a fixture.
+- =flags(options)= destructures =ConvertOptions= without =..=, so a new
+  option does not compile until it has a flag, or a stated reason it has none.
+- A new warning or error needs no test edit to be compared: it is either
+  emitted by the shared pipeline, so both sides say it, or it is not, and the
+  sweep fails.
+
+The hand-written tests beside it cover what one fixture per format cannot
+reach: an append against an existing destination, a =--crs= across layers that
+disagreed, a Shapefile =.dbf= truncation.
+
+** P7. Error parity: one check for an option the target cannot take
+The first sweep found the one error-side divergence. =--kml-version= on a
+non-KML target was refused by =cli.rs= before anything was read, with the
+version in the message, while the library refused it at the encode -- after
+the warnings, in other words -- and not at all for a GeoPackage or Shapefile
+target, which never reach =write_features_with=. Now =WriteOptions::check=
+is the one rule: =cli.rs= calls it at argument time, =pipeline::prepare=
+before it reads, and =write_features_with= before it encodes.
+
+** CHANGES THE USER CAN SEE
+- =--progress= on a GeoPackage path now reports a Hilbert sort, as the
+  single-collection path always did, and a =gpkg -> gpkg= run reports the
+  layers it found. No warning text, warning order or output byte changes.
+- A library caller gets the multi-layer =--crs= relabel warning, the
+  GeoPackage container surveys and Shapefile's =.dbf= warnings through the
+  same sink as every other warning.
+- A library caller asking for a KML version on a non-KML target is refused
+  before the read, in the binary's words, whatever the target.
+
+** DECIDED AGAINST
+- *Leaving =geopackage::container_drop_warnings= and friends public as the
+  way in.* They stay public, since a caller may want a survey alone, but the
+  sequence is no longer something a caller assembles.
+- *Moving =stale_sidecar_warnings= into the library* behind a "list of names
+  already present" argument. The survey's correctness rests on comparing
+  bytes on disk after the write, because case-folding is a property of the
+  filesystem (see its doc comment); a list of names cannot carry that.

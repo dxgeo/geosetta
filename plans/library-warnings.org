@@ -1,0 +1,139 @@
+#+TITLE: Plan: Lossy-Conversion Warnings Through the Library API
+#+AUTHOR: Daniel Okuniewicz Jr.
+#+DATE: {{{time(%Y-%m-%d)}}}
+
+* Lossy-Conversion Warnings Through the Library API
+
+** STATUS -- L1 shipped 2026-10-31; L4 and L5 superseded the same day; L2 and L3 are recorded for revisiting
+L1 (one public pre-write check, and a one-call conversion that keeps its
+warnings) is built. L4 and L5 were then built, as one change, by
+[[file:library-pipeline.org][library-pipeline.org]]: the binary now runs the
+library's pipeline rather than its own, which both gathers the GeoPackage and
+Shapefile warnings (L4) and enforces the ordering (L5). L2 and L3 stay
+decided against *for now*, with the reason, so that revisiting them starts
+from the argument rather than from zero.
+
+** THE PROBLEM
+[[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]'s rule is
+that a lossy conversion must not succeed silently. Until L1 that held for the
+=geosetta= binary and not for the crate:
+
+- The library never prints, which is right -- it returns message bodies and
+  =main.rs='s =print_warnings= presents them.
+- But the function that *collected* the pre-write checks,
+  =collect_conversion_warnings=, and the same-format warning,
+  =same_format_warning=, were both private to =main.rs=. A library caller had
+  to know the list of checks and call each one, in order, by hand.
+- =write_features= runs no check, and =convert()= discards every warning,
+  read-side included. Its own doc comment said so and told the caller to "run
+  the checks =main= runs".
+
+So a library conversion was silent by default and correct only by imitation,
+and nothing kept the imitation in step when a check was added.
+
+*The duplication had already produced a bug* --
+[[file:cross-format-audit.org][cross-format-audit.org]] F1. The KML write
+checks (=convert::kml_write_warnings=) were a third, separate call, and the
+GeoPackage *write* path never made it: =geosetta in.kml out.gpkg= dropped a
+=<Model>= -- and its non-EGM96 Z values -- with no warning, where
+=geosetta in.kml out.fgb= warned about both. Re-measured 2026-10-31 on
+=tests/fixtures/hand_hostile.kml=. L1 is that audit's A1: its D-A3 asked for
+exactly one place that names every pre-write check.
+
+** L1 -- DONE: one check function, and a conversion that keeps its warnings
+*** D1. =convert::conversion_warnings= is the single list of pre-write checks
+#+begin_src rust
+pub fn conversion_warnings(fc: &FeatureCollection, source: Format, target: Format, options: WriteOptions) -> Vec<String>
+#+end_src
+The same-format warning, the CRS / M / schema / declaration-recast checks, and
+the KML write checks, in that order -- the order the CLI printed them in, so
+no run's stderr changes. =main.rs= calls it on both the single-collection path
+and, through =collect_layer_warnings=, on every GeoPackage layer, which is what
+closes the KML→GeoPackage gap above. *A new check is one line here, and the
+CLI and the library both get it.* The GeoPackage write path also releases
+foreign natives per layer before the write now, as the shared path already
+did -- A1's other half, a memory saving that changes no output.
+
+It takes =source= because a =FeatureCollection= does not record the format it
+was read from, and the same-format warning cannot be computed without it. It
+takes =WriteOptions= because the KML checks depend on the requested version.
+
+*** D2. =convert_with= returns the warnings beside the bytes
+#+begin_src rust
+#[must_use]
+pub struct Converted { pub bytes: Vec<u8>, pub warnings: Vec<String> }
+pub fn convert_with(from: Format, to: Format, input: &[u8], options: WriteOptions) -> Result<Converted>
+#+end_src
+Read-side warnings first, then =conversion_warnings=. Bodies only, no
+=warning: = prefix, as everywhere else. This is also the shape a caller with no
+stderr needs -- the open question in the README's wasm entry.
+
+*** D3. =write_features= stays a plain encoder
+Deciding against making it return warnings (§ L3). Its doc comment points at
+=conversion_warnings=.
+
+*** D4. =convert()= keeps its signature
+It still returns bytes and discards warnings; its doc comment now names
+=convert_with= rather than telling the caller to imitate =main=. § L2 records
+the stricter alternatives.
+
+*** D5. Ordering is documented, not enforced
+=conversion_warnings= must see the collection that will be written: after a
+=--crs= override is installed, before =release_foreign_natives= drops what the
+KML checks inspect. =convert_with= has neither step, so it cannot get the
+order wrong; =main.rs= is the only ordered caller. § L5 records the
+alternatives.
+
+** DEFERRED -- decided against for now, with the reason
+*** L2. A stricter =convert()=
+Two alternatives to D4:
+- *=convert()= returns =Converted=.* A caller then cannot reach the bytes
+  without destructuring past the warnings, which is the strongest guarantee
+  short of an error. Against: it changes a re-exported signature and every test
+  that calls it, for a function that is =#[allow(dead_code)]= in the binary.
+- *Delete =convert()=*, leaving =convert_with= the only one-call path. Against:
+  the warning-free form is what most of =convert.rs='s round-trip tests want.
+
+*Revisit if* a downstream caller is found discarding warnings through
+=convert()=, or when the crate next takes a breaking release for another
+reason.
+
+*** L3. =write_features= reporting what it lost
+The alternative to D3. Against: every caller breaks, and the write alone cannot
+make the same-format check, which needs the source format the collection does
+not record. *Revisit if* =FeatureCollection= ever records its source format --
+then a write could run every check itself, and =source= would drop out of
+=conversion_warnings= too.
+
+*** L4. GeoPackage and Shapefile equivalents of =convert_with= -- SUPERSEDED by [[file:library-pipeline.org][library-pipeline.org]]
+Both already hand their warnings to the caller through their own entry points,
+so nothing is *silent* -- it is only not *collected*:
+- *GeoPackage write:* =geopackage::container_drop_warnings= and
+  =metadata_drop_warnings= are public, but a caller must know to call them,
+  against the right container bytes (source /and/ an existing destination),
+  after =reconcile_containers=. That sequence is spread through
+  =run_geopackage_write=.
+- *GeoPackage read:* =collect_layer_warnings=' de-duplicating fan-out over
+  layers is still =main.rs='s.
+- *Shapefile:* =shapefile::read= takes a sink; =shapefile::write='s
+  =Encoded.warnings= carries the post-write =.dbf= losses
+  ([[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]] § 2a).
+
+The shape would be a =convert_layers_with= over =(name, collection)= pairs and
+a Shapefile variant taking sibling bytes, each returning a =Converted=-like
+result. *Revisit* alongside the wasm consumer crate, which needs exactly this.
+
+*** L5. Enforcing the ordering -- SUPERSEDED by [[file:library-pipeline.org][library-pipeline.org]] P1
+The objection below -- =--progress= and the Hilbert sort -- was answered by an
+event callback and a =sort_hilbert= option, not by keeping two pipelines.
+Alternatives to D5:
+- *Fold the CRS override into =convert_with=* (an option on =WriteOptions= or a
+  new options struct), so the library's pipeline matches the CLI's step for
+  step and =main.rs= could call it. Against: =main.rs='s path also streams
+  =--progress= between stages and sorts by Hilbert order, so it would not
+  actually use =convert_with=.
+- *A type-state wrapper* -- a collection that has been checked and may now be
+  written, so writing an unchecked one does not compile. Against: heavy for a
+  single ordered caller.
+
+*Revisit if* a second caller has to reproduce the ordered sequence.

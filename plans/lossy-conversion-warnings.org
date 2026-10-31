@@ -77,11 +77,30 @@ enough to get fixed./
 ** THE MECHANISMS -- extend these, don't grow a bespoke path
 Two *shapes* exist in this codebase -- a prediction, and a report of what
 actually happened -- across *three sites*: a check run before the write, a
-writer reporting what it did, and (owed, not built) a reader reporting what it
-could not keep. A new gap should fit one of the two shapes, not grow a bespoke
-path. As of the *generalization pass* below, every site funnels through the
-same two shared =main.rs= functions rather than each growing its own wrapper
-— see § GENERALIZED COLLECTION.
+writer reporting what it did, and a reader reporting what it could not keep
+(§ 2b, built 2026-10-23). A new gap should fit one of the two shapes, not grow
+a bespoke path. Every site's warnings reach a caller through one channel,
+=pipeline::Event::Warning= ([[file:library-pipeline.org][library-pipeline.org]]),
+which the binary presents through =main.rs='s =print_warnings=, and every § 1
+check that needs only the collection and the target is listed once, in the
+library's =convert::conversion_warnings= -- see § GENERALIZED COLLECTION.
+
+*Where each warning comes from today* -- the whole map, so a new one has an
+obvious home:
+| Source                         | Shape      | Where it is collected                                           | Reaches a caller through              |
+|--------------------------------+------------+-----------------------------------------------------------------+---------------------------------------|
+| A check before the write (§ 1) | prediction | =convert::conversion_warnings=                                  | =pipeline::prepare=, =convert_with=   |
+| What a read dropped (§ 2b)     | report     | the sink =read_features= / =shapefile::read= take               | =pipeline::prepare=, =convert_with=   |
+| What a write did (§ 2a)        | report     | Shapefile's =Encoded.warnings=                                  | =Prepared::encode=                    |
+| A GeoPackage container (§ 1)   | prediction | =geopackage::container_drop_warnings=, =metadata_drop_warnings= | =prepare=, =Prepared::into_geopackage= |
+| A =--crs= override             | report     | =pipeline='s =apply_crs_override=                               | =pipeline::prepare=                   |
+| Stale sidecars beside a =.shp= | report     | =main.rs='s =stale_sidecar_warnings=                            | the binary only                       |
+Every row but the last is the library's and reaches the binary the same way
+it reaches any caller ([[file:library-pipeline.org][library-pipeline.org]]).
+The last is the binary's by nature: it surveys files on disk beside a written
+=.shp=, and the library never sees a path. A new warning goes in the pipeline
+unless it too is about a path, a stream or a terminal -- and
+=tests/library_pipeline.rs='s sweep fails if the two disagree.
 
 /The heading read "THE TWO EXISTING MECHANISMS -- extend these, don't invent a
 third" until 2026-10-22, and the third site is not an invention of one: a
@@ -92,10 +111,11 @@ presentation path, not a second place a loss can be observed./
 *** 1. Pre-write predictive check (preferred when the answer doesn't depend on the actual encoding)
 A pure function taking the source data and the target =Format=, returning
 =Option<String>= — =None= when nothing is lost, =Some(warning)= otherwise.
-Five real instances now. Four are each just an entry in
-=main.rs='s =collect_conversion_warnings= (see below) rather than its own
-wrapper-function pair; the last keeps the shape but not that collector, for a
-reason it states:
+The instances below are each an entry in =convert::conversion_warnings=
+(see below; until 2026-10-31 it was =main.rs='s private
+=collect_conversion_warnings=) rather than their own wrapper-function pair --
+except the two GeoPackage container checks, which keep the shape but not that
+collector, for a reason they state:
 - [[file:crs.org][=Crs::downgrade_warning(&self, target: Format) ->
   Option<String>=]] (=crs.rs=) — CRS-loss warnings, the original instance
   this pattern is named after.
@@ -118,7 +138,7 @@ reason it states:
   what =carry.rs= puts back, because a warning whose job is to name what a
   rewrite loses must stop naming content the moment it survives./ Same pure-function-of-the-source shape, but it takes the
   container's *bytes* and no target =Format=, so it cannot be an entry in
-  =collect_conversion_warnings= and is called directly from
+  =conversion_warnings= and is called directly from
   =run_geopackage_write= instead.
 
   *The deviation is the interesting part, and it is not laziness.* The other
@@ -176,7 +196,7 @@ reason it states:
 
 - =FeatureCollection::decl_recast_warning(&self, target: Format) ->
   Option<String>= (=feature.rs=) -- *the declared type* the target cannot hold,
-  added 2026-08-21. Ordinary entry in =collect_conversion_warnings=; the
+  added 2026-08-21. Ordinary entry in =conversion_warnings=; the
   interesting part is what it does *not* fire on.
 
   *It is stated against a widening relation, not equality.* =DeclType::admits=
@@ -201,15 +221,16 @@ without redoing that step's own work.
 
 **** 2a. The write side -- BUILT
 - =shapefile::writer::Encoded { warnings: Vec<String>, ... }= (=dbf.rs='s
-  field-name/value truncation) — =main.rs='s =write_shapefile_to_path=
-  prints them via the same shared =print_warnings= the pre-write checks
-  use (see below), same =--quiet= gate.
+  field-name/value truncation) — =pipeline::Prepared::encode= reports them
+  as =Event::Warning= after the encode that found them, so they reach the
+  binary's =print_warnings= the way the pre-write checks do (see below), same
+  =--quiet= gate.
 
-**** 2b. The read side -- OWED, and owed twice
+**** 2b. The read side -- BUILT
 /Scoped 2026-10-22; ***built 2026-10-23***, with both owed instances./ What
 shipped: =convert::read_features= and =shapefile::read= take
-=warnings: &mut Vec<String>=; =main.rs='s =read_input= prints them through
-=print_warnings= as the read finishes, before any write-side warning. The
+=warnings: &mut Vec<String>=; =pipeline::read= reports them as
+=Event::Warning= as the read finishes, before any write-side warning. The
 counting helper is =crate::tally::Tally=, keyed by a cause type each reader
 defines. The KML instance warned for =<Model>= and, as the GDAL measurement
 below ruled, *parses* the other three (=LinearRing=, =Track=, =MultiTrack=),
@@ -289,8 +310,8 @@ is behind one of the other two -- worth knowing before this is sized as "a
 parameter on =read_features=":
 - =convert::read_features(format, input)= -- the single-buffer spokes, where
   item 6's KML case lives (both the =Kml= and =Kmz= arms).
-- =shapefile::read(shp, dbf_bytes, prj, cpg)= -- called from =main.rs=, which
-  locates the sibling files; =read_features='s =Format::Shapefile= arm is an
+- =shapefile::read(shp, dbf_bytes, prj, cpg)= -- called from =pipeline::read=
+  with the sibling files' bytes, which =main.rs= locates; =read_features='s =Format::Shapefile= arm is an
   =Err=. ***This is where E1's =.cpg= warning has to go***, so the sink
   cannot be a =read_features= detail.
 - =geopackage::read_layers(bytes)= -- same reason, per-layer. Nothing owes a
@@ -347,23 +368,26 @@ per-warning-type wrapper-function-pair was real, and growing, duplication —
 so it was collapsed once a second real instance made the pattern
 undeniable and a third was explicitly expected.
 
-*What's shared now (=main.rs=)*:
-- =collect_conversion_warnings(fc: &FeatureCollection, target: Format) ->
-  Vec<String>= — runs every registered pre-write check (§1) against one
-  collection, in order, returning whichever fired. *A new check is one
-  line added here* — no new wrapper function, no new call sites to
-  remember.
-- =collect_layer_warnings(layers: &[(String, FeatureCollection)], target:
-  Format) -> Vec<String>= — the same de-duplicating fan-out
-  =warn_crs_loss_layers= used to do alone, now built once on top of
-  =collect_conversion_warnings= and shared by every check.
-- =print_warnings(warnings: &[String], quiet: bool)= — the =--quiet= gate
-  and =eprintln!= loop, shared by *every* site (§1, §2a and, when it is
-  built, §2b -- which adds a collection point, not a presentation one): the
-  three =main.rs= call sites use =print_warnings(&collect_conversion_warnings(...),
-  ...)=/=print_warnings(&collect_layer_warnings(...), ...)=, and
-  =write_shapefile_to_path= calls =print_warnings(&encoded.warnings, quiet)=
-  directly for its post-write =Encoded.warnings=.
+*What's shared now*:
+- =convert::conversion_warnings(fc, source, target, options) ->
+  Vec<String>= — *public*, since 2026-10-31
+  ([[file:library-warnings.org][library-warnings.org]] L1; until then this was
+  =main.rs='s private =collect_conversion_warnings=, and the same-format and
+  KML checks were separate calls beside it). Runs every registered pre-write
+  check (§1) against one collection, in order, returning whichever fired.
+  *A new check is one line added here* — no new wrapper function, no new call
+  sites to remember, and a library caller gets it too, directly or through
+  =convert::convert_with=.
+- =layer_warnings(layers, source, target, options) -> Vec<String>=
+  (=pipeline.rs=, private; =main.rs='s =collect_layer_warnings= until
+  2026-10-31) — the same de-duplicating fan-out =warn_crs_loss_layers= used to
+  do alone, built once on top of =conversion_warnings= and run by
+  =pipeline::prepare= on every conversion, single-layer or not.
+- =print_warnings(warnings: &[String], quiet: bool)= (=main.rs=) — the
+  =--quiet= gate and =eprintln!= loop. The binary's =reporter= sends every
+  =pipeline::Event::Warning= through it, whichever site (§1, §2a, §2b) the
+  warning came from, and =write_shapefile_to_path= sends its own
+  =stale_sidecar_warnings= through it too.
 
 *What deliberately stayed independent*: the check functions themselves
 (=Crs::downgrade_warning=, =FeatureCollection::m_downgrade_warning=) were
@@ -389,7 +413,7 @@ own naturally-typed functions; only the boilerplate around them is shared.
 - *A source's column schema dropped on the way to a target that does not
   carry it* -- =FeatureCollection::schema_drop_warning=, added 2026-08-20 with
   the modelled column schema (=same-format-fidelity.org= D1). Mechanism 1, one
-  line in =collect_conversion_warnings=.
+  line in what is now =convert::conversion_warnings=.
 
   *This is a gap this rule created and then closed in the same pass*, which is
   worth naming because it is the shape future spoke work will keep producing:
@@ -417,6 +441,14 @@ own naturally-typed functions; only the boilerplate around them is shared.
   counted and named. Mechanism 1, in =convert::kml_write_warnings= beside the
   KML spoke's other pre-write warnings, since it depends on whether the write
   carries a KML document back (whose stored nulls keep their spelling).
+- *A KML/KMZ source written to GeoPackage printing none of the KML spoke's
+  warnings* -- [[file:cross-format-audit.org][cross-format-audit.org]] F1,
+  closed 2026-10-31 by [[file:library-warnings.org][library-warnings.org]] L1.
+  A =<Model>=, a track's per-vertex data and Z's meaning were dropped silently
+  on that one path, because each =main.rs= path assembled its own list of
+  checks and that one's left out =kml_write_warnings=. *The fix is structural*:
+  there is now one list, =convert::conversion_warnings=, and every path calls
+  it.
 
 ** OPEN CANDIDATES -- known, not yet warned, lower priority
 /See also/ [[file:cross-format-audit.org][cross-format-audit.org]], which
@@ -507,7 +539,7 @@ ever sees is a maintenance cost with no reader.
 and the loss is exactly the kind it names: information the source carries,
 silently degraded, on a run that reports success.
 
-Whoever settles it: the shape is a fifth entry in =collect_conversion_warnings=,
+Whoever settles it: the shape is one more entry in =convert::conversion_warnings=,
 and the ignored test is written to be rewritten around it.
 
 ** OWED WARNING -- a WKT-bearing CRS written to GeoParquet loses its dialect
@@ -600,16 +632,17 @@ capability gap:
 2. If a gap exists, write the pre-write predictive check (§1) unless the
    loss is only knowable during actual encoding, in which case use the
    writer-returns-warnings shape (§2).
-3. For a §1 check: add one line to =main.rs='s =collect_conversion_warnings=
-   calling it. That's the whole wiring step — it already reaches all three
-   =main.rs= entry points (single-file convert, GeoPackage fan-out read,
-   GeoPackage fan-out write) through =collect_conversion_warnings=/
-   =collect_layer_warnings=, so there is no longer a way to wire a new
-   check into only *some* of them by mistake (the exact failure mode this
-   note used to warn about, before the collection was generalized — see §
-   GENERALIZED COLLECTION). For a §2 check: have the writer collect into
-   its own =Encoded.warnings=-shaped field and call =print_warnings= on it
-   where the writer's bytes get written.
+3. For a §1 check: add one line to =convert::conversion_warnings= calling
+   it. That's the whole wiring step — =pipeline::prepare= runs it on every
+   conversion, which is the binary's only path and =convert_with='s
+   ([[file:library-pipeline.org][library-pipeline.org]]), so there is no way
+   to wire a new check into only *some* of them by mistake, and
+   =tests/library_pipeline.rs= fails if the two ever disagree. /That way existed until
+   2026-10-31: the KML checks were a separate call the GeoPackage write path
+   missed (=cross-format-audit.org= F1)./ For a §2 write-side check: have
+   the writer collect into its own =Encoded.warnings=-shaped field and call
+   =print_warnings= on it where the writer's bytes get written. For a §2b
+   read loss: count it into the sink the reader already takes.
 4. Test both the *positive* case (the warning fires, with the right target
    named) and the *negative* case (a target that legitimately supports the
    feature stays silent) — mirroring this doc's own two new tests

@@ -643,7 +643,7 @@ which changes the same reader.
 =Storage::Rows= goes, and with it =Vec<Feature>= in the hub; shaped rows
 stay, as a block form (D-C13). The rest of the
 crate moves onto views: =reorder_hilbert= becomes =permute=, the CRS
-override, =collect_conversion_warnings= and =m_downgrade_warning=, the
+override, =convert::conversion_warnings= and =m_downgrade_warning=, the
 GeoPackage layer fan-out, =release_foreign_natives=, the same-format
 machinery. The public API of D-C8 is settled, =tests/public_api.rs= rewritten
 to it, and the breaking release made (D-C8).

@@ -3,6 +3,41 @@
 
 * Performance
 
+** BUDGETS -- the wins below are guarded, not just recorded
+Added 2026-10-31, so that what this file measured stays true. *Standing
+rules:*
+- *Accuracy is never the price.* A memory or speed change counts only if
+  every output, stderr line and exit status is byte-identical to the build
+  before it (=bench/equiv.py=), as every item below was verified. A budget is
+  never met by dropping, rounding or approximating anything a conversion
+  would otherwise keep -- that is a fidelity regression, and fidelity outranks
+  every number here ([[file:lossy-conversion-warnings.org][lossy-conversion-warnings.org]]).
+  When fidelity work costs memory or time, the budget moves, with the reason
+  written here.
+- A change that wins memory or speed, accurately, lowers the matching budget,
+  or raises the matching floor, in the same commit, so the win is kept too.
+- =tests/budgets.rs=, *every =cargo test=*:
+  - /Memory and allocations/, counted by the =bench/memprobe= allocator over
+    =geosetta::pipeline= -- the binary's path. Each format is read into GeoJSON
+    and written from it (10 000 narrow features; Shapefile on either side gets
+    points), plus the three wide cases tracked above (1 000 × 200), and each
+    conversion's peak heap and allocation count per feature must stay within
+    20% of what was measured (at least two allocations). The counts are
+    identical run to run and in debug or release, so these cannot flake.
+  - /Scaling/: every format, read and written, at 2 000 and 8 000 rows, and the
+    column-building writers at 50 and 200 columns. 4× the input must cost under
+    8× the time; a quadratic pass costs 16×. Items 1 and 11 and Mem3's
+    FlatGeobuf write were all that shape. A ratio within one run does not
+    depend on the machine.
+  - Both tables are exhaustive matches on =Format=, so a new format does not
+    compile until it has a budget.
+  - Checked against planted regressions: a whole-IR copy in =prepare= failed
+    five memory budgets, and an O(n²) loop failed every scaling case.
+- =tests/perf.rs=, *release, =--ignored=*: each throughput benchmark asserts
+  a floor of half its 2026-10-31 rate at 200 000 features, so a path that
+  halves in speed fails. Machine-dependent by nature, which is why it is not
+  in the default run. A benchmark with no floor panics.
+
 ** BENCHMARKS
 =tests/perf.rs= drives the real =geosetta= binary end-to-end (whole-pipeline
 timing, including process startup and file I/O). It generates a synthetic GeoJSON

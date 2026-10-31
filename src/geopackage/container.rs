@@ -150,7 +150,7 @@ const MAX_NAMED: usize = 6;
 /// capability gap in the target. This one takes *bytes*, because the loss is
 /// not in the target's capabilities at all — the target is GeoPackage, which
 /// represents all of this perfectly well — but in this crate's writer. Same
-/// contract, different question, so it collects in `main.rs` beside them
+/// contract, different question, so `pipeline` collects it beside them
 /// instead of growing a path of its own.
 pub fn container_drop_warnings(
     bytes: &[u8],

@@ -1,8 +1,11 @@
 //! Geosetta — the `geosetta` command-line front end.
 //!
-//! All conversion logic lives in the library crate ([`geosetta`]); this
-//! binary is a thin CLI wrapper that parses arguments, reads/writes files, and
-//! reports `--progress`.
+//! A wrapper on the library crate ([`geosetta`]): every step of a conversion is
+//! [`geosetta::pipeline`]'s, and this binary parses arguments, moves bytes
+//! between files or stdio and the pipeline, and presents what the pipeline
+//! reports — `warning: ` lines, `--quiet`, `--progress`. What stays here is
+//! what touches a path, a stream or a terminal (`plans/library-pipeline.org`
+//! § WHAT STAYS IN THE BINARY).
 //!
 //! `-` as `<input>` or `<output>` means stdin/stdout (the standard Unix
 //! convention), so any external tool composes with geosetta through an
@@ -37,7 +40,7 @@
 //! ```
 //! Where the re-encode still loses something, the run says so — the
 //! cross-format defence ("the target has no slot for it") does not apply when
-//! the target *is* the source's format. See `same_format_warning`.
+//! the target *is* the source's format. See `convert::conversion_warnings`.
 //!
 //! The same-file refusal ([`refuse_same_file`]) is the other half, and it is
 //! not merely tidiness: the format check that used to reject `a.fgb a.fgb` had
@@ -48,9 +51,10 @@
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
-use geosetta::{cli, convert, geopackage, shapefile};
+use geosetta::pipeline::{self, ConvertOptions, Event, Output, Prepared, Source};
+use geosetta::{cli, shapefile};
 use geosetta::Crs;
-use geosetta::{Error, FeatureCollection, Format, Result, WriteOptions};
+use geosetta::{Error, FeatureCollection, Format, Result};
 
 /// Read `path`'s bytes, or all of stdin when `path` is `"-"`.
 fn read_bytes(path: &str) -> Result<Vec<u8>> {
@@ -105,7 +109,7 @@ fn run() -> Result<()> {
     let out = match &args.mode {
         cli::Mode::PrintCrsCode => return print_crs_code(&args),
         cli::Mode::PrintCrs => return print_crs(&args),
-        cli::Mode::Convert { output, to } => Output { path: output, format: *to },
+        cli::Mode::Convert { output, to } => Destination { path: output, format: *to },
     };
 
     // Before anything is read or written: an output that would overwrite its
@@ -114,76 +118,99 @@ fn run() -> Result<()> {
 
     // Read the `--crs` override up front: a malformed one should fail before
     // anything has been read or written, not midway through.
-    let crs_override = load_crs_override(&args)?;
+    let crs = load_crs_override(&args)?;
 
-    // GeoPackage is a multi-layer container, so it doesn't fit the plain
-    // single-collection convert path.
-    match (args.from, out.format) {
-        (_, Format::Gpkg) => return run_geopackage_write(&args, &out, crs_override.as_ref()),
-        (Format::Gpkg, _) => return run_geopackage_read(&args, &out, crs_override.as_ref()),
-        _ => {}
+    // Every format routes through the library's one pipeline, so any input
+    // format converts to any output format the writers support. What is left
+    // here is getting the bytes in and out: Shapefile's siblings are located
+    // on disk, a GeoPackage output is appended to an existing file, and a
+    // multi-layer source fans out to a directory.
+    let input = read_input(&args)?;
+    let mut report = reporter(&args, out.format);
+    let prepared = pipeline::prepare(args.from, out.format, input.source(), convert_options(&args, &out, crs), &mut report)?;
+    if out.format == Format::Gpkg {
+        return write_geopackage(&out, prepared, args.progress, &mut report);
     }
-
-    // Everything else routes through the shared feature IR, so any input format
-    // converts to any output format the writers support. The stages are made
-    // visible under --progress (the pipeline is batch, so this is per-stage, not
-    // sub-stage). Shapefile is multi-file (read_input/write_collection handle
-    // locating/writing its .shp/.shx/.dbf/.prj siblings) but otherwise composes
-    // through the IR exactly like every other format.
-    let mut fc = read_input(&args)?;
-    if args.progress {
-        eprintln!("parsed {} features from {}", fc.features.len(), args.from.extension());
-    }
-    if args.sort_hilbert {
-        convert::reorder_hilbert(&mut fc);
-        if args.progress {
-            eprintln!("sorted {} features by Hilbert locality", fc.features.len());
-        }
-    }
-    // Before the warnings: a supplied override is exactly as authoritative as a
-    // CRS read from the file, so it must be in place before anything predicts
-    // what the target can record.
-    if let Some(crs) = &crs_override {
-        install_crs_override(&mut fc, crs);
-    }
-    print_warnings(&same_format_warning(args.from, out.format), args.quiet);
-    print_warnings(&collect_conversion_warnings(&fc, out.format), args.quiet);
-    print_warnings(&convert::kml_write_warnings(&fc, out.format, args.kml_version), args.quiet);
-    release_foreign_natives(&mut fc, out.format);
-    if args.progress {
-        eprintln!("writing {}...", out.format.extension());
-    }
-    write_collection(out.format, out.path, &fc, args.quiet, args.write_options())
-}
-
-/// Drop every native the target's writer will not read, once the warnings
-/// that inspect them have run.
-///
-/// Only a memory saving: a writer replays a payload only when its tag matches
-/// (`Native::payload_for`), so this changes no output. It matters for KML,
-/// whose natives are each feature's whole element — on a large `kml -> fgb`
-/// run they would otherwise be held through the write for nothing. KML and KMZ
-/// read each other's natives, since the two hold one document.
-fn release_foreign_natives(fc: &mut FeatureCollection, target: Format) {
-    let kept = |format: Format| {
-        format == target || matches!((format, target), (Format::Kml, Format::Kmz) | (Format::Kmz, Format::Kml))
-    };
-    if fc.native.as_ref().is_some_and(|n| !kept(n.format)) {
-        fc.native = None;
-    }
-    for f in &mut fc.features {
-        if f.native.as_ref().is_some_and(|n| !kept(n.format)) {
-            f.native = None;
-        }
-    }
+    write_layers(&args, &out, &prepared, &mut report)
 }
 
 /// The destination half of a conversion — where output goes and in what format.
 /// Lifted out of [`cli::Mode::Convert`] once, in [`run`], so nothing downstream
 /// has to re-match the mode to find out whether it has an output at all.
-struct Output<'a> {
+struct Destination<'a> {
     path: &'a str,
     format: Format,
+}
+
+/// What the pipeline does beyond the encode, from the flags. The default layer
+/// name is the input's file stem, and the GeoPackage survey messages name each
+/// container by its path, or `stdin`/`stdout`.
+fn convert_options(args: &cli::Args, out: &Destination, crs: Option<Crs>) -> ConvertOptions {
+    ConvertOptions {
+        write: args.write_options(),
+        crs,
+        sort_hilbert: args.sort_hilbert,
+        layer: args.layer.clone(),
+        default_layer_name: Some(layer_stem(&args.input)),
+        rtree: args.rtree,
+        envelope: args.envelope,
+        source_label: Some(io_label(&args.input, "stdin").into()),
+        destination_label: Some(io_label(out.path, "stdout").into()),
+    }
+}
+
+/// Present the pipeline's events: each warning as a `warning: ` line unless
+/// `--quiet`, and the stage boundaries as `--progress` lines.
+///
+/// The `warning: ` prefix the convention requires is added *here*, not by each
+/// check, so a new check cannot forget it or spell it differently — which is
+/// exactly what had happened: the `.dbf` warnings were written with the
+/// `shapefile: ` tag the shapefile *errors* use, and so read as errors. Checks
+/// return the message body; presentation is this function's job. A message may
+/// still carry its own component tag after the prefix (`warning: shapefile: …`).
+fn reporter(args: &cli::Args, to: Format) -> impl FnMut(Event<'_>) + '_ {
+    move |event| match event {
+        Event::Warning(w) => print_warnings(&[w], args.quiet),
+        Event::Read { layers } if args.progress => {
+            if args.from == Format::Gpkg {
+                eprintln!("found {} layer(s)", layers.len());
+                for (name, fc) in layers {
+                    eprintln!("  layer {name}: {} features", fc.features.len());
+                }
+            } else {
+                let features: usize = layers.iter().map(|(_, fc)| fc.features.len()).sum();
+                eprintln!("parsed {features} features from {}", args.from.extension());
+            }
+        }
+        // A GeoPackage output names its layers, so say which.
+        Event::Selected { layers } if args.progress && to == Format::Gpkg => {
+            for (name, fc) in layers {
+                eprintln!("layer {name}: {} features", fc.features.len());
+            }
+        }
+        Event::Sorted { features } if args.progress => {
+            eprintln!("sorted {features} features by Hilbert locality");
+        }
+        Event::Encoding if args.progress => eprintln!("writing {}...", to.extension()),
+        _ => {}
+    }
+}
+
+/// The input, read: one buffer, or a Shapefile's siblings.
+enum Input {
+    Bytes(Vec<u8>),
+    Shapefile { shp: Vec<u8>, dbf: Vec<u8>, prj: Option<String>, cpg: Option<String> },
+}
+
+impl Input {
+    fn source(&self) -> Source<'_> {
+        match self {
+            Input::Bytes(bytes) => Source::Bytes(bytes),
+            Input::Shapefile { shp, dbf, prj, cpg } => {
+                Source::Shapefile { shp, dbf, prj: prj.as_deref(), cpg: cpg.as_deref() }
+            }
+        }
+    }
 }
 
 /// Read and parse the `--crs` override, if one was given: text from a file, or
@@ -203,49 +230,6 @@ fn load_crs_override(args: &cli::Args) -> Result<Option<Crs>> {
         std::fs::read_to_string(path)?
     };
     Crs::from_definition_text(&text).map(Some)
-}
-
-/// Install a `--crs` override on one collection.
-///
-/// `--crs` is *assign, not enrich*: it replaces whatever the source carried — or
-/// its lack of a CRS — outright, `ogr2ogr -a_srs` style. Geosetta deliberately
-/// does not reconcile the override against the source's own declared identity,
-/// because it has no view on where the text came from or why the user is
-/// supplying it. And it relabels only: no coordinate is touched, here or
-/// anywhere else in the crate.
-fn install_crs_override(fc: &mut FeatureCollection, crs: &Crs) {
-    fc.crs = Some(crs.clone());
-}
-
-/// [`install_crs_override`] across a GeoPackage's layers, plus the one warning
-/// only a multi-layer source can earn.
-///
-/// Overriding is the user's explicit instruction, so a single CRS being replaced
-/// has nothing to report. But when the layers *disagreed*, one identity now
-/// stands in for several — a real relabel the user may not have pictured when
-/// they pointed `--crs` at a container rather than a file. Announcing it rather
-/// than performing it quietly is the same convention every other lossy path in
-/// this crate follows (`plans/lossy-conversion-warnings.org`).
-fn apply_crs_override(layers: &mut [(String, FeatureCollection)], crs: &Crs) -> Vec<String> {
-    let mut distinct: Vec<Option<Crs>> = Vec::new();
-    for (_, fc) in layers.iter() {
-        if !distinct.contains(&fc.crs) {
-            distinct.push(fc.crs.clone());
-        }
-    }
-    for (_, fc) in layers.iter_mut() {
-        install_crs_override(fc, crs);
-    }
-    if distinct.len() < 2 {
-        return Vec::new();
-    }
-    vec![format!(
-        "--crs relabels all {} layers as {}, but the source declared {} different CRSes; \
-         the override replaces every one of them.",
-        layers.len(),
-        crs.authority_code().unwrap_or_else(|| "the supplied definition".into()),
-        distinct.len(),
-    )]
 }
 
 /// `--print-crs-code`: report the source's CRS identity as `AUTHORITY:CODE` on
@@ -302,20 +286,13 @@ fn print_crs_code(args: &cli::Args) -> Result<()> {
 /// diagnostics read exactly this set, so neither can drift from the other on
 /// which layers are in scope.
 fn read_crs_sources(args: &cli::Args) -> Result<Vec<(Option<String>, FeatureCollection)>> {
-    if args.from != Format::Gpkg {
-        return Ok(vec![(None, read_input(args)?)]);
-    }
-    let input = read_bytes(&args.input)?;
-    let mut layers = geopackage::read_layers(&input)?;
-    if let Some(name) = &args.layer {
-        layers.retain(|(n, _)| n == name);
-        if layers.is_empty() {
-            return Err(Error::Usage(format!("no layer named \"{name}\"")));
-        }
-    }
+    let input = read_input(args)?;
+    let options = ConvertOptions { layer: args.layer.clone(), ..ConvertOptions::default() };
+    let layers = pipeline::read(args.from, input.source(), &options, &mut reporter(args, args.from))?;
+    let multi_layer = args.from == Format::Gpkg;
     Ok(layers
         .into_iter()
-        .map(|(name, fc)| (Some(name), fc))
+        .map(|(name, fc)| (multi_layer.then_some(name), fc))
         .collect())
 }
 
@@ -480,80 +457,107 @@ fn nothing_to_print(args: &cli::Args, sources: &[(Option<String>, FeatureCollect
     ))
 }
 
-/// Read the input into the Feature IR. Shapefile is multi-file, so its
-/// sibling files (`.dbf` required, `.prj`/`.cpg` optional) are located next to
-/// `args.input` and read explicitly (and can't be `"-"` — see the module doc
-/// comment); every other format reads a single buffer — `args.input`'s bytes,
-/// or all of stdin when it's `"-"` — through [`convert::read_features`].
-///
-/// What the read itself dropped is printed here, as the read finishes — before
-/// any write-side warning, since it happened first
-/// (`plans/lossy-conversion-warnings.org` § 2b).
-fn read_input(args: &cli::Args) -> Result<FeatureCollection> {
-    let mut warnings = Vec::new();
-    let fc = if args.from == Format::Shapefile {
+/// Read the input. Shapefile is multi-file, so its sibling files (`.dbf`
+/// required, `.prj`/`.cpg` optional) are located next to `args.input` and read
+/// explicitly (and can't be `"-"` — see the module doc comment); every other
+/// format reads a single buffer — `args.input`'s bytes, or all of stdin when
+/// it's `"-"`.
+fn read_input(args: &cli::Args) -> Result<Input> {
+    if args.from == Format::Shapefile {
         if args.input == "-" {
             return Err(no_stdio_for_multifile("Shapefile"));
         }
-        read_shapefile_from_path(&args.input, args.progress, &mut warnings)?
-    } else {
-        let input = read_bytes(&args.input)?;
-        if args.progress {
-            eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
-        }
-        convert::read_features(args.from, &input, &mut warnings)?
-    };
-    print_warnings(&warnings, args.quiet);
-    Ok(fc)
+        return read_shapefile_from_path(&args.input, args.progress);
+    }
+    let input = read_bytes(&args.input)?;
+    if args.progress {
+        eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
+    }
+    Ok(Input::Bytes(input))
 }
 
-/// Write the Feature IR to `output_path`. Shapefile is multi-file, so its
-/// sibling files are written explicitly under `output_path`'s stem (and
-/// `output_path` can't be `"-"` — see the module doc comment); every other
-/// format writes a single buffer — to `output_path`, or to stdout when it's
-/// `"-"` — through [`convert::write_features`]. Shared by the plain
-/// single-collection path and GeoPackage's per-layer fan-out
-/// (`run_geopackage_read`), so a multi-layer `.gpkg` → Shapefile conversion
-/// gets one `layer.shp` sibling set per layer for free. `options` are
-/// `--kml-version`, which the CLI only accepts for KML/KMZ output, and
-/// `--compact`.
-fn write_collection(
+/// Write every layer of a conversion to a target that is not GeoPackage.
+/// Output naming: a directory (existing or trailing `/`) gets one `layer.ext`
+/// file each; a single layer goes to the plain output path; multiple layers to
+/// a plain path is an error unless `--layer` selects one.
+fn write_layers(
+    args: &cli::Args,
+    out: &Destination,
+    prepared: &Prepared,
+    report: &mut dyn FnMut(Event<'_>),
+) -> Result<()> {
+    let layers = prepared.layers();
+    // "-" (stdout) is never a directory, regardless of what happens to exist
+    // in the current directory — a multi-layer .gpkg piped out is rejected
+    // below by the same "give a directory or --layer" error a plain file path
+    // gets, since a single stream can't fan out to more than one layer.
+    let as_dir = out.path != "-"
+        && (out.path.ends_with('/') || std::path::Path::new(out.path).is_dir());
+    if layers.len() == 1 && !as_dir {
+        return write_layer(out.format, out.path, prepared, 0, args.quiet, report);
+    }
+    if !as_dir {
+        return Err(Error::Usage(
+            "GeoPackage has multiple layers: give an output directory (trailing '/') or --layer NAME".into(),
+        ));
+    }
+
+    std::fs::create_dir_all(out.path)?;
+    let dir = std::path::Path::new(out.path);
+    for (i, (name, _)) in layers.iter().enumerate() {
+        let path = dir.join(format!("{name}.{}", out.format.extension()));
+        write_layer(out.format, &path.to_string_lossy(), prepared, i, args.quiet, report)?;
+    }
+    Ok(())
+}
+
+/// Encode layer `index` and write it to `output_path`. Shapefile is
+/// multi-file, so its sibling files are written explicitly under
+/// `output_path`'s stem (and `output_path` can't be `"-"` — see the module doc
+/// comment); every other format writes a single buffer — to `output_path`, or
+/// to stdout when it's `"-"`. One layer at a time, so a multi-layer fan-out
+/// writes each file before encoding the next.
+fn write_layer(
     to: Format,
     output_path: &str,
-    fc: &FeatureCollection,
+    prepared: &Prepared,
+    index: usize,
     quiet: bool,
-    options: WriteOptions,
+    report: &mut dyn FnMut(Event<'_>),
 ) -> Result<()> {
-    if to == Format::Shapefile {
-        if output_path == "-" {
-            return Err(no_stdio_for_multifile("Shapefile"));
-        }
-        return write_shapefile_to_path(output_path, fc, quiet);
+    if to == Format::Shapefile && output_path == "-" {
+        return Err(no_stdio_for_multifile("Shapefile"));
     }
-    let bytes = convert::write_features_with(to, fc, options)?;
-    write_bytes(output_path, &bytes)?;
-    eprintln!("wrote {} ({} bytes)", io_label(output_path, "stdout"), bytes.len());
-    Ok(())
+    match prepared.encode(index, report)? {
+        Output::Bytes(bytes) => {
+            write_bytes(output_path, &bytes)?;
+            eprintln!("wrote {} ({} bytes)", io_label(output_path, "stdout"), bytes.len());
+            Ok(())
+        }
+        Output::Shapefile(encoded) => {
+            write_shapefile_to_path(output_path, &encoded, prepared.layers()[index].1.features.len(), quiet)
+        }
+    }
 }
 
 /// Read a Shapefile given its `.shp` path, locating `.dbf` (required),
 /// `.prj`, and `.cpg` (both optional) alongside it.
-fn read_shapefile_from_path(shp_path: &str, progress: bool, warnings: &mut Vec<String>) -> Result<FeatureCollection> {
+fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<Input> {
     let shp = std::fs::read(shp_path)?;
     let dbf_path = sibling_path(shp_path, "dbf")
         .ok_or_else(|| Error::Usage(format!("shapefile: no .dbf found alongside {shp_path}")))?;
-    let dbf_bytes = std::fs::read(&dbf_path)?;
+    let dbf = std::fs::read(&dbf_path)?;
     let prj = sibling_path(shp_path, "prj").map(std::fs::read_to_string).transpose()?;
     let cpg = sibling_path(shp_path, "cpg").map(std::fs::read_to_string).transpose()?;
     if progress {
         eprintln!(
             "read {shp_path} ({} bytes) + {dbf_path} ({} bytes){}",
             shp.len(),
-            dbf_bytes.len(),
+            dbf.len(),
             if prj.is_some() { " + .prj" } else { "" },
         );
     }
-    shapefile::read(&shp, &dbf_bytes, prj.as_deref(), cpg.as_deref(), warnings)
+    Ok(Input::Shapefile { shp, dbf, prj, cpg })
 }
 
 /// Every path a side of the conversion touches, canonicalised for comparison.
@@ -612,7 +616,7 @@ fn canonical_for_compare(path: &str) -> Option<PathBuf> {
 /// This deliberately changes the GeoPackage path's behaviour, which used to
 /// permit an in-place run. That permissiveness rested on the append path
 /// reading the output before overwriting it — luck, not design.
-fn refuse_same_file(input: &str, from: Format, out: &Output) -> Result<()> {
+fn refuse_same_file(input: &str, from: Format, out: &Destination) -> Result<()> {
     let ins = touched_paths(input, from);
     let outs = touched_paths(out.path, out.format);
     let Some(clash) = outs.iter().find(|o| ins.contains(o)) else {
@@ -627,14 +631,13 @@ fn refuse_same_file(input: &str, from: Format, out: &Output) -> Result<()> {
 
 /// Write a Shapefile's sibling files under `output_path`'s stem (a trailing
 /// `.shp`/`.SHP`, if present, is stripped so `roads.shp` and `roads` both name
-/// the same `roads.{shp,shx,dbf,cpg,prj}` set).
+/// the same `roads.{shp,shx,dbf,cpg,prj}` set). The encode's own `.dbf`
+/// warnings were reported by the pipeline already.
 ///
 /// Writes every file it can and deletes none, then reports the sidecars it left
 /// behind — see [`stale_sidecar_warnings`] and `plans/shapefile.org`
 /// § THE SIDECAR POLICY.
-fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection, quiet: bool) -> Result<()> {
-    let encoded = shapefile::write(fc)?;
-    print_warnings(&encoded.warnings, quiet);
+fn write_shapefile_to_path(output_path: &str, encoded: &shapefile::Encoded, features: usize, quiet: bool) -> Result<()> {
     let stem = strip_shp_extension(output_path);
     std::fs::write(format!("{stem}.shp"), &encoded.shp)?;
     std::fs::write(format!("{stem}.shx"), &encoded.shx)?;
@@ -646,11 +649,10 @@ fn write_shapefile_to_path(output_path: &str, fc: &FeatureCollection, quiet: boo
     // After writing: say what of the destination's existing file set this run
     // left behind, because those files now describe the output beside them.
     // See `stale_sidecar_warnings` on why this cannot be checked beforehand.
-    print_warnings(&stale_sidecar_warnings(&stem, &encoded), quiet);
+    print_warnings(&stale_sidecar_warnings(&stem, encoded), quiet);
     eprintln!(
-        "wrote {stem}.shp + .shx + .dbf + .cpg{} ({} features)",
+        "wrote {stem}.shp + .shx + .dbf + .cpg{} ({features} features)",
         if encoded.prj.is_some() { " + .prj" } else { "" },
-        fc.features.len(),
     );
     Ok(())
 }
@@ -816,287 +818,43 @@ fn sibling_path(shp_path: &str, ext: &str) -> Option<String> {
     })
 }
 
-/// Read a GeoPackage (all layers) and fan out to the target format. Output
-/// naming: a directory (existing or trailing `/`) gets one `layer.ext` file
-/// each; a single layer goes to the plain output path; multiple layers to a
-/// plain path is an error unless `--layer` selects one.
-fn run_geopackage_read(args: &cli::Args, out: &Output, crs_override: Option<&Crs>) -> Result<()> {
-    let input = read_bytes(&args.input)?;
-    if args.progress {
-        eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
-    }
-    let mut layers = geopackage::read_layers(&input)?;
-    if args.progress {
-        eprintln!("found {} layer(s)", layers.len());
-        for (name, fc) in &layers {
-            eprintln!("  layer {name}: {} features", fc.features.len());
-        }
-    }
-
-    if let Some(name) = &args.layer {
-        layers.retain(|(n, _)| n == name);
-        if layers.is_empty() {
-            return Err(Error::Usage(format!("no layer named \"{name}\"")));
-        }
-    }
-    if layers.is_empty() {
-        return Err(Error::Usage("GeoPackage has no feature layers".into()));
-    }
-    if args.sort_hilbert {
-        for (_, fc) in &mut layers {
-            convert::reorder_hilbert(fc);
-        }
-    }
-    if let Some(crs) = crs_override {
-        print_warnings(&apply_crs_override(&mut layers, crs), args.quiet);
-    }
-    print_warnings(&collect_layer_warnings(&layers, out.format), args.quiet);
-    // And what a KML or KMZ write leaves out of each layer -- its nulls
-    // (`plans/kml-standard.org` D-K17) -- once per distinct message, as above.
-    let mut seen = std::collections::BTreeSet::new();
-    let kml: Vec<String> = layers
-        .iter()
-        .flat_map(|(_, fc)| convert::kml_write_warnings(fc, out.format, args.kml_version))
-        .filter(|w| seen.insert(w.clone()))
-        .collect();
-    print_warnings(&kml, args.quiet);
-
-    // "-" (stdout) is never a directory, regardless of what happens to exist
-    // in the current directory — a multi-layer .gpkg piped out is rejected
-    // below by the same "give a directory or --layer" error a plain file path
-    // gets, since a single stream can't fan out to more than one layer.
-    let as_dir = out.path != "-"
-        && (out.path.ends_with('/') || std::path::Path::new(out.path).is_dir());
-    if layers.len() == 1 && !as_dir {
-        let (_, fc) = &layers[0];
-        return write_collection(out.format, out.path, fc, args.quiet, args.write_options());
-    }
-    if !as_dir {
-        return Err(Error::Usage(
-            "GeoPackage has multiple layers: give an output directory (trailing '/') or --layer NAME".into(),
-        ));
-    }
-
-    std::fs::create_dir_all(out.path)?;
-    let dir = std::path::Path::new(out.path);
-    for (name, fc) in &layers {
-        let path = dir.join(format!("{name}.{}", out.format.extension()));
-        write_collection(out.format, &path.to_string_lossy(), fc, args.quiet, args.write_options())?;
-    }
-    Ok(())
-}
-
-/// Write a layer into a GeoPackage, creating it or appending (upserting the
-/// layer if it already exists). The layer name defaults to the input file stem.
-fn run_geopackage_write(args: &cli::Args, out: &Output, crs_override: Option<&Crs>) -> Result<()> {
-    // Independent container content the source holds — a tile pyramid today —
-    // read once here and handed to the writer, which is what stops a
-    // `gpkg -> gpkg` run from destroying it (defect 3, the carrying half).
-    // Empty for every other source format: there is no container to carry.
-    let mut carried = geopackage::Carried::default();
-    let mut new_layers = if args.from == Format::Gpkg {
-        // gpkg -> gpkg: carry over all input layers (optionally one via --layer).
-        let input = read_bytes(&args.input)?;
-        if args.progress {
-            eprintln!("read {} ({} bytes)", io_label(&args.input, "stdin"), input.len());
-        }
-        let mut ls = geopackage::read_layers(&input)?;
-        if let Some(name) = &args.layer {
-            ls.retain(|(n, _)| n == name);
-            if ls.is_empty() {
-                return Err(Error::Usage(format!("no layer named \"{name}\"")));
+/// Write a conversion into a GeoPackage, creating it or appending (upserting
+/// each layer if it already exists).
+///
+/// Append into the existing GeoPackage if the output already exists. "-"
+/// (stdout) is never "existing" — there's nothing to read back from a pipe
+/// you're about to write to, so piping to a .gpkg always starts fresh. The
+/// destination is never the source here: that run is refused by
+/// `same-format-output.org` D4 before anything is read.
+fn write_geopackage(
+    out: &Destination,
+    prepared: Prepared,
+    progress: bool,
+    report: &mut dyn FnMut(Event<'_>),
+) -> Result<()> {
+    let existing = if out.path == "-" { None } else { std::fs::read(out.path).ok() };
+    let (rtree, envelope) = (prepared.options().rtree, prepared.options().envelope);
+    let mut events = |event: Event<'_>| match event {
+        Event::Encoding => {
+            if progress {
+                let verb = if existing.is_some() { "appending to" } else { "writing" };
+                let idx = if rtree { " (+rtree index)" } else { "" };
+                let env = if envelope { " (+envelopes)" } else { "" };
+                eprintln!("{verb} {}{idx}{env}...", io_label(out.path, "stdout"));
             }
         }
-        // Carried *before* the warning is built, because the warning's job is
-        // to name what does not survive and this is what does. `--layer` does
-        // not narrow it: a pyramid is not a layer, so selecting one layer is
-        // not a statement about the container around it.
-        carried = geopackage::read_container(&input)?;
-        // Defect 3: the write below reproduces the layers, the tables they
-        // require, and whatever `carried` holds — and nothing else the source
-        // container has. Reported here, where the source's bytes are still in
-        // hand.
-        print_warnings(
-            &geopackage::container_drop_warnings(
-                &input,
-                io_label(&args.input, "stdin"),
-                &names_of(&ls),
-                &carried.reproduced_names(),
-                args.rtree,
-            ),
-            args.quiet,
-        );
-        ls
-    } else {
-        // Shapefile input's siblings are located via read_input; every other
-        // format reads a single buffer the same way it always has.
-        let fc = read_input(args)?;
-        // `--layer` wins, then the name the *source* recorded, then the input
-        // file's stem. The middle step is what makes an edit loop replace a
-        // layer instead of appending a duplicate: with `-` for input there is
-        // no stem to draw on, so before collections carried a name every piped
-        // write landed in a layer called `layer`
-        // (`plans/edit-composability.org` D4).
-        let name = args
-            .layer
-            .clone()
-            .or_else(|| fc.name.clone())
-            .unwrap_or_else(|| layer_stem(&args.input));
-        vec![(name, fc)]
+        event => report(event),
     };
-    if args.progress {
-        for (name, fc) in &new_layers {
-            eprintln!("layer {name}: {} features", fc.features.len());
-        }
-    }
-    if args.sort_hilbert {
-        for (_, fc) in &mut new_layers {
-            convert::reorder_hilbert(fc);
-        }
-    }
-    if let Some(crs) = crs_override {
-        print_warnings(&apply_crs_override(&mut new_layers, crs), args.quiet);
-    }
-    print_warnings(&collect_layer_warnings(&new_layers, out.format), args.quiet);
-
-    // Append into the existing GeoPackage if the output already exists. "-"
-    // (stdout) is never "existing" — there's nothing to read back from a pipe
-    // you're about to write to, so piping to a .gpkg always starts fresh.
-    let existing = if out.path == "-" { None } else { std::fs::read(out.path).ok() };
-    // The destination's own container content, merged with what the source
-    // carries — `plans/container-reconciliation.org` § 3. Read here rather than
-    // in the writer because the warning below has to be built against the
-    // merged result: what the destination keeps is no longer destroyed, and a
-    // survey that still named it would report surviving content as lost, which
-    // is bug 13's mistake.
-    //
-    // *Not read when the destination is the source.* That run is refused by
-    // `same-format-output.org` D4 before reaching here for a `gpkg` source, and
-    // for any other source there is no second container to merge.
-    if let Some(bytes) = existing.as_deref()
-        && !(args.from == Format::Gpkg && args.input == out.path)
-    {
-        carried = geopackage::reconcile_containers(geopackage::read_container(bytes)?, &carried)?;
-        print_warnings(
-            &geopackage::container_drop_warnings(
-                bytes,
-                io_label(out.path, "stdout"),
-                &names_of(&new_layers),
-                &carried.reproduced_names(),
-                args.rtree,
-            ),
-            args.quiet,
-        );
-    }
-    // A carried metadata pair is the one member that can survive in *part*:
-    // references naming something the output will not contain are dropped, and
-    // the container survey no longer names the pair at all now that it is
-    // carried. Reported here, after `existing` is in hand, because **an append
-    // supplies layers `new_layers` does not** — a reference to a layer only the
-    // destination has still survives, and `write_layers` composes the two
-    // before deciding. Handing this call `new_layers` alone made it claim
-    // losses the same run did not incur.
-    print_warnings(
-        &geopackage::metadata_drop_warnings(existing.as_deref(), &new_layers, &carried),
-        args.quiet,
-    );
-    if args.progress {
-        let verb = if existing.is_some() { "appending to" } else { "writing" };
-        let idx = if args.rtree { " (+rtree index)" } else { "" };
-        let env = if args.envelope { " (+envelopes)" } else { "" };
-        eprintln!("{verb} {}{idx}{env}...", io_label(out.path, "stdout"));
-    }
-    let bytes = geopackage::write_layers(
-        existing.as_deref(),
-        &new_layers,
-        &carried,
-        args.rtree,
-        args.envelope,
-    )?;
+    let bytes = prepared.into_geopackage(existing.as_deref(), &mut events)?;
     write_bytes(out.path, &bytes)?;
     eprintln!("wrote {} ({} bytes)", io_label(out.path, "stdout"), bytes.len());
     Ok(())
 }
 
-/// Every pre-write predictive lossy-conversion check this crate knows about,
-/// run against one collection and its target format. Each check is an
-/// independent `Option<String>` function (see [`Crs::downgrade_warning`],
-/// [`FeatureCollection::m_downgrade_warning`]) — adding a new kind of loss
-/// (a new format spoke's capability gap, a new IR field) is one line here,
-/// not a new wrapper-function pair. See `plans/lossy-conversion-warnings.org`.
-/// The warning that has to ship with the same-format deletion, not after it.
-///
-/// `plans/same-format-output.org` D3: M1 alone is a working feature that
-/// silently drops data, which the crate's own convention forbids. On a
-/// cross-format run a drop has a defence — the target may have no slot — and
-/// `collect_conversion_warnings` handles that case. Here there is none: the
-/// target is the source's own format, so it provably can hold what the source
-/// held.
-///
-/// Silent by design when the formats differ, and when the format round-trips
-/// clean (Shapefile), so this does not become furniture on every run.
-fn same_format_warning(from: Format, target: Format) -> Vec<String> {
-    if from != target {
-        return Vec::new();
-    }
-    let losses = target.same_format_losses();
-    if losses.is_empty() {
-        return Vec::new();
-    }
-    vec![format!(
-        "{} to {} is a re-encode through the feature model, not a copy, so it does not preserve: \
-         {}. (plans/same-format-output.org)",
-        target.display_name(),
-        target.display_name(),
-        losses.join("; "),
-    )]
-}
-
-fn collect_conversion_warnings(fc: &FeatureCollection, target: Format) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if let Some(w) = fc.crs.as_ref().and_then(|c| c.downgrade_warning(target)) {
-        warnings.push(w);
-    }
-    if let Some(w) = fc.m_downgrade_warning(target) {
-        warnings.push(w);
-    }
-    if let Some(w) = fc.schema_drop_warning(target) {
-        warnings.push(w);
-    }
-    if let Some(w) = fc.decl_recast_warning(target) {
-        warnings.push(w);
-    }
-    warnings
-}
-
-/// [`collect_conversion_warnings`] across a GeoPackage's layers,
-/// de-duplicating identical messages so a single-CRS `.gpkg` (the usual
-/// case) warns just once even when it fans out to many output files.
-fn collect_layer_warnings(layers: &[(String, FeatureCollection)], target: Format) -> Vec<String> {
-    let mut seen = std::collections::BTreeSet::new();
-    let mut out = Vec::new();
-    for (_, fc) in layers {
-        for w in collect_conversion_warnings(fc, target) {
-            if seen.insert(w.clone()) {
-                out.push(w);
-            }
-        }
-    }
-    out
-}
-
-/// Print each warning to stderr, unless `quiet`. Shared by both
-/// lossy-conversion mechanisms this crate uses: the pre-write predictive
-/// checks above, and a writer's own post-write `Encoded.warnings` (e.g.
-/// Shapefile's `.dbf` field-truncation warnings in `write_shapefile_to_path`)
-/// — see `plans/lossy-conversion-warnings.org`.
-///
-/// The `warning: ` prefix the convention requires is added *here*, not by each
-/// check, so a new check cannot forget it or spell it differently — which is
-/// exactly what had happened: the `.dbf` warnings were written with the
-/// `shapefile: ` tag the shapefile *errors* use, and so read as errors. Checks
-/// return the message body; presentation is this function's job. A message may
-/// still carry its own component tag after the prefix (`warning: shapefile: …`).
+/// Print each warning to stderr as `warning: …`, unless `quiet`. Every warning
+/// reaches the user through here — the pipeline's, by way of [`reporter`], and
+/// the binary's own [`stale_sidecar_warnings`] — see
+/// `plans/lossy-conversion-warnings.org`.
 fn print_warnings(warnings: &[String], quiet: bool) {
     if quiet {
         return;
@@ -1104,12 +862,6 @@ fn print_warnings(warnings: &[String], quiet: bool) {
     for w in warnings {
         eprintln!("warning: {w}");
     }
-}
-
-/// The layer names of a `(name, collection)` list, which is the shape both
-/// GeoPackage warning call sites need and neither should spell out inline.
-fn names_of(layers: &[(String, FeatureCollection)]) -> Vec<String> {
-    layers.iter().map(|(n, _)| n.clone()).collect()
 }
 
 /// The file stem of `path`, used as a default layer name of *last* resort:

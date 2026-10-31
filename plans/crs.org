@@ -81,7 +81,10 @@ Option<String>= in =src/crs.rs= (with a private =NamedCrs::label= for the
 =EPSG:7844= / =code 3857= / generic fallback rendering), called from the CLI
 (=src/main.rs=) on the write side for both the generic pipeline and the
 GeoPackage fan-out (=warn_crs_loss= / =warn_crs_loss_layers=, the latter
-de-duplicating so a single-CRS =.gpkg= warns once across many output files).
+de-duplicating so a single-CRS =.gpkg= warns once across many output files;
+both since folded into =convert::conversion_warnings= and =main.rs='s
+=collect_layer_warnings= -- =lossy-conversion-warnings.org= § GENERALIZED
+COLLECTION).
 Warnings are *on by default* and suppressed with =--quiet= (alias =--no-warn=).
 Verified against =examples/G01_AUST_GDA2020.gpkg= (EPSG:7844): GeoJSON gets the
 strong "will be mislabeled — reproject" message, CSV/WKT the weaker "cannot

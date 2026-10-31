@@ -18,9 +18,11 @@
 //! 3. **The run refuses** to overwrite its own input, which the deleted check
 //!    had been providing by accident.
 //!
-//! These invoke the binary rather than the library because the warning and the
-//! refusal both live in `main.rs`, which is where the input and output *paths*
-//! are — the library never sees a path.
+//! These invoke the binary rather than the library because the refusal lives
+//! in `main.rs`, which is where the input and output *paths* are — the library
+//! never sees a path. The warning is the library's
+//! (`geosetta::conversion_warnings`), and is tested here where a user meets it;
+//! `library_warnings.rs` checks the library hands back the same text.
 
 use std::process::Command;
 

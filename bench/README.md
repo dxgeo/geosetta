@@ -42,7 +42,15 @@ And two complementary benchmarks:
   ```
 
   Tune with `GEOSETTA_BENCH_N` (feature count) and `GEOSETTA_BENCH_COLS`
-  (wide-table column count).
+  (wide-table column count). In release each benchmark asserts a throughput
+  floor (`floor` in the file). Its machine-independent counterpart,
+  `tests/budgets.rs`, runs in every `cargo test`: per-feature memory and
+  allocation budgets, and a check that every path stays linear
+  (`plans/performance.org` § BUDGETS). Print what it measures with:
+
+  ```sh
+  GEOSETTA_BUDGET_REPORT=1 cargo test --test budgets -- --nocapture
+  ```
 
 - **`bench/compare.py`** — geosetta vs **ogr2ogr (GDAL)** vs **duckdb**, best-of-3
   whole-process wall-clock. Rather than the full N×M pair matrix (redundant

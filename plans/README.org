@@ -260,17 +260,36 @@ why, not to implement the spec's table from symmetry.
   tested-but-unwarned FlatGeobuf/GeoPackage alphanumeric-CRS-code gap in the
   same pass that established the rule. *Generalized* once a second
   near-identical check made the per-check wrapper-function-pair pattern's
-  duplication undeniable: =main.rs='s =collect_conversion_warnings=/
+  duplication undeniable: =convert::conversion_warnings= (the library's
+  since 2026-10-31; see the next entry) and =main.rs='s
   =collect_layer_warnings=/=print_warnings= now do the collecting/de-duping/
   printing for every check in one place — adding a new check is one line,
-  not a new function pair plus three call sites.
+  not a new function pair plus three call sites. The two mechanisms are
+  now three sites (a reader's sink is the third), mapped in one table in
+  § THE MECHANISMS.
+- [[file:library-warnings.org][library-warnings.org]] :: The same warnings
+  through the library API: =convert::conversion_warnings= as the one public
+  list of pre-write checks, which the CLI calls too, and =convert_with=, a
+  one-call conversion that returns its warnings beside the bytes. *L1 DONE
+  2026-10-31*, closing =cross-format-audit.org= F1 on the way. L2--L5 record
+  the alternatives decided against for now -- a stricter =convert()=, a
+  reporting =write_features=, GeoPackage/Shapefile equivalents, enforced
+  ordering -- each with what would reopen it.
+- [[file:library-pipeline.org][library-pipeline.org]] :: One conversion
+  pipeline, in the library: =pipeline::prepare= runs every step before the
+  encode in the order the checks need and reports through one event callback,
+  and the binary is a wrapper that moves bytes and presents events. *DONE
+  2026-10-31*, superseding =library-warnings.org= L4 and L5. Its P6 is a
+  standing rule: =tests/library_pipeline.rs= sweeps every source, target and
+  option set through both and requires the same warnings and errors, and is
+  built so a new format or option cannot compile until the sweep covers it.
 - [[file:cross-format-audit.org][cross-format-audit.org]] :: What a write
   loses without saying: a round trip through each tabular target, against
   FlatGeobuf as the control, filing every unwarned difference. Found one
   defect -- a KML source written to GeoPackage prints none of the KML spoke's
   warnings (F1) -- and eight losses every tabular target shares (F2--F9),
   each to be carried, warned or left silent on purpose. /Measured
-  2026-10-29; nothing built./
+  2026-10-29; A1 (F1) built 2026-10-31./
 - [[file:hostile-input.org][hostile-input.org]] :: Allocations the readers
   sized from counts the file states, before reading the data behind them. Ten
   sites confirmed by reproduction and fixed, among them a FlatGeobuf header

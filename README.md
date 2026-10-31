@@ -149,16 +149,21 @@ terminal; it is not safe to pipe. See
 ### The library
 
 ```rust
-use geosetta::{read_features, write_features, Format};
+use geosetta::{conversion_warnings, read_features, write_features, Format, WriteOptions};
 
 let input = std::fs::read("places.geojson")?;
 let mut warnings = Vec::new();
 let mut fc = read_features(Format::GeoJson, &input, &mut warnings)?;
 fc.for_each_position_mut(|p| p.x += 1.0);    // edit coordinates in place
+warnings.extend(conversion_warnings(&fc, Format::GeoJson, Format::Parquet, WriteOptions::default()));
 let output = write_features(Format::Parquet, &fc)?;
 ```
 
-`warnings` receives what the read dropped. GeoPackage and Shapefile span more
+`warnings` receives what the read dropped, then what the write will:
+`conversion_warnings` is the list of checks the CLI prints, and
+`write_features` itself reports nothing. With no edit in between,
+`convert_with` does all three in one call and returns the bytes with the
+warnings. GeoPackage and Shapefile span more
 than one buffer and have their own entry points: `geopackage::read_layers`,
 `geopackage::writer::write_layers`, `shapefile::read` and `shapefile::write`.
 A collection held in memory between a read and a write is never serialised,

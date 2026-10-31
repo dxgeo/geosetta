@@ -272,16 +272,9 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         })?;
         // Unlike --rtree and --envelope, which are ignored for other outputs,
         // a version is a statement about the output's content: ignoring it
-        // would drop an explicit request silently.
-        if let Some(version) = kml_version
-            && !matches!(to, Format::Kml | Format::Kmz)
-        {
-            return Err(Error::Usage(format!(
-                "--kml-version {} chooses the KML version of the output, and the output here is {}",
-                version.as_str(),
-                to.display_name()
-            )));
-        }
+        // would drop an explicit request silently. Checked here, before
+        // anything is read, by the library's own rule.
+        crate::convert::WriteOptions { kml_version, compact }.check(to)?;
         Mode::Convert { output, to }
     };
     if let (Some(flag), Some(_)) = (diagnostic, kml_version) {

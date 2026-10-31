@@ -761,7 +761,8 @@ and some forty on-disk spellings.
    length, because the temptation to consult it without maintaining it is the
    whole risk.
 3. *=FeatureCollection::decl_recast_warning=* -- the fourth entry in
-   =collect_conversion_warnings=, firing only where =admits= fails.
+   =collect_conversion_warnings= (now =convert::conversion_warnings=), firing
+   only where =admits= fails.
 4. *The sweeps.* =every_declared_type_survives_or_is_admitted= runs all sixteen
    types through all four declaring formats and asserts the real answer equals
    =Format::recast='s, then that the result either admits the original *or

@@ -17,12 +17,11 @@ use crate::{csv, flatgeobuf, geojson, kml, parquet};
 use crate::json;
 
 /// Convert `input` bytes from one format to another via the Feature IR. The
-/// hub entry point in one call; `main` unrolls it into read/parse/write stages
-/// so it can report `--progress`, so this is used mainly by the tests below.
+/// hub entry point in one call, used mainly by the tests below; the binary
+/// runs [`crate::pipeline`], as [`convert_with`] does.
 ///
 /// It reports no warnings, read-side or write-side: a caller who needs to
-/// know what a conversion lost calls [`read_features`] with a sink and runs
-/// the checks `main` runs.
+/// know what a conversion lost calls [`convert_with`].
 #[allow(dead_code)]
 pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
     write_features(to, &read_features(from, input, &mut Vec::new())?)
@@ -62,14 +61,15 @@ pub fn read_features(format: Format, input: &[u8], warnings: &mut Vec<String>) -
         Format::Wkt => read_wkt_lines(input),
         Format::Kml => kml::read_kml(input, warnings),
         Format::Kmz => kml::read_kmz(input, warnings),
-        // GeoPackage is multi-layer, so it's read via geopackage::read_layers in
-        // main.rs rather than through this single-collection path.
+        // GeoPackage is multi-layer, so it's read via geopackage::read_layers
+        // (in `pipeline::prepare`) rather than through this single-collection
+        // path.
         Format::Gpkg => Err(Error::Usage(
             "GeoPackage input is handled per-layer; this path should not be reached".into(),
         )),
         // Shapefile is multi-file (.shp/.dbf/.prj), so it's read via
-        // shapefile::read in main.rs, which locates the sibling files, rather
-        // than through this single-buffer path.
+        // shapefile::read from the sibling files' bytes (in
+        // `pipeline::prepare`) rather than through this single-buffer path.
         Format::Shapefile => Err(Error::Usage(
             "Shapefile input is handled via its sibling files; this path should not be reached".into(),
         )),
@@ -94,21 +94,41 @@ pub struct WriteOptions {
 
 /// Encode the Feature IR into a supported output format, laid out where the
 /// format has a layout.
+///
+/// A plain encoder: it reports nothing the format cannot hold. What this
+/// write will lose is [`conversion_warnings`]'s to say, or call
+/// [`convert_with`] to have both.
 pub fn write_features(format: Format, fc: &FeatureCollection) -> Result<Vec<u8>> {
     write_features_with(format, fc, WriteOptions::default())
 }
 
-/// [`write_features`], as `options` say.
-///
-/// A KML version is a statement about the output's content, so asking for
-/// one is a usage error for any format but KML and KMZ rather than ignored.
-pub fn write_features_with(format: Format, fc: &FeatureCollection, options: WriteOptions) -> Result<Vec<u8>> {
-    if options.kml_version.is_some() && !matches!(format, Format::Kml | Format::Kmz) {
-        return Err(Error::Usage(format!(
-            "--kml-version chooses the KML version of the output, and the output here is {}",
-            format.display_name()
-        )));
+impl WriteOptions {
+    /// Whether these options can be written as `target` at all — the one
+    /// place that decides, so the binary's argument check, the pipeline and
+    /// [`write_features_with`] refuse alike, in the same words.
+    ///
+    /// A KML version is a statement about the output's content, so asking for
+    /// one is a usage error for any format but KML and KMZ rather than
+    /// ignored. `compact` is not: an output with no layout has nothing for it
+    /// to change.
+    pub fn check(&self, target: Format) -> Result<()> {
+        if let Some(version) = self.kml_version
+            && !matches!(target, Format::Kml | Format::Kmz)
+        {
+            return Err(Error::Usage(format!(
+                "--kml-version {} chooses the KML version of the output, and the output here is {}",
+                version.as_str(),
+                target.display_name()
+            )));
+        }
+        Ok(())
     }
+}
+
+/// [`write_features`], as `options` say — refused first when they cannot
+/// apply to `format` ([`WriteOptions::check`]).
+pub fn write_features_with(format: Format, fc: &FeatureCollection, options: WriteOptions) -> Result<Vec<u8>> {
+    options.check(format)?;
     let (version, compact) = (options.kml_version, options.compact);
     match format {
         Format::GeoJson => Ok(geojson::to_geojson_string(fc, compact).into_bytes()),
@@ -120,7 +140,7 @@ pub fn write_features_with(format: Format, fc: &FeatureCollection, options: Writ
         Format::Kmz => kml::write_kmz(fc, version, compact),
         // GeoPackage and Shapefile are handled outside this single-buffer path
         // (see read_features above) — GeoPackage via geopackage::write_layers,
-        // Shapefile via shapefile::write, both called from main.rs.
+        // Shapefile via shapefile::write, both called from `pipeline`.
         Format::Gpkg => Err(Error::Usage(
             "GeoPackage output is handled per-layer; this path should not be reached".into(),
         )),
@@ -145,10 +165,10 @@ pub fn write_kml_features(format: Format, fc: &FeatureCollection, version: KmlVe
 /// one — cannot carry of what a KML or KMZ read held, as warning message
 /// bodies. Empty for a collection that was not read from KML.
 ///
-/// Pre-write, like the checks `main` collects for every conversion, and
-/// separate from them because it needs the requested KML version: the same
-/// collection written back to KML loses nothing as its own version and loses
-/// its styles and folders as the other one (`plans/kml-standard.org` K4).
+/// Pre-write, and one of the checks [`conversion_warnings`] runs; its own
+/// function because it needs the requested KML version: the same collection
+/// written back to KML loses nothing as its own version and loses its styles
+/// and folders as the other one (`plans/kml-standard.org` K4).
 pub fn kml_write_warnings(fc: &FeatureCollection, target: Format, kml_version: Option<KmlVersion>) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(version) = kml_version
@@ -159,6 +179,106 @@ pub fn kml_write_warnings(fc: &FeatureCollection, target: Format, kml_version: O
     out.extend(kml::drop_warnings(fc, target));
     out.extend(kml::null_warning(fc, target));
     out
+}
+
+/// Every pre-write lossy-conversion check this crate knows about, as warning
+/// message bodies: what writing `fc`, read from `source`, as `target` with
+/// `options` will not preserve. Empty when the write loses nothing.
+///
+/// The one list of checks, which the CLI calls too — a new kind of loss (a new
+/// spoke's capability gap, a new IR field) is one line here, and both get it.
+/// Each check stays its own naturally-typed function; only the list is shared
+/// (`plans/lossy-conversion-warnings.org` § GENERALIZED COLLECTION).
+///
+/// `source` is needed because a collection does not record the format it was
+/// read from, and a same-format run owes a warning a cross-format one does
+/// not. Run it on the collection that will actually be written: after any CRS
+/// override is in place, and before natives the target will not read are
+/// released, since the KML checks inspect them. [`crate::pipeline::prepare`]
+/// runs it in that place (`plans/library-pipeline.org` P1); a caller composing
+/// the stages by hand has to.
+pub fn conversion_warnings(fc: &FeatureCollection, source: Format, target: Format, options: WriteOptions) -> Vec<String> {
+    let mut out = same_format_warning(source, target);
+    out.extend(fc.crs.as_ref().and_then(|c| c.downgrade_warning(target)));
+    out.extend(fc.m_downgrade_warning(target));
+    out.extend(fc.schema_drop_warning(target));
+    out.extend(fc.decl_recast_warning(target));
+    out.extend(kml_write_warnings(fc, target, options.kml_version));
+    out
+}
+
+/// The warning that has to ship with the same-format deletion, not after it.
+///
+/// `plans/same-format-output.org` D3: M1 alone is a working feature that
+/// silently drops data, which the crate's own convention forbids. On a
+/// cross-format run a drop has a defence — the target may have no slot — and
+/// the other checks in [`conversion_warnings`] handle that case. Here there is
+/// none: the target is the source's own format, so it provably can hold what
+/// the source held.
+///
+/// Silent by design when the formats differ, and when the format round-trips
+/// clean (Shapefile), so this does not become furniture on every run.
+fn same_format_warning(from: Format, target: Format) -> Vec<String> {
+    if from != target {
+        return Vec::new();
+    }
+    let losses = target.same_format_losses();
+    if losses.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{} to {} is a re-encode through the feature model, not a copy, so it does not preserve: \
+         {}. (plans/same-format-output.org)",
+        target.display_name(),
+        target.display_name(),
+        losses.join("; "),
+    )]
+}
+
+/// What [`convert_with`] produced: the output, and every warning the
+/// conversion owes — the read's own first, then the pre-write checks.
+#[must_use = "a conversion's warnings are how it reports what it lost"]
+#[derive(Debug)]
+pub struct Converted {
+    pub bytes: Vec<u8>,
+    /// Message bodies, without the `warning: ` prefix the CLI adds.
+    pub warnings: Vec<String>,
+}
+
+/// [`convert`], keeping what it lost: [`read_features`]' warnings, then every
+/// check in [`conversion_warnings`]. Written as `options` say.
+///
+/// [`crate::pipeline::prepare`] and one encode, so it is the binary's own
+/// pipeline and cannot drift from it (`plans/library-pipeline.org` P5). One
+/// buffer in and one out: a single-layer GeoPackage source works, and a
+/// multi-layer one, a GeoPackage or Shapefile output, or a CRS override goes
+/// through the pipeline directly.
+pub fn convert_with(from: Format, to: Format, input: &[u8], options: WriteOptions) -> Result<Converted> {
+    use crate::pipeline::{self, ConvertOptions, Event, Output, Source};
+    if matches!(to, Format::Gpkg | Format::Shapefile) {
+        return Err(Error::Usage(format!(
+            "{} output is not one buffer: use pipeline::prepare",
+            to.display_name()
+        )));
+    }
+    let mut warnings = Vec::new();
+    let mut events = |e: Event<'_>| {
+        if let Event::Warning(w) = e {
+            warnings.push(w);
+        }
+    };
+    let options = ConvertOptions { write: options, ..ConvertOptions::default() };
+    let prepared = pipeline::prepare(from, to, Source::Bytes(input), options, &mut events)?;
+    if prepared.layers().len() != 1 {
+        return Err(Error::Usage(format!(
+            "the source has {} layers and convert_with writes one: select one with pipeline::prepare",
+            prepared.layers().len()
+        )));
+    }
+    let Output::Bytes(bytes) = prepared.encode(0, &mut events)? else {
+        unreachable!("a single-buffer target encodes to bytes")
+    };
+    Ok(Converted { bytes, warnings })
 }
 
 /// Read one WKT geometry per non-blank line (geometry only, no properties).
@@ -2252,7 +2372,7 @@ mod tests {
     ///
     /// **So the thing that is missing is not exactness, it is the warning.**
     /// Anyone picking this up should not try to make the value survive; they
-    /// should add a fifth check to `collect_conversion_warnings` and then
+    /// should add a check to `conversion_warnings` and then
     /// replace the assertions below with one that the warning fired. The reason
     /// it has not been written is the noise bar in
     /// `plans/lossy-conversion-warnings.org` § THE RULE: this fires only for a

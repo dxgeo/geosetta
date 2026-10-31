@@ -11,7 +11,16 @@
 //!
 //! Set `GEOSETTA_BENCH_N` to change the feature count (default 200_000). Each
 //! benchmark prints wall-clock, input MB/s, and features/s (best of a few
-//! runs); they assert only correctness, not timing, so they are not flaky.
+//! runs).
+//!
+//! **In release, each also asserts a throughput floor** (`floor`): half of
+//! what it measured on 2026-10-31 on the reference machine (an Apple-silicon
+//! Mac), so a change that halves a path's speed fails while ordinary noise
+//! does not. A debug build skips the floors, since its numbers mean nothing.
+//! Raise a floor when a change makes a path durably faster with byte-identical
+//! output (`bench/equiv.py`), so the win is kept; a floor is never met by
+//! keeping less of the data. The always-on, machine-independent guard is `tests/budgets.rs`, which
+//! checks that every path stays linear.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -205,14 +214,49 @@ fn bench(label: &str, input: &Path, in_bytes: u64, n: usize, output: &Path, extr
     }
     let secs = best.as_secs_f64();
     let mb = in_bytes as f64 / 1_048_576.0;
+    let rate = n as f64 / secs;
     println!(
         "{label:<22} {:>7.1} ms   {:>7.1} MB/s in   {:>8.0} feat/s   (out {} bytes)",
         secs * 1000.0,
         mb / secs,
-        n as f64 / secs,
+        rate,
         size
     );
+    let floor = floor(label);
+    if !cfg!(debug_assertions) {
+        assert!(rate >= floor, "{label}: {rate:.0} feat/s, under its floor of {floor:.0} (plans/performance.org § BUDGETS)");
+    }
     size
+}
+
+/// The fewest features a second each benchmark may manage in release: half of
+/// its 2026-10-31 measurement at 200 000 features. A benchmark with no floor
+/// is an error, so a new one has to say what it promises.
+fn floor(label: &str) -> f64 {
+    let measured = match label {
+        "parquet->geojson" => 1_576_000.0,
+        "fgb->geojson" => 1_584_000.0,
+        "csv->geojson" => 909_000.0,
+        "wkt->geojson" => 2_491_000.0,
+        "shp->geojson" => 1_887_000.0,
+        "gpkg->geojson" => 1_417_000.0,
+        "geojson->parquet" => 1_107_000.0,
+        "geojson->fgb" => 886_000.0,
+        "geojson->gpkg" => 720_000.0,
+        "geojson->csv" => 755_000.0,
+        "geojson->wkt" => 1_069_000.0,
+        "geojson->shp" => 761_000.0,
+        "gpkg->parquet" => 1_749_000.0,
+        "shp->parquet" => 2_545_000.0,
+        "fgb->gpkg" => 1_035_000.0,
+        "geojson->parquet (wide)" => 269_000.0,
+        "geojson->fgb (wide)" => 282_000.0,
+        "parquet->geojson (wide)" => 414_000.0,
+        "geojson->fgb (sparse)" => 966_000.0,
+        "fgb->geojson (sparse)" => 728_000.0,
+        other => panic!("benchmark {other:?} has no floor: add its measurement to `floor`"),
+    };
+    measured / 2.0
 }
 
 /// Build the shared source fixtures (geojson + the formats derived from it)

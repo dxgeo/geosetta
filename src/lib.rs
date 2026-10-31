@@ -13,23 +13,53 @@
 //! # Example
 //!
 //! ```no_run
-//! use geosetta::{read_features, write_features, Format};
+//! use geosetta::{convert_with, Format, WriteOptions};
 //!
 //! let input = std::fs::read("in.geojson")?;
-//! let mut warnings = Vec::new(); // what the read could not keep, if anything
-//! let fc = read_features(Format::GeoJson, &input, &mut warnings)?;
-//! let out = write_features(Format::Parquet, &fc)?;
-//! std::fs::write("out.parquet", out)?;
+//! let out = convert_with(Format::GeoJson, Format::Parquet, &input, WriteOptions::default())?;
+//! for w in &out.warnings {
+//!     eprintln!("warning: {w}"); // what the conversion could not keep, if anything
+//! }
+//! std::fs::write("out.parquet", out.bytes)?;
 //! # Ok::<(), geosetta::Error>(())
 //! ```
 //!
-//! Conversions are byte-in / byte-out; file I/O is left to the caller (the
-//! `geosetta` binary wraps this API with a CLI). GeoPackage is a multi-layer
-//! container, so it has its own [`geopackage::read_layers`] /
-//! [`geopackage::write_layers`] entry points. Shapefile is the opposite shape —
-//! one logical layer split across sibling files (`.shp`/`.shx`/`.dbf`/`.prj`) —
-//! so it has its own [`shapefile::read`] / [`shapefile::write`] entry points,
-//! taking each sibling's bytes explicitly rather than a single buffer.
+//! Every other conversion — a GeoPackage's layers, a Shapefile's sibling
+//! files, a CRS override, a Hilbert sort — goes through [`pipeline`], which is
+//! what [`convert_with`] and the `geosetta` binary both run. Its
+//! [`pipeline::prepare`] does every step before the encode in the order the
+//! checks need, and reports warnings and progress through one callback:
+//!
+//! ```no_run
+//! use geosetta::pipeline::{self, ConvertOptions, Event, Source};
+//! use geosetta::Format;
+//!
+//! let input = std::fs::read("in.gpkg")?;
+//! let mut events = |e: Event<'_>| {
+//!     if let Event::Warning(w) = e {
+//!         eprintln!("warning: {w}");
+//!     }
+//! };
+//! let existing = std::fs::read("out.gpkg").ok();
+//! let prepared = pipeline::prepare(Format::Gpkg, Format::Gpkg, Source::Bytes(&input), ConvertOptions::default(), &mut events)?;
+//! std::fs::write("out.gpkg", prepared.into_geopackage(existing.as_deref(), &mut events)?)?;
+//! # Ok::<(), geosetta::Error>(())
+//! ```
+//!
+//! The stages are public too: [`read_features`] takes a sink for what the read
+//! drops, [`conversion_warnings`] predicts what a write will, and
+//! [`write_features`] encodes — warning about nothing, so a caller composing
+//! the stages runs the check between them.
+//!
+//! Conversions are byte-in / byte-out; file I/O is left to the caller. The
+//! `geosetta` binary is that caller: it moves bytes between files or stdio and
+//! the pipeline, and presents what the pipeline reports
+//! (`plans/library-pipeline.org`). GeoPackage is a multi-layer container, and
+//! Shapefile the opposite shape — one logical layer split across sibling files
+//! (`.shp`/`.shx`/`.dbf`/`.prj`) — so each also has its own entry points
+//! ([`geopackage::read_layers`] / [`geopackage::write_layers`],
+//! [`shapefile::read`] / [`shapefile::write`]) for a caller who wants the
+//! format alone.
 
 // Public API surface. Formats are selected via `Format`, and the conversion
 // functions plus the IR types are re-exported at the crate root below.
@@ -41,6 +71,7 @@ pub mod format;
 pub mod geometry;
 pub mod native;
 pub mod geopackage;
+pub mod pipeline;
 pub mod shapefile;
 
 // The CLI argument parser, used by the `geosetta` binary. Exposed so downstream
@@ -66,7 +97,10 @@ pub(crate) mod xml;
 pub(crate) mod zip;
 
 // The curated entry points most callers want, hoisted to the crate root.
-pub use convert::{convert, read_features, reorder_hilbert, write_features, write_features_with, WriteOptions};
+pub use convert::{
+    conversion_warnings, convert, convert_with, read_features, reorder_hilbert, write_features, write_features_with,
+    Converted, WriteOptions,
+};
 pub use crs::{Crs, NamedCrs, WGS84_CRS_CODE};
 pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection};

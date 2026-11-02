@@ -9,8 +9,12 @@
 //!
 //! Columns appear in order of first appearance across the features.
 
-use crate::feature::{Feature, FeatureCollection};
+#[cfg(test)]
+use crate::feature::Feature;
+use crate::feature::FeatureCollection;
+#[cfg(test)]
 use crate::json::JsonValue;
+use crate::table::{ColumnRef, ColumnValues, Kinds, Table, Value};
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -186,18 +190,18 @@ pub enum Cell<'a> {
     Bytes(Cow<'a, [u8]>),
 }
 
-/// A property column over the features it was inferred from.
+/// A property column over the collection it was inferred from.
 ///
-/// It holds no values of its own: a cell is materialized from its feature
-/// when asked for ([`Column::cell`], [`Column::cells`]). Holding every cell,
-/// with every string cloned, was a second copy of the whole table for the
-/// length of every write (`plans/performance.org`, *Memory*).
+/// It holds no values of its own: a cell is materialized from its feature,
+/// or from the table's column, when asked for ([`Column::cell`],
+/// [`Column::cells`]). Holding every cell, with every string cloned, was a
+/// second copy of the whole table for the length of every write
+/// (`plans/performance.org`, *Memory*).
 #[derive(Debug, Clone)]
 pub struct Column<'a> {
     pub name: String,
     pub ty: ColumnType,
-    rows: &'a [Feature],
-    at: Slots,
+    source: Source<'a>,
     declared: OnceCell<Option<DeclType>>,
     /// What the *source* declared this column to be, when it declared
     /// anything — see [`FieldDecl`]. `None` when nothing was declared, which
@@ -210,7 +214,20 @@ pub struct Column<'a> {
     pub decl: Option<FieldDecl>,
 }
 
+/// Where a column's values are read from.
+#[derive(Debug, Clone)]
+enum Source<'a> {
+    /// Rows, read where [`infer_columns`] found them: the reference a
+    /// table's columns are tested against.
+    #[cfg(test)]
+    Rows { rows: &'a [Feature], at: Slots },
+    /// A table's column: its blocks, of whichever form (`plans/columnar.org`
+    /// D-C5).
+    Table(ColumnRef<'a>),
+}
+
 /// Where each row keeps a column's value, as an index into its properties.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 enum Slots {
     /// At the same index in every row — a table whose rows all list their
@@ -221,6 +238,7 @@ enum Slots {
 }
 
 /// A row without the column, in [`Slots::Each`].
+#[cfg(test)]
 const ABSENT: u32 = u32::MAX;
 
 impl<'a> Column<'a> {
@@ -238,24 +256,59 @@ impl<'a> Column<'a> {
 
     /// How many rows the column has: one per feature.
     pub fn len(&self) -> usize {
-        self.rows.len()
+        match &self.source {
+            #[cfg(test)]
+            Source::Rows { rows, .. } => rows.len(),
+            Source::Table(column) => column.len(),
+        }
     }
 
     /// Row `row`'s cell.
+    #[cfg(test)]
     pub fn cell(&self, row: usize) -> Cell<'a> {
-        let at = match &self.at {
-            Slots::Uniform(at) => *at,
-            Slots::Each(at) => match at[row] {
-                ABSENT => return Cell::Null,
-                at => at as usize,
-            },
-        };
-        materialize(self.ty, Some(&self.rows[row].properties[at].1))
+        match &self.source {
+            #[cfg(test)]
+            Source::Rows { rows, at } => {
+                let at = match at {
+                    Slots::Uniform(at) => *at,
+                    Slots::Each(at) => match at[row] {
+                        ABSENT => return Cell::Null,
+                        at => at as usize,
+                    },
+                };
+                materialize(self.ty, Some(Value::of(&rows[row].properties[at].1)))
+            }
+            Source::Table(column) => materialize(self.ty, column.get(row)),
+        }
     }
 
     /// Every cell, in row order.
-    pub fn cells(&self) -> impl Iterator<Item = Cell<'a>> + Clone + '_ {
-        (0..self.len()).map(|row| self.cell(row))
+    pub fn cells(&self) -> Cells<'_, 'a> {
+        match &self.source {
+            #[cfg(test)]
+            Source::Rows { .. } => Cells::Rows(self, 0..self.len()),
+            Source::Table(column) => Cells::Table(self.ty, column.values()),
+        }
+    }
+}
+
+/// [`Column::cells`]: a table's column read a block at a time.
+#[derive(Clone)]
+pub enum Cells<'c, 'a> {
+    #[cfg(test)]
+    Rows(&'c Column<'a>, std::ops::Range<usize>),
+    Table(ColumnType, ColumnValues<'c, 'a>),
+}
+
+impl<'a> Iterator for Cells<'_, 'a> {
+    type Item = Cell<'a>;
+
+    fn next(&mut self) -> Option<Cell<'a>> {
+        match self {
+            #[cfg(test)]
+            Cells::Rows(column, rows) => rows.next().map(|row| column.cell(row)),
+            Cells::Table(ty, values) => values.next().map(|v| materialize(*ty, v)),
+        }
     }
 }
 
@@ -392,6 +445,7 @@ impl FieldDecl {
 }
 
 /// The type lattice used while scanning values.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Infer {
     Bool,
@@ -401,6 +455,7 @@ enum Infer {
     Bin,
 }
 
+#[cfg(test)]
 impl Infer {
     /// Least type that accommodates both `self` and `other`.
     fn merge(self, other: Infer) -> Infer {
@@ -451,6 +506,10 @@ impl Infer {
 /// reads it from its feature.
 ///
 /// A key repeated within one row keeps its first occurrence.
+///
+/// Over rows, which no collection holds since C5: the reference that the
+/// same inference read off a table ([`inferred_columns`]) is tested against.
+#[cfg(test)]
 pub fn infer_columns(features: &[Feature]) -> Vec<Column<'_>> {
     struct Seen {
         ty: Option<Infer>,
@@ -524,16 +583,60 @@ pub fn infer_columns(features: &[Feature]) -> Vec<Column<'_>> {
             name: name.to_string(),
             // Columns whose values were all null default to String.
             ty: seen.ty.map(Infer::resolve).unwrap_or(ColumnType::String),
-            rows: features,
-            at: at.expect("every column has its slots"),
+            source: Source::Rows { rows: features, at: at.expect("every column has its slots") },
             declared: OnceCell::new(),
             decl: None,
         })
         .collect()
 }
 
-/// [`infer_columns`] over `fc`'s features, with each column's [`FieldDecl`]
-/// attached from [`FeatureCollection::schema`].
+/// [`infer_columns`] over a collection's rows, or the same inference read off
+/// its table: the columns with no declarations attached, for a writer whose
+/// format declares nothing (CSV).
+pub(crate) fn inferred_columns(fc: &FeatureCollection) -> Vec<Column<'_>> {
+    table_columns(fc.table())
+}
+
+/// [`infer_columns`]'s result for a table, read off its blocks
+/// (`plans/columnar.org` D-C5): the same columns, in the same first-seen
+/// order, of the same types.
+fn table_columns(table: &Table) -> Vec<Column<'_>> {
+    let keys = table.key_kinds();
+    let names: Vec<&str> = keys.iter().map(|(k, _)| &***k).collect();
+    keys.iter()
+        .zip(table.columns(&names))
+        .map(|((key, kinds), column)| Column {
+            name: key.to_string(),
+            ty: column_type(*kinds),
+            source: Source::Table(column),
+            declared: OnceCell::new(),
+            decl: None,
+        })
+        .collect()
+}
+
+/// [`Infer`]'s lattice, applied to the set of kinds a column holds rather
+/// than value by value: its result never depended on order or count.
+fn column_type(kinds: Kinds) -> ColumnType {
+    if kinds.is_empty() {
+        // Every value null, as in `infer_columns`.
+        ColumnType::String
+    } else if kinds == Kinds::BOOL {
+        ColumnType::Bool
+    } else if kinds == Kinds::INT {
+        ColumnType::Int64
+    } else if kinds.within(Kinds::INT | Kinds::FLOAT) {
+        ColumnType::Double
+    } else if kinds == Kinds::BINARY {
+        ColumnType::Binary
+    } else {
+        ColumnType::String
+    }
+}
+
+/// [`infer_columns`] over a collection's features, or the same inference read
+/// off its table, with each column's [`FieldDecl`] attached from
+/// [`FeatureCollection::schema`].
 ///
 /// Every writer that materializes property columns should call this rather
 /// than [`infer_columns`] directly — inference alone re-derives the schema from
@@ -545,7 +648,7 @@ pub fn infer_columns(features: &[Feature]) -> Vec<Column<'_>> {
 /// for it would add data rather than preserve it. Matching is by exact name,
 /// since a property key is a key.
 pub fn columns_for(fc: &FeatureCollection) -> Vec<Column<'_>> {
-    let mut columns = infer_columns(&fc.features);
+    let mut columns = inferred_columns(fc);
     if fc.schema.is_empty() {
         return columns;
     }
@@ -558,14 +661,14 @@ pub fn columns_for(fc: &FeatureCollection) -> Vec<Column<'_>> {
 }
 
 /// Convert one property value into a typed [`Cell`] for column type `ty`.
-fn materialize(ty: ColumnType, value: Option<&JsonValue>) -> Cell<'_> {
+fn materialize(ty: ColumnType, value: Option<Value<'_>>) -> Cell<'_> {
     let value = match value {
-        None | Some(JsonValue::Null) => return Cell::Null,
+        None | Some(Value::Null) => return Cell::Null,
         Some(v) => v,
     };
     match ty {
         ColumnType::Bool => match value {
-            JsonValue::Bool(b) => Cell::Bool(*b),
+            Value::Bool(b) => Cell::Bool(b),
             _ => Cell::Null,
         },
         // The exact integer where there is one. Going through `as_f64` cost
@@ -574,9 +677,10 @@ fn materialize(ty: ColumnType, value: Option<&JsonValue>) -> Cell<'_> {
         // A `Float` in an integer column is a genuine narrowing (the column
         // holds integers because everything else in it was one), so it still
         // truncates; that is the inference's judgement, not a lost bit.
-        ColumnType::Int64 => match value.as_i64().or_else(|| value.as_f64().map(|n| n as i64)) {
-            Some(n) => Cell::Int(n),
-            None => Cell::Null,
+        ColumnType::Int64 => match value {
+            Value::Int(n) => Cell::Int(n),
+            Value::Float(n) => Cell::Int(n as i64),
+            _ => Cell::Null,
         },
         // An `Int` reaching a `Double` column loses its low bits above 2^53,
         // and that is inference's judgement rather than a lost guarantee: the
@@ -585,20 +689,22 @@ fn materialize(ty: ColumnType, value: Option<&JsonValue>) -> Cell<'_> {
         // exactly in any format this crate writes. GDAL's `OFTReal` does the
         // same. The path that must stay exact is `Int64` above, where every
         // value is an integer and the format has a 64-bit column to put it in.
-        ColumnType::Double => match value.as_f64() {
-            Some(n) => Cell::Double(n),
-            None => Cell::Null,
+        ColumnType::Double => match value {
+            Value::Int(n) => Cell::Double(n as f64),
+            Value::Float(n) => Cell::Double(n),
+            _ => Cell::Null,
         },
         ColumnType::String => match value {
-            JsonValue::String(s) => Cell::Str(Cow::Borrowed(s)),
+            Value::Str(s) => Cell::Str(Cow::Borrowed(s)),
             // Numbers, bools, arrays, objects in a string column: stringify.
             // Bytes render as hex here, same as the JSON serializer, since a
             // string column is exactly where a byte column goes when the target
             // has no byte-level type of its own.
-            other => Cell::Str(Cow::Owned(other.to_json_string())),
+            Value::Json(other) => Cell::Str(Cow::Owned(other.to_json_string())),
+            other => Cell::Str(Cow::Owned(other.to_owned().to_json_string())),
         },
         ColumnType::Binary => match value {
-            JsonValue::Binary(bytes) => Cell::Bytes(Cow::Borrowed(bytes)),
+            Value::Binary(bytes) => Cell::Bytes(Cow::Borrowed(bytes)),
             _ => Cell::Null,
         },
     }
@@ -711,9 +817,59 @@ mod tests {
         assert_eq!(a.cell(1), Cell::Null);
     }
 
+    /// A table's columns are the rows' columns: names, order, types and every
+    /// cell, for arbitrary collections under every layout, as sealed, after a
+    /// permutation (`--sort-hilbert`) and after edits (`plans/columnar.org`
+    /// D-C5).
+    #[test]
+    fn a_table_infers_the_columns_its_rows_do() {
+        use crate::table::{arbitrary, Layout, Sizes, Table};
+        let same = |rows: &[Feature], table: Table, what: &str| {
+            let expected = infer_columns(rows);
+            let fc = FeatureCollection::from_table(table);
+            let got = inferred_columns(&fc);
+            let names = |c: &[Column<'_>]| c.iter().map(|c| (c.name.clone(), c.ty)).collect::<Vec<_>>();
+            assert_eq!(names(&got), names(&expected), "{what}");
+            for (g, e) in got.iter().zip(&expected) {
+                assert!(g.cells().eq(e.cells()), "{what}: column {}", e.name);
+            }
+        };
+        let small = Sizes { block_rows: 64, intern_sample: 32 };
+        for seed in 0..300 {
+            let mut rng = arbitrary::Rng::new(seed);
+            let rows = arbitrary::collection(&mut rng, small.block_rows);
+            for layout in [Layout::Auto, Layout::Rows, Layout::Columns] {
+                let what = format!("seed {seed}, {layout:?}");
+                same(&rows, Table::from_features_sized(rows.clone(), layout, small), &what);
+
+                let mut order: Vec<usize> = (0..rows.len()).collect();
+                rng.shuffle(&mut order);
+                let mut table = Table::from_features_sized(rows.clone(), layout, small);
+                table.permute(&order);
+                let permuted: Vec<Feature> = order.iter().map(|&i| rows[i].clone()).collect();
+                same(&permuted, table, &format!("{what}, permuted"));
+
+                if !rows.is_empty() {
+                    let mut table = Table::from_features_sized(rows.clone(), layout, small);
+                    let mut edited = rows.clone();
+                    for _ in 0..5 {
+                        let (i, value) = (rng.below(rows.len()), arbitrary::value(&mut rng, 0));
+                        let key = format!("k{}", rng.below(9));
+                        table.set(i, &key, value.clone());
+                        match edited[i].properties.iter_mut().find(|(k, _)| **k == *key) {
+                            Some((_, held)) => *held = value,
+                            None => edited[i].properties.push((key.as_str().into(), value)),
+                        }
+                    }
+                    same(&edited, table, &format!("{what}, edited"));
+                }
+            }
+        }
+    }
+
     #[test]
     fn columns_for_attaches_declarations_by_name() {
-        let mut fc = FeatureCollection::new(features(&[r#"{"a":"x","b":1}"#]));
+        let mut fc = FeatureCollection::from_features(features(&[r#"{"a":"x","b":1}"#]));
         fc.schema = vec![FieldDecl { name: "a".into(), width: Some(80), ..FieldDecl::default() }];
         let cols = columns_for(&fc);
         assert_eq!(cols[0].decl.as_ref().unwrap().width, Some(80));
@@ -726,7 +882,7 @@ mod tests {
     fn a_declaration_for_an_absent_property_is_dropped() {
         // It describes a column that will not be written; inventing an empty
         // column for it would add data rather than preserve it.
-        let mut fc = FeatureCollection::new(features(&[r#"{"a":"x"}"#]));
+        let mut fc = FeatureCollection::from_features(features(&[r#"{"a":"x"}"#]));
         fc.schema = vec![FieldDecl { name: "gone".into(), width: Some(80), ..FieldDecl::default() }];
         let cols = columns_for(&fc);
         assert_eq!(cols.len(), 1);
@@ -736,8 +892,9 @@ mod tests {
 
     #[test]
     fn a_collection_with_no_schema_is_unchanged_by_columns_for() {
-        let fc = FeatureCollection::new(features(&[r#"{"a":"x"}"#]));
-        let inferred = infer_columns(&fc.features);
+        let fc = FeatureCollection::from_features(features(&[r#"{"a":"x"}"#]));
+        let rows = fc.to_features();
+        let inferred = infer_columns(&rows);
         let attached = columns_for(&fc);
         assert_eq!(attached.len(), inferred.len());
         assert!(attached.iter().all(|c| c.decl.is_none()));
@@ -776,7 +933,7 @@ mod tests {
         assert_eq!(cells("c"), [Cell::Null, Cell::Null, Cell::Bool(true)]);
         // Every row holds `k` at index 0: nothing is kept per row.
         let uniform = features(&[r#"{"k":1}"#, r#"{"k":2}"#]);
-        assert!(matches!(infer_columns(&uniform)[0].at, Slots::Uniform(0)));
+        assert!(matches!(infer_columns(&uniform)[0].source, Source::Rows { at: Slots::Uniform(0), .. }));
     }
 
     #[test]

@@ -2,7 +2,8 @@
 
 use crate::crs::Crs;
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{FeatureCollection, Tabular};
+use crate::table::Layout;
 use crate::geometry::from_wkb;
 use crate::json::JsonValue;
 use crate::format::Format;
@@ -15,6 +16,11 @@ use std::rc::Rc;
 
 /// Read every feature layer from a GeoPackage as `(layer_name, features)`.
 pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
+    read_layers_as(bytes, Layout::Auto)
+}
+
+/// [`read_layers`], building each layer in `layout`.
+pub(crate) fn read_layers_as(bytes: &[u8], layout: Layout) -> Result<Vec<(String, FeatureCollection)>> {
     let db = Database::open(bytes)?;
     let tables = db.tables()?;
 
@@ -41,7 +47,7 @@ pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
         let geom_idx =
             geom.and_then(|g| table.columns.iter().position(|c| *c == g.column));
 
-        let mut fc = read_layer(&db, table, geom_idx)?;
+        let mut fc = read_layer(&db, table, geom_idx, layout)?;
         // Carry the layer's coordinate reference system through unchanged.
         fc.crs = geom.and_then(|g| resolve_crs(g.srs_id, &srs));
         // The table name *is* the layer's identity, so it belongs in the IR
@@ -156,11 +162,14 @@ fn carried_fid(row: &[Value], rowid_alias: Option<usize>, position: usize) -> Op
     ))
 }
 
-fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<FeatureCollection> {
+fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>, layout: Layout) -> Result<FeatureCollection> {
     let rowid_alias = table.rowid_alias();
-    let mut features = Vec::new();
     // Intern each column's key once so every row shares one `Rc`.
     let keys: Vec<Rc<str>> = table.columns.iter().map(|n| Rc::from(n.as_str())).collect();
+    // Every column except the geometry and the rowid-alias becomes a property.
+    let properties: Vec<usize> =
+        (0..keys.len()).filter(|&i| Some(i) != geom_idx && Some(i) != rowid_alias).collect();
+    let mut rows = Tabular::new(properties.iter().map(|&i| Rc::clone(&keys[i])).collect(), layout);
     // Resolved once per layer rather than per cell: the DDL does not change
     // between rows, and `decl_type` does string work.
     let decl_types: Vec<Option<DeclType>> = (0..table.columns.len())
@@ -172,18 +181,8 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
             Some(Value::Blob(b)) => Some(from_wkb(strip_gpkg_header(b)?)?),
             _ => None,
         };
-        // Every column except the geometry and the rowid-alias becomes a property.
-        let properties = keys
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| Some(*i) != geom_idx && Some(*i) != rowid_alias)
-            .map(|(i, key)| (Rc::clone(key), value_to_json(&row[i], decl_types[i])))
-            .collect();
-        features.push(Feature {
-            geometry,
-            properties,
-            native: carried_fid(&row, rowid_alias, position).map(Box::new),
-        });
+        let values = properties.iter().map(|&i| value_to_json(&row[i], decl_types[i]));
+        rows.push(geometry, values, carried_fid(&row, rowid_alias, position).map(Box::new));
     }
     // Carry each column's declared type into the IR, so it survives to a
     // target that can express it. The geometry and rowid-alias columns are
@@ -200,7 +199,7 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>) -> Result<F
 
     // The caller fills in `crs` from the layer's srs_id, and `name` from the
     // table name — both live in `read_layers`, which is where that context is.
-    let mut fc = FeatureCollection::new(features);
+    let mut fc = rows.finish();
     fc.schema = schema;
     Ok(fc)
 }
@@ -622,8 +621,8 @@ mod tests {
         let bytes = include_bytes!("../../tests/fixtures/sqlite_altered.gpkg");
         let layers = read_layers(bytes).unwrap();
         let (_, fc) = &layers[0];
-        assert_eq!(fc.features.len(), 2);
-        for f in &fc.features {
+        assert_eq!(fc.len(), 2);
+        for f in fc.to_features().iter() {
             let get = |k: &str| f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v);
             assert_eq!(get("grade"), Some(&JsonValue::String("B".into())));
             assert_eq!(get("rank"), Some(&JsonValue::Int(5)));
@@ -638,15 +637,16 @@ mod tests {
         assert_eq!(layers.len(), 1);
         let (name, fc) = &layers[0];
         assert_eq!(name, "places");
-        assert_eq!(fc.features.len(), 2);
+        assert_eq!(fc.len(), 2);
 
         // Geometry: GPKG-binary header stripped, WKB decoded.
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(10.0, 20.0))));
+        assert_eq!(fc.to_features()[0].geometry, Some(Geometry::Point(Position::new(10.0, 20.0))));
         // Properties exclude the geometry column and the fid rowid-alias.
-        let props: Vec<&str> = fc.features[0].properties.iter().map(|(k, _)| &**k).collect();
+        let rows = fc.to_features();
+        let props: Vec<&str> = rows[0].properties.iter().map(|(k, _)| &**k).collect();
         assert_eq!(props, vec!["name", "pop", "score"]);
-        assert_eq!(fc.features[1].properties[0].1.as_str(), Some("Beta"));
-        assert_eq!(fc.features[1].properties[1].1.as_f64(), Some(200.0));
+        assert_eq!(fc.to_features()[1].properties[0].1.as_str(), Some("Beta"));
+        assert_eq!(fc.to_features()[1].properties[1].1.as_f64(), Some(200.0));
     }
 
     #[test]
@@ -664,7 +664,7 @@ mod tests {
         let layers = read_layers(bytes).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(
-            layers[0].1.features[0].geometry,
+            layers[0].1.to_features()[0].geometry,
             Some(Geometry::LineString(vec![
                 Position::with_z(0.0, 0.0, 0.0),
                 Position::with_z(10.0, 10.0, 10.0),
@@ -694,7 +694,7 @@ mod tests {
         let layers = read_layers(bytes).unwrap();
         assert_eq!(layers.len(), 1);
         assert_eq!(
-            layers[0].1.features[0].geometry,
+            layers[0].1.to_features()[0].geometry,
             Some(Geometry::LineString(vec![
                 Position::with_zm(0.0, 0.0, 1.0, 10.0),
                 Position::with_zm(10.0, 10.0, 2.0, 20.0),

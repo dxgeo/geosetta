@@ -5,7 +5,9 @@
 
 use crate::crs::Crs;
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{Feature, FeatureCollection, Tabular};
+use crate::table::Layout;
+use std::rc::Rc;
 use crate::shapefile::{dbf, geometry};
 
 /// Read a Shapefile from its sibling files' bytes. `.dbf` is required (a
@@ -20,6 +22,18 @@ pub fn read(
     prj: Option<&str>,
     cpg: Option<&str>,
     warnings: &mut Vec<String>,
+) -> Result<FeatureCollection> {
+    read_as(shp, dbf_bytes, prj, cpg, warnings, Layout::Auto)
+}
+
+/// [`read`], building the collection in `layout`.
+pub(crate) fn read_as(
+    shp: &[u8],
+    dbf_bytes: &[u8],
+    prj: Option<&str>,
+    cpg: Option<&str>,
+    warnings: &mut Vec<String>,
+    layout: Layout,
 ) -> Result<FeatureCollection> {
     let geometries = geometry::read(shp)?;
     let encoding = dbf::encoding_from_cpg(cpg);
@@ -37,15 +51,17 @@ pub fn read(
 
     // .dbf and .shp are zipped by row position; a deleted .dbf record drops
     // its paired .shp record too (.shp has no deletion flag of its own).
-    let mut features = Vec::with_capacity(geometries.len());
+    // Every record holds every field, in the header's order.
+    let keys = records.first().map(|r| r.properties.iter().map(|(k, _)| Rc::clone(k)).collect());
+    let mut table = Tabular::new(keys.unwrap_or_default(), layout);
     for (geometry, record) in geometries.into_iter().zip(records) {
         if record.deleted {
             continue;
         }
-        features.push(Feature { geometry, properties: record.properties, native: None });
+        table.push_feature(Feature { geometry, properties: record.properties, native: None });
     }
 
-    let mut fc = FeatureCollection::new(features);
+    let mut fc = table.finish();
     // The `.dbf` header's own declarations, kept alongside the values so a
     // same-format write puts back the field widths it was handed rather than
     // re-deriving them from the rows (see `crate::schema::FieldDecl`).
@@ -93,7 +109,7 @@ mod tests {
     use crate::shapefile::writer;
 
     fn one_point_fc() -> FeatureCollection {
-        FeatureCollection::new(vec![Feature {
+        FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![("name".into(), crate::json::JsonValue::String("a".into()))],
             native: None,
@@ -141,14 +157,15 @@ mod tests {
         let fc = one_point_fc();
         let encoded = writer::write(&fc).unwrap();
         let back = read(&encoded.shp, &encoded.dbf, encoded.prj.as_deref(), None, &mut Vec::new()).unwrap();
-        assert_eq!(back.features.len(), 1);
-        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
+        assert_eq!(back.len(), 1);
+        assert_eq!(back.to_features()[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
     }
 
     #[test]
     fn mismatched_record_counts_error() {
         let fc = one_point_fc();
-        let columns = infer_columns(&fc.features);
+        let rows = fc.to_features();
+        let columns = infer_columns(&rows);
         // A .dbf with zero records paired against a one-record .shp.
         let (empty_dbf, _warnings) = dbf::write(&columns[..0]).unwrap();
         let (shp, _shx) = crate::shapefile::geometry::write(&[Some(Geometry::Point(Position::new(0.0, 0.0)))]).unwrap();
@@ -176,7 +193,7 @@ mod tests {
     /// re-encoded: the writer emits UTF-8, so `é` is swapped for `raw` in place
     /// (the field is space-padded, so a shorter byte run keeps its width).
     fn shapefile_with_name_bytes(raw: &[u8]) -> (Vec<u8>, Vec<u8>) {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![("name".into(), crate::json::JsonValue::String("café".into()))],
             native: None,
@@ -193,7 +210,7 @@ mod tests {
     fn name_and_warnings(shp: &[u8], dbf: &[u8], cpg: &str) -> (String, Vec<String>) {
         let mut warnings = Vec::new();
         let fc = read(shp, dbf, None, Some(cpg), &mut warnings).unwrap();
-        (fc.features[0].properties[0].1.as_str().unwrap().to_string(), warnings)
+        (fc.to_features()[0].properties[0].1.as_str().unwrap().to_string(), warnings)
     }
 
     #[test]

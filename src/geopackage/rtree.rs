@@ -47,8 +47,8 @@ pub fn build(table: &str, fc: &FeatureCollection, ids: &[i64]) -> Rtree {
     // table written under another produces entries pointing at rows that do not
     // exist, and no oracle in this tree would catch it.
     let mut entries: Vec<(i64, Bbox)> = Vec::new();
-    for (i, feat) in fc.features.iter().enumerate() {
-        if let Some(g) = &feat.geometry {
+    for (i, feat) in fc.rows().enumerate() {
+        if let Some(g) = feat.geometry() {
             let b = g.bbox();
             if !b.is_empty() {
                 entries.push((ids[i], b));
@@ -390,8 +390,8 @@ mod tests {
 
     #[test]
     fn empty_layer_still_has_a_root_node() {
-        let fc = FeatureCollection::new(vec![]);
-        let rt = build("empty", &fc, &(1..=fc.features.len() as i64).collect::<Vec<_>>());
+        let fc = FeatureCollection::from_features(vec![]);
+        let rt = build("empty", &fc, &(1..=fc.len() as i64).collect::<Vec<_>>());
         let node = rt.tables.iter().find(|t| t.name == "rtree_empty_geom_node").unwrap();
         assert_eq!(node.rows.len(), 1); // the (empty) root
         assert_eq!(node.rows[0].0, 1); // nodeno 1
@@ -399,10 +399,10 @@ mod tests {
 
     #[test]
     fn single_leaf_holds_every_feature() {
-        let fc = FeatureCollection::new(
+        let fc = FeatureCollection::from_features(
             (0..10).map(|i| point_feat(i as f64, i as f64)).collect(),
         );
-        let rt = build("pts", &fc, &(1..=fc.features.len() as i64).collect::<Vec<_>>());
+        let rt = build("pts", &fc, &(1..=fc.len() as i64).collect::<Vec<_>>());
         let node = rt.tables.iter().find(|t| t.name == "rtree_pts_geom_node").unwrap();
         let rowid = rt.tables.iter().find(|t| t.name == "rtree_pts_geom_rowid").unwrap();
         // Ten features fit one leaf, which is the root.
@@ -418,10 +418,10 @@ mod tests {
     fn many_features_build_interior_levels() {
         // More than one node's worth forces a root over multiple leaves.
         let n = MAX_CELLS * 3 + 5;
-        let fc = FeatureCollection::new(
+        let fc = FeatureCollection::from_features(
             (0..n).map(|i| point_feat(i as f64, (i * 7 % 13) as f64)).collect(),
         );
-        let rt = build("big", &fc, &(1..=fc.features.len() as i64).collect::<Vec<_>>());
+        let rt = build("big", &fc, &(1..=fc.len() as i64).collect::<Vec<_>>());
         let node = rt.tables.iter().find(|t| t.name == "rtree_big_geom_node").unwrap();
         let parent = rt.tables.iter().find(|t| t.name == "rtree_big_geom_parent").unwrap();
         let rowid = rt.tables.iter().find(|t| t.name == "rtree_big_geom_rowid").unwrap();

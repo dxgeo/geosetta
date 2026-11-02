@@ -42,7 +42,7 @@ fn cli_warnings(input: &std::path::Path, output: &std::path::Path) -> Vec<String
 }
 
 fn sample() -> FeatureCollection {
-    FeatureCollection::new(vec![Feature {
+    FeatureCollection::from_features(vec![Feature {
         geometry: Some(Geometry::Point(Position::new(12.5683, 55.6761))),
         properties: vec![("name".into(), JsonValue::String("København".into()))],
         native: None,

@@ -13,11 +13,13 @@
 //! `<ExtendedData>` repeats `name` gives, stays in `<ExtendedData>` where it
 //! came from.
 
-use crate::feature::Feature;
-use crate::json::JsonValue;
+use std::rc::Rc;
+
+use crate::feature::FeatureRef;
 use crate::kml::model::KmlElement;
 use crate::kml::project::{self, is_kml_time, ALTITUDE_MEMBERS, BEGIN, DESCRIPTION, END, ICON, NAME, TIMESTAMP};
 use crate::kml::writer::property_text;
+use crate::table::Value;
 
 /// A feature's time, as its element will hold it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,19 +54,20 @@ pub(crate) struct Placement<'f> {
     /// [`ALTITUDE_MEMBERS`] order.
     pub altitude: Vec<(KmlElement, String)>,
     /// Everything else, in the IR's order.
-    pub extended: Vec<(&'f str, &'f JsonValue)>,
+    pub extended: Vec<(&'f str, Value<'f>)>,
 }
 
 /// Sort `f`'s properties for a feature element of kind `element`, whose
 /// geometry can hold an altitude member when `carries` says so.
-pub(crate) fn place<'f>(f: &'f Feature, element: KmlElement, carries: impl Fn(KmlElement) -> bool) -> Placement<'f> {
+pub(crate) fn place<'f>(f: FeatureRef<'f>, element: KmlElement, carries: impl Fn(KmlElement) -> bool) -> Placement<'f> {
+    let properties: Vec<(&'f Rc<str>, Value<'f>)> = f.properties().collect();
     let keys: Vec<&str> = project::element_keys(element).collect();
     // Which property a member would come from: its key's first occurrence.
-    let first = |key: &str| keys.contains(&key).then(|| f.properties.iter().position(|(k, _)| &**k == key)).flatten();
-    let mut used = vec![false; f.properties.len()];
+    let first = |key: &str| keys.contains(&key).then(|| properties.iter().position(|(k, _)| &***k == key)).flatten();
+    let mut used = vec![false; properties.len()];
     let mut take = |key: &str, ok: &dyn Fn(&str) -> bool| -> Option<String> {
         let i = first(key)?;
-        let text = property_text(&f.properties[i].1);
+        let text = property_text(properties[i].1);
         ok(&text).then(|| {
             used[i] = true;
             text
@@ -93,7 +96,7 @@ pub(crate) fn place<'f>(f: &'f Feature, element: KmlElement, carries: impl Fn(Km
         }
     }
     let extended =
-        f.properties.iter().zip(&used).filter(|(_, used)| !**used).map(|((k, v), _)| (&**k, v)).collect();
+        properties.into_iter().zip(used).filter(|(_, used)| !*used).map(|((k, v), _)| (&**k, v)).collect();
     Placement { name, description, time, icon, altitude, extended }
 }
 

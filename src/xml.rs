@@ -423,6 +423,9 @@ pub(crate) struct Parsed<'a, N> {
 /// never exists twice; [`parse_document`] builds [`XmlElement`]s.
 pub(crate) trait Builder {
     type Node;
+    /// An element's start tag has been read, its namespace resolved; its
+    /// content follows, and then [`Builder::build`] for it.
+    fn open(&mut self, _name: &str, _prefix: Option<&str>, _ns: Option<&str>) {}
     fn build(&mut self, el: Parsed<'_, Self::Node>) -> Self::Node;
 }
 
@@ -788,6 +791,7 @@ impl<'a> Parser<'a> {
         }
         let (prefix, name) = split_qname(raw_name);
         let ns = self.resolve(prefix);
+        builder.open(name, prefix, ns.as_deref());
         let mut el = Parsed {
             name,
             prefix,

@@ -17,13 +17,15 @@ use std::rc::Rc;
 
 use crate::crs::Crs;
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{Collecting, Feature, FeatureCollection};
+use crate::table::Layout;
 use crate::format::{Format, KmlVersion};
 use crate::kml::document::{self, Skeleton};
 use crate::kml::model::{self, Kind, KmlDocument, KmlElement, Node, Spelling, GOOGLE_KML_2_2_NS};
 use crate::kml::project::{self, project, Context, Vertical};
 use crate::native::{KmlFeatureNative, KmlNative, Native, NativePayload};
 use crate::schema::{DeclType, FieldDecl};
+use crate::table::Value;
 use crate::xml;
 
 /// Google's 2.0 and 2.1, which are refused (D-K8): `(namespace, version)`.
@@ -41,20 +43,83 @@ fn err(message: &str) -> Error {
 /// model (`plans/kml-standard.org` D-K4, D-K11), and what a write to another
 /// format then loses is that write's warning (`crate::kml::drop_warnings`).
 /// The sink is the read-side channel every reader takes.
-pub(crate) fn read(input: &[u8], _warnings: &mut Vec<String>) -> Result<FeatureCollection> {
-    let text = xml::decode(input)?;
-    let document = read_document(&text, Format::Kml, 0)?;
-    let facts = document.facts;
-    Ok(finish(document.features, document.native, Some(document.skeleton), facts, Format::Kml))
+#[cfg(test)]
+pub(crate) fn read(input: &[u8], warnings: &mut Vec<String>) -> Result<FeatureCollection> {
+    read_with(input, warnings, Elements::Keep, crate::table::Layout::Auto)
 }
 
-/// One parsed KML document: what it says about itself, its skeleton, and its
-/// projected features, each carrying its own element as a native tagged
-/// `format`.
+/// [`read`], keeping each feature's element as `elements` says and building
+/// the collection in `layout`.
+pub(crate) fn read_with(
+    input: &[u8],
+    _warnings: &mut Vec<String>,
+    elements: Elements,
+    layout: Layout,
+) -> Result<FeatureCollection> {
+    let text = xml::decode(input)?;
+    let mut features = Collecting::new(layout);
+    let document = read_document(&text, Format::Kml, 0, elements, &mut features)?;
+    Ok(finish(features, document.native, Some(document.skeleton), document.facts, Format::Kml))
+}
+
+/// Whether a read keeps each feature's element as its native
+/// (`plans/performance.org`, KML's read). Only a KML or KMZ write reads one
+/// back, and a feature's element is most of what a read holds — 5.7 KB a
+/// point against the few dozen bytes the IR projects from it — so a read for
+/// any other target leaves each out as the parser finishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Elements {
+    Keep,
+    /// Leave each out, tallying in [`Unkept`] what the drop warnings would
+    /// have read from it.
+    Leave,
+}
+
+impl Elements {
+    /// What a read for a write as `target` keeps: everything, when the
+    /// target is unknown.
+    pub fn for_target(target: Option<Format>) -> Elements {
+        match target {
+            Some(t) if !matches!(t, Format::Kml | Format::Kmz) => Elements::Leave,
+            _ => Elements::Keep,
+        }
+    }
+}
+
+/// What the features' elements a read left out held that a write to another
+/// format cannot carry, counted in features: what
+/// [`crate::kml::drop_warnings`] would otherwise read from the elements.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Unkept {
+    /// Holding a `<Model>`.
+    pub models: usize,
+    /// Holding a track with per-vertex data.
+    pub tracks: usize,
+    /// With a Z that is not plainly flat (D-K12).
+    pub heights: usize,
+}
+
+impl Unkept {
+    /// Count `feature`, whose heights are `heights`.
+    fn add(&mut self, feature: &Node, heights: Vertical) {
+        let unprojected = project::unprojected(feature);
+        self.models += unprojected.contains(&project::Unprojected::Model) as usize;
+        self.tracks += unprojected.contains(&project::Unprojected::TrackData) as usize;
+        self.heights += (heights != Vertical::Flat) as usize;
+    }
+
+    pub fn merge(&mut self, other: Unkept) {
+        self.models += other.models;
+        self.tracks += other.tracks;
+        self.heights += other.heights;
+    }
+}
+
+/// One parsed KML document: what it says about itself and its skeleton. Its
+/// projected features went to the collection being built.
 pub(crate) struct ReadDocument {
     pub native: KmlNative,
     pub skeleton: Skeleton,
-    pub features: Vec<Feature>,
     pub facts: Facts,
 }
 
@@ -87,25 +152,107 @@ impl Facts {
 
 /// Parse, detect, raise, split and project one document's text — the piece
 /// `.kmz` repeats per entry, `index` numbering the documents in archive order.
-pub(crate) fn read_document(text: &str, format: Format, index: usize) -> Result<ReadDocument> {
+/// Each feature is pushed to `into`, carrying its own element as a native
+/// tagged `format` when `elements` keeps it.
+pub(crate) fn read_document(
+    text: &str,
+    format: Format,
+    index: usize,
+    elements: Elements,
+    into: &mut Collecting,
+) -> Result<ReadDocument> {
+    if elements == Elements::Leave
+        && let Some(document) = read_leaving(text, into)?
+    {
+        return Ok(document);
+    }
     let parsed = model::parse(text)?;
-    let native = detect(&parsed)?;
+    let mut native = detect(&parsed, false)?;
     let (skeleton, models) = document::split(parsed);
     // A `<Schema>` is document content, so it stays in the skeleton, and the
     // writer reads it from there again to project what it compares against.
     let ctx = Context::of(&skeleton.doc.root);
     let mut vertical = Vertical::Flat;
-    let features = models
-        .into_iter()
-        .map(|m| {
-            let projection = project(&m.node, &ctx)?;
-            vertical = vertical.max(project::vertical(&m.node));
-            let native = Native::new(format, NativePayload::KmlFeature(KmlFeatureNative { feature: Rc::new(m), document: index }));
-            Ok(Feature { geometry: projection.geometry, properties: projection.properties, native: Some(Box::new(native)) })
-        })
-        .collect::<Result<_>>()?;
+    for m in models {
+        let projection = project(&m.node, &ctx)?;
+        let heights = project::vertical(&m.node);
+        vertical = vertical.max(heights);
+        let native = match elements {
+            Elements::Keep => Some(Box::new(Native::new(
+                format,
+                NativePayload::KmlFeature(KmlFeatureNative { feature: Rc::new(m), document: index }),
+            ))),
+            Elements::Leave => {
+                native.unkept.add(&m.node, heights);
+                None
+            }
+        };
+        into.push(Feature { geometry: projection.geometry, properties: projection.properties, native });
+    }
     let facts = Facts { declarations: ctx.declarations(), vertical };
-    Ok(ReadDocument { native, skeleton, features, facts })
+    Ok(ReadDocument { native, skeleton, facts })
+}
+
+/// [`read_document`] keeping no feature's element: each is projected as the
+/// parser finishes it and a stub left in its place, so the document's
+/// features never exist at once. What the read would have said of a feature
+/// from its element — its heights, a 2.3-only component, what the drop
+/// warnings name — is taken from it first.
+///
+/// A projection reads the schemas declared before it. KML puts a
+/// `<Schema>` before a `<Document>`'s features, so they all are; a document
+/// that declares one after a feature gives `None`, and is read whole.
+fn read_leaving(text: &str, into: &mut Collecting) -> Result<Option<ReadDocument>> {
+    let mut ctx = Context::default();
+    let mut features = Vec::new();
+    let mut projected = 0;
+    let mut failed = None;
+    let mut late = false;
+    let mut vertical = Vertical::Flat;
+    let mut unkept = Unkept::default();
+    let mut v2_3 = false;
+    let parsed = model::parse_with(text, &mut |node, open| {
+        // Where `document::split` takes features from, and `Context::of`
+        // schemas: the root's children, and down through what they enter.
+        let (Some(element), Some((_, within))) = (node.element(), open.split_first()) else {
+            return node;
+        };
+        if element == KmlElement::Schema && within.iter().all(|e| e.is_some_and(|(e, _)| Context::reaches(e))) {
+            late |= projected > 0;
+            ctx.declare(&node);
+            return node;
+        }
+        if !(project::is_projected(element) && within.iter().all(|e| e.is_some_and(|(e, _)| e.is_container()))) {
+            return node;
+        }
+        projected += 1;
+        if failed.is_none() {
+            match project(&node, &ctx) {
+                Ok(p) => features.push(Feature { geometry: p.geometry, properties: p.properties, native: None }),
+                Err(e) => failed = Some(e),
+            }
+        }
+        let heights = project::vertical(&node);
+        vertical = vertical.max(heights);
+        unkept.add(&node, heights);
+        v2_3 |= uses_2_3_only(&node);
+        node.stub()
+    })?;
+    let mut native = detect(&parsed, v2_3)?;
+    if late {
+        return Ok(None);
+    }
+    if let Some(e) = failed {
+        return Err(e);
+    }
+    let (skeleton, models) = document::split(parsed);
+    debug_assert_eq!(models.len(), features.len(), "a stub for every feature projected");
+    for f in features {
+        into.push(f);
+    }
+    native.unkept = unkept;
+    let facts = Facts { declarations: ctx.declarations(), vertical };
+    Ok(Some(ReadDocument { native, skeleton, facts }))
 }
 
 /// Wrap collected features as a collection with the document's provenance —
@@ -113,14 +260,14 @@ pub(crate) fn read_document(text: &str, format: Format, index: usize) -> Result<
 /// the format that read it, in the CRS its heights call for and with the
 /// column declarations it makes.
 pub(crate) fn finish(
-    features: Vec<Feature>,
+    features: Collecting,
     mut document: KmlNative,
     skeleton: Option<Skeleton>,
     facts: Facts,
     format: Format,
 ) -> FeatureCollection {
     document.document = skeleton.map(Rc::new);
-    let mut fc = FeatureCollection::new(features);
+    let mut fc = features.finish();
     fc.crs = Some(match facts.vertical {
         Vertical::Absolute => Crs::wgs84_egm96(),
         Vertical::Flat | Vertical::Other => Crs::Wgs84,
@@ -130,8 +277,9 @@ pub(crate) fn finish(
         .into_iter()
         .map(|(name, ty)| FieldDecl { ty: Some(ty), ..FieldDecl::new(name) })
         .collect();
-    for key in [project::TIMESTAMP, project::BEGIN, project::END] {
-        if !schema.iter().any(|d| d.name == key) && is_date_time_column(&fc.features, key) {
+    let date_times = date_time_columns(&fc);
+    for (key, date_time) in [project::TIMESTAMP, project::BEGIN, project::END].into_iter().zip(date_times) {
+        if !schema.iter().any(|d| d.name == key) && date_time {
             schema.push(FieldDecl { ty: Some(DeclType::DateTime), ..FieldDecl::new(key) });
         }
     }
@@ -140,20 +288,32 @@ pub(crate) fn finish(
     fc
 }
 
-/// Whether the time column `key` is a date-time column: it has a value, and
-/// every value is a whole XML Schema `dateTime`. A `date`, `gYearMonth` or
-/// `gYear` — which KML's time admits too — leaves the column text, since no
-/// date-time holds one without inventing the rest (D-K15, D17 applied per
-/// column).
-fn is_date_time_column(features: &[Feature], key: &str) -> bool {
-    let mut values = features.iter().flat_map(|f| f.properties.iter().filter(|(k, _)| &**k == key)).peekable();
-    values.peek().is_some()
-        && values.all(|(_, v)| matches!(v, crate::json::JsonValue::String(s) if project::is_xsd_date_time(s)))
+/// Whether each time column — `timestamp`, `begin`, `end` — is a date-time
+/// column: it has a value, and every value is a whole XML Schema `dateTime`.
+/// A `date`, `gYearMonth` or `gYear` — which KML's time admits too — leaves
+/// the column text, since no date-time holds one without inventing the rest
+/// (D-K15, D17 applied per column). One pass over every feature's
+/// properties, repeats of a key included.
+fn date_time_columns(fc: &FeatureCollection) -> [bool; 3] {
+    let keys = [project::TIMESTAMP, project::BEGIN, project::END];
+    // Per key: whether a value was seen, and whether every one so far is one.
+    let mut seen = [false; 3];
+    let mut all = [true; 3];
+    for f in fc.rows() {
+        for (key, value) in f.properties() {
+            if let Some(i) = keys.iter().position(|k| **k == **key) {
+                seen[i] = true;
+                all[i] &= matches!(value, Value::Str(s) if project::is_xsd_date_time(s));
+            }
+        }
+    }
+    [0, 1, 2].map(|i| seen[i] && all[i])
 }
 
 /// Which KML this is, per `plans/kml-standard.org` § VERSION DETECTION, or why
-/// it is not one this crate reads (D-K1).
-fn detect(doc: &KmlDocument) -> Result<KmlNative> {
+/// it is not one this crate reads (D-K1). `features_2_3` says a feature
+/// element taken out of `doc` used a 2.3-only component.
+fn detect(doc: &KmlDocument, features_2_3: bool) -> Result<KmlNative> {
     let root = &doc.root;
     let namespace = doc.root_ns.as_deref();
     if let Some((_, version)) = GOOGLE_PRE_OGC.iter().find(|(ns, _)| Some(*ns) == namespace) {
@@ -182,7 +342,7 @@ fn detect(doc: &KmlDocument) -> Result<KmlNative> {
     // A 2.3-only component makes the document 2.3 whatever it declares; the
     // schema's assertions are written about OGC's namespace, which Google's
     // pre-OGC 2.2 namespace predates.
-    let version = if stamped == KmlVersion::V2_2 && namespace != Some(GOOGLE_KML_2_2_NS) && uses_2_3_only(root) {
+    let version = if stamped == KmlVersion::V2_2 && namespace != Some(GOOGLE_KML_2_2_NS) && (features_2_3 || uses_2_3_only(root)) {
         KmlVersion::V2_3
     } else {
         stamped
@@ -194,6 +354,7 @@ fn detect(doc: &KmlDocument) -> Result<KmlNative> {
         document: None,
         layers: Vec::new(),
         archive: None,
+        unkept: Unkept::default(),
     })
 }
 
@@ -283,8 +444,8 @@ mod tests {
         </Placemark></Document></kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
         assert_eq!(fc.crs, Some(Crs::Wgs84));
-        assert_eq!(fc.features.len(), 1);
-        let f = &fc.features[0];
+        assert_eq!(fc.len(), 1);
+        let f = &fc.to_features()[0];
         assert_eq!(f.geometry, Some(Point(Position::with_z(-73.9857, 40.7484, 10.0))));
         let prop = |k: &str| f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone());
         assert_eq!(prop("name").unwrap().as_str(), Some("Empire State"));
@@ -301,13 +462,13 @@ mod tests {
             </Polygon></Placemark>
         </kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features.len(), 2);
+        assert_eq!(fc.len(), 2);
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, 0.0)]))
         );
         assert_eq!(
-            fc.features[1].geometry,
+            fc.to_features()[1].geometry,
             Some(Polygon(vec![
                 vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 4.0), Position::new(0.0, 0.0)],
                 vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
@@ -322,7 +483,7 @@ mod tests {
             <Point><coordinates>1,1</coordinates></Point>
         </MultiGeometry></Placemark></kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])));
+        assert_eq!(fc.to_features()[0].geometry, Some(MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])));
     }
 
     #[test]
@@ -333,7 +494,7 @@ mod tests {
         </MultiGeometry></Placemark></kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(GeometryCollection(vec![
                 Point(Position::new(0.0, 0.0)),
                 LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)]),
@@ -352,7 +513,7 @@ mod tests {
         </Placemark></kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
         let prop = |k: &str| {
-            fc.features[0]
+            fc.to_features()[0]
                 .properties
                 .iter()
                 .find(|(n, _)| &**n == k)
@@ -368,21 +529,21 @@ mod tests {
             <Placemark><Point><coordinates>0,0</coordinates></Point></Placemark>
         </Folder></Folder></Document></kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features.len(), 1);
+        assert_eq!(fc.len(), 1);
     }
 
     #[test]
     fn placemark_with_no_geometry_has_none() {
         let kml = r#"<kml><Placemark><name>No shape</name></Placemark></kml>"#;
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features[0].geometry, None);
+        assert_eq!(fc.to_features()[0].geometry, None);
     }
 
     #[test]
     fn tolerates_newline_separated_coordinates() {
         let kml = "<kml><Placemark><LineString><coordinates>\n0,0\n1,1\n</coordinates></LineString></Placemark></kml>";
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features[0].geometry, Some(LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])));
+        assert_eq!(fc.to_features()[0].geometry, Some(LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])));
     }
 
     #[test]
@@ -395,7 +556,7 @@ mod tests {
     fn a_2d_point_has_no_z() {
         let kml = "<kml><Placemark><Point><coordinates>0,0</coordinates></Point></Placemark></kml>";
         let fc = read(kml.as_bytes()).unwrap();
-        assert_eq!(fc.features[0].geometry, Some(Point(Position::new(0.0, 0.0))));
+        assert_eq!(fc.to_features()[0].geometry, Some(Point(Position::new(0.0, 0.0))));
     }
 
     #[test]
@@ -403,7 +564,7 @@ mod tests {
         let kml = "<kml><Placemark><LineString><coordinates>0,0,1 1,1,2 2,0,3</coordinates></LineString></Placemark></kml>";
         let fc = read(kml.as_bytes()).unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(LineString(vec![
                 Position::with_z(0.0, 0.0, 1.0),
                 Position::with_z(1.0, 1.0, 2.0),
@@ -436,7 +597,7 @@ mod tests {
         let (fc, warnings) =
             read_warning("<kml><Placemark><LinearRing><coordinates>0,0 1,0 1,1 0,0</coordinates></LinearRing></Placemark></kml>");
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(LineString(vec![
                 Position::new(0.0, 0.0),
                 Position::new(1.0, 0.0),
@@ -455,7 +616,7 @@ mod tests {
              </Placemark></kml>"
         ));
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(LineString(vec![Position::with_z(1.0, 2.0, 3.0), Position::with_z(4.0, 5.0, 6.0)]))
         );
         assert_eq!(warnings.len(), 1);
@@ -468,7 +629,7 @@ mod tests {
         let (fc, _) = read_warning(
             r#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3"><Placemark><Track><coord>1 2 3</coord></Track></Placemark></kml>"#,
         );
-        assert_eq!(fc.features[0].geometry, Some(LineString(vec![Position::with_z(1.0, 2.0, 3.0)])));
+        assert_eq!(fc.to_features()[0].geometry, Some(LineString(vec![Position::with_z(1.0, 2.0, 3.0)])));
     }
 
     #[test]
@@ -484,7 +645,7 @@ mod tests {
     #[test]
     fn an_undeclared_gx_prefix_is_still_a_track() {
         let (fc, _) = read_warning("<kml><Placemark><gx:Track><gx:coord>1 2 3</gx:coord></gx:Track></Placemark></kml>");
-        assert!(fc.features[0].geometry.is_some());
+        assert!(fc.to_features()[0].geometry.is_some());
     }
 
     #[test]
@@ -495,7 +656,7 @@ mod tests {
              </gx:MultiTrack></Placemark></kml>"
         ));
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(MultiLineString(vec![vec![Position::with_z(1.0, 2.0, 3.0)], vec![Position::with_z(4.0, 5.0, 6.0)]]))
         );
     }
@@ -506,8 +667,8 @@ mod tests {
         let (fc, warnings) = read_warning(&format!(
             "<kml {NS}><Placemark><name>a</name>{model}</Placemark><Placemark><name>b</name>{model}</Placemark></kml>"
         ));
-        assert_eq!(fc.features.len(), 2);
-        assert!(fc.features.iter().all(|f| f.geometry.is_none()));
+        assert_eq!(fc.len(), 2);
+        assert!(fc.to_features().iter().all(|f| f.geometry.is_none()));
         assert_eq!(
             warnings,
             vec!["kml: 2 feature(s) hold <Model>, which this GeoJSON write cannot carry; written without that geometry"]
@@ -521,8 +682,8 @@ mod tests {
             "<kml {NS}><Placemark><MultiGeometry><Point><coordinates>1,2</coordinates></Point><Model/></MultiGeometry>\
              </Placemark><Placemark><MultiGeometry><Model/></MultiGeometry></Placemark></kml>"
         ));
-        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![Position::new(1.0, 2.0)])));
-        assert_eq!(fc.features[1].geometry, None);
+        assert_eq!(fc.to_features()[0].geometry, Some(MultiPoint(vec![Position::new(1.0, 2.0)])));
+        assert_eq!(fc.to_features()[1].geometry, None);
         assert!(warnings[0].starts_with("kml: 2 feature(s) hold <Model>"), "{warnings:?}");
     }
 
@@ -531,8 +692,8 @@ mod tests {
         let (fc, _) = read_warning(
             r#"<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:x="urn:x"><Placemark><x:name>not a name</x:name><x:Point><x:coordinates>1,2</x:coordinates></x:Point></Placemark></kml>"#,
         );
-        assert!(fc.features[0].geometry.is_none());
-        assert!(fc.features[0].properties.is_empty());
+        assert!(fc.to_features()[0].geometry.is_none());
+        assert!(fc.to_features()[0].properties.is_empty());
     }
 
     #[test]
@@ -540,8 +701,8 @@ mod tests {
         let (fc, _) = read_warning(
             r#"<k:kml xmlns:k="http://www.opengis.net/kml/2.2"><k:Placemark><k:name>p</k:name><k:Point><k:coordinates>1,2</k:coordinates></k:Point></k:Placemark></k:kml>"#,
         );
-        assert_eq!(fc.features[0].geometry, Some(Point(Position::new(1.0, 2.0))));
-        assert_eq!(fc.features[0].properties[0].1.as_str(), Some("p"));
+        assert_eq!(fc.to_features()[0].geometry, Some(Point(Position::new(1.0, 2.0))));
+        assert_eq!(fc.to_features()[0].properties[0].1.as_str(), Some("p"));
     }
 
     #[test]
@@ -558,7 +719,7 @@ mod tests {
             bytes.extend_from_slice(&u.to_le_bytes());
         }
         let fc = read(&bytes).unwrap();
-        assert_eq!(fc.features[0].properties[0].1.as_str(), Some("Zürich"));
+        assert_eq!(fc.to_features()[0].properties[0].1.as_str(), Some("Zürich"));
     }
 
     fn document(kml: &str) -> KmlNative {
@@ -654,7 +815,7 @@ mod tests {
     fn a_declared_latin_1_document_reads_as_what_it_declared() {
         let fc = read(b"<?xml version=\"1.0\" encoding=\"ISO-8859-1\"?><kml><Placemark><name>K\xF8benhavn</name></Placemark></kml>")
             .unwrap();
-        assert_eq!(fc.features[0].properties[0].1.as_str(), Some("København"));
+        assert_eq!(fc.to_features()[0].properties[0].1.as_str(), Some("København"));
     }
 
     fn props(f: &Feature) -> Vec<(&str, JsonValue)> {
@@ -677,9 +838,9 @@ mod tests {
               <Placemark><TimeSpan><end>1997</end></TimeSpan></Placemark></kml>",
         )
         .unwrap();
-        assert_eq!(props(&fc.features[0]), [("timestamp", text("2026-10-22T09:30:00-05:00"))]);
-        assert_eq!(props(&fc.features[1]), [("begin", text("2026-01")), ("end", text("2026-03-15"))]);
-        assert_eq!(props(&fc.features[2]), [("end", text("1997"))]);
+        assert_eq!(props(&fc.to_features()[0]), [("timestamp", text("2026-10-22T09:30:00-05:00"))]);
+        assert_eq!(props(&fc.to_features()[1]), [("begin", text("2026-01")), ("end", text("2026-03-15"))]);
+        assert_eq!(props(&fc.to_features()[2]), [("end", text("1997"))]);
         // Only a column of whole date-times is declared one; `2026-01` is no
         // instant, so neither span column is.
         assert_eq!(decl(&fc, "timestamp"), Some(DeclType::DateTime));
@@ -695,8 +856,8 @@ mod tests {
               <Placemark><Point><coordinates>1,2,3</coordinates></Point></Placemark></kml>",
         )
         .unwrap();
-        assert_eq!(props(&fc.features[0]), [("altitudeMode", text("absolute")), ("extrude", text("1"))]);
-        assert!(fc.features[1].properties.is_empty(), "no element, no property: GDAL's extrude=0 is not invented");
+        assert_eq!(props(&fc.to_features()[0]), [("altitudeMode", text("absolute")), ("extrude", text("1"))]);
+        assert!(fc.to_features()[1].properties.is_empty(), "no element, no property: GDAL's extrude=0 is not invented");
     }
 
     #[test]
@@ -708,7 +869,7 @@ mod tests {
               <coordinates>1,2,3 4,5,6</coordinates></LineString></MultiGeometry></Placemark></kml>",
         )
         .unwrap();
-        assert_eq!(props(&fc.features[0]), [("altitudeMode", text("absolute")), ("tessellate", text("1"))]);
+        assert_eq!(props(&fc.to_features()[0]), [("altitudeMode", text("absolute")), ("tessellate", text("1"))]);
     }
 
     #[test]
@@ -750,7 +911,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            props(&fc.features[0]),
+            props(&fc.to_features()[0]),
             [
                 ("n", JsonValue::Int(7)),
                 ("d", JsonValue::Float(1.5)),
@@ -788,9 +949,9 @@ mod tests {
         )
         .unwrap();
         let ring = |coords: &[(f64, f64)]| Some(Polygon(vec![coords.iter().map(|&(x, y)| Position::new(x, y)).collect()]));
-        assert_eq!(props(&fc.features[0]), [("name", text("o")), ("icon", text("img.png"))]);
-        assert_eq!(fc.features[0].geometry, ring(&[(12.0, 55.0), (13.0, 55.0), (13.0, 56.0), (12.0, 56.0), (12.0, 55.0)]));
-        assert_eq!(fc.features[1].geometry, ring(&[(0.0, 0.0), (2.0, 0.0), (2.5, 1.0), (0.0, 1.0), (0.0, 0.0)]));
+        assert_eq!(props(&fc.to_features()[0]), [("name", text("o")), ("icon", text("img.png"))]);
+        assert_eq!(fc.to_features()[0].geometry, ring(&[(12.0, 55.0), (13.0, 55.0), (13.0, 56.0), (12.0, 56.0), (12.0, 55.0)]));
+        assert_eq!(fc.to_features()[1].geometry, ring(&[(0.0, 0.0), (2.0, 0.0), (2.5, 1.0), (0.0, 1.0), (0.0, 0.0)]));
     }
 
     #[test]
@@ -801,9 +962,9 @@ mod tests {
               <ScreenOverlay><Icon><href>logo.png</href></Icon></ScreenOverlay></Document></kml>",
         )
         .unwrap();
-        assert_eq!(fc.features.len(), 1);
-        assert_eq!(fc.features[0].geometry, Some(Point(Position::with_z(1.0, 2.0, 3.0))));
-        assert_eq!(props(&fc.features[0]), [("icon", text("p.jpg")), ("altitudeMode", text("absolute"))]);
+        assert_eq!(fc.len(), 1);
+        assert_eq!(fc.to_features()[0].geometry, Some(Point(Position::with_z(1.0, 2.0, 3.0))));
+        assert_eq!(props(&fc.to_features()[0]), [("icon", text("p.jpg")), ("altitudeMode", text("absolute"))]);
         assert_eq!(fc.crs, Some(Crs::wgs84_egm96()));
     }
 }

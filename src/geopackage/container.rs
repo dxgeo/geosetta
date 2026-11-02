@@ -547,7 +547,7 @@ mod tests {
     const CONTENTS: &[u8] = include_bytes!("../../tests/fixtures/sqlite_contents.gpkg");
 
     fn layer(name: &str) -> (String, FeatureCollection) {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: Vec::new(),
             native: None,

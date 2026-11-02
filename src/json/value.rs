@@ -138,34 +138,15 @@ impl JsonValue {
     }
 
     fn write_json(&self, out: &mut String) {
-        use std::fmt::Write;
         match self {
-            JsonValue::Null => out.push_str("null"),
-            JsonValue::Bool(true) => out.push_str("true"),
-            JsonValue::Bool(false) => out.push_str("false"),
-            // Format straight into `out` (Display for i64/f64) rather than
-            // allocating a temporary String per number.
-            JsonValue::Int(n) => {
-                let _ = write!(out, "{n}");
-            }
-            JsonValue::Float(v) => {
-                // Rust's `Display` prints `1.0f64` as `1`, which would turn a
-                // float back into an integer on every round trip. A non-finite
-                // value has no JSON spelling at all; `null` is what the parser
-                // would have to read back anyway.
-                write_json_f64(*v, out);
-            }
-            JsonValue::String(s) => write_json_string(s, out),
-            // Hex, in a JSON string: the only shape a JSON document has for
-            // bytes, and the one this crate already used for undeclarable
-            // Parquet byte arrays.
-            JsonValue::Binary(bytes) => {
-                out.push('"');
-                for b in bytes {
-                    let _ = write!(out, "{b:02x}");
-                }
-                out.push('"');
-            }
+            // A scalar is spelled where a table's borrowed cell is, so the
+            // two cannot drift (`crate::table::Value::write_json_to`).
+            JsonValue::Null
+            | JsonValue::Bool(_)
+            | JsonValue::Int(_)
+            | JsonValue::Float(_)
+            | JsonValue::String(_)
+            | JsonValue::Binary(_) => crate::table::Value::of(self).write_json_to(out),
             JsonValue::Array(items) => {
                 out.push('[');
                 for (i, item) in items.iter().enumerate() {

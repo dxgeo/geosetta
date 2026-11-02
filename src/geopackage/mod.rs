@@ -19,6 +19,7 @@ pub use container::container_drop_warnings;
 /// the write path's own plumbing, not part of the format-agnostic surface.
 pub use carry::{Carried, read as read_container};
 pub use reader::read_layers;
+pub(crate) use reader::read_layers_as;
 /// Merging a destination container's carried content with a source's, for the
 /// append path — `plans/container-reconciliation.org` § 3.
 pub use reconcile::reconcile as reconcile_containers;

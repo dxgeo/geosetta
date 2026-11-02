@@ -241,6 +241,11 @@ for GeoJSON. Scope deliberately narrow — *not* a general XML library:
   streaming cursor, since KML's =Placemark= subtrees are small and read as a
   unit; lean DOM unless profiling says otherwise (this format is not on the
   performance-critical path the way GeoParquet/FlatGeobuf are).
+  /2026-11-02:/ profiling said otherwise for a read bound for another
+  format, where every feature's element was held until the read ended (616
+  MB on 100 000 points). The tree stays per element, but such a read now
+  projects each feature element as the parser finishes it and keeps a stub
+  (=performance.org=, KML's read, step 2).
 - Namespace handling: ignore/strip prefixes, match local names only (=kml:=,
   =gx:=, bare — all the same element).
 - A parallel *writer*: element-tree-to-bytes serialization with XML escaping

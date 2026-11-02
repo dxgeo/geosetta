@@ -639,8 +639,9 @@ pub(crate) struct DroppedReference {
 /// this member and everything else `carry.rs` holds.** A pyramid or a user
 /// table is valid whatever the write produces; a reference names a table, a
 /// column and a rowid, so it is valid only against *this* write. Decision 23
-/// forbids tracking that — `FeatureCollection::features` is a public field a
-/// consumer mutates directly — so it is computed here, at write, by comparing
+/// forbids tracking that — a consumer edits the features directly, through
+/// the collection's public edits, which keep no record of what they changed —
+/// so it is computed here, at write, by comparing
 /// each reference with what is actually going into the file.
 ///
 /// # What each scope is checked against
@@ -1609,8 +1610,8 @@ fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64
 ///
 /// **A carried id is only valid against the features actually being written**,
 /// which is the layer-coupled rule in `handoff.org` § M3B NEEDS A THIRD CLASS,
-/// and validity has to be *computed here* because `FeatureCollection::features`
-/// is a public field a consumer mutates directly — there is no setter to hook.
+/// and validity has to be *computed here* because a consumer edits the
+/// features directly, and the edits record nothing a write could replay.
 /// Delete a feature from the middle and the survivors' carried ids no longer
 /// line up with their positions; two of them can collide, or run backwards.
 ///
@@ -1622,10 +1623,9 @@ fn geometry_columns(layers: &[(String, FeatureCollection)], per_layer_srs: &[i64
 /// set that is neither the source's numbering nor a fresh one.
 fn feature_ids(fc: &FeatureCollection) -> Vec<i64> {
     let ids: Vec<i64> = fc
-        .features
-        .iter()
+        .rows()
         .enumerate()
-        .map(|(i, feat)| match feat.native.as_ref().and_then(|n| n.payload_for(Format::Gpkg)) {
+        .map(|(i, feat)| match feat.native().and_then(|n| n.payload_for(Format::Gpkg)) {
             Some(NativePayload::GpkgFeature(g)) => g.fid.unwrap_or((i + 1) as i64),
             _ => (i + 1) as i64,
         })
@@ -1635,7 +1635,7 @@ fn feature_ids(fc: &FeatureCollection) -> Vec<i64> {
     if ids.windows(2).all(|w| w[0] < w[1]) && ids.first().is_none_or(|&first| first > 0) {
         ids
     } else {
-        (1..=fc.features.len() as i64).collect()
+        (1..=fc.len() as i64).collect()
     }
 }
 
@@ -1659,19 +1659,20 @@ fn feature_table(
     }
     sql.push(')');
 
+    // A cursor per column, read a row at a time in step with the features.
+    let mut cells: Vec<_> = columns.iter().map(|c| c.cells()).collect();
     let rows = fc
-        .features
-        .iter()
+        .rows()
         .enumerate()
         .map(|(i, feat)| {
             let mut values = Vec::with_capacity(columns.len() + 2);
             values.push(Value::Null); // fid, carried by the rowid
-            values.push(match &feat.geometry {
+            values.push(match feat.geometry() {
                 Some(g) => Value::Blob(gpkg_geometry(g, srs_id, envelope)),
                 None => Value::Null,
             });
-            for col in &columns {
-                values.push(cell_to_value(&col.cell(i)));
+            for cells in &mut cells {
+                values.push(cell_to_value(&cells.next().expect("a cell per row")));
             }
             // The rowid is the carried id when there was one — see
             // `feature_ids`, which is also what the R*Tree is built against, so
@@ -1774,8 +1775,8 @@ fn gpb_envelope(g: &Geometry) -> Option<(u8, Vec<u8>)> {
 
 fn bbox(fc: &FeatureCollection) -> (Value, Value, Value, Value) {
     let mut b = Bbox::empty();
-    for f in &fc.features {
-        if let Some(g) = &f.geometry {
+    for f in fc.rows() {
+        if let Some(g) = f.geometry() {
             g.extend_bbox(&mut b);
         }
     }
@@ -1866,7 +1867,7 @@ mod tests {
         Some(Geometry::Point(Position::new(x, y)))
     }
     fn fc(features: Vec<Feature>) -> FeatureCollection {
-        FeatureCollection::new(features)
+        FeatureCollection::from_features(features)
     }
 
     /// Every registry table is written as the specification defines it, with
@@ -2124,7 +2125,7 @@ mod tests {
 
         let carried_in = |name: &str| -> usize {
             let (_, fc) = layers.iter().find(|(n, _)| n == name).unwrap();
-            fc.features
+            fc.to_features()
                 .iter()
                 .filter(|f| {
                     matches!(
@@ -2159,7 +2160,7 @@ mod tests {
         let mut layers = read_layers(SRC).unwrap();
         let (_, fc) = layers.iter_mut().find(|(n, _)| n == "cities").unwrap();
         // The edit a consumer makes directly, with nothing to hook.
-        fc.features.reverse();
+        fc.permute(&(0..fc.len()).rev().collect::<Vec<_>>());
 
         let bytes =
             write_layers(None, &layers, &crate::geopackage::Carried::default(), false, false)
@@ -2675,7 +2676,7 @@ mod tests {
         // The edit a consumer makes directly, with nothing to hook: after this
         // the carried ids run 40, 9, 1 and the whole layer is reissued 1, 2, 3.
         let (_, fc) = layers.iter_mut().find(|(n, _)| n == "cities").unwrap();
-        fc.features.reverse();
+        fc.permute(&(0..fc.len()).rev().collect::<Vec<_>>());
 
         let bytes = write_layers(None, &layers, &carried, false, false).unwrap();
         let refs = references_in(&bytes);
@@ -3404,12 +3405,13 @@ mod tests {
 
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, "places");
-        assert_eq!(back[0].1.features.len(), 2);
-        assert_eq!(back[0].1.features[0].geometry, point(1.0, 2.0));
+        assert_eq!(back[0].1.len(), 2);
+        assert_eq!(back[0].1.to_features()[0].geometry, point(1.0, 2.0));
         // fid is excluded from properties.
-        let names: Vec<&str> = back[0].1.features[0].properties.iter().map(|(k, _)| &**k).collect();
+        let rows = back[0].1.to_features();
+        let names: Vec<&str> = rows[0].properties.iter().map(|(k, _)| &**k).collect();
         assert_eq!(names, vec!["name", "n"]);
-        assert_eq!(back[0].1.features[0].properties[1].1.as_f64(), Some(5.0));
+        assert_eq!(back[0].1.to_features()[0].properties[1].1.as_f64(), Some(5.0));
     }
 
     /// The GeoPackage half of `edit-composability.org` D4's layer-duplication
@@ -3443,7 +3445,7 @@ mod tests {
         // Read it back the way a pipeline would, drop the middle feature, and
         // write it into the same GeoPackage using only the name the IR carries.
         let mut edited = read_layers(&bytes).unwrap().remove(0).1;
-        edited.features.retain(|f| f.properties[0].1.as_f64() != Some(2.0));
+        edited.retain(|f| f.properties().next().unwrap().1.to_owned().as_f64() != Some(2.0));
         let name = edited.name.clone().expect("the reader names the layer");
         let after = write_layers(Some(&bytes), &[(name, edited)], &Carried::default(), false, false).unwrap();
 
@@ -3451,7 +3453,7 @@ mod tests {
         assert_eq!(layers.len(), 1, "the edit loop appended a duplicate layer");
         assert_eq!(layers[0].0, "roads");
         let ids: Vec<Option<f64>> =
-            layers[0].1.features.iter().map(|f| f.properties[0].1.as_f64()).collect();
+            layers[0].1.to_features().iter().map(|f| f.properties[0].1.as_f64()).collect();
         assert_eq!(ids, vec![Some(1.0), Some(3.0)], "the deletion did not stick");
     }
 
@@ -3540,7 +3542,7 @@ mod tests {
         let bytes = write_layers(None, &[("places".into(), layer)], &Carried::default(), false, false).unwrap();
         let back = read_layers(&bytes).unwrap();
         assert_eq!(
-            back[0].1.features[0].geometry,
+            back[0].1.to_features()[0].geometry,
             Some(Geometry::Point(Position::with_zm(1.0, 2.0, 3.0, 4.0)))
         );
     }
@@ -3722,7 +3724,7 @@ mod tests {
             }]);
             let bytes = write_layers(None, &[("l".into(), layer)], &Carried::default(), false, true).unwrap();
             let back = read_layers(&bytes).unwrap();
-            assert_eq!(back[0].1.features[0].geometry, geom);
+            assert_eq!(back[0].1.to_features()[0].geometry, geom);
         }
     }
 
@@ -3781,7 +3783,7 @@ mod tests {
         let back = read_layers(&bytes).unwrap();
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].0, "grid");
-        assert_eq!(back[0].1.features.len(), 120);
+        assert_eq!(back[0].1.len(), 120);
     }
 
     #[test]
@@ -3918,14 +3920,14 @@ mod tests {
         let layers = read_layers(&g2).unwrap();
         assert_eq!(layers.len(), 2);
         assert!(layers.iter().any(|(n, _)| n == "a"));
-        assert!(layers.iter().any(|(n, l)| n == "b" && l.features.len() == 2));
+        assert!(layers.iter().any(|(n, l)| n == "b" && l.len() == 2));
 
         // Upsert "a" with three features -> still two layers, "a" replaced.
         let a2 = fc(vec![Feature { geometry: point(9.0, 9.0), properties: vec![], native: None }; 3]);
         let g3 = write_layers(Some(&g2), &[("a".into(), a2)], &Carried::default(), false, false).unwrap();
         let layers = read_layers(&g3).unwrap();
         assert_eq!(layers.len(), 2);
-        assert_eq!(layers.iter().find(|(n, _)| n == "a").unwrap().1.features.len(), 3);
+        assert_eq!(layers.iter().find(|(n, _)| n == "a").unwrap().1.len(), 3);
     }
 
     /// ***An `attributes` dataset is carried, and its `gpkg_contents` row with

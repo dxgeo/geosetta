@@ -25,7 +25,14 @@ impl<K: Ord> Default for Tally<K> {
 
 impl<K: Ord> Tally<K> {
     pub fn add(&mut self, cause: K) {
-        *self.counts.entry(cause).or_insert(0) += 1;
+        self.add_n(cause, 1);
+    }
+
+    /// Count `cause` `n` times; zero times says nothing.
+    pub fn add_n(&mut self, cause: K, n: usize) {
+        if n > 0 {
+            *self.counts.entry(cause).or_insert(0) += n;
+        }
     }
 
     /// Append one message per cause seen, rendered from the cause and its

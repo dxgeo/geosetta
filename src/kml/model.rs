@@ -186,6 +186,12 @@ impl Node {
         }
     }
 
+    /// An empty element of this one's kind and spelling: what a read that
+    /// keeps no feature's element leaves in its place.
+    pub fn stub(&self) -> Node {
+        Node { kind: self.kind.clone(), prefix: None, attrs: Vec::new(), children: Vec::new(), content: Vec::new() }
+    }
+
     /// Whether this node is `element`, in whichever spelling.
     pub fn is(&self, element: KmlElement) -> bool {
         self.element() == Some(element)
@@ -444,30 +450,56 @@ fn indentation(run: &str) -> &str {
 /// beside its model — which held a large file twice, and left the freed tree's
 /// pages scattered through the model's.
 pub(crate) fn parse(source: &str) -> Result<KmlDocument> {
-    let mut raiser = Raiser { source, last_ns: None };
+    parse_with(source, &mut |node, _| node)
+}
+
+/// [`parse`], handing each KML element to `finished` as it is raised, with
+/// the elements it sits in from the root down, and keeping what `finished`
+/// gives back in its place: how a reader that keeps no feature's element
+/// projects each one as it ends and leaves a stub (`plans/performance.org`,
+/// KML's read).
+pub(crate) fn parse_with(
+    source: &str,
+    finished: &mut dyn FnMut(Node, &[Option<(KmlElement, Spelling)>]) -> Node,
+) -> Result<KmlDocument> {
+    let mut raiser = Raiser { source, last_ns: None, open: Vec::new(), finished };
     let (before, root, after) = xml::parse_document_with(source, &mut raiser)?;
     // Built bottom-up, so the last element finished is the root.
     Ok(KmlDocument { before, root, after, root_ns: raiser.last_ns })
 }
 
-/// The [`Builder`] behind [`parse`].
-struct Raiser<'s> {
-    source: &'s str,
-    last_ns: Option<Rc<str>>,
+/// What an element is in the model: a KML element, in its spelling, or
+/// `None` for one that is foreign.
+fn identify(name: &str, prefix: Option<&str>, ns: Option<&str>) -> Option<(KmlElement, Spelling)> {
+    if is_kml(ns, prefix) {
+        KmlElement::from_name(name).map(|element| (element, Spelling::Kml))
+    } else if is_gx(ns, prefix) {
+        KmlElement::from_gx_name(name).map(|element| (element, Spelling::Gx))
+    } else {
+        None
+    }
 }
 
-impl Builder for Raiser<'_> {
+/// The [`Builder`] behind [`parse_with`].
+struct Raiser<'s, 'f> {
+    source: &'s str,
+    last_ns: Option<Rc<str>>,
+    /// The elements open, from the root down to the one being read, each
+    /// identified as its start tag is.
+    open: Vec<Option<(KmlElement, Spelling)>>,
+    finished: &'f mut dyn FnMut(Node, &[Option<(KmlElement, Spelling)>]) -> Node,
+}
+
+impl Builder for Raiser<'_, '_> {
     type Node = Node;
 
+    fn open(&mut self, name: &str, prefix: Option<&str>, ns: Option<&str>) {
+        self.open.push(identify(name, prefix, ns));
+    }
+
     fn build(&mut self, el: Parsed<'_, Node>) -> Node {
+        let identified = self.open.pop().flatten();
         let ns = el.ns.as_deref();
-        let identified = if is_kml(ns, el.prefix) {
-            KmlElement::from_name(el.name).map(|element| (element, Spelling::Kml))
-        } else if is_gx(ns, el.prefix) {
-            KmlElement::from_gx_name(el.name).map(|element| (element, Spelling::Gx))
-        } else {
-            None
-        };
         let in_kml_namespace = is_kml(ns, el.prefix);
         self.last_ns = el.ns.clone();
         let Some((element, spelling)) = identified else {
@@ -487,13 +519,14 @@ impl Builder for Raiser<'_> {
         // so it keeps no growth slack.
         let mut children = el.children;
         children.shrink_to_fit();
-        Node {
+        let node = Node {
             kind: Kind::Kml { element, spelling },
             prefix: el.prefix.map(str::to_string),
             attrs: el.attrs,
             children,
             content: el.content,
-        }
+        };
+        (self.finished)(node, &self.open)
     }
 }
 

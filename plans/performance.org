@@ -795,6 +795,37 @@ What remains of KML's cost, in three steps — Mem5 was the first:
    would project each feature element as the parser finishes it and drop the
    element then and there, unless told to keep it. Expected: about the IR
    plus the input, ~80 MB.
+
+   /Done 2026-11-02./ =pipeline::prepare= reads for its target, and
+   =ReadOptions::target= lets a caller reading alone do the same; the
+   default keeps every element. =kml::model::parse_with= hands each element
+   to the reader as the parser raises it, with the elements open around it
+   (a new =open= hook on =xml::Builder=). A feature element where
+   =document::split= would take one is projected there, against the schemas
+   declared so far, and a stub left in its place, so =split= still takes
+   one feature per stub and the skeleton is what it was. What the drop
+   warnings and detection read from an element is taken from it first: a
+   =<Model>=, a track's per-vertex data, heights that are not flat (as
+   =KmlNative::unkept=, which =drop_warnings= adds in), and a 2.3-only
+   component (passed to =detect=). A =<Schema>= declared after a feature --
+   which KML's sequence does not allow, but a reader meets -- reads the
+   document again whole. A property test reads every KML fixture and nine
+   documents built to reach each branch both ways (late schema, model and
+   tracks, each height mode, a 2.3 component inside a feature, features in
+   an =<Update>= and in an extension's element, a failed projection, a
+   failed parse, a refused version), and asks for the same features,
+   collection, version and drop warnings for every other target, under the
+   EGM96 override too; it fails on each of five planted breaks.
+   | =kml→geojson=, 100 000 points (memprobe) | before   | after    |
+   |------------------------------------------+----------+----------|
+   | read peak                                | 616.3 MB | 157.0 MB |
+   | IR resident                              | 51.4 MB  | 39.9 MB  |
+   | read time, median of 3                   | 292 ms   | 281 ms   |
+   =kml→kml= is unchanged (616 MB, 290 ms). Of the 157 MB, 49 MB is the
+   input and 40 MB the IR; the rest is transient -- the read's feature
+   =Vec= and the =<Document>='s children, stubs now, each growing by
+   doubling. Not the ~80 MB expected, and not chased. =equiv.py=, all three
+   layouts against the build before: 8 991 identical.
 3. *KML carried back to KML*, which still holds every element and goes
    through the document tree. Undecided between keeping KML's same-format
    promise — each feature stores its byte span in the kept source text and

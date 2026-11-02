@@ -18,7 +18,7 @@ use crate::flatbuffers::Builder;
 use crate::format::Format;
 use crate::native::{FgbNative, NativePayload};
 use crate::geometry::{Bbox, Geometry, Position};
-use crate::schema::{Cell, ColumnType, columns_for, DeclType};
+use crate::schema::{Cell, Cells, Column, ColumnType, columns_for, DeclType};
 
 const MAGIC: [u8; 8] = [b'f', b'g', b'b', 3, b'f', b'g', b'b', 1];
 
@@ -118,8 +118,8 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     let mut types = std::collections::BTreeSet::new();
     let mut has_z = false;
     let mut has_m = false;
-    for f in &fc.features {
-        if let Some(g) = &f.geometry {
+    for f in fc.rows() {
+        if let Some(g) = f.geometry() {
             g.extend_bbox(&mut bbox);
             types.insert(fgb_geometry_type(g));
             let dim = dim_of_geometry(g);
@@ -153,17 +153,19 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     // advertised it as opt-in, and opt-in for GeoPackage's `--rtree` right
     // beside it. So locality is now the caller's request and the index is
     // unconditional, which is the combination that spends nothing.
-    let feature_bboxes: Vec<Bbox> = fc.features.iter().map(feature_bbox).collect();
-    let indexed = !fc.features.is_empty() && fc.features.iter().all(|f| f.geometry.is_some());
+    let feature_bboxes: Vec<Bbox> = fc.rows().map(|f| feature_bbox(f.geometry())).collect();
+    let indexed = !fc.is_empty() && fc.rows().all(|f| f.geometry().is_some());
     let node_size = if indexed { NODE_SIZE } else { 0 };
 
     // Encode features in input order, recording each framed feature's byte
     // offset within the feature section (for the R-tree leaf pointers).
     let mut feature_section = Vec::new();
-    let mut offsets = Vec::with_capacity(fc.features.len());
-    for (idx, feature) in fc.features.iter().enumerate() {
+    let mut offsets = Vec::with_capacity(fc.len());
+    // A cursor per column, read a row at a time in step with the features.
+    let mut cells: Vec<Cells> = columns.iter().map(Column::cells).collect();
+    for feature in fc.rows() {
         offsets.push(feature_section.len() as u64);
-        let bytes = build_feature(feature.geometry.as_ref(), &columns, idx);
+        let bytes = build_feature(feature.geometry(), &columns, &mut cells);
         feature_section.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
         feature_section.extend_from_slice(&bytes);
     }
@@ -180,8 +182,8 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     out
 }
 
-fn feature_bbox(f: &crate::feature::Feature) -> Bbox {
-    f.geometry.as_ref().map(|g| g.bbox()).unwrap_or_else(Bbox::empty)
+fn feature_bbox(geometry: Option<&Geometry>) -> Bbox {
+    geometry.map(|g| g.bbox()).unwrap_or_else(Bbox::empty)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -255,7 +257,7 @@ fn build_header(
     b.add_u8(header::HAS_Z, has_z as u8, 0);
     b.add_u8(header::HAS_M, has_m as u8, 0);
     b.add_offset(header::COLUMNS, columns_vec);
-    b.add_u64(header::FEATURES_COUNT, fc.features.len() as u64, 0);
+    b.add_u64(header::FEATURES_COUNT, fc.len() as u64, 0);
     // Default index_node_size is 16, so an indexed file (16) omits the field and
     // an index-less one writes 0.
     b.add_u16(header::INDEX_NODE_SIZE, node_size, 16);
@@ -339,11 +341,11 @@ fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>, native: Option<&Fgb
     Some(b.end_table())
 }
 
-fn build_feature(geom: Option<&Geometry>, columns: &[crate::schema::Column], row: usize) -> Vec<u8> {
+fn build_feature(geom: Option<&Geometry>, columns: &[Column], cells: &mut [Cells]) -> Vec<u8> {
     let mut b = Builder::new();
 
     let geom_off = geom.map(|g| encode_geometry(&mut b, g));
-    let blob = encode_properties(columns, row);
+    let blob = encode_properties(columns, cells);
     let props_off = (!blob.is_empty()).then(|| b.create_byte_vector(&blob));
 
     b.start_table(feature::NUM_FIELDS);
@@ -436,11 +438,12 @@ fn geom_table(
     b.end_table()
 }
 
-/// Encode this row's non-null properties: `[u16 col_index][typed value]…`.
-fn encode_properties(columns: &[crate::schema::Column], row: usize) -> Vec<u8> {
+/// Encode the next row's non-null properties, one cell from each of
+/// `cells`: `[u16 col_index][typed value]…`.
+fn encode_properties(columns: &[Column], cells: &mut [Cells]) -> Vec<u8> {
     let mut blob = Vec::new();
-    for (i, col) in columns.iter().enumerate() {
-        let cell = &col.cell(row);
+    for (i, (col, cells)) in columns.iter().zip(cells).enumerate() {
+        let cell = &cells.next().expect("a cell per row");
         if matches!(cell, Cell::Null) {
             continue;
         }
@@ -780,13 +783,13 @@ mod tests {
                 native: None,
             })
             .collect();
-        let bytes = write(&FeatureCollection::new(features));
+        let bytes = write(&FeatureCollection::from_features(features));
 
         let back = crate::flatgeobuf::read(&bytes).unwrap();
-        assert_eq!(back.features.len(), 50);
+        assert_eq!(back.len(), 50);
         // Features are Hilbert-reordered, so check the id set is intact.
         let mut ids: Vec<i64> = back
-            .features
+            .to_features()
             .iter()
             .map(|f| f.properties.iter().find(|(k, _)| &**k == "id").unwrap().1.as_f64().unwrap() as i64)
             .collect();
@@ -796,19 +799,19 @@ mod tests {
 
     #[test]
     fn z_bearing_point_round_trips() {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::with_z(1.0, 2.0, 381.0))),
             properties: vec![],
             native: None,
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
-        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 381.0))));
+        assert_eq!(back.to_features()[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 381.0))));
     }
 
     #[test]
     fn zm_bearing_line_string_round_trips() {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::LineString(vec![
                 Position::with_zm(0.0, 0.0, 1.0, 10.0),
                 Position::with_zm(1.0, 1.0, 2.0, 20.0),
@@ -819,7 +822,7 @@ mod tests {
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
         assert_eq!(
-            back.features[0].geometry,
+            back.to_features()[0].geometry,
             Some(Geometry::LineString(vec![
                 Position::with_zm(0.0, 0.0, 1.0, 10.0),
                 Position::with_zm(1.0, 1.0, 2.0, 20.0),
@@ -829,7 +832,7 @@ mod tests {
 
     #[test]
     fn z_bearing_polygon_with_hole_round_trips() {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Polygon(vec![
                 vec![
                     Position::with_z(0.0, 0.0, 1.0),
@@ -851,7 +854,7 @@ mod tests {
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
-        assert_eq!(back.features[0].geometry, fc.features[0].geometry);
+        assert_eq!(back.to_features()[0].geometry, fc.to_features()[0].geometry);
     }
 
     fn hostile() -> FeatureCollection {
@@ -888,13 +891,13 @@ mod tests {
     /// GeoPackage edit loop append a duplicate layer instead of replacing one.
     #[test]
     fn the_header_name_is_the_collection_s_own_not_a_constant() {
-        let mut fc = FeatureCollection::new(vec![Feature::default()]);
+        let mut fc = FeatureCollection::from_features(vec![Feature::default()]);
         fc.name = Some("cities".into());
         assert_eq!(crate::flatgeobuf::read(&write(&fc)).unwrap().name.as_deref(), Some("cities"));
 
         // A nameless collection writes no name rather than inventing one:
         // naming an output is the caller's job.
-        let anonymous = FeatureCollection::new(vec![Feature::default()]);
+        let anonymous = FeatureCollection::from_features(vec![Feature::default()]);
         assert_eq!(crate::flatgeobuf::read(&write(&anonymous)).unwrap().name, None);
     }
 
@@ -903,7 +906,7 @@ mod tests {
     /// them.
     #[test]
     fn every_descriptive_header_and_column_member_round_trips() {
-        let mut fc = FeatureCollection::new(vec![Feature {
+        let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![(std::rc::Rc::from("a"), crate::json::JsonValue::String("x".into()))],
             native: None,
@@ -933,7 +936,7 @@ mod tests {
     /// another format must not reach these slots.
     #[test]
     fn a_geojson_native_is_not_replayed_into_a_flatgeobuf_header() {
-        let mut fc = FeatureCollection::new(vec![Feature::default()]);
+        let mut fc = FeatureCollection::from_features(vec![Feature::default()]);
         fc.native = Some(crate::Native::new(
             Format::GeoJson,
             NativePayload::GeoJson(vec![(std::rc::Rc::from("id"), crate::json::JsonValue::Null)]),
@@ -945,7 +948,7 @@ mod tests {
     /// payload and writes no extra slots.
     #[test]
     fn a_plain_collection_carries_no_flatgeobuf_native() {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
             native: None,
@@ -958,7 +961,7 @@ mod tests {
     /// that carries a schema between processes.
     #[test]
     fn a_column_declaration_round_trips_through_the_header() {
-        let mut fc = FeatureCollection::new(vec![Feature {
+        let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![
                 (std::rc::Rc::from("name"), crate::json::JsonValue::String("Zürich".into())),
@@ -1001,7 +1004,7 @@ mod tests {
     /// D3's rule, applied to the header rather than to a native.
     #[test]
     fn an_undeclared_column_writes_no_declaration_slots() {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![(std::rc::Rc::from("name"), crate::json::JsonValue::String("x".into()))],
             native: None,
@@ -1033,7 +1036,7 @@ mod tests {
         // Each MultiPolygon part derives its own z-presence independently
         // (mirroring wkb.rs's per-part dimension derivation) — one part is
         // Z-bearing, the other stays 2D.
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::MultiPolygon(vec![
                 vec![vec![
                     Position::with_z(0.0, 0.0, 5.0),
@@ -1053,7 +1056,7 @@ mod tests {
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
-        assert_eq!(back.features[0].geometry, fc.features[0].geometry);
+        assert_eq!(back.to_features()[0].geometry, fc.to_features()[0].geometry);
     }
 
     /// **Features go out in the order they arrived, and the file is still
@@ -1080,13 +1083,13 @@ mod tests {
                 native: None,
             })
             .collect();
-        let fc = FeatureCollection::new(anti_sorted);
+        let fc = FeatureCollection::from_features(anti_sorted);
 
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
 
         let ids: Vec<i64> = back
-            .features
+            .to_features()
             .iter()
             .map(|f| f.properties[0].1.as_i64().unwrap())
             .collect();
@@ -1104,18 +1107,18 @@ mod tests {
 
     #[test]
     fn a_2d_point_writes_no_z_or_m_vector() {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
             native: None,
         }]);
         let bytes = write(&fc);
         let back = crate::flatgeobuf::read(&bytes).unwrap();
-        assert_eq!(back.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
+        assert_eq!(back.to_features()[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
     }
 
     fn one_point(crs: Option<crate::crs::Crs>) -> FeatureCollection {
-        let mut fc = FeatureCollection::new(vec![Feature {
+        let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
             native: None,

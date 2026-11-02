@@ -94,6 +94,8 @@ Options:
     --sort-hilbert      order features by spatial locality
     --kml-version 2.3   write OGC KML 2.3 (default 2.2)
     --compact           write GeoJSON or KML on one line
+    --layout columns    hold features as columns, rows, or auto (default);
+                        memory and time only, the output is the same
     --progress          report each stage on stderr
     --quiet             no warnings on stderr
 

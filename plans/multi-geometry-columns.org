@@ -20,6 +20,16 @@ geometry column with a clear error rather than misdecode it. This plan turns
 that reject into a real decode, on both the read and write sides — 6b's
 detection code becomes this plan's M2 starting point, not a fork.
 
+/Revised 2026-11-02:/ DESIGN's IR change predates
+[[file:columnar.org][columnar.org]], under which =FeatureCollection= is a
+table of blocks and =Feature= only the owned row a caller builds with. Its
+D-C6 makes a block hold geometry columns of flat buffers, so an extra
+geometry column is another of those, named and given its CRS at the
+collection, rather than a =Vec<Option<Geometry>>= on every =Feature=. M1
+waits on columnar C6 and is redesigned then; M2--M5 keep their intent, and
+gain from it: M2 decodes WKB straight into a column, M3's WKT fallback and
+M4's per-column WKB both encode from the same =GeometryRef= as the primary.
+
 ** BACKGROUND
 
 *** Where this actually shows up: only GeoParquet, in practice

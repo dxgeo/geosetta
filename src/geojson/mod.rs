@@ -5,7 +5,8 @@
 //! only ever deals with a list of features.
 
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{Collecting, Feature, FeatureCollection, FeatureRef};
+use crate::table::Layout;
 use crate::format::Format;
 use crate::geometry::{Geometry, Position};
 use crate::json::{self, JsonValue, Parser};
@@ -69,7 +70,7 @@ pub fn from_json(value: &JsonValue) -> Result<FeatureCollection> {
 /// always WGS 84 longitude/latitude per RFC 7946; a file carries no other CRS,
 /// so reading one always yields the spec default.
 fn wgs84(features: Vec<Feature>) -> FeatureCollection {
-    wgs84_with(features, None, Vec::new())
+    wgs84_with(FeatureCollection::from_features(features), None, Vec::new())
 }
 
 /// [`wgs84`], plus the collection's own `name` and whatever else the reader
@@ -78,17 +79,14 @@ fn wgs84(features: Vec<Feature>) -> FeatureCollection {
 /// `name` is modelled ([`FeatureCollection::name`]); the rest becomes a
 /// [`Native`] tagged `GeoJson`, so only the GeoJSON writer replays it.
 fn wgs84_with(
-    features: Vec<Feature>,
+    mut fc: FeatureCollection,
     name: Option<String>,
     unmodelled: Vec<(Rc<str>, JsonValue)>,
 ) -> FeatureCollection {
-    FeatureCollection {
-        features,
-        crs: Some(crate::crs::Crs::Wgs84),
-        name,
-        schema: Vec::new(),
-        native: native_from(unmodelled),
-    }
+    fc.crs = Some(crate::crs::Crs::Wgs84);
+    fc.name = name;
+    fc.native = native_from(unmodelled);
+    fc
 }
 
 /// Tag skipped members as a GeoJSON native, or `None` when there were none —
@@ -119,7 +117,15 @@ fn is_replayable(key: &str) -> bool {
 /// and falls back to [`from_json`] over the parsed tree for the rare and tiny
 /// single-`Feature` / bare-geometry documents. Output is identical to
 /// `from_json(&parse(input))`.
+#[cfg(test)]
 pub fn from_geojson_str(input: &str) -> Result<FeatureCollection> {
+    from_geojson_str_as(input, crate::table::Layout::Auto)
+}
+
+/// [`from_geojson_str`], a `FeatureCollection`'s features streamed into
+/// `layout` (`plans/columnar.org` C3): row blocks, each sealed as its rows
+/// suit.
+pub(crate) fn from_geojson_str_as(input: &str, layout: Layout) -> Result<FeatureCollection> {
     let mut p = Parser::new(input);
     p.skip_ws();
     // Only an object can be a FeatureCollection; anything else (array, scalar,
@@ -127,7 +133,7 @@ pub fn from_geojson_str(input: &str) -> Result<FeatureCollection> {
     if p.peek() != Some(b'{') {
         return from_json(&crate::json::parse(input)?);
     }
-    match stream_collection(&mut p)? {
+    match stream_collection(&mut p, layout)? {
         Some(fc) => Ok(fc),
         // Well-formed object but no `features` member: a single Feature or a
         // bare geometry — small, so the tree path handles it.
@@ -139,9 +145,9 @@ pub fn from_geojson_str(input: &str) -> Result<FeatureCollection> {
 /// `FeatureCollection` (has a `features` array), or `None` if it is some other
 /// well-formed object. Other members are parsed and discarded so malformed
 /// input still errors exactly as the tree parser would.
-fn stream_collection(p: &mut Parser) -> Result<Option<FeatureCollection>> {
+fn stream_collection(p: &mut Parser, layout: Layout) -> Result<Option<FeatureCollection>> {
     p.expect(b'{')?;
-    let mut features: Option<Vec<Feature>> = None;
+    let mut features: Option<FeatureCollection> = None;
     let mut name: Option<String> = None;
     let mut unmodelled: Vec<(Rc<str>, JsonValue)> = Vec::new();
     p.skip_ws();
@@ -154,7 +160,7 @@ fn stream_collection(p: &mut Parser) -> Result<Option<FeatureCollection>> {
             p.skip_ws();
             p.expect(b':')?;
             if key == "features" && features.is_none() {
-                features = Some(stream_features(p)?);
+                features = Some(stream_features(p, layout)?);
             } else if key == "name" && name.is_none() {
                 // Modelled, not stashed: several formats have a first-class
                 // slot for a collection's name (see `FeatureCollection::name`).
@@ -191,15 +197,15 @@ fn stream_collection(p: &mut Parser) -> Result<Option<FeatureCollection>> {
     }
 }
 
-/// Stream a JSON array of Feature objects.
-fn stream_features(p: &mut Parser) -> Result<Vec<Feature>> {
+/// Stream a JSON array of Feature objects into `layout`.
+fn stream_features(p: &mut Parser, layout: Layout) -> Result<FeatureCollection> {
     p.skip_ws();
     p.expect(b'[')?;
-    let mut features = Vec::new();
+    let mut features = Collecting::new(layout);
     p.skip_ws();
     if p.peek() == Some(b']') {
         p.bump();
-        return Ok(features);
+        return Ok(features.finish());
     }
     let mut keys = KeyInterner::default();
     // The previous feature's property count: the next one's, in a table.
@@ -215,7 +221,7 @@ fn stream_features(p: &mut Parser) -> Result<Vec<Feature>> {
             _ => return Err(p.err("expected ',' or ']' in features")),
         }
     }
-    Ok(features)
+    Ok(features.finish())
 }
 
 /// Stream one Feature object into a [`Feature`], dispatching on member key so
@@ -481,7 +487,7 @@ fn stream_array<T>(p: &mut Parser, elem: fn(&mut Parser) -> Result<T>) -> Result
 /// [`to_json`] + [`JsonValue::to_json_string`].
 pub fn to_geojson_string(fc: &FeatureCollection, compact: bool) -> String {
     // Rough guess: geometry + a little overhead per feature.
-    let mut w = Writer { out: String::with_capacity(fc.features.len() * 96 + 64), compact, depth: 0 };
+    let mut w = Writer { out: String::with_capacity(fc.len() * 96 + 64), compact, depth: 0 };
     w.open('{');
     w.member("type");
     w.out.push_str("\"FeatureCollection\"");
@@ -492,7 +498,7 @@ pub fn to_geojson_string(fc: &FeatureCollection, compact: bool) -> String {
     w.natives(fc.native.as_ref());
     w.member("features");
     w.open('[');
-    for f in &fc.features {
+    for f in fc.rows() {
         w.item();
         w.feature(f);
     }
@@ -571,19 +577,19 @@ impl Writer {
         }
     }
 
-    fn feature(&mut self, f: &Feature) {
+    fn feature(&mut self, f: FeatureRef<'_>) {
         self.open('{');
         self.member("type");
         self.out.push_str("\"Feature\"");
-        self.natives(f.native.as_deref());
+        self.natives(f.native());
         self.member("geometry");
-        match &f.geometry {
+        match f.geometry() {
             Some(g) => self.geometry(g),
             None => self.out.push_str("null"),
         }
         self.member("properties");
         self.open('{');
-        for (k, v) in &f.properties {
+        for (k, v) in f.properties() {
             self.member(k);
             v.write_json_to(&mut self.out);
         }
@@ -677,7 +683,7 @@ fn write_rings(out: &mut String, rings: &[Vec<Position>]) {
 /// this tree builder is only compiled for tests.
 #[cfg(test)]
 pub fn to_json(fc: &FeatureCollection) -> JsonValue {
-    let features = fc.features.iter().map(feature_to_json).collect();
+    let features = fc.to_features().iter().map(feature_to_json).collect();
     let mut members = vec![("type", JsonValue::String("FeatureCollection".into()))];
     if let Some(name) = &fc.name {
         members.push(("name", JsonValue::String(name.clone())));
@@ -937,18 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_properties_hold_exactly_their_members() {
-        let fc = from_geojson_str(
-            r#"{"type":"FeatureCollection","features":[
-             {"type":"Feature","geometry":null,"properties":{"a":1,"b":2,"c":3}},
-             {"type":"Feature","geometry":null,"properties":{"a":1,"b":2,"c":3}},
-             {"type":"Feature","geometry":null,"properties":{"a":1,"b":2,"c":3,"d":4,"e":5}},
-             {"type":"Feature","geometry":null,"properties":{"a":1}},
-             {"type":"Feature","geometry":null,"properties":null}]}"#,
-        )
-        .unwrap();
-        let held: Vec<_> = fc.features.iter().map(|f| (f.properties.len(), f.properties.capacity())).collect();
-        assert_eq!(held, [(3, 3), (3, 3), (5, 5), (1, 1), (0, 0)]);
+    fn a_trailing_comma_in_properties_is_refused() {
         assert!(from_geojson_str(r#"{"type":"FeatureCollection","features":[{"properties":{"a":1,}}]}"#).is_err());
     }
 
@@ -966,8 +961,10 @@ mod tests {
             }
         };
         retag(fc.native.as_mut());
-        for f in &mut fc.features {
-            retag(f.native.as_deref_mut());
+        for i in 0..fc.len() {
+            let mut native = fc.row(i).native().cloned();
+            retag(native.as_mut());
+            fc.set_native(i, native);
         }
         let ignored = to_geojson_string(&fc, true);
 
@@ -988,7 +985,7 @@ mod tests {
         let fc = from_geojson_str(plain).unwrap();
         assert!(fc.native.is_none());
         assert!(fc.name.is_none());
-        assert!(fc.features.iter().all(|f| f.native.is_none()));
+        assert!(fc.to_features().iter().all(|f| f.native.is_none()));
     }
 
     /// `bbox` is derived, so D4 forbids replaying it — a middle stage that
@@ -1001,7 +998,7 @@ mod tests {
              "geometry":{"type":"Point","coordinates":[1,2]},"properties":{}}]}"#;
         let fc = from_geojson_str(with_bbox).unwrap();
         assert!(fc.native.is_none(), "collection bbox was stashed");
-        assert!(fc.features[0].native.is_none(), "feature bbox was stashed");
+        assert!(fc.to_features()[0].native.is_none(), "feature bbox was stashed");
         assert!(!to_geojson_string(&fc, true).contains("bbox"));
     }
     use super::*;
@@ -1018,16 +1015,16 @@ mod tests {
             ]
         }"#;
         let fc = from_json(&parse(doc).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 1);
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
-        assert_eq!(fc.features[0].properties[0].0.as_ref(), "name");
+        assert_eq!(fc.len(), 1);
+        assert_eq!(fc.to_features()[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
+        assert_eq!(fc.to_features()[0].properties[0].0.as_ref(), "name");
     }
 
     #[test]
     fn parses_and_writes_a_z_bearing_point() {
         let doc = r#"{"type":"Point","coordinates":[1.0,2.0,3.0]}"#;
         let fc = from_json(&parse(doc).unwrap()).unwrap();
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))));
+        assert_eq!(fc.to_features()[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))));
 
         // Streaming path agrees.
         let streamed = from_geojson_str(doc).unwrap();
@@ -1042,7 +1039,7 @@ mod tests {
 
     #[test]
     fn a_bare_xy_point_writes_with_no_third_element() {
-        let fc = FeatureCollection::new(vec![Feature {
+        let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
             native: None,
@@ -1057,7 +1054,7 @@ mod tests {
         // must still accept it (real producers emit it) without keeping it.
         let doc = r#"{"type":"Point","coordinates":[1.0,2.0,3.0,4.0]}"#;
         let fc = from_json(&parse(doc).unwrap()).unwrap();
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))));
+        assert_eq!(fc.to_features()[0].geometry, Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))));
         let streamed = from_geojson_str(doc).unwrap();
         assert_eq!(streamed, fc);
     }
@@ -1079,7 +1076,7 @@ mod tests {
             {"type":"Feature","geometry":{"type":"Point","coordinates":[1.5,2.5,100.0]},"properties":{}}
         ]}"#;
         let fc = from_json(&parse(doc).unwrap()).unwrap();
-        let wkb = crate::geometry::to_wkb(fc.features[0].geometry.as_ref().unwrap());
+        let wkb = crate::geometry::to_wkb(fc.to_features()[0].geometry.as_ref().unwrap());
         let back = crate::geometry::from_wkb(&wkb).unwrap();
         assert_eq!(back, Geometry::Point(Position::with_z(1.5, 2.5, 100.0)));
     }
@@ -1087,13 +1084,13 @@ mod tests {
     #[test]
     fn wraps_bare_geometry_and_feature() {
         let g = from_json(&parse(r#"{"type":"Point","coordinates":[0,0]}"#).unwrap()).unwrap();
-        assert_eq!(g.features.len(), 1);
+        assert_eq!(g.len(), 1);
         let f = from_json(
             &parse(r#"{"type":"Feature","geometry":null,"properties":null}"#).unwrap(),
         )
         .unwrap();
-        assert!(f.features[0].geometry.is_none());
-        assert!(f.features[0].properties.is_empty());
+        assert!(f.to_features()[0].geometry.is_none());
+        assert!(f.to_features()[0].properties.is_empty());
     }
 
     #[test]
@@ -1208,7 +1205,7 @@ mod tests {
 }
 "#
         );
-        let empty = FeatureCollection::new(vec![]);
+        let empty = FeatureCollection::from_features(vec![]);
         assert_eq!(to_geojson_string(&empty, false), "{\n  \"type\": \"FeatureCollection\",\n  \"features\": []\n}\n");
     }
 
@@ -1216,7 +1213,7 @@ mod tests {
     fn parses_polygon_rings() {
         let doc = r#"{"type":"Polygon","coordinates":[[[0,0],[1,0],[1,1],[0,0]]]}"#;
         let fc = from_json(&parse(doc).unwrap()).unwrap();
-        match &fc.features[0].geometry {
+        match &fc.to_features()[0].geometry {
             Some(Geometry::Polygon(rings)) => {
                 assert_eq!(rings.len(), 1);
                 assert_eq!(rings[0].len(), 4);

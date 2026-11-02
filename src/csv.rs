@@ -15,21 +15,22 @@
 //! widened, which is what `Format::same_format_losses` reports.
 
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{FeatureCollection, Tabular};
+use crate::table::Layout;
 use crate::geometry::{from_wkt, to_wkt};
 use crate::json::JsonValue;
-use crate::schema::{Cell, infer_columns};
+use crate::schema::Cell;
 use std::rc::Rc;
 
 const GEOMETRY_NAMES: [&str; 4] = ["geometry", "geom", "wkt", "the_geom"];
 
-/// Parse CSV bytes into a feature collection.
-pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
+/// Parse CSV bytes into a feature collection, built in `layout`.
+pub fn read(bytes: &[u8], layout: Layout) -> Result<FeatureCollection> {
     let text = std::str::from_utf8(bytes)
         .map_err(|_| Error::Convert("csv: input is not valid utf-8".into()))?;
     let rows = parse(text);
     let Some(header) = rows.first() else {
-        return Ok(FeatureCollection::new(Vec::new()));
+        return Ok(FeatureCollection::from_features(Vec::new()));
     };
 
     let geom_col = header
@@ -57,7 +58,8 @@ pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
         })
         .collect();
 
-    let mut features = Vec::new();
+    let properties: Vec<usize> = (0..keys.len()).filter(|&i| Some(i) != geom_col).collect();
+    let mut table = Tabular::new(properties.iter().map(|&i| Rc::clone(&keys[i])).collect(), layout);
     for row in &rows[1..] {
         if row.iter().all(|f| f.is_empty()) {
             continue; // blank line
@@ -69,24 +71,15 @@ pub fn read(bytes: &[u8]) -> Result<FeatureCollection> {
             },
             None => None,
         };
-        let properties = keys
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| Some(*i) != geom_col)
-            .map(|(i, key)| (Rc::clone(key), cell_value(row.get(i).map_or("", |s| s), typed[i])))
-            .collect();
-        features.push(Feature {
-            geometry,
-            properties,
-            native: None,
-        });
+        let values = properties.iter().map(|&i| cell_value(row.get(i).map_or("", |s| s), typed[i]));
+        table.push(geometry, values, None);
     }
-    Ok(FeatureCollection::new(features))
+    Ok(table.finish())
 }
 
 /// Serialize a feature collection to CSV bytes.
 pub fn write(fc: &FeatureCollection) -> Vec<u8> {
-    let columns = infer_columns(&fc.features);
+    let columns = crate::schema::inferred_columns(fc);
 
     let mut out = String::new();
     let header: Vec<String> = columns
@@ -97,12 +90,12 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     out.push_str(&header.join(","));
     out.push('\n');
 
-    for (row, feat) in fc.features.iter().enumerate() {
-        let mut fields: Vec<String> = columns
-            .iter()
-            .map(|c| field(&cell_text(&c.cell(row))))
-            .collect();
-        let wkt = feat.geometry.as_ref().map(to_wkt).unwrap_or_default();
+    // A cursor per column, read a row at a time in step with the features.
+    let mut cells: Vec<_> = columns.iter().map(|c| c.cells()).collect();
+    for feat in fc.rows() {
+        let mut fields: Vec<String> =
+            cells.iter_mut().map(|c| field(&cell_text(&c.next().expect("a cell per row")))).collect();
+        let wkt = feat.geometry().map(to_wkt).unwrap_or_default();
         fields.push(field(&wkt));
         out.push_str(&fields.join(","));
         out.push('\n');
@@ -278,26 +271,31 @@ fn cell_text(cell: &Cell) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::Feature;
     use crate::geometry::{Geometry, Position};
+
+    fn read(bytes: &[u8]) -> Result<FeatureCollection> {
+        super::read(bytes, crate::table::Layout::Auto)
+    }
 
     #[test]
     fn reads_wkt_and_typed_properties() {
         let text = "name,pop,geometry\nA,100,\"POINT (1 2)\"\n\"B, city\",50,\"LINESTRING (0 0, 1 1)\"\n";
         let fc = read(text.as_bytes()).unwrap();
-        assert_eq!(fc.features.len(), 2);
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
-        assert_eq!(fc.features[0].properties[0], ("name".into(), JsonValue::String("A".into())));
+        assert_eq!(fc.len(), 2);
+        assert_eq!(fc.to_features()[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
+        assert_eq!(fc.to_features()[0].properties[0], ("name".into(), JsonValue::String("A".into())));
         assert_eq!(
-            fc.features[0].properties[1],
+            fc.to_features()[0].properties[1],
             ("pop".into(), JsonValue::Int(100))
         );
         // Quoted field with an embedded comma survives.
-        assert_eq!(fc.features[1].properties[0].1.as_str(), Some("B, city"));
+        assert_eq!(fc.to_features()[1].properties[0].1.as_str(), Some("B, city"));
     }
 
     #[test]
     fn round_trips_through_csv() {
-        let fc = FeatureCollection::new(vec![
+        let fc = FeatureCollection::from_features(vec![
                 Feature {
                     geometry: Some(Geometry::Point(Position::new(-73.9, 40.7))),
                     properties: vec![
@@ -322,10 +320,10 @@ mod tests {
             ]);
         let bytes = write(&fc);
         let back = read(&bytes).unwrap();
-        assert_eq!(back.features.len(), 2);
-        assert_eq!(back.features[0].geometry, fc.features[0].geometry);
-        assert_eq!(back.features[1].geometry, fc.features[1].geometry);
-        assert_eq!(back.features[0].properties[1].1, JsonValue::Int(3));
+        assert_eq!(back.len(), 2);
+        assert_eq!(back.to_features()[0].geometry, fc.to_features()[0].geometry);
+        assert_eq!(back.to_features()[1].geometry, fc.to_features()[1].geometry);
+        assert_eq!(back.to_features()[0].properties[1].1, JsonValue::Int(3));
     }
 
     /// D17's gate, one row per spelling — the table in
@@ -377,7 +375,8 @@ mod tests {
     fn one_refused_cell_types_its_whole_column_as_text() {
         let fc = read(b"zip,geometry\n007,\"POINT (1 2)\"\n08001,\"POINT (3 4)\"\n12345,\"POINT (5 6)\"\n")
             .unwrap();
-        let zips: Vec<&JsonValue> = fc.features.iter().map(|f| &f.properties[0].1).collect();
+        let rows = fc.to_features();
+        let zips: Vec<&JsonValue> = rows.iter().map(|f| &f.properties[0].1).collect();
         assert_eq!(
             zips,
             vec![
@@ -398,14 +397,14 @@ mod tests {
     fn a_column_with_nothing_refused_is_still_typed() {
         let fc = read(b"n,f,b,mixed,geometry\n7,1.5,true,7,\"POINT (1 2)\"\n8,2.5,false,hello,\"POINT (3 4)\"\n")
             .unwrap();
-        let row0 = &fc.features[0].properties;
+        let row0 = &fc.to_features()[0].properties;
         assert_eq!(row0[0].1, JsonValue::Int(7));
         assert_eq!(row0[1].1, JsonValue::Float(1.5));
         assert_eq!(row0[2].1, JsonValue::Bool(true));
         // `hello` has no typed reading, so it is not a refusal and does not
         // gate the `7` beside it — that mix is the type lattice's to settle.
         assert_eq!(row0[3].1, JsonValue::Int(7));
-        assert_eq!(fc.features[1].properties[3].1, JsonValue::String("hello".into()));
+        assert_eq!(fc.to_features()[1].properties[3].1, JsonValue::String("hello".into()));
     }
 
     /// The gate is defined against `cell_text`, so this spoke's reader and
@@ -447,8 +446,8 @@ mod tests {
     #[test]
     fn no_geometry_column_is_ok() {
         let fc = read(b"a,b\n1,2\n").unwrap();
-        assert_eq!(fc.features.len(), 1);
-        assert!(fc.features[0].geometry.is_none());
-        assert_eq!(fc.features[0].properties.len(), 2);
+        assert_eq!(fc.len(), 1);
+        assert!(fc.to_features()[0].geometry.is_none());
+        assert_eq!(fc.to_features()[0].properties.len(), 2);
     }
 }

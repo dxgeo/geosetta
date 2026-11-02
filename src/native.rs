@@ -174,6 +174,11 @@ pub struct KmlNative {
     /// M3c): its overlay images, icons and model files, so a `.kmz` write
     /// gives them back. `None` for a `.kml` read.
     pub archive: Option<Rc<KmzArchive>>,
+    /// What the features' elements held that a write to another format
+    /// cannot carry, tallied as a read that kept none of them left each out
+    /// (`plans/performance.org`, KML's read). Zero for a read that kept them,
+    /// whose elements say it themselves.
+    pub(crate) unkept: crate::kml::Unkept,
 }
 
 /// A `.kmz` archive's entries, as a `.kmz` write puts them back: every entry

@@ -42,19 +42,12 @@ use crate::json::{self, JsonValue};
 
 const MAGIC: &[u8; 4] = b"PAR1";
 
-/// One decoded property column, values aligned to rows (nulls as `Null`).
+/// One decoded property column, values aligned to rows (nulls as `Null`) --
+/// for the tests; see [`GeoParquetFile::property`].
+#[cfg(test)]
 pub struct PropertyColumn {
     pub name: String,
     pub values: Vec<JsonValue>,
-    /// The type the file declared this column to be, from its physical type
-    /// and any `converted_type` annotation.
-    ///
-    /// Recovered rather than re-inferred because Parquet's type system is
-    /// wider than the hub's four: an `INT32` annotated `INT_16` is a 16-bit
-    /// column, and a `TIMESTAMP_MILLIS` is a time rather than the text it
-    /// decodes to. Dropping that was defect 5 — and the reader already had
-    /// both facts in hand to decode the values at all.
-    pub decl: Option<DeclType>,
 }
 
 /// The decoded columns of a GeoParquet file, all at once — for the tests;
@@ -129,7 +122,12 @@ fn decl_type(physical: i32, converted: Option<i32>) -> Option<DeclType> {
 pub fn read_geoparquet(bytes: &[u8]) -> Result<GeoParquet> {
     let file = open_geoparquet(bytes)?;
     let geometry = file.geometry()?;
-    let properties = (0..file.property_count()).map(|i| file.property(i)).collect::<Result<_>>()?;
+    let properties = (0..file.property_count())
+        .map(|i| {
+            let (name, _) = file.property_meta(i);
+            Ok(PropertyColumn { name: name.to_string(), values: file.property(i)? })
+        })
+        .collect::<Result<_>>()?;
     Ok(GeoParquet { num_rows: file.num_rows(), properties, geometry })
 }
 
@@ -278,9 +276,22 @@ impl GeoParquetFile<'_> {
         Ok(out)
     }
 
-    /// Property `i`, decoded across every row group.
-    pub fn property(&self, i: usize) -> Result<PropertyColumn> {
+    /// Property `i`'s name and the type the file declared it to be, from its
+    /// physical type and any `converted_type` annotation, without decoding
+    /// it.
+    ///
+    /// The type is recovered rather than re-inferred because Parquet's type
+    /// system is wider than the hub's four: an `INT32` annotated `INT_16` is a
+    /// 16-bit column, and a `TIMESTAMP_MILLIS` is a time rather than the text
+    /// it decodes to. Dropping that was defect 5 — and the reader already had
+    /// both facts in hand to decode the values at all.
+    pub fn property_meta(&self, i: usize) -> (&str, Option<DeclType>) {
         let first = &self.meta.row_groups[0].columns[self.properties[i][0]];
+        (&first.name, decl_type(first.physical, first.converted_type))
+    }
+
+    /// Property `i`'s values, decoded across every row group.
+    pub fn property(&self, i: usize) -> Result<Vec<JsonValue>> {
         let mut values = Vec::with_capacity(capacity_hint(self.num_rows(), self.bytes));
         for (rg, &at) in self.meta.row_groups.iter().zip(&self.properties[i]) {
             match decode_column(self.bytes, &rg.columns[at], rg.num_rows as usize, false)? {
@@ -288,11 +299,7 @@ impl GeoParquetFile<'_> {
                 ColumnSink::Wkb(_) => unreachable!("a property column decodes to JSON"),
             }
         }
-        Ok(PropertyColumn {
-            name: first.name.clone(),
-            values,
-            decl: decl_type(first.physical, first.converted_type),
-        })
+        Ok(values)
     }
 
     /// The CRS from the `geo` metadata, and the file-level metadata with no IR
@@ -3018,7 +3025,7 @@ mod tests {
 
         // Unpatched, the same file reads.
         let (b, _) = patched_geoparquet(footer, &[], &[]);
-        assert_eq!(crate::read_features(crate::Format::Parquet, &b, &mut Vec::new()).unwrap().features.len(), 3);
+        assert_eq!(crate::read_features(crate::Format::Parquet, &b, &mut Vec::new()).unwrap().len(), 3);
     }
 
     #[test]

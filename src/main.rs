@@ -147,6 +147,7 @@ struct Destination<'a> {
 /// container by its path, or `stdin`/`stdout`.
 fn convert_options(args: &cli::Args, out: &Destination, crs: Option<Crs>) -> ConvertOptions {
     ConvertOptions {
+        read: args.read_options(),
         write: args.write_options(),
         crs,
         sort_hilbert: args.sort_hilbert,
@@ -175,17 +176,17 @@ fn reporter(args: &cli::Args, to: Format) -> impl FnMut(Event<'_>) + '_ {
             if args.from == Format::Gpkg {
                 eprintln!("found {} layer(s)", layers.len());
                 for (name, fc) in layers {
-                    eprintln!("  layer {name}: {} features", fc.features.len());
+                    eprintln!("  layer {name}: {} features", fc.len());
                 }
             } else {
-                let features: usize = layers.iter().map(|(_, fc)| fc.features.len()).sum();
+                let features: usize = layers.iter().map(|(_, fc)| fc.len()).sum();
                 eprintln!("parsed {features} features from {}", args.from.extension());
             }
         }
         // A GeoPackage output names its layers, so say which.
         Event::Selected { layers } if args.progress && to == Format::Gpkg => {
             for (name, fc) in layers {
-                eprintln!("layer {name}: {} features", fc.features.len());
+                eprintln!("layer {name}: {} features", fc.len());
             }
         }
         Event::Sorted { features } if args.progress => {
@@ -535,7 +536,7 @@ fn write_layer(
             Ok(())
         }
         Output::Shapefile(encoded) => {
-            write_shapefile_to_path(output_path, &encoded, prepared.layers()[index].1.features.len(), quiet)
+            write_shapefile_to_path(output_path, &encoded, prepared.layers()[index].1.len(), quiet)
         }
     }
 }

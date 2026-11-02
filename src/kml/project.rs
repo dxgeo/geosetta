@@ -94,18 +94,26 @@ impl Context {
     fn collect(&mut self, container: &Node) {
         for child in &container.children {
             match child.element() {
-                Some(KmlElement::Schema) => {
-                    let Some(id) = child.attr("id") else { continue };
-                    let fields = child
-                        .children_of(KmlElement::SimpleField)
-                        .filter_map(|f| Some((f.attr("name")?.to_string(), FieldType::from_kml(f.attr("type")?)?)))
-                        .collect();
-                    self.schemas.entry(format!("#{id}")).or_insert(fields);
-                }
-                Some(e) if e.is_container() || e == KmlElement::Kml => self.collect(child),
+                Some(KmlElement::Schema) => self.declare(child),
+                Some(e) if Context::reaches(e) => self.collect(child),
                 _ => {}
             }
         }
+    }
+
+    /// Whether the walk for schemas goes into `element`.
+    pub fn reaches(element: KmlElement) -> bool {
+        element.is_container() || element == KmlElement::Kml
+    }
+
+    /// Add `schema`'s fields, unless a schema of its id came first.
+    pub fn declare(&mut self, schema: &Node) {
+        let Some(id) = schema.attr("id") else { return };
+        let fields = schema
+            .children_of(KmlElement::SimpleField)
+            .filter_map(|f| Some((f.attr("name")?.to_string(), FieldType::from_kml(f.attr("type")?)?)))
+            .collect();
+        self.schemas.entry(format!("#{id}")).or_insert(fields);
     }
 
     /// The declared type of field `name` in the schema `schema_url` names, if

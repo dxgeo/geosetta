@@ -17,6 +17,7 @@ go:
   python3 bench/equiv.py                 # the working tree against HEAD
   PIN=v0.27.0 python3 bench/equiv.py     # against another revision
   WIDE=1 python3 bench/equiv.py          # the wide table at 50 000 rows
+  LAYOUTS=auto,rows,columns python3 bench/equiv.py  # the candidate under each --layout
   ```
 
   Exit status 1 means a conversion differed, 2 that one ran past `TIMEOUT`
@@ -24,8 +25,10 @@ go:
 
 - **`bench/memprobe/`** — links geosetta under a counting allocator and splits
   one conversion into its phases: input, read peak, the IR left resident,
-  write peak and scratch, output, with allocation counts and times. Its own
-  crate, so it is not part of the published one.
+  write peak and scratch, output, with allocation counts and times. The read
+  is `pipeline::prepare` and the write `Prepared::encode`, the binary's own
+  path; single-buffer inputs only. Its own crate, so it is not part of the
+  published one.
 
   ```sh
   cargo run --release --manifest-path bench/memprobe/Cargo.toml -- in.geojson kml

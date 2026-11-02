@@ -162,7 +162,7 @@ impl Input {
 /// count.
 fn convert(from: Format, to: Format, input: &Input) -> usize {
     let prepared = pipeline::prepare(from, to, input.source(), ConvertOptions::default(), &mut quiet).unwrap();
-    let features = prepared.layers().iter().map(|(_, fc)| fc.features.len()).sum();
+    let features = prepared.layers().iter().map(|(_, fc)| fc.len()).sum();
     if to == Format::Gpkg {
         prepared.into_geopackage(None, &mut quiet).unwrap();
     } else {
@@ -249,10 +249,10 @@ fn cases() -> Vec<Budget> {
             Format::Wkt => Some((435, 3)),
             Format::Gpkg => Some((893, 9)),
             Format::Shapefile => Some((791, 5)),
-            // The read keeps each element for a KML write to replay
-            // (`performance.org`, "KML is now the heaviest spoke").
-            Format::Kml => Some((6791, 64)),
-            Format::Kmz => Some((7395, 64)),
+            // A read for another format keeps no feature's element
+            // (`performance.org`, KML's read, step 2).
+            Format::Kml => Some((1477, 61)),
+            Format::Kmz => Some((1984, 61)),
         }
     }
     fn target_budget(to: Format) -> (usize, usize) {
@@ -267,8 +267,8 @@ fn cases() -> Vec<Budget> {
             // "Also seen, not yet acted on").
             Format::Gpkg => (1383, 50),
             Format::Shapefile => (552, 28),
-            Format::Kml => (1067, 23),
-            Format::Kmz => (2080, 23),
+            Format::Kml => (774, 23),
+            Format::Kmz => (1788, 23),
         }
     }
     let mut out = Vec::new();

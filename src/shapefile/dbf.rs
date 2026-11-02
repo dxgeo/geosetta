@@ -374,10 +374,12 @@ pub fn write(columns: &[Column]) -> Result<(Vec<u8>, Vec<String>)> {
     out.push(FIELD_TERMINATOR);
 
     // Records.
-    for row in 0..num_rows {
+    // A cursor per column, read a row at a time.
+    let mut cells: Vec<_> = columns.iter().map(|c| c.cells()).collect();
+    for _ in 0..num_rows {
         out.push(b' '); // active
-        for (field, col) in fields.iter().zip(columns) {
-            write_cell(&mut out, field, &col.cell(row));
+        for (field, cells) in fields.iter().zip(&mut cells) {
+            write_cell(&mut out, field, &cells.next().expect("a cell per row"));
         }
     }
     out.push(FILE_TERMINATOR);

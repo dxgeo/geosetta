@@ -110,15 +110,9 @@ fn read(format: Format, path: &str) -> FeatureCollection {
 }
 
 fn set(fc: &mut FeatureCollection, i: usize, key: &str, value: Option<&str>) {
-    let props = &mut fc.features[i].properties;
-    let at = props.iter().position(|(k, _)| &**k == key);
-    match (value, at) {
-        (Some(v), Some(j)) => props[j].1 = JsonValue::String(v.into()),
-        (Some(v), None) => props.push((key.into(), JsonValue::String(v.into()))),
-        (None, Some(j)) => {
-            props.remove(j);
-        }
-        (None, None) => {}
+    match value {
+        Some(v) => fc.set(i, key, JsonValue::String(v.into())),
+        None => fc.remove(i, key),
     }
 }
 
@@ -130,13 +124,19 @@ fn edited(mut fc: FeatureCollection, extra: &FeatureCollection) -> FeatureCollec
     set(&mut fc, 0, "added", Some("a new <Data>"));
     set(&mut fc, 0, "seaFloorAltitudeMode", Some("clampToSeaFloor"));
     set(&mut fc, 0, "timestamp", None);
-    if let Some(g) = fc.features.last_mut().and_then(|f| f.geometry.as_mut()) {
-        shift(g);
+    let last = fc.len() - 1;
+    if let Some(mut g) = fc.row(last).geometry().cloned() {
+        shift(&mut g);
+        fc.set_geometry(last, Some(g));
     }
-    if fc.features.len() > 2 {
-        fc.features.remove(1);
+    if fc.len() > 2 {
+        let mut i = 0;
+        fc.retain(|_| {
+            i += 1;
+            i != 2
+        });
     }
-    fc.features.push(extra.features[0].clone());
+    fc.push(extra.row(0).to_feature());
     fc
 }
 

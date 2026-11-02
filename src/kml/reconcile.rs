@@ -16,10 +16,9 @@ use std::fmt::Write as _;
 use std::rc::Rc;
 
 use crate::crs::Crs;
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{FeatureCollection, FeatureRef};
 use crate::format::{Format, KmlVersion};
 use crate::geometry::{Geometry, Position};
-use crate::json::JsonValue;
 use crate::kml::document::{self, FeatureModel, Skeleton};
 use crate::kml::model::{self, KmlDocument, KmlElement, Layout, Node};
 use crate::kml::place::{place, Placement, Time};
@@ -29,20 +28,26 @@ use crate::kml::project::{
 use crate::kml::writer::{
     altitude_element, feature_to_placemark, geometry_rank, geometry_to_element, property_text, time_element, Typed,
 };
-use crate::native::NativePayload;
+use crate::native::{Native, NativePayload};
+use crate::table::Value;
 use crate::tally::Tally;
 use crate::xml::{Content, XmlElement};
 
 /// The stored element of a feature read from KML or KMZ, if it has one.
-pub(crate) fn feature_model(f: &Feature) -> Option<&FeatureModel> {
-    stored(f).map(|(m, _)| m)
+#[cfg(test)]
+pub(crate) fn feature_model(f: &crate::feature::Feature) -> Option<&FeatureModel> {
+    stored_in(f.native.as_deref()).map(|(m, _)| m)
 }
 
 /// A feature's stored element and which of the source's documents it was
 /// read from (0 for the first, `n` for layer `n - 1`).
-pub(crate) fn stored(f: &Feature) -> Option<(&FeatureModel, usize)> {
-    let native = f.native.as_ref()?;
-    match native.payload_for(Format::Kml).or_else(|| native.payload_for(Format::Kmz))? {
+pub(crate) fn stored(f: FeatureRef<'_>) -> Option<(&FeatureModel, usize)> {
+    stored_in(f.native())
+}
+
+/// [`stored`], from the feature's native alone.
+fn stored_in(native: Option<&Native>) -> Option<(&FeatureModel, usize)> {
+    match native?.payload_for(Format::Kml).or_else(|| native?.payload_for(Format::Kmz))? {
         NativePayload::KmlFeature(k) => Some((&k.feature, k.document)),
         _ => None,
     }
@@ -54,7 +59,7 @@ pub(crate) fn stored(f: &Feature) -> Option<(&FeatureModel, usize)> {
 /// caller's to say (`crate::kml::writer`), since a layered `.kmz` holds
 /// several.
 pub(crate) fn assemble<'f>(
-    features: impl Iterator<Item = (&'f Feature, Option<&'f FeatureModel>)>,
+    features: impl Iterator<Item = (FeatureRef<'f>, Option<&'f FeatureModel>)>,
     skeleton: &Skeleton,
     version: KmlVersion,
     compact: bool,
@@ -133,7 +138,7 @@ impl Writing<'_> {
     /// A feature with no stored element, built from the IR and laid out for a
     /// place indented by `lead`. Its values go in `<Data>`: the document's
     /// schemas were written for the features it held.
-    fn fresh(&self, f: &Feature, lead: Option<&str>) -> Node {
+    fn fresh(&self, f: FeatureRef<'_>, lead: Option<&str>) -> Node {
         let b = Build { prefix: self.prefix, layout: self.layout };
         let mut node = b.node(&feature_to_placemark(f, self.version, &Typed::default()));
         if let (Some(layout), Some(lead)) = (self.layout, lead) {
@@ -143,13 +148,14 @@ impl Writing<'_> {
     }
 
     /// `stored`, indented by `lead`, with `f`'s edits applied.
-    fn reconcile(&self, stored: &Node, f: &Feature, lead: Option<&str>) -> Node {
+    fn reconcile(&self, stored: &Node, f: FeatureRef<'_>, lead: Option<&str>) -> Node {
         let Ok(projected) = project(stored, self.ctx) else {
             // It projected when it was read, so this cannot happen; if it did,
             // the IR is the only statement of the feature left.
             return self.fresh(f, lead);
         };
-        if projected.properties == f.properties && projected.geometry == f.geometry {
+        let unedited = projected.properties.iter().map(|(k, v)| (&**k, Value::of(v))).eq(f.properties().map(|(k, v)| (&**k, v)));
+        if unedited && projected.geometry.as_ref() == f.geometry() {
             return stored.clone();
         }
         let element = stored.element().expect("a projected feature is a KML element");
@@ -158,7 +164,7 @@ impl Writing<'_> {
         let mut node = stored.clone();
         // The geometry first, so the properties are placed against the
         // geometry that will be written.
-        if projected.geometry != f.geometry && reconcile_geometry(&mut node, f.geometry.as_ref(), self.version, b).is_err() {
+        if projected.geometry.as_ref() != f.geometry() && reconcile_geometry(&mut node, f.geometry(), self.version, b).is_err() {
             // What the overlay was is gone with its geometry; the feature is
             // a Placemark now, and `drop_warnings` says so.
             return self.fresh(f, lead);
@@ -321,10 +327,10 @@ fn for_each_carrier(geometry: &mut Node, f: &mut dyn FnMut(&mut Node)) {
 /// its place and is updated or removed, and a property it has no element for
 /// is appended as `<Data>`. Values are compared as the projection reads them,
 /// so a typed `<SimpleData>` whose value did not change keeps its spelling.
-fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &Context, b: Build<'_>) {
+fn reconcile_extended_data(node: &mut Node, want: &[(&str, Value<'_>)], ctx: &Context, b: Build<'_>) {
     let at = node.children.iter().position(|c| c.is(KmlElement::ExtendedData));
     let have = at.map(|i| project::extended_data_values(&node.children[i], ctx)).unwrap_or_default();
-    if have.len() == want.len() && have.iter().zip(want).all(|((hk, hv), (wk, wv))| hk == wk && hv == *wv) {
+    if have.len() == want.len() && have.iter().zip(want).all(|((hk, hv), (wk, wv))| hk == wk && Value::of(hv) == *wv) {
         return;
     }
     let i = match at {
@@ -347,7 +353,7 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
         match (child.element(), key) {
             (Some(KmlElement::Data), Some(key)) => match claim(&key) {
                 Some(v) => {
-                    if project::data_value(&ed.children[j]) != *v {
+                    if Value::of(&project::data_value(&ed.children[j])) != v {
                         set_data_value(&mut ed.children[j], &property_text(v), b);
                     }
                     j += 1;
@@ -364,7 +370,7 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
                     match (simple.is(KmlElement::SimpleData), key) {
                         (true, Some(key)) => match claim(&key) {
                             Some(v) => {
-                                if project::simple_data_value(simple, url.as_deref(), ctx) != *v {
+                                if Value::of(&project::simple_data_value(simple, url.as_deref(), ctx)) != v {
                                     schema_data.children[s].set_text(&property_text(v));
                                 }
                                 s += 1;
@@ -381,7 +387,7 @@ fn reconcile_extended_data(node: &mut Node, want: &[(&str, &JsonValue)], ctx: &C
     }
     for ((k, v), placed) in want.iter().zip(placed) {
         if !placed {
-            let data = XmlElement::with_children("Data", vec![XmlElement::leaf("value", property_text(v))]).with_attr("name", *k);
+            let data = XmlElement::with_children("Data", vec![XmlElement::leaf("value", property_text(*v))]).with_attr("name", *k);
             // After the last `<Data>`, else before the first `<SchemaData>`:
             // 2.2's sequence holds every `<Data>` ahead of every `<SchemaData>`.
             let at = match ed.children.iter().rposition(|c| c.is(KmlElement::Data)) {
@@ -697,8 +703,10 @@ pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format, carried: boo
     let mut causes = Tally::default();
     let to_kml = matches!(target, Format::Kml | Format::Kmz);
     let stated = fc.crs.as_ref().is_some_and(Crs::is_wgs84_egm96);
-    for f in &fc.features {
-        let Some(m) = feature_model(f) else {
+    // Read in place: every target runs this, and a table it found holding
+    // no KML element would otherwise be copied into rows to say so.
+    for f in fc.rows() {
+        let Some((m, _)) = stored_in(f.native()) else {
             continue;
         };
         let unprojected = project::unprojected(&m.node);
@@ -713,12 +721,21 @@ pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format, carried: boo
                 causes.add(Cause::Vertical);
             }
         } else {
-            if unprojected.contains(&project::Unprojected::TrackData) && track_edit_drops_data(&m.node, f) {
+            if unprojected.contains(&project::Unprojected::TrackData) && track_edit_drops_data(&m.node, f.geometry()) {
                 causes.add(Cause::EditedTrack);
             }
-            if overlay_edit_unwritable(&m.node, f) {
+            if overlay_edit_unwritable(&m.node, f.geometry()) {
                 causes.add(Cause::EditedOverlay);
             }
+        }
+    }
+    // A read that kept no element counted what they held instead. One is
+    // only ever made for another format's write, so nothing is carried.
+    if let Some(unkept) = crate::kml::writer::source_document(fc).map(|s| s.unkept) {
+        causes.add_n(Cause::Model, unkept.models);
+        causes.add_n(Cause::TrackData, unkept.tracks);
+        if !to_kml && !stated {
+            causes.add_n(Cause::Vertical, unkept.heights);
         }
     }
     let name = target.display_name();
@@ -750,37 +767,38 @@ pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format, carried: boo
 
 /// Whether reconciling `f` into its stored element will replace a track
 /// rather than update it in place.
-fn track_edit_drops_data(stored: &Node, f: &Feature) -> bool {
+fn track_edit_drops_data(stored: &Node, geometry: Option<&Geometry>) -> bool {
     let Ok(projected) = project(stored, &Context::default()) else {
         return false;
     };
-    if projected.geometry == f.geometry {
+    if projected.geometry.as_ref() == geometry {
         return false;
     }
     let Some(track) = stored.children.iter().find(|c| c.element().is_some_and(KmlElement::is_geometry)) else {
         return false;
     };
     let mut probe = track.clone();
-    !matches!(f.geometry, Some(ref g) if update_in_place(&mut probe, g))
+    !matches!(geometry, Some(g) if update_in_place(&mut probe, g))
 }
 
 /// Whether reconciling `f` into its stored overlay leaves it a geometry the
 /// overlay cannot hold.
-fn overlay_edit_unwritable(stored: &Node, f: &Feature) -> bool {
+fn overlay_edit_unwritable(stored: &Node, geometry: Option<&Geometry>) -> bool {
     if !stored.element().is_some_and(KmlElement::is_overlay) {
         return false;
     }
     let Ok(projected) = project(stored, &Context::default()) else {
         return false;
     };
-    projected.geometry != f.geometry
-        && reconcile_geometry(&mut stored.clone(), f.geometry.as_ref(), KmlVersion::V2_3, Build { prefix: None, layout: None })
+    projected.geometry.as_ref() != geometry
+        && reconcile_geometry(&mut stored.clone(), geometry, KmlVersion::V2_3, Build { prefix: None, layout: None })
             .is_err()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::Feature;
     use crate::format::KmlVersion;
     use crate::json::JsonValue;
     use std::rc::Rc;
@@ -804,8 +822,17 @@ mod tests {
         String::from_utf8(crate::kml::writer::write(fc, None, false)).unwrap()
     }
 
-    /// Set, add or remove a property, keeping its place when it had one.
-    fn set(f: &mut Feature, key: &str, value: Option<&str>) {
+    /// Set, add or remove feature `i`'s property through the collection's
+    /// edits, keeping its place when it had one.
+    fn set(fc: &mut FeatureCollection, i: usize, key: &str, value: Option<&str>) {
+        match value {
+            Some(v) => fc.set(i, key, JsonValue::String(v.into())),
+            None => fc.remove(i, key),
+        }
+    }
+
+    /// [`set`] on an owned feature, for one about to be added.
+    fn set_owned(f: &mut Feature, key: &str, value: Option<&str>) {
         let at = f.properties.iter().position(|(k, _)| &**k == key);
         match (value, at) {
             (Some(v), Some(i)) => f.properties[i].1 = JsonValue::String(v.into()),
@@ -827,12 +854,11 @@ mod tests {
     #[test]
     fn an_edit_rewrites_only_what_it_changed() {
         let mut fc = read(DOC);
-        let f = &mut fc.features[0];
-        set(f, "name", Some("renamed"));
-        set(f, "description", None);
-        set(f, "k1", Some("one"));
-        set(f, "k2", None);
-        set(f, "k3", Some("three"));
+        set(&mut fc, 0, "name", Some("renamed"));
+        set(&mut fc, 0, "description", None);
+        set(&mut fc, 0, "k1", Some("one"));
+        set(&mut fc, 0, "k2", None);
+        set(&mut fc, 0, "k3", Some("three"));
         let written = write_back(&fc);
         for kept in [
             r#"<Style id="s">"#,
@@ -851,14 +877,14 @@ mod tests {
         assert!(written.contains(r#"<Data name="k3"><value>three</value></Data>"#), "{written}");
         // And it reads back as edited, in the same folder.
         let again = read(&written);
-        assert_eq!(again.features[0].properties, fc.features[0].properties);
-        assert_eq!(feature_model(&again.features[0]).unwrap().address.container, vec![0, 1]);
+        assert_eq!(again.to_features()[0].properties, fc.to_features()[0].properties);
+        assert_eq!(feature_model(&again.to_features()[0]).unwrap().address.container, vec![0, 1]);
     }
 
     #[test]
     fn an_added_element_goes_where_the_schema_puts_it() {
         let mut fc = read(r#"<kml><Placemark><name>a</name><styleUrl>#s</styleUrl><Point><coordinates>1,2</coordinates></Point></Placemark></kml>"#);
-        set(&mut fc.features[0], "description", Some("new"));
+        set(&mut fc, 0, "description", Some("new"));
         let written = write_back(&fc);
         assert!(written.contains("<name>a</name><description>new</description><styleUrl>"), "{written}");
     }
@@ -866,7 +892,7 @@ mod tests {
     #[test]
     fn an_edited_point_keeps_its_other_children() {
         let mut fc = read(DOC);
-        fc.features[0].geometry = Some(Geometry::Point(Position::with_z(5.0, 6.0, 7.0)));
+        fc.set_geometry(0, Some(Geometry::Point(Position::with_z(5.0, 6.0, 7.0))));
         let written = write_back(&fc);
         assert!(
             written.contains("<Point><extrude>1</extrude><altitudeMode>absolute</altitudeMode><coordinates>5,6,7</coordinates></Point>"),
@@ -879,8 +905,7 @@ mod tests {
     #[test]
     fn a_track_edited_to_the_same_vertex_count_keeps_its_times() {
         let mut fc = read(TRACK);
-        fc.features[0].geometry =
-            Some(Geometry::LineString(vec![Position::with_z(1.5, 2.0, 3.0), Position::with_z(4.0, 5.0, 6.0)]));
+        fc.set_geometry(0, Some(Geometry::LineString(vec![Position::with_z(1.5, 2.0, 3.0), Position::with_z(4.0, 5.0, 6.0)])));
         assert!(drop_warnings(&fc, Format::Kml, true).is_empty());
         let written = write_back(&fc);
         assert!(written.contains("<when>t1</when><when>t2</when><gx:coord>1.5 2 3</gx:coord>"), "{written}");
@@ -889,7 +914,7 @@ mod tests {
     #[test]
     fn a_track_edited_to_another_vertex_count_is_replaced_and_says_so() {
         let mut fc = read(TRACK);
-        fc.features[0].geometry = Some(Geometry::LineString(vec![Position::with_z(1.0, 2.0, 3.0)]));
+        fc.set_geometry(0, Some(Geometry::LineString(vec![Position::with_z(1.0, 2.0, 3.0)])));
         let warnings = drop_warnings(&fc, Format::Kml, true);
         assert_eq!(warnings.len(), 1, "{warnings:?}");
         assert!(warnings[0].contains("edited to a different number of vertices"), "{warnings:?}");
@@ -901,7 +926,7 @@ mod tests {
     #[test]
     fn a_new_feature_joins_the_first_container_in_the_documents_prefix() {
         let mut fc = read(r#"<k:kml xmlns:k="http://www.opengis.net/kml/2.2"><k:Document><k:name>d</k:name></k:Document></k:kml>"#);
-        fc.features.push(Feature {
+        fc.push(Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![(Rc::from("name"), JsonValue::String("new".into()))],
             native: None,
@@ -909,14 +934,14 @@ mod tests {
         let written = write_back(&fc);
         assert!(written.contains("<k:Placemark><k:name>new</k:name>"), "{written}");
         let again = read(&written);
-        assert_eq!(again.features.len(), 1);
-        assert_eq!(again.features[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
+        assert_eq!(again.len(), 1);
+        assert_eq!(again.to_features()[0].geometry, Some(Geometry::Point(Position::new(1.0, 2.0))));
     }
 
     #[test]
     fn a_removed_feature_is_gone_and_nothing_else_is() {
         let mut fc = read(DOC);
-        fc.features.clear();
+        fc.retain(|_| false);
         let written = write_back(&fc);
         assert!(!written.contains("Placemark"), "{written}");
         // The comment sat directly before the placemark, so it went with it.
@@ -945,9 +970,10 @@ mod tests {
         String::from_utf8(crate::kml::writer::write(fc, Some(version), false)).unwrap()
     }
 
-    fn edited(source: &str, edit: impl FnOnce(&mut Feature)) -> (FeatureCollection, String) {
+    /// `source` read, edited by `edit` and written back.
+    fn edited(source: &str, edit: impl FnOnce(&mut FeatureCollection)) -> (FeatureCollection, String) {
         let mut fc = read(source);
-        edit(&mut fc.features[0]);
+        edit(&mut fc);
         let written = write_back(&fc);
         (fc, written)
     }
@@ -955,19 +981,19 @@ mod tests {
     #[test]
     fn an_edited_time_keeps_its_primitive_and_changes_kind_when_it_must() {
         let source = r#"<kml><Placemark><name>a</name><TimeStamp id="t"><when>2026</when></TimeStamp></Placemark></kml>"#;
-        let (_, written) = edited(source, |f| set(f, "timestamp", Some("2027-01-01")));
+        let (_, written) = edited(source, |fc| set(fc, 0, "timestamp", Some("2027-01-01")));
         assert!(written.contains(r#"<TimeStamp id="t"><when>2027-01-01</when></TimeStamp>"#), "{written}");
-        let (_, written) = edited(source, |f| {
-            set(f, "timestamp", None);
-            set(f, "begin", Some("2026-01"));
+        let (_, written) = edited(source, |fc| {
+            set(fc, 0, "timestamp", None);
+            set(fc, 0, "begin", Some("2026-01"));
         });
         assert!(written.contains("<name>a</name><TimeSpan><begin>2026-01</begin></TimeSpan>"), "{written}");
         // A value no time element admits is not lost: it moves to
         // <ExtendedData> under its own key, and reads back the same.
-        let (fc, written) = edited(source, |f| set(f, "timestamp", Some("last tuesday")));
+        let (fc, written) = edited(source, |fc| set(fc, 0, "timestamp", Some("last tuesday")));
         assert!(!written.contains("TimeStamp"), "{written}");
         assert!(written.contains(r#"<Data name="timestamp"><value>last tuesday</value></Data>"#), "{written}");
-        assert_eq!(read(&written).features[0].properties, fc.features[0].properties);
+        assert_eq!(read(&written).to_features()[0].properties, fc.to_features()[0].properties);
     }
 
     #[test]
@@ -975,9 +1001,9 @@ mod tests {
         let source = "<kml><Placemark><MultiGeometry><Point><altitudeMode>relativeToGround</altitudeMode>\
             <coordinates>1,2,3</coordinates></Point><LineString><altitudeMode>relativeToGround</altitudeMode>\
             <coordinates>1,2,3 4,5,6</coordinates></LineString></MultiGeometry></Placemark></kml>";
-        let (_, written) = edited(source, |f| {
-            set(f, "altitudeMode", Some("absolute"));
-            set(f, "tessellate", Some("1"));
+        let (_, written) = edited(source, |fc| {
+            set(fc, 0, "altitudeMode", Some("absolute"));
+            set(fc, 0, "tessellate", Some("1"));
         });
         assert_eq!(written.matches("<altitudeMode>absolute</altitudeMode>").count(), 2, "{written}");
         assert!(written.contains("<tessellate>1</tessellate><altitudeMode>absolute</altitudeMode><coordinates>1,2,3 4,5,6"), "{written}");
@@ -989,15 +1015,15 @@ mod tests {
     #[test]
     fn a_sea_floor_mode_added_to_a_2_2_document_is_gx_and_declares_itself() {
         let source = "<kml><Placemark><Point><altitudeMode>absolute</altitudeMode><coordinates>1,2,3</coordinates></Point></Placemark></kml>";
-        let (fc, written) = edited(source, |f| {
-            set(f, "altitudeMode", None);
-            set(f, "seaFloorAltitudeMode", Some("clampToSeaFloor"));
+        let (fc, written) = edited(source, |fc| {
+            set(fc, 0, "altitudeMode", None);
+            set(fc, 0, "seaFloorAltitudeMode", Some("clampToSeaFloor"));
         });
         assert!(
             written.contains(r#"<Point><gx:altitudeMode xmlns:gx="http://www.google.com/kml/ext/2.2">clampToSeaFloor</gx:altitudeMode><coordinates>"#),
             "{written}"
         );
-        assert_eq!(read(&written).features[0].properties, fc.features[0].properties);
+        assert_eq!(read(&written).to_features()[0].properties, fc.to_features()[0].properties);
     }
 
     const OVERLAY: &str = r#"<kml xmlns="http://www.opengis.net/kml/2.2"><Document><GroundOverlay id="g"><name>o</name>
@@ -1013,7 +1039,10 @@ mod tests {
 
     #[test]
     fn a_moved_ground_overlay_keeps_its_box_and_its_rotation() {
-        let (fc, written) = edited(OVERLAY, |f| f.geometry = Some(shifted(f.geometry.as_ref().unwrap(), 1.0)));
+        let (fc, written) = edited(OVERLAY, |fc| {
+            let moved = shifted(fc.row(0).geometry().unwrap(), 1.0);
+            fc.set_geometry(0, Some(moved))
+        });
         assert!(written.contains("<GroundOverlay id=\"g\">"), "{written}");
         assert!(written.contains("<north>61</north><south>59</south><east>13</east><west>9</west><rotation>45</rotation>"), "{written}");
         assert!(drop_warnings(&fc, Format::Kml, true).is_empty());
@@ -1021,14 +1050,14 @@ mod tests {
 
     #[test]
     fn a_reshaped_ground_overlay_becomes_a_quad_in_its_versions_spelling() {
-        let reshape = |f: &mut Feature| {
-            f.geometry = Some(Geometry::Polygon(vec![vec![
+        let reshape = |fc: &mut FeatureCollection| {
+            fc.set_geometry(0, Some(Geometry::Polygon(vec![vec![
                 Position::new(0.0, 0.0),
                 Position::new(2.0, 0.0),
                 Position::new(2.5, 1.0),
                 Position::new(0.0, 1.0),
                 Position::new(0.0, 0.0),
-            ]]))
+            ]])))
         };
         let (fc, written) = edited(OVERLAY, reshape);
         assert!(
@@ -1036,7 +1065,7 @@ mod tests {
             "{written}"
         );
         assert!(!written.contains("LatLonBox"), "{written}");
-        assert_eq!(read(&written).features[0].geometry, fc.features[0].geometry);
+        assert_eq!(read(&written).to_features()[0].geometry, fc.to_features()[0].geometry);
         // A 2.3 document spells it in its own namespace.
         let (_, written) = edited(&OVERLAY.replace("<kml ", r#"<kml version="2.3" "#), reshape);
         assert!(written.contains("<LatLonQuad><coordinates>0,0 2,0 2.5,1 0,1</coordinates></LatLonQuad>"), "{written}");
@@ -1044,13 +1073,13 @@ mod tests {
 
     #[test]
     fn an_overlay_edited_to_a_shape_it_cannot_hold_is_a_placemark_and_says_so() {
-        let (fc, written) = edited(OVERLAY, |f| {
-            f.geometry = Some(Geometry::Polygon(vec![vec![
+        let (fc, written) = edited(OVERLAY, |fc| {
+            fc.set_geometry(0, Some(Geometry::Polygon(vec![vec![
                 Position::new(0.0, 0.0),
                 Position::new(1.0, 0.0),
                 Position::new(0.0, 1.0),
                 Position::new(0.0, 0.0),
-            ]]))
+            ]])))
         });
         assert!(!written.contains("GroundOverlay"), "{written}");
         assert!(written.contains(r#"<Data name="icon"><value>img.png</value></Data>"#), "{written}");
@@ -1061,9 +1090,9 @@ mod tests {
 
     #[test]
     fn an_overlays_icon_edit_keeps_the_rest_of_its_icon() {
-        let (_, written) = edited(OVERLAY, |f| set(f, "icon", Some("other.png")));
+        let (_, written) = edited(OVERLAY, |fc| set(fc, 0, "icon", Some("other.png")));
         assert!(written.contains("<Icon><href>other.png</href><refreshMode>onInterval</refreshMode></Icon>"), "{written}");
-        let (_, written) = edited(OVERLAY, |f| set(f, "icon", None));
+        let (_, written) = edited(OVERLAY, |fc| set(fc, 0, "icon", None));
         assert!(written.contains("<Icon><refreshMode>onInterval</refreshMode></Icon>"), "{written}");
     }
 
@@ -1071,10 +1100,10 @@ mod tests {
     fn a_photo_overlay_moves_its_point_and_refuses_a_line() {
         let source = "<kml><PhotoOverlay><Icon><href>p.jpg</href></Icon><Point><altitudeMode>absolute</altitudeMode>\
             <coordinates>1,2,3</coordinates></Point></PhotoOverlay></kml>";
-        let (_, written) = edited(source, |f| f.geometry = Some(Geometry::Point(Position::with_z(4.0, 5.0, 6.0))));
+        let (_, written) = edited(source, |fc| fc.set_geometry(0, Some(Geometry::Point(Position::with_z(4.0, 5.0, 6.0)))));
         assert!(written.contains("<Point><altitudeMode>absolute</altitudeMode><coordinates>4,5,6</coordinates></Point></PhotoOverlay>"), "{written}");
-        let (_, written) = edited(source, |f| {
-            f.geometry = Some(Geometry::LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)]))
+        let (_, written) = edited(source, |fc| {
+            fc.set_geometry(0, Some(Geometry::LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])))
         });
         assert!(written.contains("<Placemark><ExtendedData><Data name=\"icon\">"), "{written}");
     }
@@ -1084,7 +1113,7 @@ mod tests {
         let source = "<kml><Document><Schema id='s'><SimpleField name='n' type='int'/></Schema><Placemark>\
             <ExtendedData><SchemaData schemaUrl='#s'><SimpleData name='n'>7</SimpleData></SchemaData></ExtendedData>\
             </Placemark></Document></kml>";
-        let (_, written) = edited(source, |f| set(f, "added", Some("x")));
+        let (_, written) = edited(source, |fc| set(fc, 0, "added", Some("x")));
         assert!(
             written.contains(r#"<ExtendedData><Data name="added"><value>x</value></Data><SchemaData"#),
             "{written}"
@@ -1096,9 +1125,9 @@ mod tests {
         let source = "<kml><Document><Schema id='s'><SimpleField name='d' type='double'/><SimpleField name='n' type='int'/></Schema>\
             <Placemark><name>a</name><ExtendedData><SchemaData schemaUrl='#s'><SimpleData name='d'>1.50</SimpleData>\
             <SimpleData name='n'>007</SimpleData></SchemaData></ExtendedData></Placemark></Document></kml>";
-        let (_, written) = edited(source, |f| {
-            set(f, "name", Some("b"));
-            f.properties.iter_mut().find(|(k, _)| &**k == "n").unwrap().1 = JsonValue::Int(8);
+        let (_, written) = edited(source, |fc| {
+            set(fc, 0, "name", Some("b"));
+            fc.set(0, "n", JsonValue::Int(8));
         });
         assert!(written.contains("<SimpleData name=\"d\">1.50</SimpleData><SimpleData name=\"n\">8</SimpleData>"), "{written}");
     }
@@ -1126,7 +1155,7 @@ mod tests {
         assert!(written.contains(r#"<Schema id="s"><SimpleField name="n" type="int"/></Schema>"#), "{written}");
         assert!(written.contains("<Point><altitudeMode>absolute</altitudeMode>"), "{written}");
         let again = read(&written);
-        assert_eq!(again.features[0].properties, fc.features[0].properties);
+        assert_eq!(again.to_features()[0].properties, fc.to_features()[0].properties);
         assert_eq!(again.schema, fc.schema);
         assert_eq!(again.crs, fc.crs);
     }
@@ -1139,12 +1168,14 @@ mod tests {
     #[test]
     fn what_an_edit_adds_is_laid_out_as_the_document_is_and_what_it_removes_leaves_no_line() {
         let mut fc = read(LAID_OUT);
-        let mut added = Feature { native: None, ..fc.features[0].clone() };
+        let mut added = Feature { native: None, ..fc.to_features()[0].clone() };
         added.properties.retain(|(k, _)| &**k == "name");
-        set(&mut added, "name", Some("c"));
-        set(&mut fc.features[0], "description", None);
-        set(&mut fc.features[0], "k", Some("v"));
-        fc.features[1] = added;
+        set_owned(&mut added, "name", Some("c"));
+        set(&mut fc, 0, "description", None);
+        set(&mut fc, 0, "k", Some("v"));
+        // The second feature replaced: the last, so dropped and pushed again.
+        fc.retain_at(|i| i != 1);
+        fc.push(added);
         assert_eq!(
             write_back(&fc),
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -1158,9 +1189,9 @@ mod tests {
 
     #[test]
     fn an_edit_keeps_the_documents_newline_and_indent() {
-        let (_, written) = edited("<kml>\r\n\t<Placemark>\r\n\t\t<name>a</name>\r\n\t</Placemark>\r\n</kml>", |f| {
-            set(f, "description", Some("d"));
-            set(f, "k", Some("v"));
+        let (_, written) = edited("<kml>\r\n\t<Placemark>\r\n\t\t<name>a</name>\r\n\t</Placemark>\r\n</kml>", |fc| {
+            set(fc, 0, "description", Some("d"));
+            set(fc, 0, "k", Some("v"));
         });
         assert!(
             written.ends_with(
@@ -1173,19 +1204,19 @@ mod tests {
 
     #[test]
     fn a_compact_document_and_a_compact_sibling_keep_their_habit() {
-        let (_, written) = edited("<kml><Placemark><name>a</name></Placemark></kml>", |f| set(f, "k", Some("v")));
+        let (_, written) = edited("<kml><Placemark><name>a</name></Placemark></kml>", |fc| set(fc, 0, "k", Some("v")));
         assert!(written.ends_with(r#"<Placemark><name>a</name><ExtendedData><Data name="k"><value>v</value></Data></ExtendedData></Placemark></kml>"#), "{written}");
         let mut fc = read("<kml>\n  <Document>\n    <Placemark><name>a</name></Placemark>\n  </Document>\n</kml>");
-        let mut added = Feature { native: None, ..fc.features[0].clone() };
-        set(&mut added, "name", Some("c"));
-        fc.features.push(added);
+        let mut added = Feature { native: None, ..fc.to_features()[0].clone() };
+        set_owned(&mut added, "name", Some("c"));
+        fc.push(added);
         let written = write_back(&fc);
         assert!(written.ends_with("    <Placemark><name>a</name></Placemark>\n    <Placemark><name>c</name></Placemark>\n  </Document>\n</kml>"), "{written:?}");
     }
 
     #[test]
     fn a_rewritten_leaf_keeps_the_whitespace_around_its_value() {
-        let (_, written) = edited("<kml><Placemark><name>\n  Zürich\n</name></Placemark></kml>", |f| set(f, "name", Some("Bern")));
+        let (_, written) = edited("<kml><Placemark><name>\n  Zürich\n</name></Placemark></kml>", |fc| set(fc, 0, "name", Some("Bern")));
         assert!(written.contains("<name>\n  Bern\n</name>"), "{written}");
     }
 

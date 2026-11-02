@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use geosetta::pipeline::{self, ConvertOptions, Event, Output, Source};
-use geosetta::{geopackage, Crs, Feature, FeatureCollection, Format, Geometry, KmlVersion, Position, WriteOptions};
+use geosetta::{
+    geopackage, Crs, Feature, FeatureCollection, Format, Geometry, KmlVersion, Layout, Position, ReadOptions,
+    WriteOptions,
+};
 
 const GEOSETTA: &str = env!("CARGO_BIN_EXE_geosetta");
 
@@ -85,7 +88,8 @@ fn fixture(format: Format) -> &'static str {
 const UTM_33N: &str = r#"PROJCS["WGS 84 / UTM zone 33N",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],UNIT["metre",1],AUTHORITY["EPSG","32633"]]"#;
 
 /// The option sets the sweep runs: none, every flag at once, and the one flag
-/// that is only valid for some targets.
+/// that is only valid for some targets. The two forced layouts ride along,
+/// one each, rather than doubling the sweep.
 fn option_sets() -> Vec<ConvertOptions> {
     vec![
         ConvertOptions::default(),
@@ -96,10 +100,12 @@ fn option_sets() -> Vec<ConvertOptions> {
             layer: Some("cities".into()),
             rtree: true,
             envelope: true,
+            read: ReadOptions { layout: Layout::Columns, ..Default::default() },
             ..ConvertOptions::default()
         },
         ConvertOptions {
             write: WriteOptions { kml_version: Some(KmlVersion::V2_3), ..WriteOptions::default() },
+            read: ReadOptions { layout: Layout::Rows, ..Default::default() },
             ..ConvertOptions::default()
         },
     ]
@@ -110,6 +116,9 @@ fn option_sets() -> Vec<ConvertOptions> {
 /// stated reason it has none, so the sweep covers it from its first commit.
 fn flags(options: &ConvertOptions, dir: &Path) -> Vec<String> {
     let ConvertOptions {
+        // `prepare` reads for the format it writes, whatever `target` says;
+        // it is for a caller reading alone, which the binary never does.
+        read: ReadOptions { layout, target: _ },
         write: WriteOptions { kml_version, compact },
         crs,
         sort_hilbert,
@@ -133,6 +142,9 @@ fn flags(options: &ConvertOptions, dir: &Path) -> Vec<String> {
     }
     if let Some(layer) = layer {
         out.extend(["--layer".into(), layer.clone()]);
+    }
+    if *layout != Layout::Auto {
+        out.extend(["--layout".into(), layout.as_str().into()]);
     }
     for (on, flag) in [(*compact, "--compact"), (*sort_hilbert, "--sort-hilbert"), (*rtree, "--rtree"), (*envelope, "--envelope")] {
         if on {
@@ -259,9 +271,14 @@ fn an_append_surveys_the_destination_through_both() {
 fn a_crs_override_across_disagreeing_layers_warns_through_both() {
     let dir = tmp_dir();
     let mercator = Crs::from_authority_code(Some("EPSG".into()), Some("3857".into()), None, None);
+    let layer = |crs, feature| {
+        let mut fc = FeatureCollection::from_features(vec![feature]);
+        fc.crs = Some(crs);
+        fc
+    };
     let layers = vec![
-        ("a".to_string(), FeatureCollection { crs: Some(Crs::Wgs84), ..FeatureCollection::new(vec![point(1.0, 2.0)]) }),
-        ("b".to_string(), FeatureCollection { crs: Some(mercator), ..FeatureCollection::new(vec![point(3.0, 4.0)]) }),
+        ("a".to_string(), layer(Crs::Wgs84, point(1.0, 2.0))),
+        ("b".to_string(), layer(mercator, point(3.0, 4.0))),
     ];
     let input = dir.join("two.gpkg");
     std::fs::write(&input, geopackage::write_layers(None, &layers, &geopackage::Carried::default(), false, false).unwrap())
@@ -305,7 +322,7 @@ fn shapefile_on_either_side_warns_the_same_through_both() {
 
     // And out to a Shapefile: a property name too long for dBase is a `.dbf`
     // warning the encode finds, which the binary used to print from the field.
-    let fc = FeatureCollection::new(vec![Feature {
+    let fc = FeatureCollection::from_features(vec![Feature {
         properties: vec![("a_name_longer_than_ten".into(), geosetta::JsonValue::String("x".into()))],
         ..point(1.0, 2.0)
     }]);
@@ -331,7 +348,7 @@ fn shapefile_on_either_side_warns_the_same_through_both() {
 /// in the wrong shape.
 #[test]
 fn each_encode_refuses_the_other_targets_shape() {
-    let bytes = geosetta::write_features(Format::GeoJson, &FeatureCollection::new(vec![point(1.0, 2.0)])).unwrap();
+    let bytes = geosetta::write_features(Format::GeoJson, &FeatureCollection::from_features(vec![point(1.0, 2.0)])).unwrap();
     let mut events = |_: Event<'_>| {};
     let to_fgb =
         pipeline::prepare(Format::GeoJson, Format::FlatGeobuf, Source::Bytes(&bytes), ConvertOptions::default(), &mut events)

@@ -2,7 +2,8 @@
 
 use crate::crs::Crs;
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{FeatureCollection, Tabular};
+use crate::table::Layout;
 use crate::flatbuffers::{Table, Vector};
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
@@ -122,7 +123,13 @@ struct Column {
 }
 
 /// Parse a FlatGeobuf file into a feature collection.
+#[cfg(test)]
 pub fn read(data: &[u8]) -> Result<FeatureCollection> {
+    read_as(data, Layout::Auto)
+}
+
+/// [`read`], building the collection in `layout`.
+pub(crate) fn read_as(data: &[u8], layout: Layout) -> Result<FeatureCollection> {
     if data.len() < MAGIC_LEN + 4 || &data[0..3] != b"fgb" || &data[4..7] != b"fgb" {
         return Err(Error::FlatGeobuf("not a flatgeobuf file (bad magic)".into()));
     }
@@ -160,7 +167,9 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
             ))
         })?;
 
-    let mut features = Vec::new();
+    let mut table = Tabular::new(keys, layout);
+    // One row's cells, by column, reused row after row.
+    let mut values = vec![JsonValue::Null; columns.len()];
     while pos < data.len() {
         let feat_len = u32_at(data, pos)? as usize;
         pos += 4;
@@ -169,8 +178,8 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
             .ok_or_else(|| Error::FlatGeobuf("truncated feature".into()))?;
         pos += feat_len;
 
-        let table = Table::root(feat_buf)?;
-        let geometry = match table.read_table(feature::GEOMETRY)? {
+        let feature_table = Table::root(feat_buf)?;
+        let geometry = match feature_table.read_table(feature::GEOMETRY)? {
             Some(g) => Some(decode_geometry(&g, default_geom_type)?),
             None => None,
         };
@@ -178,15 +187,11 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
         // every cell is null encodes as an *empty* blob, and the writer omits
         // an empty vector altogether. The columns still stand in the header,
         // so decode against them either way and let the omission mean null.
-        let properties = match table.read_vector(feature::PROPERTIES)? {
-            Some(v) => decode_properties(v.bytes()?, &columns, &keys)?,
-            None => decode_properties(&[], &columns, &keys)?,
-        };
-        features.push(Feature {
-            geometry,
-            properties,
-            native: None,
-        });
+        match feature_table.read_vector(feature::PROPERTIES)? {
+            Some(v) => decode_properties(v.bytes()?, &columns, &mut values)?,
+            None => decode_properties(&[], &columns, &mut values)?,
+        }
+        table.push(geometry, values.iter_mut().map(|v| std::mem::replace(v, JsonValue::Null)), None);
     }
 
     let schema = columns.iter().filter_map(|c| c.decl.clone()).collect();
@@ -199,17 +204,16 @@ pub fn read(data: &[u8]) -> Result<FeatureCollection> {
         crs_code_string: crs_extras.2,
         columns: columns.iter().filter_map(|c| c.native.clone()).collect(),
     };
-    Ok(FeatureCollection {
-        features,
-        crs,
-        // The header's own `name`, which the writer used to overwrite with a
-        // constant. Modelled rather than stashed (D1) because it is what makes
-        // a layer name survive a pipe — see `FeatureCollection::name`.
-        name: owned(header.read_str(header::NAME)?),
-        schema,
-        native: (!native.is_empty())
-            .then(|| Native::new(Format::FlatGeobuf, NativePayload::FlatGeobuf(native))),
-    })
+    let mut fc = table.finish();
+    fc.crs = crs;
+    // The header's own `name`, which the writer used to overwrite with a
+    // constant. Modelled rather than stashed (D1) because it is what makes
+    // a layer name survive a pipe — see `FeatureCollection::name`.
+    fc.name = owned(header.read_str(header::NAME)?);
+    fc.schema = schema;
+    fc.native = (!native.is_empty())
+        .then(|| Native::new(Format::FlatGeobuf, NativePayload::FlatGeobuf(native)));
+    Ok(fc)
 }
 
 /// An owned copy of a FlatBuffers string field, preserving the distinction
@@ -491,12 +495,10 @@ fn parts<'a>(g: &Table<'a>) -> Result<Vec<Table<'a>>> {
 /// This makes the output rectangular, which is what every other spoke in this
 /// crate already produces (GeoParquet, GeoPackage and CSV are byte-identical
 /// to `ogr2ogr` here) and what `ogr2ogr` itself writes from a FlatGeobuf.
-fn decode_properties(
-    blob: &[u8],
-    columns: &[Column],
-    keys: &[Rc<str>],
-) -> Result<Vec<(Rc<str>, JsonValue)>> {
-    let mut values: Vec<JsonValue> = vec![JsonValue::Null; columns.len()];
+///
+/// `values` holds a cell per column, every one `Null` on entry, and comes
+/// back holding the row's.
+fn decode_properties(blob: &[u8], columns: &[Column], values: &mut [JsonValue]) -> Result<()> {
     let mut pos = 0usize;
     while pos < blob.len() {
         let idx = u16_at(blob, pos)? as usize;
@@ -506,7 +508,7 @@ fn decode_properties(
             .ok_or_else(|| Error::FlatGeobuf("property column index out of range".into()))?;
         values[idx] = read_property_value(blob, &mut pos, col.ty)?;
     }
-    Ok(keys.iter().cloned().zip(values).collect())
+    Ok(())
 }
 
 fn read_property_value(blob: &[u8], pos: &mut usize, ty: u8) -> Result<JsonValue> {
@@ -641,7 +643,7 @@ mod tests {
 
     #[test]
     fn an_index_running_past_the_file_is_an_error_not_an_empty_read() {
-        assert_eq!(read(&with_features_count(3)).unwrap().features.len(), 3);
+        assert_eq!(read(&with_features_count(3)).unwrap().len(), 3);
         // Too large to fit: this used to skip every feature and return an
         // empty collection with no error.
         let e = read(&with_features_count(1_000_000)).unwrap_err().to_string();

@@ -28,6 +28,7 @@
 
 use crate::error::{Error, Result};
 use crate::format::{Format, KmlVersion};
+use crate::table::Layout;
 
 /// What this invocation is asking for.
 ///
@@ -101,9 +102,18 @@ pub struct Args {
     /// rather than laid out (`plans/kml-layout.org` D-L8). Like `--rtree`, it
     /// is ignored for an output with no layout.
     pub compact: bool,
+    /// `--layout`: how the features are held between read and write
+    /// (`plans/columnar.org` D-C14). A memory and time setting only: the
+    /// output is the same under every layout.
+    pub layout: Layout,
 }
 
 impl Args {
+    /// What the read takes from the flags.
+    pub fn read_options(&self) -> crate::convert::ReadOptions {
+        crate::convert::ReadOptions { layout: self.layout, ..Default::default() }
+    }
+
     /// What the write takes from the flags.
     pub fn write_options(&self) -> crate::convert::WriteOptions {
         crate::convert::WriteOptions { kml_version: self.kml_version, compact: self.compact }
@@ -111,7 +121,7 @@ impl Args {
 }
 
 /// One-line usage string.
-pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--crs PATH] [--sort-hilbert] [--rtree] [--envelope] [--kml-version 2.2|2.3] [--compact] [--progress] [--quiet]\n       geosetta <input> --print-crs-code [--from FMT] [--layer NAME]\n       geosetta <input> --print-crs [--escape] [--from FMT] [--layer NAME]\n  \"-\" for <input>/<output> means stdin/stdout (needs --from/--to; not for Shapefile)\n  --crs PATH reads WKT or PROJJSON text (\"-\" for stdin) and uses it as the output CRS\n  --print-crs-code prints the source's AUTHORITY:CODE; --print-crs prints the CRS\n  definition the source recorded, verbatim (PROJJSON when it carries both)\n  --escape renders control bytes visibly (cat -v style) for reading at a terminal;\n  it is not round-trip safe, so leave it off when piping\n  --compact writes GeoJSON and KML on one line, to save space, instead of indented";
+pub const USAGE: &str = "usage: geosetta <input> <output> [--from FMT] [--to FMT] [--layer NAME] [--crs PATH] [--sort-hilbert] [--rtree] [--envelope] [--kml-version 2.2|2.3] [--compact] [--layout auto|rows|columns] [--progress] [--quiet]\n       geosetta <input> --print-crs-code [--from FMT] [--layer NAME]\n       geosetta <input> --print-crs [--escape] [--from FMT] [--layer NAME]\n  \"-\" for <input>/<output> means stdin/stdout (needs --from/--to; not for Shapefile)\n  --crs PATH reads WKT or PROJJSON text (\"-\" for stdin) and uses it as the output CRS\n  --print-crs-code prints the source's AUTHORITY:CODE; --print-crs prints the CRS\n  definition the source recorded, verbatim (PROJJSON when it carries both)\n  --escape renders control bytes visibly (cat -v style) for reading at a terminal;\n  it is not round-trip safe, so leave it off when piping\n  --compact writes GeoJSON and KML on one line, to save space, instead of indented\n  --layout holds the features as rows or columns between read and write; it\n  changes memory and time only, never the output";
 
 /// Parse arguments from an iterator (typically `std::env::args()`), whose
 /// first item is the program name.
@@ -133,6 +143,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
     let mut print_crs = false;
     let mut escape = false;
     let mut kml_version: Option<KmlVersion> = None;
+    let mut layout = Layout::default();
     let mut compact = false;
 
     while let Some(arg) = iter.next() {
@@ -170,6 +181,12 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
                     .next()
                     .ok_or_else(|| Error::Usage("--kml-version needs a value (2.2 or 2.3)".into()))?;
                 kml_version = Some(KmlVersion::parse(&v)?);
+            }
+            "--layout" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| Error::Usage("--layout needs a value (auto, rows or columns)".into()))?;
+                layout = Layout::parse(&v)?;
             }
             "--crs" => {
                 crs = Some(
@@ -295,6 +312,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Args> {
         crs,
         kml_version,
         compact,
+        layout,
     })
 }
 

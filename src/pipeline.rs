@@ -18,10 +18,11 @@
 
 use std::collections::BTreeSet;
 
-use crate::convert::{self, WriteOptions};
+use crate::convert::{self, ReadOptions, WriteOptions};
 use crate::crs::Crs;
 use crate::error::{Error, Result};
 use crate::feature::FeatureCollection;
+use crate::table::Layout;
 use crate::format::Format;
 use crate::{geopackage, shapefile};
 
@@ -39,6 +40,8 @@ pub enum Source<'a> {
 /// conversion.
 #[derive(Debug, Clone, Default)]
 pub struct ConvertOptions {
+    /// How each layer is held once read (`plans/columnar.org` D-C14).
+    pub read: ReadOptions,
     /// How each single-buffer layer is written — `--kml-version`, `--compact`.
     pub write: WriteOptions,
     /// Relabel every layer with this CRS — `--crs`. Assign, not enrich: it
@@ -124,7 +127,8 @@ pub fn prepare(
     // Before anything is read: options that cannot apply to the target fail
     // the conversion outright, as the binary's argument check does.
     options.write.check(to)?;
-    let mut layers = read(from, source, &options, events)?;
+    // The target is known here, so a read keeps only what its writer reads.
+    let mut layers = read_as(from, source, &options, events, options.read.layout, Some(to))?;
     let mut carried = geopackage::Carried::default();
     if let (Format::Gpkg, Format::Gpkg, Source::Bytes(bytes)) = (from, to, source) {
         // Carried *before* the survey, because the survey's job is to name
@@ -150,7 +154,7 @@ pub fn prepare(
         for (_, fc) in &mut layers {
             convert::reorder_hilbert(fc);
         }
-        events(Event::Sorted { features: layers.iter().map(|(_, fc)| fc.features.len()).sum() });
+        events(Event::Sorted { features: layers.iter().map(|(_, fc)| fc.len()).sum() });
     }
     if let Some(crs) = &options.crs {
         for w in apply_crs_override(&mut layers, crs) {
@@ -186,10 +190,22 @@ pub fn read(
     options: &ConvertOptions,
     events: &mut dyn FnMut(Event<'_>),
 ) -> Result<Vec<(String, FeatureCollection)>> {
+    read_as(from, source, options, events, options.read.layout, options.read.target)
+}
+
+/// [`read`], building each collection in `layout` for a write as `target`.
+fn read_as(
+    from: Format,
+    source: Source<'_>,
+    options: &ConvertOptions,
+    events: &mut dyn FnMut(Event<'_>),
+    layout: Layout,
+    target: Option<Format>,
+) -> Result<Vec<(String, FeatureCollection)>> {
     let mut warnings = Vec::new();
     let fc = match (from, source) {
         (Format::Gpkg, Source::Bytes(bytes)) => {
-            let mut layers = geopackage::read_layers(bytes)?;
+            let mut layers = geopackage::read_layers_as(bytes, layout)?;
             events(Event::Read { layers: &layers });
             if let Some(name) = &options.layer {
                 select_layer(&mut layers, name)?;
@@ -197,7 +213,7 @@ pub fn read(
             return Ok(layers);
         }
         (Format::Shapefile, Source::Shapefile { shp, dbf, prj, cpg }) => {
-            shapefile::read(shp, dbf, prj, cpg, &mut warnings)?
+            shapefile::read_as(shp, dbf, prj, cpg, &mut warnings, layout)?
         }
         (Format::Shapefile, Source::Bytes(_)) => {
             return Err(Error::Usage("Shapefile input is read from its sibling files, not one buffer".into()));
@@ -208,7 +224,7 @@ pub fn read(
                 from.display_name()
             )));
         }
-        (_, Source::Bytes(bytes)) => convert::read_features(from, bytes, &mut warnings)?,
+        (_, Source::Bytes(bytes)) => convert::read_features_as(from, bytes, &mut warnings, layout, target)?,
     };
     for w in warnings {
         events(Event::Warning(w));
@@ -381,11 +397,7 @@ fn release_foreign_natives(fc: &mut FeatureCollection, target: Format) {
     if fc.native.as_ref().is_some_and(|n| !kept(n.format)) {
         fc.native = None;
     }
-    for f in &mut fc.features {
-        if f.native.as_ref().is_some_and(|n| !kept(n.format)) {
-            f.native = None;
-        }
-    }
+    fc.drop_natives(|n| !kept(n.format));
 }
 
 /// The layer names of a `(name, collection)` list, which is the shape both

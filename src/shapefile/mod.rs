@@ -15,4 +15,5 @@ mod reader;
 mod writer;
 
 pub use reader::read;
+pub(crate) use reader::read_as;
 pub use writer::{write, Encoded};

@@ -8,7 +8,8 @@ use std::rc::Rc;
 
 use crate::format::{Format, KmlVersion};
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{Feature, FeatureCollection, Tabular};
+use crate::table::Layout;
 use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox, Geometry, Position};
 use crate::{csv, flatgeobuf, geojson, kml, parquet};
 // `json` is only needed by the test helpers below (the read path streams
@@ -30,14 +31,29 @@ pub fn convert(from: Format, to: Format, input: &[u8]) -> Result<Vec<u8>> {
 /// Reorder features by Hilbert-curve locality, so spatially-close features are
 /// adjacent (better GeoParquet row-group clustering and compression).
 pub fn reorder_hilbert(fc: &mut FeatureCollection) {
-    let bboxes: Vec<Bbox> = fc
-        .features
-        .iter()
-        .map(|f| f.geometry.as_ref().map(|g| g.bbox()).unwrap_or_else(Bbox::empty))
-        .collect();
-    let order = crate::spatial::hilbert_order(&bboxes);
-    let mut slots: Vec<Option<Feature>> = std::mem::take(&mut fc.features).into_iter().map(Some).collect();
-    fc.features = order.into_iter().map(|i| slots[i].take().unwrap()).collect();
+    let bboxes: Vec<Bbox> =
+        fc.rows().map(|f| f.geometry().map(|g| g.bbox()).unwrap_or_else(Bbox::empty)).collect();
+    fc.reorder(&crate::spatial::hilbert_order(&bboxes));
+}
+
+/// How to read: what [`read_features_with`] takes beyond the format.
+/// `Default` is what [`read_features`] reads.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReadOptions {
+    /// How the collection holds its features (`plans/columnar.org` D-C14). A
+    /// memory and time setting only: the features, and anything written from
+    /// them, are the same under every layout.
+    pub layout: Layout,
+    /// The format the collection will be written as, when the caller knows
+    /// it. A read may then leave out what only another format's writer
+    /// reads back: a KML or KMZ read for any target but those two keeps no
+    /// feature's element, which is most of what it holds
+    /// (`plans/performance.org`, KML's read), and still says what the write
+    /// loses of them. Writing the collection as KML anyway then builds each
+    /// feature fresh, as from any other source. `None` keeps everything.
+    /// [`crate::pipeline::prepare`] reads for the format it writes, whatever
+    /// this says.
+    pub target: Option<Format>,
 }
 
 /// Decode any supported input format into the shared Feature IR.
@@ -49,18 +65,40 @@ pub fn reorder_hilbert(fc: &mut FeatureCollection) {
 /// holds the collection, nothing records that it happened. Most formats never
 /// write to it.
 pub fn read_features(format: Format, input: &[u8], warnings: &mut Vec<String>) -> Result<FeatureCollection> {
-    match format {
+    read_features_with(format, input, warnings, ReadOptions::default())
+}
+
+/// [`read_features`], holding the collection as `options` says.
+pub fn read_features_with(
+    format: Format,
+    input: &[u8],
+    warnings: &mut Vec<String>,
+    options: ReadOptions,
+) -> Result<FeatureCollection> {
+    read_features_as(format, input, warnings, options.layout, options.target)
+}
+
+/// [`read_features`], building the collection's blocks under `layout`.
+/// `target` is [`ReadOptions::target`].
+pub(crate) fn read_features_as(
+    format: Format,
+    input: &[u8],
+    warnings: &mut Vec<String>,
+    layout: Layout,
+    target: Option<Format>,
+) -> Result<FeatureCollection> {
+    let fc = match format {
         Format::GeoJson => {
             let text = std::str::from_utf8(input)
                 .map_err(|_| Error::GeoJson("input is not valid utf-8".into()))?;
-            geojson::from_geojson_str(text)
+            geojson::from_geojson_str_as(text, layout)
         }
-        Format::Parquet => parquet_to_features(input),
-        Format::FlatGeobuf => flatgeobuf::read(input),
-        Format::Csv => csv::read(input),
+        Format::Parquet => parquet_to_features_as(input, layout),
+        Format::FlatGeobuf => flatgeobuf::read_as(input, layout),
+        Format::Csv => csv::read(input, layout),
         Format::Wkt => read_wkt_lines(input),
-        Format::Kml => kml::read_kml(input, warnings),
-        Format::Kmz => kml::read_kmz(input, warnings),
+        Format::Kml => kml::read_kml_with(input, warnings, kml::Elements::for_target(target), layout),
+        Format::Kmz => kml::read_kmz_with(input, warnings, kml::Elements::for_target(target), layout),
         // GeoPackage is multi-layer, so it's read via geopackage::read_layers
         // (in `pipeline::prepare`) rather than through this single-collection
         // path.
@@ -73,7 +111,8 @@ pub fn read_features(format: Format, input: &[u8], warnings: &mut Vec<String>) -
         Format::Shapefile => Err(Error::Usage(
             "Shapefile input is handled via its sibling files; this path should not be reached".into(),
         )),
-    }
+    }?;
+    Ok(fc)
 }
 
 /// How to write: what [`write_features_with`] takes beyond the format.
@@ -297,14 +336,14 @@ fn read_wkt_lines(input: &[u8]) -> Result<FeatureCollection> {
         }
     }
     // A .wkt file is bare geometry with no coordinate-reference metadata.
-    Ok(FeatureCollection::new(features))
+    Ok(FeatureCollection::from_features(features))
 }
 
 /// Write one WKT geometry per line (properties are dropped).
 fn write_wkt_lines(fc: &FeatureCollection) -> Vec<u8> {
     let mut out = String::new();
-    for f in &fc.features {
-        if let Some(g) = &f.geometry {
+    for f in fc.rows() {
+        if let Some(g) = f.geometry() {
             out.push_str(&to_wkt(g));
         }
         out.push('\n');
@@ -328,9 +367,9 @@ fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
     // metadata for the Z case, and GDAL's for M/ZM, before implementing).
     let mut bbox = Bbox::empty();
     let mut types: BTreeSet<String> = BTreeSet::new();
-    let mut geometry: Vec<Option<Vec<u8>>> = Vec::with_capacity(fc.features.len());
-    for feature in &fc.features {
-        match &feature.geometry {
+    let mut geometry: Vec<Option<Vec<u8>>> = Vec::with_capacity(fc.len());
+    for feature in fc.rows() {
+        match feature.geometry() {
             Some(g) => {
                 g.extend_bbox(&mut bbox);
                 types.insert(format!("{}{}", g.type_name(), geoparquet_dim_suffix(g)));
@@ -406,64 +445,66 @@ fn geoparquet_first_position_dim(g: &Geometry) -> (bool, bool) {
 }
 
 /// GeoParquet bytes → Feature IR.
+#[cfg(test)]
 fn parquet_to_features(bytes: &[u8]) -> Result<FeatureCollection> {
-    let file = parquet::open_geoparquet(bytes)?;
-    let num_cols = file.property_count();
+    parquet_to_features_as(bytes, Layout::Auto)
+}
 
-    // Seed one feature per row with its geometry and an empty property vec,
-    // freeing each row's WKB once it is decoded.
+/// [`parquet_to_features`], building the collection in `layout`.
+fn parquet_to_features_as(bytes: &[u8], layout: Layout) -> Result<FeatureCollection> {
+    let file = parquet::open_geoparquet(bytes)?;
+    let rows = file.num_rows();
+
+    // Every row's geometry, freeing each row's WKB once it is decoded.
     // `num_rows` is the file's own claim; reserve no more than its bytes.
-    let mut features = Vec::with_capacity(file.num_rows().min(bytes.len()));
+    let mut geometry = Vec::with_capacity(rows.min(bytes.len()));
     let mut wkbs = file.geometry()?.into_iter();
-    for _ in 0..file.num_rows() {
-        let geometry = match wkbs.next() {
+    for _ in 0..rows {
+        geometry.push(match wkbs.next() {
             Some(Some(wkb)) => Some(from_wkb(&wkb)?),
             Some(None) => None,
             None => return Err(Error::Parquet("the geometry column has fewer values than the file has rows".into())),
-        };
-        features.push(Feature {
-            geometry,
-            properties: Vec::with_capacity(num_cols),
-            native: None,
         });
     }
     drop(wkbs);
 
-    // Transpose columns → rows a column at a time: each is decoded, *drained*
-    // into the rows (values move rather than being cloned, sharing one `Rc`
-    // key across every row), and dropped before the next is decoded, so the
-    // table is never held twice (`plans/performance.org`, *Memory*). Columns
-    // are consumed in file order, so each row keeps that property order.
+    // Built a column at a time: each is decoded, moved into the rows or the
+    // blocks, and dropped before the next is decoded, so the values are
+    // never held twice (`plans/performance.org`, *Memory*).
+    // Columns are taken in file order, which is every row's property order.
     let mut schema = Vec::new();
-    for i in 0..num_cols {
-        let col = file.property(i)?;
+    let mut keys = Vec::with_capacity(file.property_count());
+    for i in 0..file.property_count() {
+        let (name, decl) = file.property_meta(i);
         // The type the file declared, kept so it can reach a target able to
         // express it — a `TIMESTAMP` column stops becoming text (defect 5).
-        if let Some(ty) = col.decl {
-            schema.push(crate::schema::FieldDecl {
-                name: col.name.clone(),
-                ty: Some(ty),
-                ..Default::default()
-            });
+        if let Some(ty) = decl {
+            schema.push(crate::schema::FieldDecl { name: name.to_string(), ty: Some(ty), ..Default::default() });
         }
-        let key: Rc<str> = Rc::from(col.name);
-        for (feature, value) in features.iter_mut().zip(col.values) {
-            feature.properties.push((Rc::clone(&key), value));
-        }
+        keys.push(Rc::<str>::from(name));
     }
+    let column = |i: usize| -> Result<Vec<crate::json::JsonValue>> {
+        let mut values = file.property(i)?;
+        if values.len() < rows {
+            return Err(Error::Parquet(format!(
+                "the column \"{}\" has fewer values than the file has rows",
+                keys[i]
+            )));
+        }
+        values.truncate(rows);
+        Ok(values)
+    };
+    let mut fc = Tabular::from_columns(keys.clone(), geometry, column, layout)?;
     let (crs, native) = file.into_parts();
-    Ok(FeatureCollection {
-        features,
-        crs,
-        name: None,
-        schema,
-        native: (!native.is_empty()).then(|| {
-            crate::native::Native::new(
-                Format::Parquet,
-                crate::native::NativePayload::Parquet(native),
-            )
-        }),
-    })
+    fc.crs = crs;
+    fc.schema = schema;
+    fc.native = (!native.is_empty()).then(|| {
+        crate::native::Native::new(
+            Format::Parquet,
+            crate::native::NativePayload::Parquet(native),
+        )
+    });
+    Ok(fc)
 }
 
 // Thin named wrappers used by the tests below.
@@ -507,14 +548,14 @@ mod tests {
         let back = geoparquet_to_geojson(&pq).unwrap();
         let fc = geojson::from_json(&json::parse(&back).unwrap()).unwrap();
 
-        assert_eq!(fc.features.len(), 4);
+        assert_eq!(fc.len(), 4);
         // Geometry survives the WKB round trip.
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(crate::geometry::Geometry::Point(Position::new(-73.9857, 40.7484)))
         );
         // A present string property, including non-ASCII.
-        let cafe = &fc.features[3];
+        let cafe = &fc.to_features()[3];
         let name = cafe.properties.iter().find(|(k, _)| &**k == "name").unwrap();
         assert_eq!(name.1.as_str(), Some("Café ☕"));
         // The nested-array property fell back to a JSON string on the way in,
@@ -543,7 +584,7 @@ mod tests {
     fn check_duckdb_fixture(bytes: &[u8]) {
         let out = geoparquet_to_geojson(bytes).unwrap();
         let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 5000);
+        assert_eq!(fc.len(), 5000);
 
         let prop = |f: &Feature, k: &str| {
             f.properties
@@ -553,7 +594,7 @@ mod tests {
                 .unwrap()
         };
         for i in [0usize, 1, 3, 2499, 4999] {
-            let f = &fc.features[i];
+            let f = &fc.to_features()[i];
             assert_eq!(prop(f, "bucket").as_f64(), Some((i % 7) as f64));
             assert_eq!(prop(f, "color").as_str(), Some(format!("color_{}", i % 3).as_str()));
             assert_eq!(prop(f, "even"), crate::json::JsonValue::Bool(i % 2 == 0));
@@ -601,12 +642,12 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/duckdb_dates.parquet");
         let out = geoparquet_to_geojson(bytes).unwrap();
         let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 300);
+        assert_eq!(fc.len(), 300);
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
-        let f0 = &fc.features[0];
+        let f0 = &fc.to_features()[0];
         assert_eq!(prop(f0, "d").as_str(), Some("2020-01-01"));
         // The `Z` is deliberate: `TIMESTAMP_MICROS` counts from the Unix
         // epoch, so it *is* UTC, and a bare `2020-01-01T00:00:00` is an
@@ -614,7 +655,7 @@ mod tests {
         // `gpkg -> parquet -> gpkg` round trip was found to be quietly
         // dropping the designator GeoPackage requires.
         assert_eq!(prop(f0, "ts").as_str(), Some("2020-01-01T00:00:00Z"));
-        let f2 = &fc.features[2];
+        let f2 = &fc.to_features()[2];
         assert_eq!(prop(f2, "d").as_str(), Some("2020-01-03"));
         assert_eq!(prop(f2, "ts").as_str(), Some("2020-01-01T02:00:00Z"));
     }
@@ -628,13 +669,13 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/duckdb_int32_float.parquet");
         let out = geoparquet_to_geojson(bytes).unwrap();
         let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 400);
+        assert_eq!(fc.len(), 400);
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
         for i in [0usize, 1, 7, 399] {
-            let f = &fc.features[i];
+            let f = &fc.to_features()[i];
             assert_eq!(prop(f, "i32").as_f64(), Some(i as f64));
             // f32 value round-trips exactly through f64.
             assert_eq!(prop(f, "f32").as_f64(), Some((i as f32 * 1.25) as f64));
@@ -659,7 +700,7 @@ mod tests {
     fn check_pyarrow_types_fixture(bytes: &[u8]) {
         let out = geoparquet_to_geojson(bytes).unwrap();
         let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 40);
+        assert_eq!(fc.len(), 40);
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
@@ -671,7 +712,7 @@ mod tests {
             (39, "234.46", "23456.773", "1900002.3446", "2020-09-13T12:27:19.000000039", "2728292a"),
         ];
         for &(i, dec_i32, dec_i64, dec_flba, ts, raw) in cases {
-            let f = &fc.features[i];
+            let f = &fc.to_features()[i];
             assert_eq!(prop(f, "decimal_i32").as_str(), Some(dec_i32), "row {i} decimal_i32");
             assert_eq!(prop(f, "decimal_i64").as_str(), Some(dec_i64), "row {i} decimal_i64");
             assert_eq!(prop(f, "decimal_flba").as_str(), Some(dec_flba), "row {i} decimal_flba");
@@ -708,13 +749,13 @@ mod tests {
     fn check_data_page_v2_fixture(bytes: &[u8]) {
         let out = geoparquet_to_geojson(bytes).unwrap();
         let fc = geojson::from_json(&json::parse(&out).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 60);
+        assert_eq!(fc.len(), 60);
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
         for i in 0..60usize {
-            let f = &fc.features[i];
+            let f = &fc.to_features()[i];
             assert_eq!(prop(f, "id").as_f64(), Some(i as f64), "row {i} id");
             assert_eq!(prop(f, "req").as_f64(), Some((i * 2) as f64), "row {i} req");
             if i % 5 == 0 {
@@ -757,14 +798,14 @@ mod tests {
     fn reads_gdal_native_geometry_with_a_non_default_column_name() {
         let bytes = include_bytes!("../tests/fixtures/gdal_native_geometry_custom_name.parquet");
         let fc = parquet_to_features(bytes).unwrap();
-        assert_eq!(fc.features.len(), 3);
+        assert_eq!(fc.len(), 3);
         assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
         let expected = [("a", Position::new(1.5, 2.5)), ("b", Position::new(3.5, 4.5)), ("c", Position::new(-5.25, 10.75))];
-        for (f, (name, coords)) in fc.features.iter().zip(expected) {
+        for (f, (name, coords)) in fc.to_features().iter().zip(expected) {
             assert_eq!(prop(f, "name").as_str(), Some(name));
             assert_eq!(f.geometry, Some(crate::geometry::Geometry::Point(coords)));
         }
@@ -781,15 +822,15 @@ mod tests {
         use crate::crs::Crs;
         let bytes = include_bytes!("../tests/fixtures/gdal_native_geometry_3857.parquet");
         let fc = parquet_to_features(bytes).unwrap();
-        assert_eq!(fc.features.len(), 3);
-        match fc.crs {
+        assert_eq!(fc.len(), 3);
+        match &fc.crs {
             Some(Crs::Named(n)) => {
                 assert_eq!(n.authority.as_deref(), Some("EPSG"));
                 assert_eq!(n.code.as_deref(), Some("3857"));
             }
             other => panic!("expected EPSG:3857 recovered from the native logicalType, got {other:?}"),
         }
-        assert_eq!(fc.features[0].geometry, Some(crate::geometry::Geometry::Point(Position::new(1.5, 2.5))));
+        assert_eq!(fc.to_features()[0].geometry, Some(crate::geometry::Geometry::Point(Position::new(1.5, 2.5))));
     }
 
     fn fgb_to_fc(bytes: &[u8]) -> FeatureCollection {
@@ -803,7 +844,7 @@ mod tests {
         // DuckDB-written FGB with mixed geometry types (per-feature type).
         let fc = fgb_to_fc(include_bytes!("../tests/fixtures/duckdb_geoms.fgb"));
         let by_id = |id: i64| {
-            fc.features
+            fc.to_features()
                 .iter()
                 .find(|f| f.properties.iter().any(|(k, v)| &**k == "id" && v.as_f64() == Some(id as f64)))
                 .unwrap()
@@ -836,9 +877,9 @@ mod tests {
         // via `ogrinfo -al` to read back as `LINESTRING Z (0 0 1,1 1 2,2 0 3)`
         // before trusting the fixture (see M6 of `plans/zm-geometry.org`).
         let fc = fgb_to_fc(include_bytes!("../tests/fixtures/gdal_linestring_z.fgb"));
-        assert_eq!(fc.features.len(), 1);
+        assert_eq!(fc.len(), 1);
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(LineString(vec![
                 Position::with_z(0.0, 0.0, 1.0),
                 Position::with_z(1.0, 1.0, 2.0),
@@ -850,8 +891,8 @@ mod tests {
     #[test]
     fn reads_flatgeobuf_property_types() {
         let fc = fgb_to_fc(include_bytes!("../tests/fixtures/duckdb_props.fgb"));
-        let feat = fc
-            .features
+        let features = fc.to_features();
+        let feat = features
             .iter()
             .find(|f| f.properties.iter().any(|(k, v)| &**k == "n" && v.as_f64() == Some(10.0)))
             .unwrap();
@@ -874,7 +915,7 @@ mod tests {
         )
         .unwrap();
         let geoms = |fc: &FeatureCollection| {
-            let mut g: Vec<_> = fc.features.iter().map(|f| f.geometry.clone()).collect();
+            let mut g: Vec<_> = fc.to_features().iter().map(|f| f.geometry.clone()).collect();
             g.sort_by_key(|g| format!("{g:?}"));
             g
         };
@@ -882,7 +923,7 @@ mod tests {
     }
 
     fn sorted_geoms(fc: &FeatureCollection) -> Vec<Option<crate::geometry::Geometry>> {
-        let mut g: Vec<_> = fc.features.iter().map(|f| f.geometry.clone()).collect();
+        let mut g: Vec<_> = fc.to_features().iter().map(|f| f.geometry.clone()).collect();
         g.sort_by_key(|g| format!("{g:?}"));
         g
     }
@@ -894,7 +935,7 @@ mod tests {
         let fgb = convert(Format::GeoJson, Format::FlatGeobuf, SAMPLE.as_bytes()).unwrap();
         let back = fgb_to_fc(&fgb);
         let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
-        assert_eq!(back.features.len(), orig.features.len());
+        assert_eq!(back.len(), orig.len());
         assert_eq!(sorted_geoms(&orig), sorted_geoms(&back));
     }
 
@@ -915,22 +956,22 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/cities.csv");
         let out = convert(Format::Csv, Format::GeoJson, bytes).unwrap();
         let fc = geojson::from_json(&json::parse(std::str::from_utf8(&out).unwrap()).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 3);
+        assert_eq!(fc.len(), 3);
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
-        assert_eq!(fc.features[0].geometry, Some(Geometry::Point(Position::new(10.0, 20.0))));
-        assert_eq!(prop(&fc.features[0], "population").as_f64(), Some(120000.0));
-        assert_eq!(prop(&fc.features[0], "capital"), crate::json::JsonValue::Bool(true));
+        assert_eq!(fc.to_features()[0].geometry, Some(Geometry::Point(Position::new(10.0, 20.0))));
+        assert_eq!(prop(&fc.to_features()[0], "population").as_f64(), Some(120000.0));
+        assert_eq!(prop(&fc.to_features()[0], "capital"), crate::json::JsonValue::Bool(true));
         // Quoted field with an embedded comma.
-        assert_eq!(prop(&fc.features[1], "name").as_str(), Some("Beta, City"));
+        assert_eq!(prop(&fc.to_features()[1], "name").as_str(), Some("Beta, City"));
         assert!(matches!(
-            fc.features[1].geometry,
+            fc.to_features()[1].geometry,
             Some(Geometry::LineString(_))
         ));
         // Empty numeric cell -> null.
-        assert_eq!(prop(&fc.features[2], "population"), crate::json::JsonValue::Null);
+        assert_eq!(prop(&fc.to_features()[2], "population"), crate::json::JsonValue::Null);
     }
 
     #[test]
@@ -949,7 +990,7 @@ mod tests {
     #[test]
     fn hilbert_reorder_preserves_the_feature_set() {
         use crate::geometry::Geometry::Point;
-        let mut fc = FeatureCollection::new(vec![
+        let mut fc = FeatureCollection::from_features(vec![
             Feature { geometry: Some(Point(Position::new(100.0, 100.0))), properties: vec![], native: None },
             Feature { geometry: Some(Point(Position::new(0.0, 0.0))), properties: vec![], native: None },
             Feature { geometry: Some(Point(Position::new(1.0, 1.0))), properties: vec![], native: None },
@@ -958,7 +999,7 @@ mod tests {
         reorder_hilbert(&mut fc);
         assert_eq!(sorted_geoms(&fc), before); // same set, reordered
         // The far point ends up last; the origin cluster is first.
-        assert_eq!(fc.features.last().unwrap().geometry, Some(Point(Position::new(100.0, 100.0))));
+        assert_eq!(fc.to_features().last().unwrap().geometry, Some(Point(Position::new(100.0, 100.0))));
     }
 
     #[test]
@@ -1010,7 +1051,7 @@ mod tests {
         // `POINT ZM` WKT source produces `"geometry_types":["Point ZM"]`) —
         // this test would have caught the earlier bug where M/ZM were never
         // suffixed at all.
-        let fc = FeatureCollection::new(vec![
+        let fc = FeatureCollection::from_features(vec![
             Feature {
                 geometry: Some(crate::geometry::Geometry::Point(Position::with_m(1.0, 2.0, 5.0))),
                 properties: vec![],
@@ -1066,7 +1107,7 @@ mod tests {
         // GeoPackage -> FlatGeobuf (via the IR) preserves an EPSG code even
         // though neither format is the source: authority+code is the portable
         // token both speak.
-        let mut src = FeatureCollection::new(vec![Feature {
+        let mut src = FeatureCollection::from_features(vec![Feature {
             geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
             native: None,
@@ -1124,7 +1165,7 @@ mod tests {
         // reader must lift the CRS's own id out of the WKT so the identity
         // survives to every authority+code target — here FlatGeobuf -> Parquet.
         let wkt = "GEOGCRS[\"GDA2020\",DATUM[\"GDA2020\",ELLIPSOID[\"GRS 1980\",6378137,298.257222101,ID[\"EPSG\",7019]]],CS[ellipsoidal,2],ID[\"EPSG\",7844]]";
-        let mut fc = FeatureCollection::new(vec![Feature {
+        let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![],
             native: None,
@@ -1176,10 +1217,10 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(fc.features.len(), 1);
-        assert_eq!(fc.features[0].geometry, Some(Point(Position::new(1.5, 2.5))));
+        assert_eq!(fc.len(), 1);
+        assert_eq!(fc.to_features()[0].geometry, Some(Point(Position::new(1.5, 2.5))));
         let prop = |k: &str| {
-            fc.features[0].properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
+            fc.to_features()[0].properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
         assert_eq!(prop("id").as_f64(), Some(1.0));
         assert_eq!(prop("name").as_str(), Some("alpha"));
@@ -1197,7 +1238,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(MultiLineString(vec![
                 vec![Position::new(0.0, 0.0), Position::new(1.0, 0.0)],
                 vec![Position::new(5.0, 5.0), Position::new(6.0, 6.0), Position::new(7.0, 5.0)],
@@ -1216,7 +1257,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(fc.features[0].geometry, Some(MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, -1.0)])));
+        assert_eq!(fc.to_features()[0].geometry, Some(MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0), Position::new(2.0, -1.0)])));
     }
 
     #[test]
@@ -1231,7 +1272,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(Polygon(vec![
                 vec![Position::new(0.0, 0.0), Position::new(0.0, 4.0), Position::new(4.0, 4.0), Position::new(4.0, 0.0), Position::new(0.0, 0.0)],
                 vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
@@ -1251,7 +1292,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(MultiPolygon(vec![
                 vec![vec![Position::new(0.0, 0.0), Position::new(0.0, 1.0), Position::new(1.0, 1.0), Position::new(1.0, 0.0), Position::new(0.0, 0.0)]],
                 vec![vec![Position::new(5.0, 5.0), Position::new(5.0, 6.0), Position::new(6.0, 6.0), Position::new(6.0, 5.0), Position::new(5.0, 5.0)]],
@@ -1276,7 +1317,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(fc.features[0].geometry, Some(Point(Position::with_z(-73.9857, 40.7484, 381.0))));
+        assert_eq!(fc.to_features()[0].geometry, Some(Point(Position::with_z(-73.9857, 40.7484, 381.0))));
     }
 
     #[test]
@@ -1294,7 +1335,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(Polygon(vec![
                 vec![
                     Position::with_z(0.0, 0.0, 1.0),
@@ -1330,7 +1371,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(fc.features[0].geometry, Some(Point(Position::with_m(1.0, 2.0, 5.0))));
+        assert_eq!(fc.to_features()[0].geometry, Some(Point(Position::with_m(1.0, 2.0, 5.0))));
     }
 
     #[test]
@@ -1347,7 +1388,7 @@ mod tests {
             &mut Vec::new(),
         )
         .unwrap();
-        assert_eq!(fc.features[0].geometry, Some(Point(Position::with_zm(-73.9857, 40.7484, 381.0, 12.5))));
+        assert_eq!(fc.to_features()[0].geometry, Some(Point(Position::with_zm(-73.9857, 40.7484, 381.0, 12.5))));
     }
 
     #[test]
@@ -1366,7 +1407,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(LineString(vec![
                 Position::with_zm(0.0, 0.0, 1.0, 10.0),
                 Position::with_zm(1.0, 1.0, 2.0, 20.0),
@@ -1391,7 +1432,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(Polygon(vec![
                 vec![
                     Position::with_zm(0.0, 0.0, 1.0, 10.0),
@@ -1424,7 +1465,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            fc.features[0].geometry,
+            fc.to_features()[0].geometry,
             Some(MultiPoint(vec![Position::with_zm(0.0, 0.0, 1.0, 10.0), Position::with_zm(1.0, 1.0, 2.0, 20.0)]))
         );
     }
@@ -1502,9 +1543,9 @@ mod tests {
 
         // What an external tool does: lengthen a value and widen the
         // declaration that governs it.
-        for f in &mut transit.features {
-            if let Some((_, v)) = f.properties.iter_mut().find(|(k, _)| &**k == "name") {
-                *v = crate::json::JsonValue::String("x".repeat(100));
+        for i in 0..transit.len() {
+            if transit.row(i).get("name").is_some() {
+                transit.set(i, "name", crate::json::JsonValue::String("x".repeat(100)));
             }
         }
         transit.schema.iter_mut().find(|d| d.name == "name").unwrap().width = Some(120);
@@ -1517,7 +1558,7 @@ mod tests {
             "the widened declaration, not the original 80"
         );
         assert_eq!(
-            far_end.features[0].properties.iter().find(|(k, _)| &**k == "name").unwrap().1,
+            far_end.to_features()[0].properties.iter().find(|(k, _)| &**k == "name").unwrap().1,
             crate::json::JsonValue::String("x".repeat(100)),
             "and the lengthened value survives it"
         );
@@ -1579,12 +1620,12 @@ mod tests {
         // SAMPLE mixes Point/LineString/Polygon, which a single .shp can't
         // represent (one shape family per file) — isolate the Point features,
         // matching the real-world constraint this spoke's writer enforces.
-        let points_only = FeatureCollection::new(
-            geojson_fc.features.iter().filter(|f| matches!(f.geometry, Some(crate::geometry::Geometry::Point(_)))).cloned().collect(),
+        let points_only = FeatureCollection::from_features(
+            geojson_fc.to_features().iter().filter(|f| matches!(f.geometry, Some(crate::geometry::Geometry::Point(_)))).cloned().collect(),
         );
         let encoded = crate::shapefile::write(&points_only).unwrap();
         let back = crate::shapefile::read(&encoded.shp, &encoded.dbf, None, None, &mut Vec::new()).unwrap();
-        assert_eq!(back.features.len(), points_only.features.len());
+        assert_eq!(back.len(), points_only.len());
         assert_eq!(sorted_geoms(&back), sorted_geoms(&points_only));
     }
 
@@ -1597,8 +1638,8 @@ mod tests {
             &json::parse(std::str::from_utf8(&convert(Format::Wkt, Format::GeoJson, &wkt).unwrap()).unwrap()).unwrap(),
         )
         .unwrap();
-        let geoms: Vec<_> = orig.features.iter().map(|f| f.geometry.clone()).collect();
-        let back_geoms: Vec<_> = back.features.iter().map(|f| f.geometry.clone()).collect();
+        let geoms: Vec<_> = orig.to_features().iter().map(|f| f.geometry.clone()).collect();
+        let back_geoms: Vec<_> = back.to_features().iter().map(|f| f.geometry.clone()).collect();
         assert_eq!(geoms, back_geoms);
     }
 
@@ -1617,12 +1658,13 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/duckdb_geoms.kml");
         let fc = convert(Format::Kml, Format::GeoJson, bytes).unwrap();
         let fc = geojson::from_json(&json::parse(std::str::from_utf8(&fc).unwrap()).unwrap()).unwrap();
-        assert_eq!(fc.features.len(), 3);
+        assert_eq!(fc.len(), 3);
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
-        let by_name = |name: &str| fc.features.iter().find(|f| prop(f, "name").as_str() == Some(name)).unwrap();
+        let rows = fc.to_features();
+        let by_name = |name: &str| rows.iter().find(|f| prop(f, "name").as_str() == Some(name)).unwrap();
 
         let alpha = by_name("alpha");
         assert_eq!(prop(alpha, "n"), json::JsonValue::Int(1));
@@ -1667,7 +1709,7 @@ mod tests {
         )
         .unwrap();
         let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
-        assert_eq!(back.features.len(), orig.features.len());
+        assert_eq!(back.len(), orig.len());
         assert_eq!(sorted_geoms(&orig), sorted_geoms(&back));
     }
 
@@ -1690,7 +1732,7 @@ mod tests {
         )
         .unwrap();
         let orig = geojson::from_json(&json::parse(SAMPLE).unwrap()).unwrap();
-        assert_eq!(back.features.len(), orig.features.len());
+        assert_eq!(back.len(), orig.len());
         assert_eq!(sorted_geoms(&orig), sorted_geoms(&back));
     }
 
@@ -1713,12 +1755,13 @@ mod tests {
         let bytes = include_bytes!("../tests/fixtures/gdal_networklink.kmz");
         let fc = read_features(Format::Kmz, bytes, &mut Vec::new()).unwrap();
         assert_eq!(fc.crs, Some(crate::crs::Crs::Wgs84));
-        assert_eq!(fc.features.len(), 3);
+        assert_eq!(fc.len(), 3);
 
         let prop = |f: &Feature, k: &str| {
             f.properties.iter().find(|(n, _)| &**n == k).map(|(_, v)| v.clone()).unwrap()
         };
-        let by_name = |name: &str| fc.features.iter().find(|f| prop(f, "name").as_str() == Some(name)).unwrap();
+        let rows = fc.to_features();
+        let by_name = |name: &str| rows.iter().find(|f| prop(f, "name").as_str() == Some(name)).unwrap();
 
         assert_eq!(
             by_name("square-with-hole").geometry,
@@ -1763,7 +1806,7 @@ mod tests {
     /// Build a one-row collection whose single property is `value`, declared
     /// as `ty`. The declaration is what a real reader would have recovered.
     fn declared(name: &str, ty: crate::schema::DeclType, value: json::JsonValue) -> FeatureCollection {
-        let mut fc = FeatureCollection::new(vec![Feature {
+        let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![(Rc::from(name), value)],
             native: None,
@@ -1808,7 +1851,7 @@ mod tests {
             assert_eq!(decl_of(&back, "v"), Some(ty), "{ty:?} did not survive");
             // The value has to survive the narrower on-disk encoding too — a
             // column written as `SHORT` stores two bytes, not eight.
-            assert_eq!(back.features[0].properties[0].1, value, "{ty:?} value changed");
+            assert_eq!(back.to_features()[0].properties[0].1, value, "{ty:?} value changed");
         }
     }
 
@@ -1822,9 +1865,10 @@ mod tests {
         let fc = declared("cnt", crate::schema::DeclType::Int16, json::JsonValue::Null);
         let back = flatgeobuf::read(&flatgeobuf::write(&fc)).unwrap();
 
-        let keys: Vec<&str> = back.features[0].properties.iter().map(|(k, _)| &**k).collect();
+        let rows = back.to_features();
+        let keys: Vec<&str> = rows[0].properties.iter().map(|(k, _)| &**k).collect();
         assert_eq!(keys, vec!["cnt"], "the all-null column vanished");
-        assert_eq!(back.features[0].properties[0].1, json::JsonValue::Null);
+        assert_eq!(back.to_features()[0].properties[0].1, json::JsonValue::Null);
         assert_eq!(decl_of(&back, "cnt"), Some(crate::schema::DeclType::Int16));
     }
 
@@ -1839,7 +1883,7 @@ mod tests {
         let fc = declared("v", crate::schema::DeclType::Int16, big.clone());
         let back = flatgeobuf::read(&flatgeobuf::write(&fc)).unwrap();
         // Written as a wider type, so the value survives intact...
-        assert_eq!(back.features[0].properties[0].1, big);
+        assert_eq!(back.to_features()[0].properties[0].1, big);
         // ...and the header now says what was actually written, not the stale
         // declaration.
         assert_ne!(decl_of(&back, "v"), Some(crate::schema::DeclType::Int16));
@@ -1847,7 +1891,7 @@ mod tests {
         // A type change the data contradicts outright is declined the same way.
         let text = declared("v", crate::schema::DeclType::Int16, json::JsonValue::String("no".into()));
         let back = flatgeobuf::read(&flatgeobuf::write(&text)).unwrap();
-        assert_eq!(back.features[0].properties[0].1, json::JsonValue::String("no".into()));
+        assert_eq!(back.to_features()[0].properties[0].1, json::JsonValue::String("no".into()));
         assert_eq!(decl_of(&back, "v"), Some(crate::schema::DeclType::String));
     }
 
@@ -1860,7 +1904,7 @@ mod tests {
         let fc = declared("flag", crate::schema::DeclType::Bool, json::JsonValue::Bool(true));
         let bytes = crate::geopackage::write_layers(None, &[("t".into(), fc)], &crate::geopackage::Carried::default(), false, false).unwrap();
         let back = crate::geopackage::read_layers(&bytes).unwrap().remove(0).1;
-        assert_eq!(back.features[0].properties[0].1, json::JsonValue::Bool(true));
+        assert_eq!(back.to_features()[0].properties[0].1, json::JsonValue::Bool(true));
         assert_eq!(decl_of(&back, "flag"), Some(crate::schema::DeclType::Bool));
     }
 
@@ -1885,7 +1929,7 @@ mod tests {
                 crate::geopackage::write_layers(None, &[("t".into(), fc)], &crate::geopackage::Carried::default(), false, false).unwrap();
             let back = crate::geopackage::read_layers(&bytes).unwrap().remove(0).1;
             assert_eq!(decl_of(&back, "v"), Some(ty), "{ty:?} did not survive");
-            assert_eq!(back.features[0].properties[0].1, value, "{ty:?} value changed");
+            assert_eq!(back.to_features()[0].properties[0].1, value, "{ty:?} value changed");
         }
     }
 
@@ -1984,7 +2028,7 @@ mod tests {
             let fc = declared("v", ty, value.clone());
             let back = parquet_to_features(&features_to_parquet(&fc)).unwrap();
             assert_eq!(decl_of(&back, "v"), Some(ty), "{ty:?} did not survive");
-            assert_eq!(back.features[0].properties[0].1, value, "{ty:?} value changed");
+            assert_eq!(back.to_features()[0].properties[0].1, value, "{ty:?} value changed");
         }
     }
 
@@ -2002,7 +2046,7 @@ mod tests {
             );
             let back = parquet_to_features(&features_to_parquet(&fc)).unwrap();
             // Kept as exact text rather than turned into a wrong instant.
-            assert_eq!(back.features[0].properties[0].1, json::JsonValue::String(text.into()));
+            assert_eq!(back.to_features()[0].properties[0].1, json::JsonValue::String(text.into()));
             assert_eq!(decl_of(&back, "v"), Some(crate::schema::DeclType::String));
         }
     }
@@ -2056,9 +2100,7 @@ mod tests {
 
         // What a middle stage does: add a column the source never had.
         let mut edited = source.clone();
-        for f in &mut edited.features {
-            f.properties.push((Rc::from("added"), json::JsonValue::Bool(true)));
-        }
+        edited.set_column("added", (0..edited.len()).map(|_| Some(json::JsonValue::Bool(true))));
 
         let back = parquet_to_features(&features_to_parquet(&edited)).unwrap();
         let keys: Vec<&str> =
@@ -2126,7 +2168,7 @@ mod tests {
 
     /// A one-column collection declaring `ty`, with a value that fits it.
     fn one_declared_column(ty: crate::schema::DeclType) -> FeatureCollection {
-        let mut fc = FeatureCollection::new(vec![crate::feature::Feature {
+        let mut fc = FeatureCollection::from_features(vec![crate::feature::Feature {
             geometry: Some(crate::geometry::Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![("v".into(), representative_value(ty))],
             native: None,
@@ -2148,7 +2190,7 @@ mod tests {
     /// never looks at a value can be green while the values are destroyed.**
     fn value_after(format: Format, fc: &FeatureCollection) -> json::JsonValue {
         let back = round_trip(format, fc);
-        back.features[0]
+        back.to_features()[0]
             .properties
             .iter()
             .find(|(k, _)| &**k == "v")
@@ -2287,7 +2329,7 @@ mod tests {
                     continue;
                 }
                 let fc = one_declared_column(ty);
-                let before = fc.features[0].properties[0].1.clone();
+                let before = fc.to_features()[0].properties[0].1.clone();
                 let after = value_after(format, &fc);
 
                 // A `Json` column is compared *as JSON*, not as text: the
@@ -2391,7 +2433,7 @@ mod tests {
 
         let column = |name: &str| -> Vec<json::JsonValue> {
             round_tripped
-                .features
+                .to_features()
                 .iter()
                 .map(|f| f.properties.iter().find(|(k, _)| &**k == name).unwrap().1.clone())
                 .collect()
@@ -2486,7 +2528,7 @@ mod tests {
 
         // A layer with no native — every cross-format source — still gets the
         // sentinel, never a clock reading.
-        let bare = crate::FeatureCollection::new(Vec::new());
+        let bare = crate::FeatureCollection::from_features(Vec::new());
         let bytes = crate::geopackage::write_layers(
             None,
             &[("fresh".to_string(), bare)], &crate::geopackage::Carried::default(),
@@ -2514,7 +2556,7 @@ mod tests {
     /// `a_geopackage_last_change_survives_its_own_format`; this is its mirror./
     #[test]
     fn our_own_last_change_sentinel_is_not_carried_back() {
-        let layer = crate::FeatureCollection::new(Vec::new());
+        let layer = crate::FeatureCollection::from_features(Vec::new());
         let bytes =
             crate::geopackage::write_layers(None, &[("fresh".to_string(), layer)], &crate::geopackage::Carried::default(), false, false)
                 .unwrap();
@@ -2580,9 +2622,7 @@ mod tests {
     #[test]
     fn a_data_column_row_is_dropped_when_its_column_goes() {
         let mut fc = hostile_layer("cities");
-        for feature in &mut fc.features {
-            feature.properties.retain(|(key, _)| &**key != "price");
-        }
+        fc.drop_column("price");
         fc.schema.retain(|decl| decl.name != "price");
         let layers = vec![("cities".to_string(), fc)];
         let bytes = crate::geopackage::write_layers(None, &layers, &crate::geopackage::Carried::default(), false, false).unwrap();

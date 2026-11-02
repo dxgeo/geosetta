@@ -3,8 +3,16 @@
 
 * A Columnar IR
 
-** STATUS -- C0 done, the IR itself not started
-The IR is not built; the harness is (C0). Written 2026-10-28, after
+** STATUS -- C0 through C5 done; C6 next
+C0's harness is built, and C1 (2026-11-02): the =table= module behind the
+collection's private storage, its views, selections and edits, =--layout=,
+and both property tests (§ MILESTONES, C1). C2 the same day: the tabular
+spokes read into column blocks and write from either form (§ MILESTONES,
+C2), and C3: GeoJSON reads into blocks, sealed by D-C13's rule, and
+writes from views (§ MILESTONES, C3); C4: KML the same, after
+=performance.org='s KML step 2 (§ MILESTONES, C4); C5: the hub is only
+blocks, and D-C8's API is public (§ MILESTONES, C5). Next, C6: geometry
+buffers. Written 2026-10-28, after
 =performance.org='s /Memory/ section measured where the hub's bytes go and
 Mem1--Mem5 took the contained wins. What remains is the shape of the IR
 itself, and that is this plan.
@@ -26,6 +34,15 @@ Smoke-tested 2026-10-29 with a scratch prototype outside the crate (§ SMOKE
 TEST): the memory estimates hold, a block's column order changed from
 first-seen to modal (D-C4), and pure columns turned out worse than today on
 ragged GeoJSON, which only the hybrid avoids.
+
+Revised 2026-11-02: C1's on-demand conversion decided (D-C15). The storage
+goes private behind accessors, and the pipeline converts once, by =&mut=,
+to the form the target's writer reads.
+
+Revised 2026-11-02, after C5: D-C6 decides C6's layout -- GeoArrow-shaped,
+not conformant, for per-position Z and M, mixed types and collections -- and
+that a block holds geometry columns, so multiple geometry columns
+(=multi-geometry-columns.org=) build on it.
 
 ** WHY
 The hub stores a collection as rows: =FeatureCollection { features:
@@ -82,7 +99,7 @@ loses one has changed behaviour, so each needs a home in the design:
 #+begin_src rust
 pub struct FeatureCollection {
     len: usize,
-    geometry: GeometryColumn,       // one Option<Geometry> per row (D-C6)
+    geometry: GeometryColumn,       // flat buffers (D-C6)
     columns: Vec<Column>,           // in a block, its modal key order (D-C4)
     shapes: RowShapes,              // D-C4: rows that deviate from column order
     natives: RowNatives,            // D-C7: sparse, row -> Box<Native>
@@ -113,6 +130,11 @@ enum ColumnData {
 =valid= is null-ness; =present= is absence, and is =None= -- costing
 nothing -- for a column every row holds, which is every column a tabular
 source produces. Guarantee 1 is the two bitmaps being different.
+
+Built with one buffer more than the sketch: =Null=, for a column whose every
+cell so far is null or absent. It holds nothing, and takes the first real
+value's buffer when one arrives (D-C3) -- the promotion is free, since every
+slot it holds is a placeholder.
 
 *** D-C3 -- a column's type is the narrowest that holds every value exactly
 Built as the reader appends, by the same lattice =schema::Infer= uses today,
@@ -158,12 +180,51 @@ columns directly; =columns_for='s declaration matching moves onto the
 table. The reconciliation =FieldDecl::type_for= does stays, against the
 column's real type rather than an inferred one.
 
-*** D-C6 -- geometry stays a column of =Option<Geometry>= until C6
+*** D-C6 -- geometry is flat buffers, GeoArrow-shaped but not conformant
 Geometry is the other half of the memory story (=Position= is 48 bytes for
-16 of XY), but it is independent of properties and every format already
-reads and writes it per feature. C6 replaces it with flat coordinate buffers
-(GeoArrow's layout: coordinates, ring and part offsets, dimension per
-column), which absorbs =performance.org='s "compact =Position=" item.
+16 of XY, and an =Option<Geometry>= point 56), but it is independent of
+properties and every format already reads and writes it per feature. C6
+replaces each block's =Vec<Option<Geometry>>= with flat coordinate buffers,
+which absorbs =performance.org='s "compact =Position=" item.
+
+*The layout borrows GeoArrow's idea, not its spec.* Coordinates in one
+buffer, structure in offset arrays, as GeoArrow has them; but the buffers are
+private (D-C9), nothing hands them to Arrow, and geosetta takes no
+dependency on =geoarrow-rs= or =arrow-rs= (the crate writes its own
+Parquet). Where GeoArrow's layout would lose what =Geometry= holds today,
+the layout departs from it:
+- *Z and M per position.* GeoArrow fixes a column's dimension (XY, XYZ, XYM,
+  XYZM). =Position= lets one point lack a Z or M that its neighbours have,
+  which Shapefile's M no-data sentinel relies on. Z and M are each their own
+  buffer, absent when no row has them, and carry a presence bitmap only when
+  some position lacks one.
+- *Mixed types in one block.* GeoArrow gives each type its own array and
+  mixes them through a union of children. GeoJSON and KML columns are often
+  mixed, so a block holds one type tag per row and one set of offsets
+  (geometry → part → ring → coordinate) that every type uses, in row order,
+  without the union's indirection. A block of only points needs no offsets.
+- *Collections.* GeoArrow nests them as a union. They are rare here, so a
+  =GeometryCollection= is kept whole, in a sparse side table as natives are
+  (D-C7).
+
+A block of one type in XY is laid out as GeoArrow's own array of that type,
+so a writer of GeoArrow output (Arrow, or GeoParquet's native encoding
+rather than WKB) would be cheap for the common case. Neither is in scope:
+both change output bytes, and are features of their own.
+
+*A block holds geometry columns, not a geometry column.* The type is
+self-contained -- no block or view assumes there is exactly one -- so
+=multi-geometry-columns.org='s extra columns are more of the same (§ DEPENDS
+ON / RELATED).
+
+*The API.* =Feature=, =from_features=, =push= and =set_geometry= keep the
+owned =Geometry=. =FeatureRef::geometry()= returns a =GeometryRef<'_>= view
+with =to_geometry()=, since nothing in the buffers is a =&Geometry=; this
+breaks callers that match on the reference. =for_each_position_mut= keeps its
+=&mut Position=, built and written back per coordinate.
+=for_each_position_run_mut= cannot hand out a =[Position]= that does not
+exist: it takes the XY run as =&mut [[f64; 2]]= and Z beside it, and its
+one caller (=tests/reproject_pipe.rs=) moves with it.
 
 *** D-C7 -- per-row natives are a sparse side table
 =Vec<(row, Box<Native>)>= sorted by row, or a map. Today's =Option<Box<Native>>=
@@ -187,11 +248,13 @@ explicit:
 - =Value<'_>= is a borrowed cell (=Null=, =Bool=, =Int=, =Float=, =Str(&str)=,
   =Binary(&[u8])=, =Json(&JsonValue)=) with =to_owned() -> JsonValue=.
 
-*This is a breaking release.* =fc.features= and =Feature::properties= as a
-field of the collection disappear. Nothing in the workspace links geosetta
-(geoscribe and nazca compose over pipes, by =../architecture.org=), so the
-break reaches only the published crate's users. It takes the next version
-that may break the API -- under 1.0, the next minor -- whenever C5 lands.
+*This is a breaking release.* =fc.features= goes private in C1, behind the
+stopgap accessors of D-C15; C5 replaces those with the views above, and
+=Feature::properties= as a field of the collection goes. The intermediate
+API is internal to the work and never released on its own. Nothing in the
+workspace links geosetta (geoscribe and nazca compose over pipes, by
+=../architecture.org=), and the published crate has no users who need a
+break avoided; under 1.0 it takes the next minor.
 
 *** D-C9 -- the API never exposes a whole buffer
 Every accessor works by row index and column, never by "the whole buffer",
@@ -253,8 +316,10 @@ What it costs:
 =retain= and =permute= (=--sort-hilbert=) record a =Vec<u32>= of the rows
 to keep, in order, rather than moving every column, =RowShapes= and
 =RowNatives= at once. A writer gathers through it; anything that must see
-the result materialized (a second permute, a column read with a fast path)
-gathers once and drops it. This is duckdb's =SelectionVector= and polars'
+the result materialized (a column read with a fast path) gathers once and
+drops it. A second =retain= or =permute= composes with the first instead --
+mapping through the existing selection costs what building one does -- so
+it gathers nothing (built that way in C1). This is duckdb's =SelectionVector= and polars'
 =take=. A sort mixes rows from every block, so the gather builds new blocks,
 whose shapes can be wider than the originals: a sorted ragged file keeps
 less of its saving than an unsorted one (§ RISKS).
@@ -289,6 +354,24 @@ a key the row has keeps its position; a new key goes last in that row's own
 order, with a =RowShapes= entry when that is not its block's column order;
 =remove= from a column with no =present= bitmap creates one; and =1= written
 into a column of floats stays an integer. C1's dual storage is what tests it.
+
+/As built in C1:/
+- *The patch holds whole rows,* not =(row, key)= cells: an edited row's full
+  property list, sorted by row. An edit is then the row IR's own edit to a
+  =Vec=, so position, last-in-order and repeats hold by it, at one row copy
+  per edited row. A row block still takes a =set= of a key the row has in
+  place.
+- *=remove= takes every occurrence* of the key, repeats included; =set=
+  changes the first.
+- *Column-sized edits run on the cell path.* =set_column=, =map_column= and
+  =drop_column= are correct and tested, at about 50 ms per 20 000 rows in a
+  debug build; replacing each block's buffer directly is the fast path C2's
+  profile can ask for.
+- *=fold=* re-seals the blocks an edit touched, and every block from the
+  first =push= reached; =gather= applies the selection and folds everything.
+  Neither runs at a size threshold yet.
+- *=map_blocks= is not built:* it has no caller until a streamed pipeline
+  or C5's public API.
 
 *** D-C13 -- a block is columns or shaped rows, chosen as it seals
 #+begin_src rust
@@ -357,8 +440,10 @@ is documented as one, so that no one reaches for =rows= to "preserve more".
 - *Library first.* =read_features= takes no options today; the layout is a
   =ReadOptions= beside =WriteOptions=, landing in C1, where the equivalence
   runs need it.
-- *Then the CLI.* =--layout= lands with C2, the first milestone in which a
-  real conversion's layout changes.
+- *Then the CLI.* =--layout= landed in C1 rather than C2, the first
+  milestone in which a real conversion's layout changes, because the
+  equivalence corpus drives the binary and C1's acceptance runs it under
+  each layout (=LAYOUTS= in =bench/equiv.py=).
 - *Forcing can be far worse than =auto=,* and the flag's documentation names
   both cases: =columns= on many-keyed sparse input brings back the dense
   slot per key per row that D-C10 exists to avoid, and =rows= on a wide
@@ -371,6 +456,48 @@ This follows duckdb and polars, which expose tuning settings
 (=map_inference_threshold=, =sample_size=, =infer_schema_length=, the
 streaming engine) rather than a layout switch; geosetta's finer knobs, the
 D-C13 thresholds and the block size, stay internal until someone needs them.
+
+*** D-C15 -- the storage is private, and the pipeline converts it once, by =&mut=
+Until C5 a collection is rows or a table at the collection level (C1's
+=Storage=), and a spoke not yet moved reads rows. Where that conversion runs
+decides whether the migration costs anything on paths that do not need it.
+#+begin_src rust
+pub struct FeatureCollection {
+    storage: Storage,            // enum Storage { Rows(Vec<Feature>), Table(Table) }
+    pub crs: Option<Crs>,
+    // ...
+}
+impl FeatureCollection {
+    pub fn features(&self) -> Cow<'_, [Feature]>;      // borrows rows; converts a table, uncached
+    pub fn features_mut(&mut self) -> &mut Vec<Feature>; // a table becomes rows, in place
+    pub(crate) fn into_form(&mut self, form: Form);      // the explicit conversion
+}
+#+end_src
+- *The field goes private in C1.* =Storage= cannot sit behind a public
+  =features= field, and keeping that field beside a private table would leave
+  a caller of a table-backed collection reading an empty =Vec=. Nothing
+  links the crate, so the break costs nothing (D-C8).
+- *The pipeline converts once.* =pipeline::prepare= already holds =&mut
+  layers= and knows the target; as soon as =read= returns, it calls
+  =fc.into_form(to.preferred_form())=, before the sort, the CRS override, the
+  warnings and the release of natives, so each of those sees one form. Writers
+  keep taking =&FeatureCollection= and find their form already there. On
+  =--layout auto= in C1 every reader makes rows and every writer reads rows,
+  so the call does nothing, and the "no =compare.py= case slower" bar holds by
+  construction.
+- *=--layout columns= pays its conversion openly.* In C1 the library's
+  =ReadOptions= layout (D-C14) transposes rows to a table right after the read
+  and =into_form= transposes back before the write: the equivalence corpus
+  runs through the table on real data, and only when asked to.
+- *A =&self= caller converts for that call alone.* =features()= on a table
+  builds rows into a =Cow::Owned= and keeps nothing. Hot loops hold one
+  =let rows = fc.features();= rather than calling it again; on a row
+  collection that borrow is free.
+- *Stopgaps.* =features()= and =features_mut()= are documented as temporary;
+  C5 removes them with =Storage::Rows=, in favour of D-C8's views.
+
+Rejected: converting from =&self= into a cached second form
+(=OnceCell=/=OnceLock=, § ALTERNATIVES CONSIDERED).
 
 ** HOW EACH FORMAT FITS
 | format      | fit                | notes                                                                                                                                           |
@@ -560,8 +687,9 @@ crate's, so none of it saw that cost.
   bound.
 
 ** MILESTONES
-Each one lands with the equivalence corpus byte-identical and =compare.py=
-no slower on any case.
+Each one ends with the equivalence corpus byte-identical and =compare.py=
+no slower on any case. That is a checkpoint, not a release: the work is
+merged as a whole, and between checkpoints the code need not build.
 
 *** DONE C0 -- the harness, in the repo
 /Done 2026-10-29./ Both halves are in =bench/= (=bench/README.md=):
@@ -601,7 +729,7 @@ is the one a sort mixes. The corpus holds GeoJSON-shaped sources; a Parquet
 or GeoPackage file whose blocks disagree in type, which § RISKS asks for, is
 only as varied as the stretch fixture converted.
 
-*** C1 -- the table type, behind the old API
+*** DONE C1 -- the table type, behind the old API
 =Table= (a =Vec<Block>=, D-C10), both block forms (D-C13), =Column=,
 =RowShapes=, =RowNatives=, selection vectors (D-C11), the views, and the
 library's =ReadOptions= layout (D-C14), with
@@ -609,23 +737,192 @@ library's =ReadOptions= layout (D-C14), with
 that =to_features(from_features(x)) == x= for arbitrary collections,
 including every guarantee above, and a second that random edit sequences
 (D-C12) applied to both forms give equal =to_features=. =FeatureCollection= holds
-=enum Storage { Rows(Vec<Feature>), Table(Table) }=, converting on demand,
-so every spoke keeps working untouched. A migration device; C5 removes it.
-Converting on demand from =&self= either needs interior mutability or holds
-both forms at once; whichever it is, the acceptance bar ("no =compare.py=
-case slower") applies to C1 as to the rest, so the conversion must not run
-on a path that does not need it.
+=enum Storage { Rows(Vec<Feature>), Table(Table) }=, private behind
+=features()=, =features_mut()= and =into_form= (D-C15), and the pipeline
+converts once in =prepare= to the form the target reads, so every spoke
+keeps working with only its =.features= accesses rewritten. A migration
+device; C5 removes it.
 
-*** C2 -- tabular spokes go columnar
+/Built 2026-11-02:/
+- =src/table/=: =Bitmap=, =Column= (D-C2, D-C3, with D-C2's =Null=), both
+  block forms behind =Block= with =RowShapes= as a sorted vector of
+  irregular rows and =RowNatives= the same, a =RowBuilder= that interns
+  shapes and stops after 1 024 rows if more than half are new, and the
+  seal-time choice by § SMOKE TEST's starting rule. =Table::from_features=
+  and =into_features=; the block is 8 192 rows for now.
+- =FeatureCollection='s storage private (D-C15): =features()=,
+  =features_mut()=, =into_features()=, =len()=, =into_form=; every
+  =.features= in the crate and its tests rewritten; =columns_for= takes rows
+  and a schema rather than the collection.
+- =ReadOptions { layout }=, =read_features_with= and =ConvertOptions::read=;
+  =Format::preferred_form= is rows for every writer; =prepare= converts once
+  after the read. No =--layout= flag yet (C2).
+- Tests: the guarantees through every layout, block boundaries, the seal
+  choice, column promotion, and =tests/columnar_layouts.rs=: every fixture
+  to every format, sorted and not, writes byte-identical output and the same
+  warnings under =rows= and =columns= as under =auto=. Breaking the table's
+  number read-back fails it.
+- Checkpoint, 2026-11-02, under =auto=: =bench/equiv.py= against =a317c76=,
+  111 inputs, 2 997 conversions, all identical. =compare.py= with both
+  binaries built standalone under the crate's release profile: every case
+  within ±6% best-of-3, peak memory unchanged but for +1.4 MB on the two
+  GeoPackage sources; the three worst cases re-timed interleaved, 15 runs
+  each, came out level (medians =shp(3857)→parquet= 48.7 / 49.1 ms, wide
+  =parquet→geojson= 618.9 / 619.7, =csv→geojson= 106.4 / 105.6).
+
+- Selection vectors and views, 2026-11-02, crate-internal on =Table= until
+  C5 makes them the public API: =retain=, =permute= (composing), =gather=
+  (re-sealing under the table's layout); =row(i) -> RowRef= (=geometry=,
+  =native=, =properties= in the row's own order, =get= as the first value,
+  =to_feature=), =rows()=, =column(key) -> ColumnRef= across blocks of
+  either form; =Value<'_>=, which =Column::get= now goes through.
+- Property tests over 300 seeded arbitrary collections (=table/arbitrary.rs=:
+  regular, ragged, sparse, two stretches, own-order; every value kind,
+  repeats, natives, missing geometry), each under every layout: the first
+  of C1's two property tests (=into_features(from_features(x)) == x=); every
+  view against the rows; and random =retain= / =permute= sequences against
+  the same edits to a =Vec<Feature>=, before and after a gather. Each test
+  fails when the presence check, the selection's composition or the block
+  lookup is broken.
+- Block size and interning sample are a parameter, =Sizes= (default 8 192
+  and 1 024), carried by the table so a gather re-seals under the same. The
+  property tests run 300 seeds at 64 / 32, so a few hundred rows cross
+  several boundaries, and four at the real size, each two full blocks and
+  part of a third: the code under test is the code that ships. The first
+  real-size run found a quadratic: a =Mixed= column promoted to =Mixed= again
+  on every typed push, copying itself each time, so transposing ~20 000 rows
+  took ~10 s in a debug build. Fixed, and held by a test counting promotions
+  (two, where the old code made 750).
+
+- =--layout auto|rows|columns= on the binary, brought forward from C2 so
+  the corpus can run under each layout: =Layout::parse= / =as_str=,
+  =Args::read_options=, the usage text and README, the parity sweep in
+  =tests/library_pipeline.rs= (=columns= in the every-flag set, =rows= with
+  =--kml-version=), and =LAYOUTS= in =bench/equiv.py=, which compares the
+  candidate under each layout with the pin's plain run.
+
+- The edit overlay (D-C12, as built there): =set=, =remove=,
+  =set_geometry=, =push= into a tail row block, =set_column=, =map_column=,
+  =drop_column=, =fold=, and =gather= folding. C1's second property test:
+  random sequences of twelve edits, =retain=, =permute=, =fold= and =gather=
+  among them, against the same edits to a =Vec<Feature>=, every view
+  checked, under every layout and both block sizes; and a fold that misses
+  an appended block fails it, through the forms a forced layout gives.
+- =bench/memprobe= follows the accessors and takes =--layout=, reporting the
+  IR as the table the read held, then the conversion to rows.
+- The 1.4--1.5 MB RSS rise =compare.py= saw on GeoPackage sources is not the
+  crate's heap: a counting-allocator probe through =pipeline::prepare= and
+  =encode=, built against =a317c76= and the working tree, makes the same
+  allocations to a peak within 352 bytes (one larger =FeatureCollection=). It
+  is the system allocator's layout.
+- Checkpoint, 2026-11-02, the finished milestone: =LAYOUTS=auto,rows,columns
+  bench/equiv.py= against =a317c76=, 8 991 conversions, all identical. Since
+  the =compare.py= checkpoint above nothing on the =auto= path has changed
+  but =--layout='s parsing: the views, selections and edits are reached
+  only through a table.
+
+/Deferred from C1:/ =map_blocks= and the direct-buffer column edits (D-C12,
+as built), and folding at a size threshold.
+
+*** DONE C2 -- tabular spokes go columnar
 Parquet, FlatGeobuf, Shapefile, CSV and GeoPackage read into =Table= and
 write from it. A tabular-to-tabular conversion (=parquet → fgb=, the wide
 cases) never builds a row. Expected: the wide =geojson→parquet= peak moves
 only partly (its GeoJSON read is still rows until C3); =parquet→fgb= wide
-should fall to roughly input + table + output. The =--layout= flag lands
-here (D-C14).
+should fall to roughly input + table + output. =--layout= is already in
+place (C1, D-C14); here it first changes what a real conversion holds.
 
-*** C3 -- GeoJSON reads into blocks
-Two steps, each shippable. First, the streaming reader fills row blocks
+/Step 1, writers take either form -- built 2026-11-02./
+- =schema::Column= reads a table's column as well as rows (D-C5's seam):
+  =columns_for(fc)= and =inferred_columns(fc)= dispatch on the storage. A
+  table's columns come from =Table::key_kinds=: every key in first-seen
+  order with the set of value kinds it holds -- the row inference's lattice
+  is a function of that set -- read block by block, a typed column without
+  visiting a cell (=Kinds=, =Column::kinds=, each block's recorded first-seen
+  order), and row by row in logical order once a selection or patch is
+  present. =materialize= takes a =Value=.
+- =Table::columns(keys)= locates every key in each block in one pass: its
+  column, or in a row block its position in each shape that has it. The
+  first version looked a key up row by row, quadratic in a row's width:
+  forced =rows= on the wide table took 5.9 s against 0.6.
+- =FeatureRef= / =feature_refs()=: a feature's geometry and native read in
+  place from either form. Parquet, FlatGeobuf, Shapefile, CSV, GeoPackage
+  (and its R*Tree) and WKT write through it and =columns_for=, and
+  =Format::preferred_form= is =None= for them: =prepare= converts nothing
+  for them. GeoJSON and KML still ask for rows.
+- =reorder_hilbert= permutes a table as a selection (D-C11) and
+  =release_foreign_natives= drops natives inside the blocks, so neither
+  turns a table back into rows.
+- Tests: a property test that a table's inferred columns -- names, order,
+  types, every cell -- equal the rows', over 300 arbitrary collections under
+  every layout, plain, permuted and edited; it fails when repeats' types are
+  ignored, when a column block declares in column order, or when the lattice
+  maps ints and floats to =Int64=. =LAYOUTS=auto,rows,columns= =equiv.py=:
+  8 991 conversions identical.
+- Measured, release, wide table (50 000 × 200): with the read-side
+  conversion netted out by a WKT target, writing from column blocks is about
+  30 ms faster than from rows, from row blocks about 190 ms slower (a shape
+  lookup per cell). Under =auto= the tabular readers will hand writers
+  column blocks; the row-block cost is forced =rows='s now and GeoJSON's in
+  C3.
+
+/Step 2, tabular readers build column blocks -- built 2026-11-02./
+- All five readers are rectangular: every row holds every declared key, in
+  declared order. So one builder serves them: =TableBuilder= (a row at a
+  time -- FlatGeobuf into a reused cell buffer, CSV, GeoPackage with its
+  per-row fid native, Shapefile) and =Table::from_columns= (a column at a
+  time -- Parquet, one decoded column held at once). A block's cells go
+  straight into its columns: no shape to intern, nothing to transpose. With
+  its keys distinct the block is exactly what the row builder would seal --
+  one shape, so declared order is both its column order and first-seen,
+  and D-C13 always picks columns. A key declared twice, or =--layout rows=,
+  goes the row builder's way.
+- Two departures from the plan above. Blocks are =Sizes::DEFAULT= rows, not
+  Parquet's row groups: a row group's size is the writer's choice, from one
+  row to 122 880, and fixed blocks keep the size a parameter. A column's
+  buffer is chosen by its values, not the file's declared type: a column of
+  one kind promotes once, from =Null=, and a mixed one (SQLite's dynamic
+  typing) goes =Mixed= exactly as transposed rows would.
+- =Form::to_read=: under =auto=, for a target that reads rows (GeoJSON,
+  KML), a tabular reader builds rows outright through the same seam
+  (=Tabular=) instead of a table =prepare= would convert straight back.
+  Building the table there cost Parquet → GeoJSON wide 147 allocations a
+  feature against a budget of 86 (=tests/budgets.rs=). Readers take a
+  =Form=; =hold= converts only what a row reader built.
+- A Parquet column with fewer values than the file has rows is now an
+  error, as a short geometry column already was; the old zip left the
+  trailing rows without the key.
+- memprobe found =kml::reconcile::drop_warnings= -- run for every target --
+  copying a table into rows to look at KML natives: +640 MB and +200 ms on
+  the wide read. It reads views now. memprobe itself now measures through
+  =pipeline::prepare= and =encode=, the binary's path.
+- Tests: the builder, a row or a column at a time, equals
+  =Table::from_features= on the same rows (=PartialEq= on the table) over
+  300 arbitrary rectangular collections and two at the real size, every
+  layout, repeated keys included; it fails when repeats seal as columns or
+  first-seen is reversed. =LAYOUTS=auto,rows,columns= =equiv.py=: 8 991
+  identical. 853 tests.
+- Measured, memprobe against the pin (row IR):
+
+  | conversion               | read peak  | IR resident | write peak |
+  |--------------------------+------------+-------------+------------|
+  | wide parquet → fgb       | 548 → 131  | 510 → 93    | 713 → 296  |
+  | wide parquet → csv       | 548 → 131  | 510 → 93    | 628 → 212  |
+  | wide parquet → parquet   | 548 → 131  | 510 → 93    | 670 → 254  |
+  | fgb → parquet            | 50 → 28    | 34 → 11     | 56 → 34    |
+  | csv → fgb                | 72 → 50    | 35 → 13     | 83 → 61    |
+
+  (MB; wide is 50 000 × 200.) =parquet → fgb= wide now peaks at table plus
+  output, as expected, and never builds a row. GeoJSON targets are
+  unchanged until C3. =compare.py= against the pin, standalone builds:
+  times within ±7%, most a few percent faster; RSS flat except
+  =fgb(3857)→gpkg= −34% and =gpkg(3857)→parquet= −13%. It caught
+  =shp→geojson= +24% RSS: the rows path copied each =.dbf= record's
+  property list instead of moving it (=Tabular::push_feature= now moves
+  it), level with the pin after.
+
+*** DONE C3 -- GeoJSON reads into blocks
+Two steps, each checked on its own. First, the streaming reader fills row blocks
 (D-C13) and seals them as rows: shaped rows' saving, with every guarantee
 held by existing. Second, the seal-time choice: a block regular and dense
 enough is transposed to columns, recording =RowShapes= for its irregular
@@ -633,25 +930,176 @@ rows and promoting as D-C3 says. The direct writer reads row views. The
 second step is taken only if C2's numbers and a profile of the first say it
 pays; the ragged and stretch-ragged fixtures in C0 are its test.
 
-*** C4 -- KML reads into blocks
+/Built 2026-11-02./ Both steps at once: C1 had already built D-C13's
+seal-time rule into =RowBuilder::seal=, so the profile below compares the
+rule (=auto=) against sealing rows (=--layout rows=) rather than building
+the rule after it.
+- The streaming reader appends each feature to a =RowTableBuilder= (row
+  blocks, sealed by =layout=; =from_features= is now built on it) through
+  =Collecting=, which builds rows outright when =Form::to_read= says so --
+  under =auto=, now only for a KML target. A single feature or bare
+  geometry still reads as rows.
+- The writer reads views: =FeatureRef::properties= yields each member as a
+  =Value=, and =Value::write_json_to= is now the one spelling of a scalar
+  (=JsonValue='s scalars delegate to it). =Format::preferred_form= is =None=
+  for GeoJSON; only KML still asks for rows.
+- Reading a row block's column was a binary search per cell over the shapes
+  holding the key. Each =Slot::Shapes= now carries a bit per shape, so a
+  row whose shape lacks the key -- most rows of a sparse block -- answers
+  without searching; and =ColumnRef::values= walks a column a block at a
+  time (no per-cell block search, the patch checked once per block), which
+  =schema::Column::cells= uses. The row-major writers (FlatGeobuf, CSV,
+  GeoPackage, =.dbf=) keep a cursor per column and step them together.
+  Before these, =sparse → parquet= wrote in 369 ms against the pin's 142.
+- Tests: the view property test checks =values()= against =get= for every
+  key, plain, selected and edited; it fails when the cursor ignores the
+  patch or a shape bit is misplaced. =LAYOUTS=auto,rows,columns=
+  =equiv.py=: 8 991 identical. 853 tests.
+- The rule, on the C0 shapes (memprobe, IR resident, MB):
+
+  | fixture                    | pin | rows | columns | auto chose |
+  |----------------------------+-----+------+---------+------------|
+  | narrow (100 000)           |  35 |   24 |      12 | columns    |
+  | wide (50 000 × 200)        | 508 |  437 |      93 | columns    |
+  | sparse (20 000, 2 000 keys)|   8 |    9 |   1 853 | rows       |
+  | ragged (200 000)           |  74 |   73 |      64 | rows       |
+  | ownorder (100 000)         |  49 |   46 |      52 | rows       |
+  | stretch (200 000)          | 114 |   96 |      32 | columns    |
+
+  It picks the smaller form everywhere but ragged, where a quarter of the
+  rows in their own order keep it on rows at 12% over columns. Left as the
+  smoke test set it: the miss is small, and the other side of the
+  threshold is ownorder, where columns cost more.
+- =compare.py= against the pin, standalone builds: RSS 15--34% lower on
+  every conversion reading GeoJSON or writing it from a tabular source
+  (wide =parquet → geojson= 847 → 375 MB), flat for KML. Times within
+  ±10%, except wide =geojson → fgb= at +17% before the per-column cursors;
+  memprobe since: its write 209 → 180 ms, its read 730 → 884 ms.
+- What it costs: a GeoJSON read that seals columns runs about 20% slower
+  than the pin's (narrow 71 → 86 ms, wide 731 → 905). The transpose moves
+  each value into its column, and a string is copied into the column's
+  bytes and its own allocation freed. Parsing a member straight into the
+  block would remove that; not done. A tabular write from a sparse row
+  block is 1.6× the pin's time (=sparse → fgb=, 100 000 rows: 828 → 1 332
+  ms) at an eighth of its peak (881 → 119 MB): the pin's dense per-row
+  index was what its memory bought. D-C13's per-block transpose for a
+  tabular writer would close it, and needs the Parquet writer to write a
+  row group a block; not done.
+
+
+*** DONE C4 -- KML reads into blocks
 The same two steps. =project= appends to a row block; =place=, the direct
 writer and reconcile read row views; =drop_warnings= and the read-time tally
 (=performance.org=, KML step 2) read the table. Best done after KML step 2,
 which changes the same reader.
 
-*** C5 -- the hub is only blocks
-=Storage::Rows= goes, and with it =Vec<Feature>= in the hub; shaped rows
-stay, as a block form (D-C13). The rest of the
+/Built 2026-11-02/, after KML step 2 (=performance.org=, KML's read), which
+came first as planned.
+- The reader pushes each projected feature to =Collecting=, so a =.kml= or
+  each document of a =.kmz= fills one collection in the form asked for,
+  sealed by D-C13's rule under =auto=. The time columns' date-time check
+  reads views, in one pass for all three keys.
+- =place= takes a =FeatureRef= and hands out =Value=s, and with it the
+  direct writer, =null_keys=, the tree writer, =property_text=, the
+  =<Data>= emitter and reconcile (=fresh=, =reconcile=, =assemble=,
+  =reconcile_extended_data=) read views. Reconcile's "unedited" test
+  compares the stored element's projection with the view member by member.
+  =null_warning= and =version_change_warnings= iterate =feature_refs=.
+- =Format::preferred_form= is =None= for every format: nothing converts
+  in =prepare= now, and =hold= converts only WKT's rows.
+- Tests: KML's unit tests read into tables (=auto=), the edit tests through
+  =features_mut= into rows, so both forms reach the writer and reconcile.
+  854 tests; =LAYOUTS=auto,rows,columns= =equiv.py=: 8 991 identical.
+  =tests/budgets.rs= lowered: KML read 6 791 → 1 477 B a feature, KMZ
+  7 395 → 1 984, the KML write 1 067 → 774, KMZ 2 080 → 1 788.
+- memprobe against the pin (MB; with step 2):
+  | conversion                 | read peak     | IR           | write peak      |
+  |----------------------------+---------------+--------------+-----------------|
+  | =kml→geojson= (100 000)    | 616 → 157     | 51.4 → 8.1   | 90 → 47         |
+  | =kmz→geojson=              | 622 → 155     | 37.4 → 8.1   | 76 → 47         |
+  | points =geojson→kml=       | 46 → 25       | 30.5 → 8.1   | 71 → 49         |
+  | wide =parquet→kml=         | 548 → 131     | 510 → 93     | 1 164 → 747     |
+  | wide =geojson→kmz=         | 661 → 311     | 508 → 93     | 3 329 → 2 913   |
+  | =kml→kml=                  | 616 → 597     | 568 → 526    | 892 → 850       |
+- What it costs, median of three: a KML write from a table runs about 15%
+  slower (points 53 → 62 ms; wide =geojson→kmz= 1 990 → 2 120), from
+  =place= collecting each feature's members out of the view. The read
+  before a KML write now builds what the rule chooses rather than rows:
+  wide =parquet→kml= reads in 270 ms against 207 at a quarter of the peak,
+  and a GeoJSON read pays C3's cost (wide 730 → 940). =kml→geojson= and
+  =kml→kml= are within 4%.
+
+*** DONE C5 -- the hub is only blocks
+=Storage::Rows= goes, and with it =Vec<Feature>= in the hub, D-C15's
+stopgap accessors and =into_form=; shaped rows stay, as a block form (D-C13). The rest of the
 crate moves onto views: =reorder_hilbert= becomes =permute=, the CRS
 override, =convert::conversion_warnings= and =m_downgrade_warning=, the
 GeoPackage layer fan-out, =release_foreign_natives=, the same-format
 machinery. The public API of D-C8 is settled, =tests/public_api.rs= rewritten
 to it, and the breaking release made (D-C8).
 
+/Built 2026-11-02/, in three steps: the API beside the old one, every test
+ported to it, then the row storage deleted. Most of the list above had
+already moved onto views in C2--C4.
+- *The collection is a table.* =FeatureCollection= holds a =Table=; =Storage=,
+  =Form= (readers take a =Layout=), =Format::preferred_form=, =into_form=,
+  =hold=, =as_rows= and the =Rows= arms of =Collecting= and =Tabular= are
+  gone, as are =features()=, =features_mut()=, =into_features()= and
+  =FeatureCollection::new=. Equality compares views.
+- *The public API, D-C8 as built:* =from_features=, =push=; =len=, =row(i)=,
+  =rows()=, =column(key)=; =FeatureRef= (=geometry=, =native=, =properties=,
+  =get=, =to_feature=), =ColumnRef= (=len=, =get=, =values=), =Value= with
+  =to_owned=; =set=, =remove=, =set_geometry=, =set_native=, =retain=,
+  =permute=, =set_column=, =map_column=, =drop_column=. Where it departs from
+  D-C8: =properties()= yields =(&Rc<str>, Value)=, as =Feature::properties=
+  holds its keys, rather than =&str=; =set_native= is added, since natives
+  are public data and a caller retagged them through =features_mut=; =Value=
+  is =#[non_exhaustive]=, as =JsonValue= is; =permute= panics unless the
+  order names every feature once (=reorder= is the crate's unchecked one);
+  and =for_each_position_mut= edits each block's geometry in place.
+- Tests: about 270 uses ported. Inside the crate a test compares owned
+  rows through a =#[cfg(test)]= =to_features= and drops by position through
+  =retain_at=; the KML reconcile tests edit through =set=, =set_geometry=,
+  =push= and =retain=, so an edited table now reaches reconcile through the
+  public path. Row inference (=infer_columns=) stays as the tests'
+  reference for =inferred_columns=, test-only. =tests/public_api.rs= reads
+  and edits through every call above and writes the result. 856 tests;
+  =LAYOUTS=auto,rows,columns= =equiv.py=: 8 991 identical; budgets pass
+  unchanged.
+- *Open.* Nothing folds edits: =Table::fold= and =gather= are test-only,
+  so a column-sized edit stays in each block's patch until the write reads
+  through it. Correct, and costs memory per edited row; a fold before the
+  write is the fix when a profile asks. And the breaking release is not
+  made: that, and merging the branch, are the owner's.
+
 *** C6 -- geometry buffers
-D-C6: flat coordinate buffers with offsets, dimension-aware, replacing
-=Option<Geometry>= per row. Measured separately, because the property
-milestones above leave geometry untouched.
+D-C6: flat coordinate buffers with offsets, replacing =Option<Geometry>= per
+row. Measured separately, because the property milestones above leave
+geometry untouched. In steps, each checked against the corpus:
+1. *Measure.* What geometry costs today, by memprobe, on the points bench and
+   on a polygon-heavy input added for it -- the bench is 80% points and
+   understates the saving.
+2. *The column.* The geometry column, =GeometryRef=, and a builder that
+   flattens a =Geometry=, replacing each block's vector. Readers still push
+   =Geometry=, so every format works from the first step. A property test
+   rebuilds every geometry exactly: per-position Z and M, empty parts and
+   rings, collections, mixed types in a block, and -0.0 and NaN bit for bit.
+3. *Writers read views.* WKB (Parquet, GeoPackage), FlatGeobuf, Shapefile,
+   GeoJSON, KML, WKT and CSV encode from =GeometryRef=, and so do the bbox,
+   the R-tree and the Hilbert sort. KML's reconcile materializes only the
+   rows it edits.
+4. *Hot readers write coordinates.* GeoJSON, WKB, FlatGeobuf and Shapefile
+   push straight into the buffers; KML, WKT and CSV may keep flattening a
+   =Geometry= a feature, which costs time but not peak.
+5. *Edits.* =set_geometry= goes through the patch (D-C12), and the position
+   editors walk the buffers (D-C6's API).
+6. *Verify.* The corpus identical under all three layouts, budgets lowered
+   in =tests/budgets.rs=, =compare.py= within noise of C5.
+
+*Risk:* geometry fidelity is what the property tests have never aimed at.
+Per-position Z and M, empty rings, Shapefile's ring classification and each
+writer's coordinate formatting all pass through new code; the corpus catches
+drift, and step 2's test aims at it directly.
 
 ** ACCEPTANCE
 - The equivalence corpus is byte-identical at every milestone, under each
@@ -665,7 +1113,10 @@ milestones above leave geometry untouched.
 ** RISKS
 - *Scope.* 79 uses of =.features= in =convert.rs= alone, every spoke's
   reader and writer, the KML projection and reconcile. C1's dual storage is
-  what keeps each milestone shippable.
+  what lets each milestone be checked against the corpus on its own, so a
+  regression is found in the milestone that made it; its accessors (D-C15) rewrite every
+  one of those uses once, mechanically, by hand (the code is not
+  =cargo fmt=-formatted).
 - *Promotion cost.* A column that is narrow for a million rows and then
   meets a string would copy a million cells once in one table. D-C10 bounds
   it to one block, and =Mixed= from the start is today's cost.
@@ -848,6 +1299,23 @@ consumer of the hub handles both forms for good. Only as a migration step
 at the collection level; D-C13 keeps the idea at the block, behind views,
 where consumers see one form.
 
+*** Converting from =&self= into a cached second form
+C1's =Storage= converting lazily behind =&self=, the result kept in a
+=OnceCell= or =OnceLock= beside the original. It lets every writer keep its
+signature with no pipeline step, but:
+- *The cache goes stale.* Every =&mut= path -- =reorder_hilbert=, the CRS
+  override, =release_foreign_natives=, a caller's edit -- must invalidate or
+  update it, and a miss leaves two forms that disagree silently.
+- *=OnceCell= makes the collection =!Sync=*, a quiet API change; =OnceLock=
+  avoids that at a small cost on every access.
+- *The second form is hidden memory,* against the plan's goal, and it blurs
+  what memprobe's /IR resident/ measures.
+D-C15's single =&mut= conversion in =prepare= gets the same result with
+none of these: the pipeline already holds =&mut= there and knows the target.
+
+Holding both forms eagerly was the other route considered, and is worse
+still: double the IR on every path.
+
 *** Compact values within rows
 A smaller =JsonValue= (inline short strings, a boxed nested case) under the
 row layout. Contained and modest; stacks with shaped rows; does not reach
@@ -874,5 +1342,10 @@ is D-C10's blocks.
   the table must keep, and route (a), which D-C8 must keep possible.
 - [[file:streaming-progress.org][streaming-progress.org]] -- D-C9's chunk
   seam is where batching would start.
+- [[file:multi-geometry-columns.org][multi-geometry-columns.org]] -- its
+  =Feature::extra_geometries= predates this plan. Under D-C6 an extra
+  geometry column is another geometry column in each block, named and given
+  its CRS at the collection, read through =GeometryRef= and written by the
+  same encoders; its M1 waits on C6 rather than adding a per-row vector.
 - [[file:kml-standard.org][kml-standard.org]] -- D-K4: a KML feature's
   element stays a native; C4 changes where the IR side of it lives, not that.

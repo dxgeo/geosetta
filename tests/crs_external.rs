@@ -69,7 +69,7 @@ fn tmp_dir() -> std::path::PathBuf {
 }
 
 fn point_fc(crs: Option<Crs>) -> FeatureCollection {
-    let mut fc = FeatureCollection::new(vec![Feature {
+    let mut fc = FeatureCollection::from_features(vec![Feature {
         geometry: Some(Geometry::Point(Position::new(149.13, -35.28))),
         properties: vec![],
         native: None,

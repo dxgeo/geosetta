@@ -51,7 +51,7 @@ fn run(args: &[&str]) -> (bool, String) {
 }
 
 fn sample() -> FeatureCollection {
-    FeatureCollection::new(vec![Feature {
+    FeatureCollection::from_features(vec![Feature {
         geometry: Some(Geometry::Point(Position::new(12.5683, 55.6761))),
         properties: vec![
             ("name".into(), JsonValue::String("København".into())),
@@ -180,11 +180,11 @@ fn write_kml_as(src: &std::path::Path, dst: &std::path::Path, version: KmlVersio
 }
 
 fn assert_same_features(before: &FeatureCollection, after: &FeatureCollection, what: &str) {
-    assert!(!before.features.is_empty(), "{what}: read as nothing");
-    assert_eq!(before.features.len(), after.features.len(), "{what}");
-    for (i, (b, a)) in before.features.iter().zip(&after.features).enumerate() {
-        assert_eq!(b.properties, a.properties, "{what}: feature {i}");
-        assert_eq!(b.geometry, a.geometry, "{what}: feature {i}");
+    assert!(!before.is_empty(), "{what}: read as nothing");
+    assert_eq!(before.len(), after.len(), "{what}");
+    for (i, (b, a)) in before.rows().zip(after.rows()).enumerate() {
+        assert!(b.properties().eq(a.properties()), "{what}: feature {i}: {b:?} against {a:?}");
+        assert_eq!(b.geometry(), a.geometry(), "{what}: feature {i}");
     }
     assert_eq!(before.schema, after.schema, "{what}");
     assert_eq!(before.crs, after.crs, "{what}");
@@ -338,7 +338,7 @@ fn every_format_puts_back_what_its_reader_recovered() {
         let (first, again) = round_trip(format, &fixture);
 
         assert!(
-            !first.is_empty() && first.iter().any(|fc| !fc.features.is_empty()),
+            !first.is_empty() && first.iter().any(|fc| !fc.is_empty()),
             "{format:?}: {} read as nothing, so this assertion proves nothing",
             fixture.path,
         );
@@ -349,8 +349,8 @@ fn every_format_puts_back_what_its_reader_recovered() {
         );
         for (i, (before, after)) in first.iter().zip(&again).enumerate() {
             assert_eq!(
-                before.features.len(),
-                after.features.len(),
+                before.len(),
+                after.len(),
                 "{format:?} layer {i}: the feature count changed. Carries: {}",
                 fixture.carries,
             );
@@ -364,7 +364,7 @@ fn every_format_puts_back_what_its_reader_recovered() {
                 "{format:?} layer {i}: the column schema did not survive. Carries: {}",
                 fixture.carries,
             );
-            for (f, (b, a)) in before.features.iter().zip(&after.features).enumerate() {
+            for (f, (b, a)) in before.rows().map(|r| r.to_feature()).zip(after.rows().map(|r| r.to_feature())).enumerate() {
                 assert_eq!(
                     b.native, a.native,
                     "{format:?} layer {i} feature {f}: a feature native was dropped",
@@ -408,10 +408,10 @@ fn every_format_converts_to_itself() {
         assert!(ok, "{format:?} to itself failed: {err}");
 
         let back = geosetta::read_features(format, &std::fs::read(&dst).unwrap(), &mut Vec::new()).unwrap();
-        assert_eq!(back.features.len(), 1, "{format:?}");
+        assert_eq!(back.len(), 1, "{format:?}");
         assert_eq!(
-            back.features[0].properties.iter().find(|(k, _)| &**k == "name").map(|(_, v)| v),
-            Some(&JsonValue::String("København".into())),
+            back.row(0).get("name").map(|v| v.to_owned()),
+            Some(JsonValue::String("København".into())),
             "{format:?} lost the property value"
         );
     }
@@ -443,7 +443,7 @@ fn the_pipe_pass_through_stage_runs() {
     assert!(piped.status.success(), "{}", String::from_utf8_lossy(&piped.stderr));
 
     let back = geosetta::read_features(Format::FlatGeobuf, &std::fs::read(&dst).unwrap(), &mut Vec::new()).unwrap();
-    assert_eq!(back.features.len(), 1);
+    assert_eq!(back.len(), 1);
 }
 
 /// The warning fires where the format still loses something, and stays silent

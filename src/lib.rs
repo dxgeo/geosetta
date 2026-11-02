@@ -91,6 +91,7 @@ pub(crate) mod kml;
 pub(crate) mod parquet;
 pub(crate) mod schema;
 pub(crate) mod spatial;
+pub(crate) mod table;
 pub(crate) mod sqlite;
 pub(crate) mod tally;
 pub(crate) mod xml;
@@ -98,12 +99,13 @@ pub(crate) mod zip;
 
 // The curated entry points most callers want, hoisted to the crate root.
 pub use convert::{
-    conversion_warnings, convert, convert_with, read_features, reorder_hilbert, write_features, write_features_with,
-    Converted, WriteOptions,
+    conversion_warnings, convert, convert_with, read_features, read_features_with, reorder_hilbert, write_features,
+    write_features_with, Converted, ReadOptions, WriteOptions,
 };
+pub use table::{ColumnRef, ColumnValues, Layout, Value};
 pub use crs::{Crs, NamedCrs, WGS84_CRS_CODE};
 pub use error::{Error, Result};
-pub use feature::{Feature, FeatureCollection};
+pub use feature::{Feature, FeatureCollection, FeatureProperties, FeatureRef, FeatureRefs};
 pub use format::{Format, KmlVersion};
 pub use native::{
     FgbColumnNative, FgbNative, GpkgConstraint, GpkgDataColumn, GpkgFeatureNative, GpkgNative,

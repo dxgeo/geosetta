@@ -5,10 +5,9 @@
 //! `GeoJson | Kml` arm, so this writer doesn't need to look at the source CRS
 //! at all — it just emits whatever coordinates the geometry carries.
 
-use crate::feature::{Feature, FeatureCollection};
+use crate::feature::{FeatureCollection, FeatureRef};
 use crate::format::{Format, KmlVersion};
 use crate::geometry::{Geometry, Position};
-use crate::json::JsonValue;
 use crate::kml::document::Skeleton;
 use crate::kml::{lower, raise};
 use crate::kml::model::{self, KmlElement, GX_NS, GX_PREFIX, KML_NS};
@@ -16,6 +15,7 @@ use crate::kml::place::{place, Time};
 use crate::kml::project::{self, can_carry, FieldType};
 use crate::kml::reconcile;
 use crate::native::{KmlNative, NativePayload};
+use crate::table::Value;
 use crate::xml::{self, XmlElement};
 use std::collections::HashSet;
 
@@ -50,7 +50,7 @@ pub(crate) fn write(fc: &FeatureCollection, version: Option<KmlVersion>, compact
     if let Some(schema) = typed.schema() {
         out.element(&schema);
     }
-    for f in &fc.features {
+    for f in fc.rows() {
         placemark(&mut out, f, written, &typed);
     }
     out.end();
@@ -73,7 +73,7 @@ fn write_tree(fc: &FeatureCollection, version: Option<KmlVersion>, compact: bool
     let written = version.or(source_document(fc).map(|s| s.version)).unwrap_or(KmlVersion::V2_2);
     let typed = Typed::of(fc);
     let mut children: Vec<XmlElement> = typed.schema().into_iter().collect();
-    children.extend(fc.features.iter().map(|f| feature_to_placemark(f, written, &typed)));
+    children.extend(fc.rows().map(|f| feature_to_placemark(f, written, &typed)));
     let document = XmlElement::with_children("Document", children);
     let mut root = root_element(source_document(fc), version, vec![document]);
     if compact {
@@ -177,7 +177,7 @@ pub(crate) fn write_document(fc: &FeatureCollection, index: usize, version: Opti
         n => (&source.layers[n - 1].skeleton, source.layers[n - 1].version),
     };
     let documents = 1 + source.layers.len();
-    let features = fc.features.iter().filter_map(|f| match reconcile::stored(f) {
+    let features = fc.rows().filter_map(|f| match reconcile::stored(f) {
         Some((m, d)) if d < documents => (d == index).then_some((f, Some(m))),
         _ => (index == 0).then_some((f, None)),
     });
@@ -242,8 +242,8 @@ fn root_element(source: Option<&KmlNative>, version: Option<KmlVersion>, childre
 /// where KML has one that admits it (`crate::kml::place`), the columns
 /// `typed` declares in `<SchemaData>`, and every other property in
 /// `<ExtendedData><Data name="k"><value>v</value></Data></ExtendedData>`.
-pub(crate) fn feature_to_placemark(f: &Feature, version: KmlVersion, typed: &Typed) -> XmlElement {
-    let mut geometry = f.geometry.as_ref().map(geometry_to_element);
+pub(crate) fn feature_to_placemark(f: FeatureRef<'_>, version: KmlVersion, typed: &Typed) -> XmlElement {
+    let mut geometry = f.geometry().map(geometry_to_element);
     let placement = place(f, KmlElement::Placemark, |member| geometry.as_ref().is_some_and(|g| carries(g, member)));
     let mut children = Vec::new();
     if let Some(name) = placement.name {
@@ -261,7 +261,7 @@ pub(crate) fn feature_to_placemark(f: &Feature, version: KmlVersion, typed: &Typ
     let mut seen = HashSet::new();
     // KML has no null: one is left out, as GDAL writes it, and reads back
     // absent (`plans/kml-standard.org` D-K17).
-    for (key, value) in placement.extended.into_iter().filter(|(_, v)| !matches!(v, JsonValue::Null)) {
+    for (key, value) in placement.extended.into_iter().filter(|(_, v)| *v != Value::Null) {
         let text = property_text(value);
         if typed.types(key) && seen.insert(key) {
             simple.push(XmlElement::leaf("SimpleData", text).with_attr("name", key));
@@ -353,18 +353,23 @@ pub(crate) fn geometry_rank(member: KmlElement) -> u8 {
 /// A property value as `<Data>`'s plain text. Nested arrays/objects fall back
 /// to compact JSON, the same convention `schema::infer_columns` uses for
 /// heterogeneous/nested properties elsewhere.
-pub(crate) fn property_text(value: &JsonValue) -> String {
+pub(crate) fn property_text(value: Value<'_>) -> String {
+    let json = || {
+        let mut out = String::new();
+        value.write_json_to(&mut out);
+        out
+    };
     match value {
-        JsonValue::String(s) => s.clone(),
-        JsonValue::Null => String::new(),
-        JsonValue::Bool(b) => b.to_string(),
-        JsonValue::Int(n) => n.to_string(),
+        Value::Str(s) => s.to_string(),
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Int(n) => n.to_string(),
         // Via the JSON serializer so a whole float keeps its `.0` here too.
-        JsonValue::Float(_) => value.to_json_string(),
+        Value::Float(_) => json(),
         // KML `<Data>` is text; bytes render as the hex the JSON serializer
         // produces, minus its quotes.
-        JsonValue::Binary(_) => value.to_json_string().trim_matches('"').to_string(),
-        JsonValue::Array(_) | JsonValue::Object(_) => value.to_json_string(),
+        Value::Binary(_) => json().trim_matches('"').to_string(),
+        Value::Json(_) => json(),
     }
 }
 
@@ -541,7 +546,7 @@ impl Emitter {
     /// text written straight in rather than through [`property_text`]'s
     /// `String`. It is most of a wide KML write (`plans/performance.org` item
     /// 9). A null never reaches it: those are left out (D-K17).
-    fn data(&mut self, key: &str, value: &JsonValue) {
+    fn data(&mut self, key: &str, value: Value<'_>) {
         self.seal();
         let depth = self.open.len();
         if let Some((_, holds)) = self.open.last_mut() {
@@ -561,14 +566,14 @@ impl Emitter {
         }
         self.out.push_str("<value");
         match value {
-            JsonValue::String(s) if s.is_empty() => self.out.push_str("/>"),
-            JsonValue::String(s) => {
+            Value::Str("") => self.out.push_str("/>"),
+            Value::Str(s) => {
                 self.out.push('>');
                 xml::escape_into(s, &mut self.out, false);
                 self.out.push_str("</value>");
             }
             // Their text has nothing to escape.
-            JsonValue::Bool(_) | JsonValue::Int(_) | JsonValue::Float(_) => {
+            Value::Bool(_) | Value::Int(_) | Value::Float(_) => {
                 self.out.push('>');
                 value.write_json_to(&mut self.out);
                 self.out.push_str("</value>");
@@ -612,8 +617,8 @@ impl Emitter {
 }
 
 /// [`feature_to_placemark`], written as it is built.
-fn placemark(out: &mut Emitter, f: &Feature, version: KmlVersion, typed: &Typed) {
-    let placement = place(f, KmlElement::Placemark, |member| f.geometry.as_ref().is_some_and(|g| geometry_carries(g, member)));
+fn placemark(out: &mut Emitter, f: FeatureRef<'_>, version: KmlVersion, typed: &Typed) {
+    let placement = place(f, KmlElement::Placemark, |member| f.geometry().is_some_and(|g| geometry_carries(g, member)));
     out.start("Placemark");
     if let Some(name) = &placement.name {
         out.leaf("name", name);
@@ -641,12 +646,12 @@ fn placemark(out: &mut Emitter, f: &Feature, version: KmlVersion, typed: &Typed)
     // A column `typed` declares goes in `<SchemaData>`, once, after every
     // `<Data>`; a second property of the same name is a `<Data>`.
     let mut simple: Vec<(&str, String)> = Vec::new();
-    let mut data: Vec<(&str, &JsonValue)> = Vec::new();
+    let mut data: Vec<(&str, Value)> = Vec::new();
     // The keys already in `simple`, so a repeat is found without scanning it.
     let mut seen = HashSet::new();
     // KML has no null: one is left out, as GDAL writes it, and reads back
     // absent (`plans/kml-standard.org` D-K17).
-    for (key, value) in placement.extended.into_iter().filter(|(_, v)| !matches!(v, JsonValue::Null)) {
+    for (key, value) in placement.extended.into_iter().filter(|(_, v)| *v != Value::Null) {
         if typed.types(key) && seen.insert(key) {
             simple.push((key, property_text(value)));
         } else {
@@ -655,7 +660,7 @@ fn placemark(out: &mut Emitter, f: &Feature, version: KmlVersion, typed: &Typed)
     }
     if !data.is_empty() || !simple.is_empty() {
         out.start("ExtendedData");
-        for (key, value) in &data {
+        for (key, value) in data {
             out.data(key, value);
         }
         if !simple.is_empty() {
@@ -671,7 +676,7 @@ fn placemark(out: &mut Emitter, f: &Feature, version: KmlVersion, typed: &Typed)
         }
         out.end();
     }
-    if let Some(g) = &f.geometry {
+    if let Some(g) = f.geometry() {
         geometry(out, g, &placement.altitude, version);
     }
     out.end();
@@ -690,12 +695,12 @@ fn geometry_kind(g: &Geometry) -> KmlElement {
 /// The keys of `f`'s nulls a Placemark built from the IR leaves out of
 /// `<ExtendedData>` (`plans/kml-standard.org` D-K17), in the order it holds
 /// them: what [`placemark`] and [`feature_to_placemark`] skip.
-pub(crate) fn null_keys(f: &Feature) -> Vec<&str> {
-    if !f.properties.iter().any(|(_, v)| matches!(v, JsonValue::Null)) {
+pub(crate) fn null_keys(f: FeatureRef<'_>) -> Vec<&str> {
+    if !f.properties().any(|(_, v)| v == Value::Null) {
         return Vec::new();
     }
-    let placement = place(f, KmlElement::Placemark, |member| f.geometry.as_ref().is_some_and(|g| geometry_carries(g, member)));
-    placement.extended.into_iter().filter(|(_, v)| matches!(v, JsonValue::Null)).map(|(k, _)| k).collect()
+    let placement = place(f, KmlElement::Placemark, |member| f.geometry().is_some_and(|g| geometry_carries(g, member)));
+    placement.extended.into_iter().filter(|(_, v)| *v == Value::Null).map(|(k, _)| k).collect()
 }
 
 /// [`carries`], for a geometry not yet built.
@@ -807,6 +812,8 @@ fn coordinates(out: &mut Emitter, points: &[Position]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::Feature;
+    use crate::json::JsonValue;
     use crate::kml::reader;
     use std::rc::Rc;
 
@@ -876,7 +883,7 @@ mod tests {
         // first feature's second `t` goes in a `<Data>`.
         assert_eq!(Typed::of(&fc).fields.len(), 2);
         assert_written_as_the_tree_writer_would(&fc, "hand-built, typed");
-        assert_written_as_the_tree_writer_would(&FeatureCollection::new(Vec::new()), "empty");
+        assert_written_as_the_tree_writer_would(&FeatureCollection::from_features(Vec::new()), "empty");
 
         // Every fixture any reader here takes, as each one reads it.
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures");
@@ -900,7 +907,7 @@ mod tests {
 
     #[test]
     fn a_document_built_from_the_ir_is_in_the_house_layout() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::Point(Position::new(1.0, 2.0))),
             vec![("name", JsonValue::String("a".into())), ("description", JsonValue::String("<b>x</b>".into()))],
         )]);
@@ -922,7 +929,7 @@ mod tests {
 
     #[test]
     fn writes_name_description_and_extended_data() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::Point(Position::new(1.0, 2.0))),
             vec![
                 ("name", JsonValue::String("A Point".into())),
@@ -939,7 +946,7 @@ mod tests {
 
     #[test]
     fn writes_z_bearing_point_with_third_coordinate() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::Point(Position::with_z(-73.9857, 40.7484, 381.0))),
             vec![],
         )]);
@@ -949,7 +956,7 @@ mod tests {
 
     #[test]
     fn writes_polygon_with_hole() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::Polygon(vec![
                 vec![Position::new(0.0, 0.0), Position::new(4.0, 0.0), Position::new(4.0, 4.0), Position::new(0.0, 4.0), Position::new(0.0, 0.0)],
                 vec![Position::new(1.0, 1.0), Position::new(2.0, 1.0), Position::new(2.0, 2.0), Position::new(1.0, 2.0), Position::new(1.0, 1.0)],
@@ -963,7 +970,7 @@ mod tests {
 
     #[test]
     fn writes_multi_point_as_multi_geometry() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::MultiPoint(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)])),
             vec![],
         )]);
@@ -984,8 +991,8 @@ mod tests {
         let original = geojson::from_json(&json::parse(src).unwrap()).unwrap();
         let kml_bytes = write(&original, None, false);
         let back = reader::read(&kml_bytes, &mut Vec::new()).unwrap();
-        assert_eq!(back.features.len(), original.features.len());
-        for (a, b) in original.features.iter().zip(back.features.iter()) {
+        assert_eq!(back.len(), original.len());
+        for (a, b) in original.to_features().iter().zip(back.to_features().iter()) {
             assert_eq!(a.geometry, b.geometry);
             let name = |f: &Feature| f.properties.iter().find(|(k, _)| &**k == "name").unwrap().1.clone();
             assert_eq!(name(a), name(b));
@@ -994,7 +1001,7 @@ mod tests {
 
     #[test]
     fn escapes_special_characters_in_name() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             None,
             vec![("name", JsonValue::String("Fish & Chips <Shop>".into()))],
         )]);
@@ -1017,13 +1024,13 @@ mod tests {
 
     #[test]
     fn a_collection_from_another_format_is_written_as_unstamped_ogc_2_2() {
-        assert_eq!(root_tag(&write(&FeatureCollection::new(vec![]), None, false)), OGC_ROOT);
+        assert_eq!(root_tag(&write(&FeatureCollection::from_features(vec![]), None, false)), OGC_ROOT);
     }
 
     #[test]
     fn asking_for_2_3_stamps_it() {
         assert_eq!(
-            root_tag(&write(&FeatureCollection::new(vec![]), Some(KmlVersion::V2_3), false)),
+            root_tag(&write(&FeatureCollection::from_features(vec![]), Some(KmlVersion::V2_3), false)),
             r#"<kml xmlns="http://www.opengis.net/kml/2.2" version="2.3">"#
         );
     }
@@ -1072,7 +1079,7 @@ mod tests {
 
     #[test]
     fn time_and_altitude_properties_are_written_as_their_elements() {
-        let fc = FeatureCollection::new(vec![
+        let fc = FeatureCollection::from_features(vec![
             feature(
                 Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))),
                 vec![("timestamp", text("2026-10-22T14:30:00Z")), ("altitudeMode", text("absolute")), ("extrude", JsonValue::Bool(true))],
@@ -1089,12 +1096,12 @@ mod tests {
         );
         assert!(out.contains("<TimeSpan><begin>2026-01</begin></TimeSpan><LineString><tessellate>1</tessellate><coordinates>"), "{out}");
         let back = reader::read(out.as_bytes(), &mut Vec::new()).unwrap();
-        assert_eq!(back.features[0].properties[2], (Rc::from("extrude"), text("true")));
+        assert_eq!(back.to_features()[0].properties[2], (Rc::from("extrude"), text("true")));
     }
 
     #[test]
     fn a_property_no_element_admits_goes_to_extended_data_under_its_key() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::Point(Position::new(1.0, 2.0))),
             vec![
                 ("timestamp", text("soon")),
@@ -1111,14 +1118,14 @@ mod tests {
         // The stamp was refused, so the span holds the begin.
         assert!(out.contains("<TimeSpan><begin>2026</begin></TimeSpan>"), "{out}");
         let back = reader::read(out.as_bytes(), &mut Vec::new()).unwrap();
-        let mut keys: Vec<_> = back.features[0].properties.iter().map(|(k, _)| k.to_string()).collect();
+        let mut keys: Vec<_> = back.to_features()[0].properties.iter().map(|(k, _)| k.to_string()).collect();
         keys.sort();
         assert_eq!(keys, ["altitudeMode", "begin", "icon", "tessellate", "timestamp"]);
     }
 
     #[test]
     fn a_sea_floor_mode_is_spelled_for_the_version_written() {
-        let fc = FeatureCollection::new(vec![feature(
+        let fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::Point(Position::with_z(1.0, 2.0, 3.0))),
             vec![("seaFloorAltitudeMode", text("relativeToSeaFloor"))],
         )]);
@@ -1128,14 +1135,14 @@ mod tests {
         assert!(written(&fc, Some(KmlVersion::V2_3)).contains("<seaFloorAltitudeMode>relativeToSeaFloor</seaFloorAltitudeMode>"));
         for version in [None, Some(KmlVersion::V2_3)] {
             let back = reader::read(&write(&fc, version, false), &mut Vec::new()).unwrap();
-            assert_eq!(back.features[0].properties, fc.features[0].properties, "{version:?}");
+            assert_eq!(back.to_features()[0].properties, fc.to_features()[0].properties, "{version:?}");
         }
     }
 
     #[test]
     fn declared_columns_are_written_as_a_schema() {
         use crate::schema::{DeclType, FieldDecl};
-        let mut fc = FeatureCollection::new(vec![feature(
+        let mut fc = FeatureCollection::from_features(vec![feature(
             Some(Geometry::Point(Position::new(1.0, 2.0))),
             vec![("name", text("a")), ("n", JsonValue::Int(7)), ("free", text("x")), ("big", JsonValue::Int(1 << 40))],
         )]);
@@ -1157,8 +1164,8 @@ mod tests {
         let back = reader::read(out.as_bytes(), &mut Vec::new()).unwrap();
         let decls: Vec<_> = back.schema.iter().map(|d| (d.name.as_str(), d.ty.unwrap())).collect();
         assert_eq!(decls, [("n", DeclType::Int16), ("big", DeclType::String)]);
-        assert_eq!(back.features[0].properties[1], (Rc::from("free"), text("x")));
-        assert_eq!(back.features[0].properties[2], (Rc::from("n"), JsonValue::Int(7)));
+        assert_eq!(back.to_features()[0].properties[1], (Rc::from("free"), text("x")));
+        assert_eq!(back.to_features()[0].properties[2], (Rc::from("n"), JsonValue::Int(7)));
     }
 
     /// `plans/kml-standard.org` D-K17: KML has no null, so a null is left out
@@ -1168,7 +1175,7 @@ mod tests {
     fn a_null_is_left_out_of_extended_data_and_counted() {
         use crate::schema::{DeclType, FieldDecl};
         let point = || Some(Geometry::Point(Position::new(1.0, 2.0)));
-        let mut fc = FeatureCollection::new(vec![
+        let mut fc = FeatureCollection::from_features(vec![
             feature(point(), vec![("n", JsonValue::Null), ("s", JsonValue::Null), ("free", JsonValue::Null), ("e", text(""))]),
             feature(point(), vec![("n", JsonValue::Null), ("free", JsonValue::Null)]),
             feature(point(), vec![("n", JsonValue::Int(7))]),
@@ -1185,17 +1192,20 @@ mod tests {
         assert!(!out.contains(r#"<SimpleData name="n"/>"#) && !out.contains(r#"<Data name="free""#), "{out}");
 
         let back = reader::read(out.as_bytes(), &mut Vec::new()).unwrap();
-        assert_eq!(back.features[0].properties, vec![(Rc::from("e"), text(""))]);
-        assert!(back.features[1].properties.is_empty());
+        assert_eq!(back.to_features()[0].properties, vec![(Rc::from("e"), text(""))]);
+        assert!(back.to_features()[1].properties.is_empty());
 
-        assert_eq!(null_keys(&fc.features[0]), ["n", "s", "free"]);
+        assert_eq!(null_keys(fc.rows().next().unwrap()), ["n", "s", "free"]);
         assert_eq!(
             crate::kml::null_warning(&fc, Format::Kml).unwrap(),
             "kml: 5 null properties (n, s, free) left out of <ExtendedData>, since KML has no null; they read back absent"
         );
         assert!(crate::kml::null_warning(&fc, Format::GeoJson).is_none());
-        fc.features.truncate(1);
-        fc.features[0].properties.retain(|(k, _)| &**k == "n");
+        fc.retain_at(|i| i == 0);
+        let others: Vec<_> = fc.row(0).properties().map(|(k, _)| k.clone()).filter(|k| &**k != "n").collect();
+        for key in others {
+            fc.remove(0, &key);
+        }
         assert_eq!(
             crate::kml::null_warning(&fc, Format::Kmz).unwrap(),
             "kml: 1 null property (n) left out of <ExtendedData>, since KML has no null; it reads back absent"
@@ -1214,12 +1224,12 @@ mod tests {
 <Placemark><ExtendedData><SchemaData schemaUrl="#t"><SimpleData name="n"/></SchemaData></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>
 </Document></kml>"##;
         let mut fc = reader::read(source, &mut Vec::new()).unwrap();
-        assert_eq!(fc.features[0].properties, vec![(Rc::from("n"), JsonValue::Null)]);
+        assert_eq!(fc.to_features()[0].properties, vec![(Rc::from("n"), JsonValue::Null)]);
         assert!(crate::kml::null_warning(&fc, Format::Kml).is_none());
         assert!(squeezed(&write(&fc, None, false)).contains(r#"<SimpleData name="n"/>"#));
 
         let added = feature(Some(Geometry::Point(Position::new(3.0, 4.0))), vec![("m", JsonValue::Null)]);
-        fc.features.push(added);
+        fc.push(added);
         let out = squeezed(&write(&fc, None, false));
         assert!(out.contains(r#"<SimpleData name="n"/>"#) && !out.contains(r#"name="m""#), "{out}");
         assert_eq!(

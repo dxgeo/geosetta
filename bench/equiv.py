@@ -34,6 +34,11 @@ that changes that format's output: --compact (GeoJSON, KML, KMZ),
 --envelope (GeoPackage). A conversion that fails must fail the same way; one that runs past TIMEOUT
 seconds (default 300) in either binary is reported as unchecked.
 
+With LAYOUTS, the candidate runs each conversion once per layout
+(plans/columnar.org D-C14), each compared with the pinned binary's plain run:
+a layout changes memory and time, never output, and the pin need not know the
+flag.
+
 Usage:
     python3 bench/equiv.py                       # candidate: the working tree; pin: HEAD
     PIN=v0.27.0 python3 bench/equiv.py           # pin another revision
@@ -43,6 +48,7 @@ Usage:
     SCALE=0.25 python3 bench/equiv.py            # generated sizes (default 1)
     JOBS=8 KEEP=1 python3 bench/equiv.py         # parallelism; keep every run's files
     TIMEOUT=600 python3 bench/equiv.py           # seconds a conversion may take
+    LAYOUTS=auto,rows,columns python3 bench/equiv.py  # the candidate under each --layout
 
 The pinned binary is built once per revision from a clean `git archive`, with
 the crate's own release profile, and cached under the system temp dir; the
@@ -69,6 +75,7 @@ WIDE = os.environ.get("WIDE", "0") != "0"
 JOBS = int(os.environ.get("JOBS", str(os.cpu_count() or 4)))
 KEEP = os.environ.get("KEEP", "0") != "0"
 TIMEOUT = float(os.environ.get("TIMEOUT", "300"))
+LAYOUTS = os.environ.get("LAYOUTS", "auto").split(",")
 READABLE = (".geojson", ".json", ".kml", ".kmz", ".csv", ".tsv", ".fgb", ".parquet",
             ".gpkg", ".shp", ".wkt", ".zip")
 TARGETS = ["geojson", "kml", "kmz", "csv", "wkt", "fgb", "parquet", "gpkg", "shp"]
@@ -273,17 +280,28 @@ def first_difference(a, b):
     return None
 
 
+def layout_flag(layout):
+    return [] if layout == "auto" else ["--layout", layout]
+
+
 def case(job):
+    """The pinned binary once, then the candidate under each layout: a
+    (layout, difference or None, run dir) for each."""
     n, pin, cand, src, target, opts, work = job
     where = os.path.join(work, f"{n:05d}")
-    finished = run_one(pin, src, target, opts, os.path.join(where, "pin"))
-    finished &= run_one(cand, src, target, opts, os.path.join(where, "candidate"))
-    if not finished:
-        return f"unchecked: ran past {TIMEOUT:.0f} s", where
-    diff = first_difference(os.path.join(where, "pin"), os.path.join(where, "candidate"))
-    if diff is None and not KEEP:
+    pinned = os.path.join(where, "pin")
+    if not run_one(pin, src, target, opts, pinned):
+        return [(layout, f"unchecked: ran past {TIMEOUT:.0f} s", where) for layout in LAYOUTS]
+    results = []
+    for layout in LAYOUTS:
+        candidate = os.path.join(where, "candidate-" + layout)
+        if not run_one(cand, src, target, opts + layout_flag(layout), candidate):
+            results.append((layout, f"unchecked: ran past {TIMEOUT:.0f} s", where))
+        else:
+            results.append((layout, first_difference(pinned, candidate), where))
+    if all(diff is None for _, diff, _ in results) and not KEEP:
         shutil.rmtree(where)
-    return diff, where
+    return results
 
 
 def main():
@@ -301,17 +319,20 @@ def main():
     runs = os.path.join(work, "runs")
     jobs = [(src, target, opts) for src in inputs for target in TARGETS for opts in options(target)]
     jobs = [(n, pin, cand, src, target, opts, runs) for n, (src, target, opts) in enumerate(jobs)]
-    print(f"{len(inputs)} inputs, {len(jobs)} conversions, {JOBS} at a time ...", file=sys.stderr)
+    conversions = len(jobs) * len(LAYOUTS)
+    print(f"{len(inputs)} inputs, {conversions} conversions (layouts: {', '.join(LAYOUTS)}), "
+          f"{JOBS} at a time ...", file=sys.stderr)
     differ, unchecked = [], []
     with concurrent.futures.ThreadPoolExecutor(JOBS) as pool:
-        for job, (diff, where) in zip(jobs, pool.map(case, jobs)):
-            if diff is not None:
-                _, _, _, src, target, opts, _ = job
-                label = f"{os.path.basename(src)} -> {target} {' '.join(opts)}".rstrip()
-                (unchecked if diff.startswith("unchecked") else differ).append((label, diff, where))
+        for job, results in zip(jobs, pool.map(case, jobs)):
+            for layout, diff, where in results:
+                if diff is not None:
+                    _, _, _, src, target, opts, _ = job
+                    label = f"{os.path.basename(src)} -> {target} {' '.join(opts + layout_flag(layout))}".rstrip()
+                    (unchecked if diff.startswith("unchecked") else differ).append((label, diff, where))
 
     print(f"pinned:    {pin}\ncandidate: {cand}")
-    print(f"{len(inputs)} inputs, {len(jobs)} conversions: {len(jobs) - len(differ) - len(unchecked)} identical, "
+    print(f"{len(inputs)} inputs, {conversions} conversions: {conversions - len(differ) - len(unchecked)} identical, "
           f"{len(differ)} differ, {len(unchecked)} unchecked ({time.time() - started:.0f} s)")
     for label, diff, where in (differ + unchecked)[:40]:
         print(f"  {label}: {diff}\n    {where}")

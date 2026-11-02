@@ -8,7 +8,8 @@
 //! (`plans/same-format-fidelity.org` M3c).
 
 use crate::error::{Error, Result};
-use crate::feature::FeatureCollection;
+use crate::feature::{Collecting, FeatureCollection};
+use crate::table::Layout;
 use crate::format::{Format, KmlVersion};
 use crate::native::{KmzArchive, KmzEntry};
 use std::rc::Rc;
@@ -23,7 +24,10 @@ mod raise;
 mod reconcile;
 mod writer;
 
+#[cfg(test)]
 pub(crate) use reader::read as read_kml;
+pub(crate) use reader::read_with as read_kml_with;
+pub(crate) use reader::{Elements, Unkept};
 pub(crate) use writer::write as write_kml;
 
 /// Whether `key` is one of the properties a feature's time projects to.
@@ -67,7 +71,7 @@ pub(crate) fn null_warning(fc: &FeatureCollection, target: Format) -> Option<Str
     let mut count = 0;
     let mut seen = std::collections::HashSet::new();
     let mut names: Vec<&str> = Vec::new();
-    for f in fc.features.iter().filter(|f| !(carried && reconcile::feature_model(f).is_some())) {
+    for f in fc.rows().filter(|f| !(carried && reconcile::stored(*f).is_some())) {
         for key in writer::null_keys(f) {
             count += 1;
             if seen.insert(key) {
@@ -161,7 +165,7 @@ pub(crate) fn version_change_warnings(fc: &FeatureCollection, target: Format, ve
     for (index, (skeleton, own)) in documents {
         from = Some(own);
         // A feature sits in a container; every container admits it alike.
-        let features = fc.features.iter().filter_map(reconcile::stored).filter(|(_, d)| *d == index).map(|(m, _)| &m.node);
+        let features = fc.rows().filter_map(reconcile::stored).filter(|(_, d)| *d == index).map(|(m, _)| &m.node);
         let nodes = skeleton.doc.root.children.iter().map(|n| (n, KmlElement::Kml)).chain(features.map(|n| (n, KmlElement::Document)));
         for (node, parent) in nodes {
             match version {
@@ -183,14 +187,26 @@ pub(crate) fn version_change_warnings(fc: &FeatureCollection, target: Format, ve
 /// instead writes a root `doc.kml` that's only a `<NetworkLink>` pointing at
 /// the actual per-layer data in `layers/*.kml`; reading only the first entry
 /// would silently produce zero features for archives shaped that way.
-pub(crate) fn read_kmz(bytes: &[u8], _warnings: &mut Vec<String>) -> Result<FeatureCollection> {
+#[cfg(test)]
+pub(crate) fn read_kmz(bytes: &[u8], warnings: &mut Vec<String>) -> Result<FeatureCollection> {
+    read_kmz_with(bytes, warnings, Elements::Keep, crate::table::Layout::Auto)
+}
+
+/// [`read_kmz`], keeping each feature's element as `elements` says and
+/// building the collection in `layout`.
+pub(crate) fn read_kmz_with(
+    bytes: &[u8],
+    _warnings: &mut Vec<String>,
+    elements: Elements,
+    layout: Layout,
+) -> Result<FeatureCollection> {
     let archive = crate::zip::read_archive(bytes)?;
     let entries = &archive.entries;
     let kml_entries: Vec<_> = entries.iter().enumerate().filter(|(_, e)| is_kml_entry(&e.name)).collect();
     if kml_entries.is_empty() {
         return Err(Error::Convert("kmz: no .kml entry found in the archive".into()));
     }
-    let mut features = Vec::new();
+    let mut features = Collecting::new(layout);
     // The collection's provenance is the first document's — conventionally
     // the root `doc.kml`, which a layered archive (GDAL's) fills with network
     // links to the rest. Every other document is a layer, with its own
@@ -204,20 +220,21 @@ pub(crate) fn read_kmz(bytes: &[u8], _warnings: &mut Vec<String>) -> Result<Feat
             Error::Convert(m) => Error::Convert(format!("kmz: entry \"{}\": {m}", entry.name)),
             other => other,
         })?;
-        let document = reader::read_document(&text, Format::Kmz, index)?;
-        features.extend(document.features);
+        let document = reader::read_document(&text, Format::Kmz, index, elements, &mut features)?;
         facts = Some(match facts {
             Some(f) => f.merge(document.facts),
             None => document.facts,
         });
-        if first.is_none() {
-            first = Some((document.native, document.skeleton));
-        } else {
-            layers.push(document::Layer {
-                entry: *entry_at,
-                version: document.native.version,
-                skeleton: Rc::new(document.skeleton),
-            });
+        match &mut first {
+            None => first = Some((document.native, document.skeleton)),
+            Some((native, _)) => {
+                native.unkept.merge(document.native.unkept);
+                layers.push(document::Layer {
+                    entry: *entry_at,
+                    version: document.native.version,
+                    skeleton: Rc::new(document.skeleton),
+                });
+            }
         }
     }
     let (mut native, skeleton) = first.expect("at least one .kml entry was read");
@@ -308,6 +325,110 @@ pub(crate) fn write_kmz(fc: &FeatureCollection, version: Option<KmlVersion>, com
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A read for another format's write, which keeps no feature's element,
+    /// against one that keeps them all: the same features, collection and
+    /// warnings for every target but KML and KMZ (`plans/performance.org`,
+    /// KML's read).
+    fn assert_leaving_reads_as_keeping(bytes: &[u8], kmz: bool, what: &str) {
+        let layout = crate::table::Layout::Auto;
+        let read = |elements| match kmz {
+            true => read_kmz_with(bytes, &mut Vec::new(), elements, layout),
+            false => reader::read_with(bytes, &mut Vec::new(), elements, layout),
+        };
+        let kept = match read(Elements::Keep) {
+            Ok(fc) => fc,
+            Err(e) => {
+                assert_eq!(read(Elements::Leave).unwrap_err().to_string(), e.to_string(), "{what}: the error");
+                return;
+            }
+        };
+        let left = read(Elements::Leave).unwrap();
+        let strip = |fc: &FeatureCollection| -> Vec<Feature> {
+            fc.to_features().iter().map(|f| Feature { native: None, ..f.clone() }).collect()
+        };
+        assert_eq!(strip(&left), strip(&kept), "{what}: the features");
+        assert!(left.to_features().iter().all(|f| f.native.is_none()), "{what}: no element kept");
+        assert_eq!((&left.crs, &left.schema, &left.name), (&kept.crs, &kept.schema, &kept.name), "{what}: the collection");
+        let version = |fc: &FeatureCollection| writer::source_document(fc).map(|s| s.version);
+        assert_eq!(version(&left), version(&kept), "{what}: the version");
+        for target in Format::ALL.into_iter().filter(|t| !matches!(t, Format::Kml | Format::Kmz)) {
+            assert_eq!(drop_warnings(&left, target), drop_warnings(&kept, target), "{what}: warnings for {target:?}");
+            let mut overridden = (left.clone(), kept.clone());
+            overridden.0.crs = Some(crate::crs::Crs::wgs84_egm96());
+            overridden.1.crs = Some(crate::crs::Crs::wgs84_egm96());
+            assert_eq!(
+                drop_warnings(&overridden.0, target),
+                drop_warnings(&overridden.1, target),
+                "{what}: warnings for {target:?} under an EGM96 override"
+            );
+        }
+    }
+
+    #[test]
+    fn a_read_that_keeps_no_element_reads_as_one_that_keeps_them() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+        let mut seen = 0;
+        for entry in std::fs::read_dir(&fixtures).unwrap() {
+            let path = entry.unwrap().path();
+            let kmz = match path.extension().and_then(|e| e.to_str()) {
+                Some("kml") => false,
+                Some("kmz") => true,
+                _ => continue,
+            };
+            assert_leaving_reads_as_keeping(&std::fs::read(&path).unwrap(), kmz, &path.display().to_string());
+            seen += 1;
+        }
+        assert!(seen >= 8, "the KML fixtures were found");
+        const OGC: &str = r#"xmlns="http://www.opengis.net/kml/2.2" xmlns:gx="http://www.google.com/kml/ext/2.2""#;
+        let documents = [
+            // Typed by a schema declared first, in a nested folder.
+            format!(
+                r##"<kml {OGC}><Document><Schema id="s"><SimpleField name="n" type="int"/></Schema>
+                <Folder><Placemark><ExtendedData><SchemaData schemaUrl="#s"><SimpleData name="n">7</SimpleData>
+                </SchemaData></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark></Folder>
+                </Document></kml>"##
+            ),
+            // A schema declared after the feature it types: read whole.
+            format!(
+                r##"<kml {OGC}><Document><Placemark><ExtendedData><SchemaData schemaUrl="#s">
+                <SimpleData name="n">7</SimpleData></SchemaData></ExtendedData></Placemark>
+                <Schema id="s"><SimpleField name="n" type="int"/></Schema></Document></kml>"##
+            ),
+            // A model, a track with per-vertex data, heights in each mode.
+            format!(
+                r##"<kml {OGC}><Document>
+                <Placemark><Model><Location><longitude>1</longitude><latitude>2</latitude></Location></Model></Placemark>
+                <Placemark><gx:Track><when>2026-01-01</when><gx:coord>1 2 3</gx:coord></gx:Track></Placemark>
+                <Placemark><Point><altitudeMode>absolute</altitudeMode><coordinates>1,2,3</coordinates></Point></Placemark>
+                <Placemark><Point><coordinates>1,2,3</coordinates></Point></Placemark>
+                </Document></kml>"##
+            ),
+            // Only absolute heights: the collection is EGM96, and says nothing.
+            format!(r##"<kml {OGC}><Placemark><Point><altitudeMode>absolute</altitudeMode><coordinates>1,2,3</coordinates></Point></Placemark></kml>"##),
+            // A 2.3-only component inside a feature makes the document 2.3.
+            format!(r##"<kml {OGC}><Placemark><Point><altitudeOffset>2</altitudeOffset><coordinates>1,2</coordinates></Point></Placemark></kml>"##),
+            // A feature that is not one of the document's: in an update, and
+            // in an extension's element.
+            format!(
+                r##"<kml {OGC}><NetworkLinkControl><Update><Create><Document><Placemark><name>u</name></Placemark>
+                </Document></Create></Update></NetworkLinkControl><Document><x:wrap xmlns:x="urn:x"><Placemark/></x:wrap>
+                <GroundOverlay><LatLonBox><north>1</north><south>0</south><east>1</east><west>0</west></LatLonBox></GroundOverlay>
+                <PhotoOverlay><Point><coordinates>1,2</coordinates></Point></PhotoOverlay></Document></kml>"##
+            ),
+            // A feature that fails to project, and one that would after it.
+            format!(r##"<kml {OGC}><Placemark><Point><coordinates>x</coordinates></Point></Placemark><Placemark/></kml>"##),
+            // A document that fails to parse after its features.
+            format!(r##"<kml {OGC}><Placemark><name>a</name></Placemark><Placemark></kml>"##),
+            // Refused by version, though its features project.
+            r##"<kml xmlns="http://earth.google.com/kml/2.1"><Placemark><name>a</name></Placemark></kml>"##.to_string(),
+        ];
+        for (i, doc) in documents.iter().enumerate() {
+            assert_leaving_reads_as_keeping(doc.as_bytes(), false, &format!("document {i}"));
+            let kmz = crate::zip::write(&[("doc.kml", doc.as_bytes()), ("layers/b.kml", documents[2].as_bytes())]).unwrap();
+            assert_leaving_reads_as_keeping(&kmz, true, &format!("document {i} in a .kmz"));
+        }
+    }
     use crate::feature::Feature;
 
     #[test]
@@ -315,7 +436,7 @@ mod tests {
         let layer = br#"<kml xmlns="http://www.opengis.net/kml/2.2"><Placemark><Model/></Placemark></kml>"#;
         let kmz = crate::zip::write(&[("doc.kml", &layer[..]), ("layers/a.kml", &layer[..])]).unwrap();
         let fc = read_kmz(&kmz, &mut Vec::new()).unwrap();
-        assert_eq!(fc.features.len(), 2);
+        assert_eq!(fc.len(), 2);
         // A .kmz holds both documents, models and all.
         assert!(drop_warnings(&fc, Format::Kmz).is_empty());
         // A .kml holds one, so it is built from the IR, and both say so.
@@ -383,7 +504,8 @@ mod tests {
         assert_eq!(back[3].data, b"notes");
         // The document is written from the model, edits and all.
         let mut edited = fc.clone();
-        edited.features[0].properties[0].1 = crate::json::JsonValue::String("renamed".into());
+        let key = edited.row(0).properties().next().unwrap().0.clone();
+        edited.set(0, &key, crate::json::JsonValue::String("renamed".into()));
         let back = crate::zip::read(&write_kmz(&edited, Some(KmlVersion::V2_3), false).unwrap()).unwrap();
         let text = String::from_utf8(back[2].data.clone()).unwrap();
         assert!(text.contains("<name>renamed</name>") && text.contains(r#"version="2.3""#), "{text}");
@@ -423,7 +545,7 @@ mod tests {
         let (a, b) = (layer_doc("a"), layer_doc("b"));
         let kmz = crate::zip::write(&[("doc.kml", DOC), ("layers/a.kml", &a), ("icon.png", b"i"), ("layers/b.kml", &b)]).unwrap();
         let fc = read_kmz(&kmz, &mut Vec::new()).unwrap();
-        assert_eq!(fc.features.len(), 3);
+        assert_eq!(fc.len(), 3);
         let back = crate::zip::read(&write_kmz(&fc, None, false).unwrap()).unwrap();
         let names: Vec<_> = back.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["doc.kml", "layers/a.kml", "icon.png", "layers/b.kml"]);
@@ -435,9 +557,11 @@ mod tests {
         // An edit lands in its own document; a removed feature leaves only
         // its own; a feature added since joins the first.
         let mut edited = fc.clone();
-        edited.features[1].properties[0].1 = crate::json::JsonValue::String("a, renamed".into());
-        let added = edited.features.remove(2);
-        edited.features.push(Feature { native: None, ..added });
+        let key = edited.row(1).properties().next().unwrap().0.clone();
+        edited.set(1, &key, crate::json::JsonValue::String("a, renamed".into()));
+        let added = edited.row(2).to_feature();
+        edited.retain_at(|i| i != 2);
+        edited.push(Feature { native: None, ..added });
         let back = crate::zip::read(&write_kmz(&edited, None, false).unwrap()).unwrap();
         let text = |i: usize| String::from_utf8(back[i].data.clone()).unwrap();
         assert!(text(1).contains("<Folder><name>a</name><Placemark><name>a, renamed</name><styleUrl>#s</styleUrl>"), "{}", text(1));
@@ -451,7 +575,7 @@ mod tests {
         let fc = read_kmz(source, &mut Vec::new()).unwrap();
         let again = read_kmz(&write_kmz(&fc, None, false).unwrap(), &mut Vec::new()).unwrap();
         assert_eq!(again.native, fc.native, "the archive, its documents and their layers");
-        assert_eq!(again.features, fc.features);
+        assert_eq!(again.to_features(), fc.to_features());
         // Each document written is the one read, network links and all.
         let (before, after) = (crate::zip::read(source).unwrap(), crate::zip::read(&write_kmz(&fc, None, false).unwrap()).unwrap());
         for (b, a) in before.iter().zip(&after).filter(|(b, _)| b.name.ends_with(".kml")) {
@@ -462,7 +586,7 @@ mod tests {
         let raised = read_kmz(&write_kmz(&fc, Some(KmlVersion::V2_3), false).unwrap(), &mut Vec::new()).unwrap();
         let source = writer::source_document(&raised).unwrap();
         assert_eq!((source.version, source.layers[0].version), (KmlVersion::V2_3, KmlVersion::V2_3));
-        assert_eq!(raised.features, fc.features);
+        assert_eq!(raised.to_features(), fc.to_features());
     }
 
     /// `source` in the house's lexical form (`plans/kml-layout.org` tier 3),
@@ -598,10 +722,10 @@ mod tests {
         assert!(flat.contains("<name>\r\n\t\t\t\t\tZürich\r\n\t\t\t\t</name>"), "a leaf's text is its value: {flat}");
         assert!(document.starts_with("<!DOCTYPE kml><!-- head --><kml"), "{flat}");
         assert!(!flat.ends_with('\n'));
-        let values = |fc: &FeatureCollection| -> Vec<_> { fc.features.iter().map(|f| (f.geometry.clone(), f.properties.clone())).collect() };
+        let values = |fc: &FeatureCollection| -> Vec<_> { fc.to_features().iter().map(|f| (f.geometry.clone(), f.properties.clone())).collect() };
         assert_eq!(values(&read_kml(flat.as_bytes(), &mut Vec::new()).unwrap()), values(&fc));
         // Built from the IR, and as a .kmz, it is flat too.
-        let fresh = FeatureCollection::new(fc.features.iter().map(|f| Feature { native: None, ..f.clone() }).collect());
+        let fresh = FeatureCollection::from_features(fc.to_features().iter().map(|f| Feature { native: None, ..f.clone() }).collect());
         let flat = String::from_utf8(write_kml(&fresh, None, true)).unwrap();
         assert!(!laid_out(flat.split_once('\n').unwrap().1), "{flat}");
         assert!(laid_out(&String::from_utf8(write_kml(&fresh, None, false)).unwrap()));

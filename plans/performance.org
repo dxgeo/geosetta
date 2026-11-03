@@ -38,6 +38,13 @@ rules:*
   halves in speed fails. Machine-dependent by nature, which is why it is not
   in the default run. A benchmark with no floor panics.
 
+/Lowered 2026-11-02/, after the columnar table (=columnar.org= C1--C5) and
+its speed recovery: every memory budget is reset to 20% above what it now
+measures. The tabular reads went from 791--893 to 600 bytes a feature or
+less, and the wide cases fell by half to two thirds (=geojson → parquet=
+16 061 to 5 934). Allocation budgets fell where the measurement did; the
+three wide ones stay as they were, already within 20%.
+
 ** BENCHMARKS
 =tests/perf.rs= drives the real =geosetta= binary end-to-end (whole-pipeline
 timing, including process startup and file I/O). It generates a synthetic GeoJSON

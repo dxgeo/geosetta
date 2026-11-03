@@ -243,12 +243,12 @@ fn cases() -> Vec<Budget> {
         match from {
             // The target sweep's GeoJSON case is this one.
             Format::GeoJson => None,
-            Format::Parquet => Some((832, 5)),
-            Format::FlatGeobuf => Some((893, 6)),
-            Format::Csv => Some((910, 20)),
-            Format::Wkt => Some((435, 3)),
-            Format::Gpkg => Some((893, 9)),
-            Format::Shapefile => Some((791, 5)),
+            Format::Parquet => Some((600, 4)),
+            Format::FlatGeobuf => Some((600, 4)),
+            Format::Csv => Some((617, 18)),
+            Format::Wkt => Some((336, 3)),
+            Format::Gpkg => Some((600, 8)),
+            Format::Shapefile => Some((564, 3)),
             // A read for another format keeps no feature's element
             // (`performance.org`, KML's read, step 2).
             Format::Kml => Some((1477, 61)),
@@ -258,17 +258,17 @@ fn cases() -> Vec<Budget> {
     fn target_budget(to: Format) -> (usize, usize) {
         // (peak bytes / feature, allocations / feature), written from GeoJSON.
         match to {
-            Format::GeoJson => (915, 16),
-            Format::Parquet => (743, 18),
-            Format::FlatGeobuf => (934, 27),
-            Format::Csv => (560, 38),
-            Format::Wkt => (512, 23),
+            Format::GeoJson => (622, 16),
+            Format::Parquet => (450, 18),
+            Format::FlatGeobuf => (642, 26),
+            Format::Csv => (268, 37),
+            Format::Wkt => (218, 23),
             // Every row is built as a `Vec<Value>` first (`performance.org`,
             // "Also seen, not yet acted on").
-            Format::Gpkg => (1383, 50),
-            Format::Shapefile => (552, 28),
-            Format::Kml => (774, 23),
-            Format::Kmz => (1788, 23),
+            Format::Gpkg => (846, 47),
+            Format::Shapefile => (258, 28),
+            Format::Kml => (774, 20),
+            Format::Kmz => (1788, 20),
         }
     }
     let mut out = Vec::new();
@@ -280,9 +280,9 @@ fn cases() -> Vec<Budget> {
         out.push(Budget { from: Format::GeoJson, to: format, wide: false, peak, allocs });
     }
     // The wide table, the case the memory work was about.
-    out.push(Budget { from: Format::GeoJson, to: Format::Parquet, wide: true, peak: 16_061, allocs: 336 });
-    out.push(Budget { from: Format::GeoJson, to: Format::FlatGeobuf, wide: true, peak: 19_685, allocs: 347 });
-    out.push(Budget { from: Format::Parquet, to: Format::GeoJson, wide: true, peak: 19_247, allocs: 86 });
+    out.push(Budget { from: Format::GeoJson, to: Format::Parquet, wide: true, peak: 5_934, allocs: 336 });
+    out.push(Budget { from: Format::GeoJson, to: Format::FlatGeobuf, wide: true, peak: 9_576, allocs: 347 });
+    out.push(Budget { from: Format::Parquet, to: Format::GeoJson, wide: true, peak: 9_511, allocs: 86 });
     out
 }
 

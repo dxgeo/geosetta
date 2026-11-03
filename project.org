@@ -209,6 +209,8 @@ specification rather than pulled from a crate:
 - =feature.rs= :: the shared, format-neutral feature model (=Feature= /
   =FeatureCollection=) — the IR every format converts to and from; all spokes
   depend on it, not on each other
+- =table/= :: the collection's storage: blocks, each held as typed columns or
+  as rows of shared shapes, read through views (=plans/columnar.org=)
 - =format.rs= :: the =Format= enum every entry point is keyed by — extension and
   name parsing, plus each format's capability answers (=display_name= for the one
   spelling used in every user-facing message, =supports_m=). Its module doc
@@ -264,8 +266,8 @@ specification rather than pulled from a crate:
 
 Design choices for the writer: Snappy-compressed Parquet pages (the codec
 implemented from scratch in =compress/snappy.rs=, keeping the zero-crate goal),
-one row group, and property columns typed by scanning all features
-(heterogeneous or nested values fall back to a JSON string).
+one row group, and property columns typed by the kinds of value each column
+holds (heterogeneous or nested values fall back to a JSON string).
 
 ** USAGE
 #+begin_src sh

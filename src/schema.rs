@@ -1,10 +1,11 @@
-//! Infer a flat, typed column schema from GeoJSON feature properties.
+//! Infer a flat, typed column schema from a collection's property columns.
 //!
 //! Every property becomes one optional column. A column's type is the least
 //! type that fits all of its non-null values:
 //!   * all booleans            -> Bool
 //!   * all integers            -> Int64
 //!   * integers and/or floats  -> Double
+//!   * all bytes               -> Binary
 //!   * anything else / mixed   -> String (values JSON-stringified)
 //!
 //! Columns appear in order of first appearance across the features.
@@ -590,9 +591,9 @@ pub fn infer_columns(features: &[Feature]) -> Vec<Column<'_>> {
         .collect()
 }
 
-/// [`infer_columns`] over a collection's rows, or the same inference read off
-/// its table: the columns with no declarations attached, for a writer whose
-/// format declares nothing (CSV).
+/// [`infer_columns`]'s inference read off a collection's table: the columns
+/// with no declarations attached, for a writer whose format declares nothing
+/// (CSV).
 pub(crate) fn inferred_columns(fc: &FeatureCollection) -> Vec<Column<'_>> {
     table_columns(fc.table())
 }
@@ -634,9 +635,8 @@ fn column_type(kinds: Kinds) -> ColumnType {
     }
 }
 
-/// [`infer_columns`] over a collection's features, or the same inference read
-/// off its table, with each column's [`FieldDecl`] attached from
-/// [`FeatureCollection::schema`].
+/// [`infer_columns`]'s inference read off a collection's table, with each
+/// column's [`FieldDecl`] attached from [`FeatureCollection::schema`].
 ///
 /// Every writer that materializes property columns should call this rather
 /// than [`infer_columns`] directly — inference alone re-derives the schema from

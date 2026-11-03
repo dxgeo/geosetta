@@ -103,8 +103,9 @@ why, not to implement the spec's table from symmetry.
   order recorded only where it deviates, and a =Number= column that keeps =1=
   and =1.0= apart, so every same-format guarantee holds. Every format fits;
   GeoJSON and KML need the exceptions. Milestones C0--C6, from an in-repo
-  equivalence harness to geometry buffers. /C0 built (=bench/equiv.py=,
-  =bench/memprobe/=); the IR itself not started./
+  equivalence harness to geometry buffers. /C0--C5 built: the collection is
+  only blocks, read and edited through public views; C6, geometry buffers,
+  is next./
 - [[file:crs.org][crs.org]] :: CRS pass-through across all formats — warnings when
   a CRS-degrading target (GeoJSON/CSV/WKT) can't express the source CRS (those
   formats stay as-is), making authority+code universal among the rich formats,

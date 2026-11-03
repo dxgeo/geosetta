@@ -271,8 +271,8 @@ See [plans/kml-standard.org](plans/kml-standard.org).
 -   **No reprojection, and no CRS registry.** A CRS given only as a code has
     to be looked up by another tool (see USAGE).
 -   **Everything is held in memory.** A conversion reads the whole input
-    before writing. Reading KML uses the most, about 6 KB per feature on a
-    file of points.
+    before writing. KML to KML or KMZ uses the most, about 6 KB per feature
+    on a file of points, since each feature keeps its element.
 -   **Text encodings.** GeoJSON, CSV and WKT must be UTF-8, and KML must be
     UTF-8 or an encoding Geosetta has a table for; anything else is refused.
     There is no flag yet to name the input's encoding. A `.dbf` whose `.cpg`
@@ -311,13 +311,14 @@ items in [plans/todo.org](plans/todo.org).
 
 Every format is implemented from its specification:
 
--   **`feature.rs`:** the feature model (`Feature`, `FeatureCollection`).
-    Every format depends on it and none on each other.
+-   **`feature.rs`, `table/`:** the feature model (`Feature`,
+    `FeatureCollection`), held as blocks of columns or of shaped rows. Every
+    format depends on it and none on each other.
 -   **`format.rs`:** the `Format` enum and each format's capabilities. Its
     module doc lists what adding a format requires.
 -   **`json/`, `geojson/`:** a JSON parser and GeoJSON.
--   **`schema.rs`:** property column type inference for the Parquet and
-    FlatGeobuf writers.
+-   **`schema.rs`:** property column types for the tabular writers, read
+    off the table's columns, and what a source declared about them.
 -   **`flatbuffers.rs`, `flatgeobuf/`:** a FlatBuffers reader and builder, and
     FlatGeobuf.
 -   **`geometry/`:** the geometry model, with WKB and WKT codecs.

@@ -195,12 +195,6 @@ impl Tabular {
         self.0.push(geometry, values, native);
     }
 
-    /// Append a row a reader already holds as a feature, its properties
-    /// the keys in declared order.
-    pub(crate) fn push_feature(&mut self, feature: Feature) {
-        self.0.push(feature.geometry, feature.properties.into_iter().map(|(_, v)| v), feature.native);
-    }
-
     pub(crate) fn finish(self) -> FeatureCollection {
         FeatureCollection::from_table(self.0.finish())
     }

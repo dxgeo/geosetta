@@ -5,9 +5,8 @@
 
 use crate::crs::Crs;
 use crate::error::{Error, Result};
-use crate::feature::{Feature, FeatureCollection, Tabular};
+use crate::feature::{FeatureCollection, Tabular};
 use crate::table::Layout;
-use std::rc::Rc;
 use crate::shapefile::{dbf, geometry};
 
 /// Read a Shapefile from its sibling files' bytes. `.dbf` is required (a
@@ -38,29 +37,30 @@ pub(crate) fn read_as(
     let geometries = geometry::read(shp)?;
     let encoding = dbf::encoding_from_cpg(cpg);
     let mut losses = dbf::TextLosses::default();
-    let records = dbf::read(dbf_bytes, encoding, cpg.is_some(), &mut losses)?;
+    // .dbf and .shp are zipped by row position; a deleted .dbf record drops
+    // its paired .shp record too (.shp has no deletion flag of its own).
+    // Every record holds every field, in the header's order, and goes
+    // straight into the table as it is decoded.
+    let shapes = geometries.len();
+    let mut geometries = geometries.into_iter();
+    let (mut table, mut records) = (None, 0);
+    dbf::read_each(dbf_bytes, encoding, cpg.is_some(), &mut losses, |keys, deleted, values| {
+        records += 1;
+        let geometry = geometries.next().flatten();
+        let table = table.get_or_insert_with(|| Tabular::new(keys.to_vec(), layout));
+        if !deleted {
+            table.push(geometry, values.drain(..), None);
+        }
+    })?;
     report_text_losses(&losses, cpg, warnings);
 
-    if geometries.len() != records.len() {
+    if shapes != records {
         return Err(Error::Convert(format!(
-            "shapefile: .shp has {} record(s) but .dbf has {} — the sibling files disagree",
-            geometries.len(),
-            records.len()
+            "shapefile: .shp has {shapes} record(s) but .dbf has {records} — the sibling files disagree"
         )));
     }
 
-    // .dbf and .shp are zipped by row position; a deleted .dbf record drops
-    // its paired .shp record too (.shp has no deletion flag of its own).
-    // Every record holds every field, in the header's order.
-    let keys = records.first().map(|r| r.properties.iter().map(|(k, _)| Rc::clone(k)).collect());
-    let mut table = Tabular::new(keys.unwrap_or_default(), layout);
-    for (geometry, record) in geometries.into_iter().zip(records) {
-        if record.deleted {
-            continue;
-        }
-        table.push_feature(Feature { geometry, properties: record.properties, native: None });
-    }
-
+    let table = table.unwrap_or_else(|| Tabular::new(Vec::new(), layout));
     let mut fc = table.finish();
     // The `.dbf` header's own declarations, kept alongside the values so a
     // same-format write puts back the field widths it was handed rather than
@@ -104,6 +104,7 @@ fn report_text_losses(losses: &dbf::TextLosses, cpg: Option<&str>, warnings: &mu
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::feature::Feature;
     use crate::geometry::{Geometry, Position};
     use crate::schema::infer_columns;
     use crate::shapefile::writer;

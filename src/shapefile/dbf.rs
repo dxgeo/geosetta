@@ -28,6 +28,7 @@ struct Field {
 /// with the corresponding `.shp` record by the caller (see
 /// `shapefile::reader`), since `.dbf` and `.shp` are zipped by row position and
 /// `.shp` has no deletion flag of its own.
+#[cfg(test)]
 pub struct Record {
     pub deleted: bool,
     pub properties: Vec<(Rc<str>, JsonValue)>,
@@ -77,11 +78,29 @@ pub struct TextLosses {
     pub replaced: usize,
 }
 
-/// Parse a `.dbf` file into its records. `cpg_declared` is whether a `.cpg`
-/// file was present (see [`encoding_from_cpg`]) — when it wasn't, a UTF-8
-/// decode failure per field falls back to Latin-1 rather than erroring.
-/// `losses` counts the text values that did not decode exactly.
+/// Parse a `.dbf` file into its records.
+#[cfg(test)]
 pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool, losses: &mut TextLosses) -> Result<Vec<Record>> {
+    let mut records = Vec::new();
+    read_each(data, encoding, cpg_declared, losses, |keys, deleted, values| {
+        records.push(Record { deleted, properties: keys.iter().cloned().zip(values.drain(..)).collect() });
+    })?;
+    Ok(records)
+}
+
+/// Decode a `.dbf` file a record at a time, handing `each` the field names,
+/// whether the record is deleted, and its values in field order, to drain.
+/// `cpg_declared` is whether a `.cpg` file was present (see
+/// [`encoding_from_cpg`]) — when it wasn't, a UTF-8 decode failure per field
+/// falls back to Latin-1 rather than erroring. `losses` counts the text
+/// values that did not decode exactly.
+pub fn read_each(
+    data: &[u8],
+    encoding: Encoding,
+    cpg_declared: bool,
+    losses: &mut TextLosses,
+    mut each: impl FnMut(&[Rc<str>], bool, &mut Vec<JsonValue>),
+) -> Result<()> {
     if data.len() < HEADER_LEN {
         return Err(Error::Convert("shapefile: dbf file shorter than its header".into()));
     }
@@ -98,11 +117,8 @@ pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool, losses: &mut Te
         return Err(Error::Convert("shapefile: dbf header declares a zero record size".into()));
     }
     // Truncated files are read up to where their data ends (the loop below),
-    // so the declared count is not rejected -- but it only sizes the `Vec` up
-    // to what the bytes can hold. Trusting it let a 65-byte file request
-    // `u32::MAX` records: a "capacity overflow" panic on wasm32.
-    let capacity = num_records.min(data.len().saturating_sub(header_size) / record_size);
-    let mut records = Vec::with_capacity(capacity);
+    // so the declared count is not rejected.
+    let mut values = Vec::with_capacity(fields.len());
     let mut pos = header_size;
     for _ in 0..num_records {
         if pos >= data.len() || data[pos] == FILE_TERMINATOR {
@@ -114,19 +130,18 @@ pub fn read(data: &[u8], encoding: Encoding, cpg_declared: bool, losses: &mut Te
         pos += record_size;
 
         let deleted = rec[0] == b'*';
-        let mut properties = Vec::with_capacity(fields.len());
+        values.clear();
         let mut field_pos = 1usize; // skip the deletion flag byte
-        for (field, key) in fields.iter().zip(&keys) {
+        for field in &fields {
             let raw = rec
                 .get(field_pos..field_pos + field.len)
                 .ok_or_else(|| Error::Convert("shapefile: dbf record shorter than its schema".into()))?;
             field_pos += field.len;
-            let value = decode_field(field, raw, encoding, cpg_declared, losses)?;
-            properties.push((Rc::clone(key), value));
+            values.push(decode_field(field, raw, encoding, cpg_declared, losses)?);
         }
-        records.push(Record { deleted, properties });
+        each(&keys, deleted, &mut values);
     }
-    Ok(records)
+    Ok(())
 }
 
 /// The field descriptors' *declarations*, independent of any record — the
@@ -206,7 +221,11 @@ fn decode_field(
     losses: &mut TextLosses,
 ) -> Result<JsonValue> {
     Ok(match field.ty {
-        b'C' => JsonValue::String(decode_text(raw, encoding, cpg_declared, losses).trim_end().to_string()),
+        b'C' => {
+            let mut text = decode_text(raw, encoding, cpg_declared, losses);
+            text.truncate(text.trim_end().len());
+            JsonValue::String(text)
+        }
         b'D' => {
             // Raw YYYYMMDD digits, rendered as ISO-8601 text (matches
             // parquet/reader.rs's date-as-formatted-string convention).
@@ -929,11 +948,11 @@ mod tests {
     #[test]
     fn huge_declared_record_count_reads_what_the_bytes_hold() {
         // Declares u32::MAX records but holds two. The count used to size
-        // the `Vec` first: a "capacity overflow" panic on wasm32.
+        // a `Vec` of records first: a "capacity overflow" panic on wasm32.
+        // Records are now decoded one at a time, and nothing is sized by it.
         let dbf = dbf_with(u32::MAX, 2, 2);
         let records = read(&dbf, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
         assert_eq!(records.len(), 2);
-        assert!(records.capacity() <= 2, "capacity {}", records.capacity());
     }
 
     #[test]

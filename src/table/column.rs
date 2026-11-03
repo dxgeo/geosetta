@@ -32,7 +32,9 @@ enum ColumnData {
     /// Integers and floats together (D-C3): each slot's bits are an `i64` or
     /// an `f64`, and `is_int` says which, so `1` and `1.0` stay two values.
     Number { bits: Vec<u64>, is_int: Bitmap },
-    Str { offsets: Vec<u32>, bytes: Vec<u8> },
+    /// Text as one `String`, so reading a slot checks only its two ends
+    /// fall on character boundaries, not the whole slot.
+    Str { offsets: Vec<u32>, text: String },
     Binary { offsets: Vec<u32>, bytes: Vec<u8> },
     /// The escape hatch: anything the narrower buffers cannot hold exactly.
     Mixed(Vec<JsonValue>),
@@ -76,7 +78,7 @@ impl ColumnData {
         match kind {
             Kind::Bool => ColumnData::Bool(Bitmap::filled(len, false)),
             Kind::Number => ColumnData::Number { bits: vec![0; len], is_int: Bitmap::filled(len, false) },
-            Kind::Str => ColumnData::Str { offsets: vec![0; len + 1], bytes: Vec::new() },
+            Kind::Str => ColumnData::Str { offsets: vec![0; len + 1], text: String::new() },
             Kind::Binary => ColumnData::Binary { offsets: vec![0; len + 1], bytes: Vec::new() },
             Kind::Mixed => ColumnData::Mixed(vec![JsonValue::Null; len]),
         }
@@ -101,21 +103,26 @@ impl ColumnData {
                 bits.push(0);
                 is_int.push(false);
             }
-            (ColumnData::Str { offsets, bytes }, JsonValue::String(v)) => push_bytes(offsets, bytes, v.as_bytes()),
-            (ColumnData::Binary { offsets, bytes }, JsonValue::Binary(v)) => push_bytes(offsets, bytes, &v),
-            (ColumnData::Str { offsets, bytes } | ColumnData::Binary { offsets, bytes }, _) => {
-                push_bytes(offsets, bytes, &[])
+            (ColumnData::Str { offsets, text }, JsonValue::String(v)) => {
+                text.push_str(&v);
+                push_end(offsets, text.len());
             }
+            (ColumnData::Str { offsets, text }, _) => push_end(offsets, text.len()),
+            (ColumnData::Binary { offsets, bytes }, JsonValue::Binary(v)) => {
+                bytes.extend_from_slice(&v);
+                push_end(offsets, bytes.len());
+            }
+            (ColumnData::Binary { offsets, bytes }, _) => push_end(offsets, bytes.len()),
             (ColumnData::Mixed(values), v) => values.push(v),
         }
     }
 }
 
-fn push_bytes(offsets: &mut Vec<u32>, bytes: &mut Vec<u8>, v: &[u8]) {
-    bytes.extend_from_slice(v);
+/// End the slot just pushed at `end`, the buffer's new length.
+fn push_end(offsets: &mut Vec<u32>, end: usize) {
     // A block past 4 GiB of text is not a case designed for (D-C10); the
     // reader seals early before one could form.
-    offsets.push(u32::try_from(bytes.len()).expect("a block's text exceeds 4 GiB"));
+    offsets.push(u32::try_from(end).expect("a block's text exceeds 4 GiB"));
 }
 
 fn slice(offsets: &[u32], row: usize) -> std::ops::Range<usize> {
@@ -188,10 +195,7 @@ impl Column {
                 true => Value::Int(bits[row] as i64),
                 false => Value::Float(f64::from_bits(bits[row])),
             },
-            // Every slot was pushed from a `String`, whole.
-            ColumnData::Str { offsets, bytes } => {
-                Value::Str(std::str::from_utf8(&bytes[slice(offsets, row)]).expect("a Str column holds UTF-8"))
-            }
+            ColumnData::Str { offsets, text } => Value::Str(&text[slice(offsets, row)]),
             ColumnData::Binary { offsets, bytes } => Value::Binary(&bytes[slice(offsets, row)]),
             ColumnData::Mixed(values) => Value::of(&values[row]),
         }

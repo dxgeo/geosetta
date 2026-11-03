@@ -373,11 +373,24 @@ impl Table {
 /// Builds a table a feature at a time, for a reader with no schema (C3):
 /// each block fills as shaped rows and seals as `layout` says -- under
 /// `Auto`, by D-C13's rule.
+///
+/// While every row of a block holds its first row's keys, distinct and in
+/// the same order, the rows go straight into columns, as a tabular reader's
+/// do: that is the block transposing them would build, and D-C13 always
+/// chooses it, so regular input never builds rows only to copy them out.
+/// The first row that differs turns what the block holds into rows.
 pub(crate) struct RowTableBuilder {
     layout: Layout,
     sizes: Sizes,
     blocks: Vec<Block>,
-    block: RowBuilder,
+    block: Filling,
+}
+
+/// The block a [`RowTableBuilder`] is filling.
+enum Filling {
+    /// Every row so far holds `keys`, distinct, in this order.
+    Regular { keys: Box<[Rc<str>]>, block: TabularBlock },
+    Rows(RowBuilder),
 }
 
 impl RowTableBuilder {
@@ -386,23 +399,70 @@ impl RowTableBuilder {
     }
 
     pub(crate) fn sized(layout: Layout, sizes: Sizes) -> RowTableBuilder {
-        RowTableBuilder { layout, sizes, blocks: Vec::new(), block: RowBuilder::new(sizes.intern_sample) }
+        RowTableBuilder { layout, sizes, blocks: Vec::new(), block: Filling::Rows(RowBuilder::new(sizes.intern_sample)) }
     }
 
     pub(crate) fn push(&mut self, feature: Feature) {
-        self.block.push(feature);
-        if self.block.len() == self.sizes.block_rows {
-            let full = std::mem::replace(&mut self.block, RowBuilder::new(self.sizes.intern_sample));
-            self.blocks.push(full.seal(self.layout));
+        match &mut self.block {
+            Filling::Regular { keys, block } if holds(keys, &feature) => {
+                let Feature { geometry, properties, native } = feature;
+                block.push(geometry, properties.into_iter().map(|(_, value)| value), native);
+            }
+            Filling::Regular { .. } => {
+                let rows = Filling::Rows(RowBuilder::new(self.sizes.intern_sample));
+                let (Filling::Regular { block, .. }, Filling::Rows(rows)) = (std::mem::replace(&mut self.block, rows), &mut self.block)
+                else {
+                    unreachable!("the block was regular, and is now rows")
+                };
+                block.into_rows(rows);
+                rows.push(feature);
+            }
+            Filling::Rows(rows) if rows.len() == 0 && self.layout != Layout::Rows => {
+                let keys: Box<[Rc<str>]> = feature.properties.iter().map(|(key, _)| key.clone()).collect();
+                if are_distinct(&keys) {
+                    let mut block = TabularBlock::new(&keys);
+                    let Feature { geometry, properties, native } = feature;
+                    block.push(geometry, properties.into_iter().map(|(_, value)| value), native);
+                    self.block = Filling::Regular { keys, block };
+                } else {
+                    rows.push(feature);
+                }
+            }
+            Filling::Rows(rows) => rows.push(feature),
+        }
+        let len = match &self.block {
+            Filling::Regular { block, .. } => block.len(),
+            Filling::Rows(rows) => rows.len(),
+        };
+        if len == self.sizes.block_rows {
+            let full = std::mem::replace(&mut self.block, Filling::Rows(RowBuilder::new(self.sizes.intern_sample)));
+            self.blocks.push(self.seal(full));
+        }
+    }
+
+    fn seal(&self, block: Filling) -> Block {
+        match block {
+            Filling::Regular { block, .. } => block.seal(true, self.layout, self.sizes.intern_sample),
+            Filling::Rows(rows) => rows.seal(self.layout),
         }
     }
 
     pub(crate) fn finish(mut self) -> Table {
-        if self.block.len() > 0 {
-            self.blocks.push(self.block.seal(self.layout));
+        let last = std::mem::replace(&mut self.block, Filling::Rows(RowBuilder::new(self.sizes.intern_sample)));
+        let empty = matches!(&last, Filling::Rows(rows) if rows.len() == 0);
+        if !empty {
+            let block = self.seal(last);
+            self.blocks.push(block);
         }
         Table::from_blocks(self.blocks, self.layout, self.sizes)
     }
+}
+
+/// Whether `feature` holds exactly `keys`, in order. A reader that interns
+/// its keys hands back the same `Rc`, which compares without reading text.
+fn holds(keys: &[Rc<str>], feature: &Feature) -> bool {
+    keys.len() == feature.properties.len()
+        && keys.iter().zip(&feature.properties).all(|(a, (b, _))| Rc::ptr_eq(a, b) || a == b)
 }
 
 /// Builds a table from a tabular reader's rows (C2): every row holds every

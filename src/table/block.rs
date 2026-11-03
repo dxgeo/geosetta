@@ -574,15 +574,20 @@ impl TabularBlock {
                 first_seen,
             });
         }
+        let mut builder = RowBuilder::new(intern_sample);
+        self.into_rows(&mut builder);
+        builder.seal(layout)
+    }
+
+    /// Push every row to `builder`, as the features they were.
+    pub(crate) fn into_rows(self, builder: &mut RowBuilder) {
         let TabularBlock { geometry, mut columns, natives } = self;
         let mut natives = natives.into_iter().peekable();
-        let mut builder = RowBuilder::new(intern_sample);
         for (row, geometry) in geometry.into_iter().enumerate() {
             let properties = columns.iter_mut().map(|c| (c.name.clone(), c.take(row))).collect();
             let native = natives.next_if(|(r, _)| *r as usize == row).map(|(_, n)| n);
             builder.push(Feature { geometry, properties, native });
         }
-        builder.seal(layout)
     }
 }
 

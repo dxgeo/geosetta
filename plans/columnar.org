@@ -1072,6 +1072,33 @@ already moved onto views in C2--C4.
   write is the fix when a profile asks. And the breaking release is not
   made: that, and merging the branch, are the owner's.
 
+/Speed recovered 2026-11-02/, after C5. =compare.py= against the pin
+found most conversions 5--19% slower: every GeoJSON read, the KML write,
+=shp→geojson=. Profiled with =sample= on 1M-feature inputs, and fixed:
+- *A regular block never builds rows.* =RowTableBuilder= fills columns
+  straight away while each row holds its block's first keys, distinct and
+  in order -- the block transposing those rows would build, and D-C13
+  always chooses it -- and turns them into rows at the first row that
+  differs. The transpose was the GeoJSON read's whole cost (C3's 20%).
+- *The =.dbf= streams.* =dbf::read_each= decodes a record at a time into
+  the table, where =read= had built every record first and the table then
+  copied and freed them; a =C= field is trimmed in place, not copied.
+- *=place= allocates once a feature*, not four times: properties kept as
+  =(&str, Value)= and filtered into =extended= in place, the element's keys
+  checked without collecting them, used positions recorded only when used.
+- A =Str= column holds a =String=, so reading a cell checks its two ends,
+  not its whole text, for UTF-8.
+Tried and dropped: folding =Column::push='s kind checks into the push, and
+a branchless =Bitmap::push= -- no difference measurable.
+- =compare.py=, the same machine, pin then this: every case within ±2% of
+  the pin or faster, peaks lower throughout. Notable: =kml→geojson= 411 →
+  331 ms (678 → 153 MB); the three 3857 cases 9--14% faster; wide
+  =geojson→parquet= 1 092 → 988 ms and 837 → 367 MB, wide =geojson→fgb=
+  1 014 → 1 025 ms and 916 → 447 MB. Output checks as the pin's.
+  =LAYOUTS=auto,rows,columns= =equiv.py=: 8 991 identical; 856 tests.
+- Still slower, outside =compare.py=: a tabular write from a sparse row
+  block (C3's =sparse → fgb=, 1.6×).
+
 *** C6 -- geometry buffers
 D-C6: flat coordinate buffers with offsets, replacing =Option<Geometry>= per
 row. Measured separately, because the property milestones above leave

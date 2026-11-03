@@ -13,7 +13,6 @@
 //! `<ExtendedData>` repeats `name` gives, stays in `<ExtendedData>` where it
 //! came from.
 
-use std::rc::Rc;
 
 use crate::feature::FeatureRef;
 use crate::kml::model::KmlElement;
@@ -60,16 +59,19 @@ pub(crate) struct Placement<'f> {
 /// Sort `f`'s properties for a feature element of kind `element`, whose
 /// geometry can hold an altitude member when `carries` says so.
 pub(crate) fn place<'f>(f: FeatureRef<'f>, element: KmlElement, carries: impl Fn(KmlElement) -> bool) -> Placement<'f> {
-    let properties: Vec<(&'f Rc<str>, Value<'f>)> = f.properties().collect();
-    let keys: Vec<&str> = project::element_keys(element).collect();
+    // What is not placed in an element stays, in order, as `extended`.
+    let mut properties: Vec<(&'f str, Value<'f>)> = f.properties().map(|(k, v)| (&**k, v)).collect();
     // Which property a member would come from: its key's first occurrence.
-    let first = |key: &str| keys.contains(&key).then(|| properties.iter().position(|(k, _)| &***k == key)).flatten();
-    let mut used = vec![false; properties.len()];
+    let first = |key: &str| {
+        project::element_keys(element).any(|k| k == key).then(|| properties.iter().position(|(k, _)| *k == key)).flatten()
+    };
+    // The positions placed, which most features have none of.
+    let mut used: Vec<usize> = Vec::new();
     let mut take = |key: &str, ok: &dyn Fn(&str) -> bool| -> Option<String> {
         let i = first(key)?;
         let text = property_text(properties[i].1);
         ok(&text).then(|| {
-            used[i] = true;
+            used.push(i);
             text
         })
     };
@@ -95,9 +97,14 @@ pub(crate) fn place<'f>(f: FeatureRef<'f>, element: KmlElement, carries: impl Fn
             altitude.push((member, v));
         }
     }
-    let extended =
-        properties.into_iter().zip(used).filter(|(_, used)| !*used).map(|((k, v), _)| (&**k, v)).collect();
-    Placement { name, description, time, icon, altitude, extended }
+    if !used.is_empty() {
+        let mut i = 0;
+        properties.retain(|_| {
+            i += 1;
+            !used.contains(&(i - 1))
+        });
+    }
+    Placement { name, description, time, icon, altitude, extended: properties }
 }
 
 /// Whether `text` is a value the altitude member `member` admits.

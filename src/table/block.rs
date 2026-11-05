@@ -2,6 +2,7 @@
 //! (`plans/columnar.org` D-C10, D-C13).
 
 use super::column::Column;
+use super::geometry::{GeometryColumn, GeometryRef};
 use super::kinds::Kinds;
 use super::value::Value;
 use super::Layout;
@@ -33,7 +34,7 @@ pub(crate) enum Block {
 /// as it does in `Vec<Feature>`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct RowBlock {
-    geometry: Vec<Option<Geometry>>,
+    geometry: GeometryColumn,
     /// Key lists, in order, repeats kept.
     shapes: Vec<Box<[Rc<str>]>>,
     row_shape: Vec<u32>,
@@ -48,7 +49,7 @@ pub(crate) struct RowBlock {
 /// order (D-C4), with the rows that deviate from it in `shapes`.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub(crate) struct ColumnBlock {
-    geometry: Vec<Option<Geometry>>,
+    geometry: GeometryColumn,
     columns: Vec<Column>,
     /// D-C4: the irregular rows, sorted by row.
     shapes: Vec<(u32, Box<[Member]>)>,
@@ -85,10 +86,21 @@ impl Block {
         }
     }
 
-    pub(crate) fn geometry(&self, row: usize) -> Option<&Geometry> {
+    pub(crate) fn geometry(&self, row: usize) -> Option<GeometryRef<'_>> {
+        self.geometry_column().get(row)
+    }
+
+    fn geometry_column(&self) -> &GeometryColumn {
         match self {
-            Block::Rows(b) => b.geometry[row].as_ref(),
-            Block::Columns(b) => b.geometry[row].as_ref(),
+            Block::Rows(b) => &b.geometry,
+            Block::Columns(b) => &b.geometry,
+        }
+    }
+
+    pub(crate) fn geometry_column_mut(&mut self) -> &mut GeometryColumn {
+        match self {
+            Block::Rows(b) => &mut b.geometry,
+            Block::Columns(b) => &mut b.geometry,
         }
     }
 
@@ -259,6 +271,57 @@ impl Block {
         edit(self.patch_mut().get_mut(&(row as u32)).expect("inserted above"));
     }
 
+    /// Row `row`'s properties as an owned list to edit -- reorder, rename,
+    /// insert anywhere, repeat a key -- kept as `f` leaves them (D-C16). A
+    /// list `f` leaves as it was is not patched, so a pass over every row
+    /// that changes a few costs a patch entry for those few.
+    pub(crate) fn edit_properties<R>(&mut self, row: usize, f: impl FnOnce(&mut Vec<(Rc<str>, JsonValue)>) -> R) -> R {
+        let mut members: Vec<(Rc<str>, JsonValue)> =
+            self.properties(row).map(|(k, v)| (k.clone(), v.to_owned())).collect();
+        let r = f(&mut members);
+        if !self.has_properties(row, &members) {
+            self.patch_mut().insert(row as u32, members);
+        }
+        r
+    }
+
+    /// Whether row `row`'s properties are `members`, bit for bit.
+    fn has_properties(&self, row: usize, members: &[(Rc<str>, JsonValue)]) -> bool {
+        let mut held = self.properties(row);
+        members.iter().all(|(k, v)| held.next().is_some_and(|(hk, hv)| hk == k && hv.identical(v)))
+            && held.next().is_none()
+    }
+
+    /// Row `row` as an owned [`Feature`] to edit, kept as `f` leaves it
+    /// (D-C16): its geometry, its properties and its native together.
+    pub(crate) fn edit_feature<R>(&mut self, row: usize, f: impl FnOnce(&mut Feature) -> R) -> R {
+        // Owned, the geometry is moved out and back; flat, it is copied, and
+        // written back only when `f` changed it.
+        let owned = matches!(self.geometry_column(), GeometryColumn::Owned(_));
+        let geometry = match owned {
+            true => self.edit_geometry(row, Option::take),
+            false => self.geometry(row).map(GeometryRef::to_geometry),
+        };
+        let native = self.native(row).cloned().map(Box::new);
+        let mut feature = Feature { geometry, properties: Vec::new(), native };
+        let r = self.edit_properties(row, |members| {
+            feature.properties = std::mem::take(members);
+            let r = f(&mut feature);
+            *members = std::mem::take(&mut feature.properties);
+            r
+        });
+        match owned {
+            true => self.edit_geometry(row, |g| *g = feature.geometry),
+            false => self.edit_geometry(row, |g| {
+                if !super::geometry::identical(g, &feature.geometry) {
+                    *g = feature.geometry;
+                }
+            }),
+        }
+        self.set_native(row, feature.native.map(|n| *n));
+        r
+    }
+
     /// Give row `row`'s first `key` the value `value`, in its place; a row
     /// without the key gains it last (D-C12).
     pub(crate) fn set(&mut self, row: usize, key: &str, value: JsonValue) {
@@ -309,18 +372,13 @@ impl Block {
         natives.retain(|(_, n)| !drop(n));
     }
 
-    pub(crate) fn geometries_mut(&mut self) -> &mut [Option<Geometry>] {
-        match self {
-            Block::Rows(b) => &mut b.geometry,
-            Block::Columns(b) => &mut b.geometry,
-        }
+    /// Row `row`'s geometry as an owned value, kept as `f` leaves it.
+    pub(crate) fn edit_geometry<R>(&mut self, row: usize, f: impl FnOnce(&mut Option<Geometry>) -> R) -> R {
+        self.geometry_column_mut().edit(row, f)
     }
 
     pub(crate) fn set_geometry(&mut self, row: usize, geometry: Option<Geometry>) {
-        match self {
-            Block::Rows(b) => b.geometry[row] = geometry,
-            Block::Columns(b) => b.geometry[row] = geometry,
-        }
+        self.geometry_column_mut().set(row, geometry);
     }
 
     /// Append a feature to a row block (D-C12's tail block).
@@ -491,7 +549,8 @@ impl RowBuilder {
     /// Seal the block as `layout` asks: as rows, as columns, or by D-C13's
     /// rule.
     pub(crate) fn seal(self, layout: Layout) -> Block {
-        let block = self.block;
+        let mut block = self.block;
+        block.geometry = block.geometry.seal(layout);
         let plan = match layout {
             Layout::Rows => None,
             Layout::Columns => Some(ColumnPlan::of(&block)),
@@ -566,7 +625,7 @@ impl TabularBlock {
         if distinct && layout != Layout::Rows {
             let first_seen = (0..self.columns.len() as u32).collect();
             return Block::Columns(ColumnBlock {
-                geometry: self.geometry,
+                geometry: GeometryColumn::Owned(self.geometry).seal(layout),
                 columns: self.columns,
                 shapes: Vec::new(),
                 natives: self.natives,
@@ -697,7 +756,7 @@ impl RowBlock {
     fn into_features(mut self, out: &mut Vec<Feature>) {
         let mut values = self.values.into_iter();
         let mut natives = self.natives.into_iter().peekable();
-        for (row, (geometry, &s)) in self.geometry.into_iter().zip(&self.row_shape).enumerate() {
+        for (row, (geometry, &s)) in self.geometry.into_owned().into_iter().zip(&self.row_shape).enumerate() {
             let keys = &self.shapes[s as usize];
             let held = values.by_ref().take(keys.len());
             let properties = match self.patch.remove(&(row as u32)) {
@@ -718,7 +777,7 @@ impl ColumnBlock {
     fn into_features(mut self, out: &mut Vec<Feature>) {
         let mut shapes = self.shapes.into_iter().peekable();
         let mut natives = self.natives.into_iter().peekable();
-        for (row, geometry) in self.geometry.into_iter().enumerate() {
+        for (row, geometry) in self.geometry.into_owned().into_iter().enumerate() {
             let irregular = shapes.next_if(|(r, _)| *r as usize == row);
             let properties = match (self.patch.remove(&(row as u32)), irregular) {
                 (Some(patched), _) => patched,

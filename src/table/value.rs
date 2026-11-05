@@ -32,6 +32,20 @@ impl<'a> Value<'a> {
         }
     }
 
+    /// [`JsonValue::identical`], between a cell and an owned value.
+    pub(crate) fn identical(self, other: &JsonValue) -> bool {
+        match (self, other) {
+            (Value::Null, JsonValue::Null) => true,
+            (Value::Bool(a), JsonValue::Bool(b)) => a == *b,
+            (Value::Int(a), JsonValue::Int(b)) => a == *b,
+            (Value::Float(a), JsonValue::Float(b)) => a.to_bits() == b.to_bits(),
+            (Value::Str(a), JsonValue::String(b)) => a == b,
+            (Value::Binary(a), JsonValue::Binary(b)) => a == &b[..],
+            (Value::Json(a), b) => a.identical(b),
+            _ => false,
+        }
+    }
+
     /// The cell as compact JSON, as [`JsonValue::write_json_to`] writes it.
     pub(crate) fn write_json_to(self, out: &mut String) {
         use std::fmt::Write;

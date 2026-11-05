@@ -9,6 +9,7 @@ mod wkt;
 
 pub use wkb::decode as from_wkb;
 pub use wkb::encode as to_wkb;
+pub(crate) use wkb::encode_ref as wkb_ref;
 pub use wkt::decode as from_wkt;
 pub use wkt::encode as to_wkt;
 

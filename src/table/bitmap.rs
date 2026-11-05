@@ -38,6 +38,15 @@ impl Bitmap {
         self.words[i / 64] >> (i % 64) & 1 == 1
     }
 
+    pub(crate) fn set(&mut self, i: usize, bit: bool) {
+        debug_assert!(i < self.len);
+        let mask = 1 << (i % 64);
+        match bit {
+            true => self.words[i / 64] |= mask,
+            false => self.words[i / 64] &= !mask,
+        }
+    }
+
     /// Whether some bit set here is `bit` in `other`, which is as long.
     pub(crate) fn any_where(&self, other: &Bitmap, bit: bool) -> bool {
         debug_assert_eq!(self.len, other.len);

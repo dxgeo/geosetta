@@ -17,7 +17,8 @@ use crate::feature::FeatureCollection;
 use crate::flatbuffers::Builder;
 use crate::format::Format;
 use crate::native::{FgbNative, NativePayload};
-use crate::geometry::{Bbox, Geometry, Position};
+use crate::geometry::Bbox;
+use crate::table::{GeometryRef, Rings, Run, Shape};
 use crate::schema::{Cell, Cells, Column, ColumnType, columns_for, DeclType};
 
 const MAGIC: [u8; 8] = [b'f', b'g', b'b', 3, b'f', b'g', b'b', 1];
@@ -182,7 +183,7 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     out
 }
 
-fn feature_bbox(geometry: Option<&Geometry>) -> Bbox {
+fn feature_bbox(geometry: Option<GeometryRef<'_>>) -> Bbox {
     geometry.map(|g| g.bbox()).unwrap_or_else(Bbox::empty)
 }
 
@@ -341,7 +342,7 @@ fn build_crs(b: &mut Builder, crs: Option<&crate::crs::Crs>, native: Option<&Fgb
     Some(b.end_table())
 }
 
-fn build_feature(geom: Option<&Geometry>, columns: &[Column], cells: &mut [Cells]) -> Vec<u8> {
+fn build_feature(geom: Option<GeometryRef<'_>>, columns: &[Column], cells: &mut [Cells]) -> Vec<u8> {
     let mut b = Builder::new();
 
     let geom_off = geom.map(|g| encode_geometry(&mut b, g));
@@ -361,51 +362,45 @@ fn build_feature(geom: Option<&Geometry>, columns: &[Column], cells: &mut [Cells
 
 /// Encode a geometry into a Geometry table, returning its rev-offset. Children
 /// (xy / z / m / ends / parts) are built before the table.
-fn encode_geometry(b: &mut Builder, g: &Geometry) -> usize {
+fn encode_geometry(b: &mut Builder, g: GeometryRef<'_>) -> usize {
     let ty = fgb_geometry_type(g);
-    match g {
-        Geometry::Point(p) => {
+    match g.shape() {
+        Shape::Point(p) => {
             let xy = b.create_f64_vector(&[p.x, p.y]);
             let z = p.z.map(|z| b.create_f64_vector(&[z]));
             let m = p.m.map(|m| b.create_f64_vector(&[m]));
             geom_table(b, ty, None, Some(xy), None, z, m)
         }
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => {
+        Shape::LineString(ps) | Shape::MultiPoint(ps) => {
             let xy = b.create_f64_vector(&flatten(ps));
             let dim = dim_of_first(ps);
             let z = dim.0.then(|| b.create_f64_vector(&flatten_z(ps)));
             let m = dim.1.then(|| b.create_f64_vector(&flatten_m(ps)));
             geom_table(b, ty, None, Some(xy), None, z, m)
         }
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            let xy = b.create_f64_vector(&flatten_rings(rings));
-            let ends = (rings.len() > 1).then(|| b.create_u32_vector(&ring_ends(rings)));
-            let dim = dim_of_rings(rings);
-            let z = dim.0.then(|| b.create_f64_vector(&flatten_rings_z(rings)));
-            let m = dim.1.then(|| b.create_f64_vector(&flatten_rings_m(rings)));
-            geom_table(b, ty, ends, Some(xy), None, z, m)
-        }
-        Geometry::MultiPolygon(polys) => {
-            let part_offsets: Vec<usize> = polys
-                .iter()
-                .map(|rings| {
-                    let xy = b.create_f64_vector(&flatten_rings(rings));
-                    let ends = (rings.len() > 1).then(|| b.create_u32_vector(&ring_ends(rings)));
-                    let dim = dim_of_rings(rings);
-                    let z = dim.0.then(|| b.create_f64_vector(&flatten_rings_z(rings)));
-                    let m = dim.1.then(|| b.create_f64_vector(&flatten_rings_m(rings)));
-                    geom_table(b, gtype::POLYGON, ends, Some(xy), None, z, m)
-                })
-                .collect();
+        Shape::Polygon(rings) | Shape::MultiLineString(rings) => rings_table(b, ty, rings),
+        Shape::MultiPolygon(polys) => {
+            let part_offsets: Vec<usize> = polys.iter().map(|rings| rings_table(b, gtype::POLYGON, rings)).collect();
             let parts = b.create_offset_vector(&part_offsets);
             geom_table(b, ty, None, None, Some(parts), None, None)
         }
-        Geometry::GeometryCollection(geoms) => {
-            let part_offsets: Vec<usize> = geoms.iter().map(|g| encode_geometry(b, g)).collect();
+        Shape::Collection(geoms) => {
+            let part_offsets: Vec<usize> = geoms.iter().map(|g| encode_geometry(b, GeometryRef::owned(g))).collect();
             let parts = b.create_offset_vector(&part_offsets);
             geom_table(b, ty, None, None, Some(parts), None, None)
         }
     }
+}
+
+/// A polygon's or multilinestring's Geometry table: its rings' positions
+/// back to back, and where each ends when there is more than one.
+fn rings_table(b: &mut Builder, ty: u8, rings: Rings<'_>) -> usize {
+    let xy = b.create_f64_vector(&flatten_rings(rings));
+    let ends = (rings.len() > 1).then(|| b.create_u32_vector(&ring_ends(rings)));
+    let dim = dim_of_rings(rings);
+    let z = dim.0.then(|| b.create_f64_vector(&flatten_rings_z(rings)));
+    let m = dim.1.then(|| b.create_f64_vector(&flatten_rings_m(rings)));
+    geom_table(b, ty, ends, Some(xy), None, z, m)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -483,15 +478,15 @@ fn encode_properties(columns: &[Column], cells: &mut [Cells]) -> Vec<u8> {
     blob
 }
 
-fn fgb_geometry_type(g: &Geometry) -> u8 {
-    match g {
-        Geometry::Point(_) => gtype::POINT,
-        Geometry::LineString(_) => gtype::LINESTRING,
-        Geometry::Polygon(_) => gtype::POLYGON,
-        Geometry::MultiPoint(_) => gtype::MULTIPOINT,
-        Geometry::MultiLineString(_) => gtype::MULTILINESTRING,
-        Geometry::MultiPolygon(_) => gtype::MULTIPOLYGON,
-        Geometry::GeometryCollection(_) => gtype::GEOMETRYCOLLECTION,
+fn fgb_geometry_type(g: GeometryRef<'_>) -> u8 {
+    match g.shape() {
+        Shape::Point(_) => gtype::POINT,
+        Shape::LineString(_) => gtype::LINESTRING,
+        Shape::Polygon(_) => gtype::POLYGON,
+        Shape::MultiPoint(_) => gtype::MULTIPOINT,
+        Shape::MultiLineString(_) => gtype::MULTILINESTRING,
+        Shape::MultiPolygon(_) => gtype::MULTIPOLYGON,
+        Shape::Collection(_) => gtype::GEOMETRYCOLLECTION,
     }
 }
 
@@ -577,12 +572,12 @@ fn decl_column_type(d: DeclType) -> u8 {
     }
 }
 
-fn flatten(ps: &[Position]) -> Vec<f64> {
+fn flatten(ps: Run<'_>) -> Vec<f64> {
     ps.iter().flat_map(|p| [p.x, p.y]).collect()
 }
 
-fn flatten_rings(rings: &[Vec<Position>]) -> Vec<f64> {
-    rings.iter().flat_map(|r| flatten(r)).collect()
+fn flatten_rings(rings: Rings<'_>) -> Vec<f64> {
+    rings.iter().flat_map(|r| r.iter().flat_map(|p| [p.x, p.y])).collect()
 }
 
 /// A position list's `z`/`m` values, in the same order as `flatten`'s `xy`.
@@ -590,20 +585,20 @@ fn flatten_rings(rings: &[Vec<Position>]) -> Vec<f64> {
 /// Shapefile's M sentinel), so a position that lacks the ordinate a
 /// Z/M-bearing geometry declares falls back to `0.0` — the same choice
 /// `wkb.rs`'s encoder makes for the same reason.
-fn flatten_z(ps: &[Position]) -> Vec<f64> {
+fn flatten_z(ps: Run<'_>) -> Vec<f64> {
     ps.iter().map(|p| p.z.unwrap_or(0.0)).collect()
 }
 
-fn flatten_m(ps: &[Position]) -> Vec<f64> {
+fn flatten_m(ps: Run<'_>) -> Vec<f64> {
     ps.iter().map(|p| p.m.unwrap_or(0.0)).collect()
 }
 
-fn flatten_rings_z(rings: &[Vec<Position>]) -> Vec<f64> {
-    rings.iter().flat_map(|r| flatten_z(r)).collect()
+fn flatten_rings_z(rings: Rings<'_>) -> Vec<f64> {
+    rings.iter().flat_map(|r| r.iter().map(|p| p.z.unwrap_or(0.0))).collect()
 }
 
-fn flatten_rings_m(rings: &[Vec<Position>]) -> Vec<f64> {
-    rings.iter().flat_map(|r| flatten_m(r)).collect()
+fn flatten_rings_m(rings: Rings<'_>) -> Vec<f64> {
+    rings.iter().flat_map(|r| r.iter().map(|p| p.m.unwrap_or(0.0))).collect()
 }
 
 /// The dimensionality implied by a position list's first element (or 2D if
@@ -612,14 +607,14 @@ fn flatten_rings_m(rings: &[Vec<Position>]) -> Vec<f64> {
 /// `wkb.rs`'s `dim_of_first` declares dimensionality once per geometry
 /// rather than per point. Kept as an independent copy in this module rather
 /// than shared, matching every other format spoke's self-contained style.
-fn dim_of_first(ps: &[Position]) -> (bool, bool) {
+fn dim_of_first(ps: Run<'_>) -> (bool, bool) {
     ps.first().map(|p| (p.z.is_some(), p.m.is_some())).unwrap_or((false, false))
 }
 
 /// The dimensionality implied by a ring list's first position (its first
 /// ring's first point), or 2D if empty.
-fn dim_of_rings(rings: &[Vec<Position>]) -> (bool, bool) {
-    rings.first().map(|r| dim_of_first(r)).unwrap_or((false, false))
+fn dim_of_rings(rings: Rings<'_>) -> (bool, bool) {
+    rings.first().map(dim_of_first).unwrap_or((false, false))
 }
 
 /// The dimensionality of a geometry's very first position, found by
@@ -627,29 +622,15 @@ fn dim_of_rings(rings: &[Vec<Position>]) -> (bool, bool) {
 /// `hasZ`/`hasM` header hint (each geometry's own z/m vectors are still
 /// derived independently in `encode_geometry`, so a per-feature dimension
 /// mismatch never loses data, only the header's summary hint).
-fn dim_of_geometry(g: &Geometry) -> (bool, bool) {
-    first_position(g).map(|p| (p.z.is_some(), p.m.is_some())).unwrap_or((false, false))
-}
-
-fn first_position(g: &Geometry) -> Option<Position> {
-    match g {
-        Geometry::Point(p) => Some(*p),
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => ps.first().copied(),
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            rings.first().and_then(|r| r.first()).copied()
-        }
-        Geometry::MultiPolygon(polys) => {
-            polys.first().and_then(|p| p.first()).and_then(|r| r.first()).copied()
-        }
-        Geometry::GeometryCollection(geoms) => geoms.first().and_then(first_position),
-    }
+fn dim_of_geometry(g: GeometryRef<'_>) -> (bool, bool) {
+    g.first_position().map(|p| (p.z.is_some(), p.m.is_some())).unwrap_or((false, false))
 }
 
 /// Cumulative point counts marking the end of each ring/line.
-fn ring_ends(rings: &[Vec<Position>]) -> Vec<u32> {
+fn ring_ends(rings: Rings<'_>) -> Vec<u32> {
     let mut ends = Vec::with_capacity(rings.len());
     let mut total = 0u32;
-    for r in rings {
+    for r in rings.iter() {
         total += r.len() as u32;
         ends.push(total);
     }
@@ -766,6 +747,7 @@ impl Node {
 mod tests {
     use super::*;
     use crate::feature::Feature;
+    use crate::geometry::{Geometry, Position};
     use crate::json::JsonValue;
 
     #[test]

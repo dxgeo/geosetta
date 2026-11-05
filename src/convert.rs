@@ -9,8 +9,8 @@ use std::rc::Rc;
 use crate::format::{Format, KmlVersion};
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection, Tabular};
-use crate::table::Layout;
-use crate::geometry::{from_wkb, from_wkt, to_wkb, to_wkt, Bbox, Geometry, Position};
+use crate::table::{GeometryRef, Layout};
+use crate::geometry::{from_wkb, from_wkt, to_wkt, Bbox};
 use crate::{csv, flatgeobuf, geojson, kml, parquet};
 // `json` is only needed by the test helpers below (the read path streams
 // GeoJSON directly rather than through a JsonValue tree).
@@ -343,8 +343,8 @@ fn read_wkt_lines(input: &[u8]) -> Result<FeatureCollection> {
 fn write_wkt_lines(fc: &FeatureCollection) -> Vec<u8> {
     let mut out = String::new();
     for f in fc.rows() {
-        if let Some(g) = f.geometry() {
-            out.push_str(&to_wkt(g));
+        if let Some(g) = f.geometry_cow() {
+            out.push_str(&to_wkt(&g));
         }
         out.push('\n');
     }
@@ -373,7 +373,7 @@ fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
             Some(g) => {
                 g.extend_bbox(&mut bbox);
                 types.insert(format!("{}{}", g.type_name(), geoparquet_dim_suffix(g)));
-                geometry.push(Some(to_wkb(g)));
+                geometry.push(Some(crate::geometry::wkb_ref(g)));
             }
             None => geometry.push(None),
         }
@@ -410,37 +410,12 @@ fn features_to_parquet(fc: &FeatureCollection) -> Vec<u8> {
 /// the mistake; fixed by checking the actual spec
 /// (=raw.githubusercontent.com/opengeospatial/geoparquet/main/format-specs/geoparquet.md=)
 /// rather than inferring it from DuckDB alone.
-fn geoparquet_dim_suffix(g: &Geometry) -> &'static str {
-    let (z, m) = geoparquet_first_position_dim(g);
-    match (z, m) {
+fn geoparquet_dim_suffix(g: GeometryRef<'_>) -> &'static str {
+    match g.first_position().map(|p| (p.z.is_some(), p.m.is_some())).unwrap_or((false, false)) {
         (true, true) => " ZM",
         (true, false) => " Z",
         (false, true) => " M",
         (false, false) => "",
-    }
-}
-
-fn geoparquet_first_position_dim(g: &Geometry) -> (bool, bool) {
-    fn dim(p: Position) -> (bool, bool) {
-        (p.z.is_some(), p.m.is_some())
-    }
-    match g {
-        Geometry::Point(p) => dim(*p),
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => {
-            ps.first().map(|p| dim(*p)).unwrap_or((false, false))
-        }
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            rings.first().and_then(|r| r.first()).map(|p| dim(*p)).unwrap_or((false, false))
-        }
-        Geometry::MultiPolygon(polys) => polys
-            .first()
-            .and_then(|p| p.first())
-            .and_then(|r| r.first())
-            .map(|p| dim(*p))
-            .unwrap_or((false, false)),
-        Geometry::GeometryCollection(geoms) => {
-            geoms.first().map(geoparquet_first_position_dim).unwrap_or((false, false))
-        }
     }
 }
 
@@ -522,7 +497,7 @@ fn geoparquet_to_geojson(bytes: &[u8]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Position;
+    use crate::geometry::{Geometry, Position};
 
     const SAMPLE: &str = r#"{
         "type": "FeatureCollection",

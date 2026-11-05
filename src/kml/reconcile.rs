@@ -155,7 +155,9 @@ impl Writing<'_> {
             return self.fresh(f, lead);
         };
         let unedited = projected.properties.iter().map(|(k, v)| (&**k, Value::of(v))).eq(f.properties().map(|(k, v)| (&**k, v)));
-        if unedited && projected.geometry.as_ref() == f.geometry() {
+        let geometry = f.geometry_cow();
+        let geometry = geometry.as_deref();
+        if unedited && projected.geometry.as_ref() == geometry {
             return stored.clone();
         }
         let element = stored.element().expect("a projected feature is a KML element");
@@ -164,7 +166,7 @@ impl Writing<'_> {
         let mut node = stored.clone();
         // The geometry first, so the properties are placed against the
         // geometry that will be written.
-        if projected.geometry.as_ref() != f.geometry() && reconcile_geometry(&mut node, f.geometry(), self.version, b).is_err() {
+        if projected.geometry.as_ref() != geometry && reconcile_geometry(&mut node, geometry, self.version, b).is_err() {
             // What the overlay was is gone with its geometry; the feature is
             // a Placemark now, and `drop_warnings` says so.
             return self.fresh(f, lead);
@@ -721,10 +723,11 @@ pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format, carried: boo
                 causes.add(Cause::Vertical);
             }
         } else {
-            if unprojected.contains(&project::Unprojected::TrackData) && track_edit_drops_data(&m.node, f.geometry()) {
+            let geometry = f.geometry_cow();
+            if unprojected.contains(&project::Unprojected::TrackData) && track_edit_drops_data(&m.node, geometry.as_deref()) {
                 causes.add(Cause::EditedTrack);
             }
-            if overlay_edit_unwritable(&m.node, f.geometry()) {
+            if overlay_edit_unwritable(&m.node, geometry.as_deref()) {
                 causes.add(Cause::EditedOverlay);
             }
         }
@@ -1040,7 +1043,7 @@ mod tests {
     #[test]
     fn a_moved_ground_overlay_keeps_its_box_and_its_rotation() {
         let (fc, written) = edited(OVERLAY, |fc| {
-            let moved = shifted(fc.row(0).geometry().unwrap(), 1.0);
+            let moved = shifted(&fc.row(0).geometry().unwrap().to_geometry(), 1.0);
             fc.set_geometry(0, Some(moved))
         });
         assert!(written.contains("<GroundOverlay id=\"g\">"), "{written}");

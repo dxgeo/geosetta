@@ -8,7 +8,7 @@ use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
 use crate::native::Native;
 use crate::schema::FieldDecl;
-use crate::table::{ColumnRef, Layout, Properties, RowRef, RowTableBuilder, Sizes, Table, TableBuilder, Value};
+use crate::table::{ColumnRef, GeometryRef, Layout, Properties, RowRef, RowTableBuilder, Sizes, Table, TableBuilder, Value};
 use std::rc::Rc;
 
 /// A vector feature: an optional geometry plus ordered properties.
@@ -89,8 +89,18 @@ pub struct FeatureCollection {
 pub struct FeatureRef<'a>(RowRef<'a>);
 
 impl<'a> FeatureRef<'a> {
-    pub fn geometry(self) -> Option<&'a Geometry> {
+    /// The feature's geometry, read in place: a view, since a block may
+    /// hold it flat (`plans/columnar.org` D-C6). [`GeometryRef::to_geometry`]
+    /// copies it out; [`FeatureCollection::edit_geometry`] edits it.
+    pub fn geometry(self) -> Option<GeometryRef<'a>> {
         self.0.geometry()
+    }
+
+    /// The geometry as a [`Geometry`]: borrowed where the block holds one,
+    /// copied out where it is flat. What a writer that walks a `Geometry`
+    /// reads (`plans/columnar.org` C6 step 4).
+    pub(crate) fn geometry_cow(self) -> Option<std::borrow::Cow<'a, Geometry>> {
+        self.geometry().map(GeometryRef::to_cow)
     }
 
     /// What the feature's source recorded beyond its geometry and
@@ -291,6 +301,57 @@ impl FeatureCollection {
         self.table_mut().set_geometry(i, geometry);
     }
 
+    /// Edit feature `i`'s geometry as an owned value: `f` gets it to change
+    /// as it likes -- match on it, push a ring, change its type, take it
+    /// away -- and what `f` leaves is kept. Returns what `f` returns.
+    /// Panics when `i` is not below [`Self::len`].
+    ///
+    /// The way to make any edit to a geometry (`plans/columnar.org` D-C16).
+    /// For one that keeps each geometry's shape, such as a reprojection,
+    /// [`Self::for_each_position_mut`] is cheaper.
+    pub fn edit_geometry<R>(&mut self, i: usize, f: impl FnOnce(&mut Option<Geometry>) -> R) -> R {
+        assert!(i < self.len(), "row {i} of a collection of {}", self.len());
+        self.table_mut().edit_geometry(i, f)
+    }
+
+    /// [`Self::edit_geometry`] for every feature, in order, with its index:
+    /// one pass, rather than one call a feature.
+    pub fn for_each_geometry_mut(&mut self, f: impl FnMut(usize, &mut Option<Geometry>)) {
+        self.table_mut().for_each_geometry_mut(f);
+    }
+
+    /// Edit feature `i`'s properties as an owned list: `f` gets them, in the
+    /// feature's own order and with any repeated key as often as it is
+    /// held, to change as it likes -- rename a key in its place, reorder,
+    /// insert anywhere, repeat a key -- and what `f` leaves is kept. Returns
+    /// what `f` returns. Panics when `i` is not below [`Self::len`].
+    ///
+    /// The way to make any edit to a feature's properties
+    /// (`plans/columnar.org` D-C16); [`Self::set`] and [`Self::remove`] are
+    /// the cheaper calls for the edits they make, and [`Self::map_column`]
+    /// for a key every feature has.
+    pub fn edit_properties<R>(&mut self, i: usize, f: impl FnOnce(&mut Vec<(Rc<str>, JsonValue)>) -> R) -> R {
+        assert!(i < self.len(), "row {i} of a collection of {}", self.len());
+        self.table_mut().edit_properties(i, f)
+    }
+
+    /// Edit feature `i` as an owned [`Feature`] -- its geometry, properties
+    /// and native together -- kept as `f` leaves it. Returns what `f`
+    /// returns. Panics when `i` is not below [`Self::len`].
+    ///
+    /// Every edit a feature can take, as ordinary Rust (`plans/columnar.org`
+    /// D-C16). The narrower calls beside it cost less for what they do.
+    pub fn edit_feature<R>(&mut self, i: usize, f: impl FnOnce(&mut Feature) -> R) -> R {
+        assert!(i < self.len(), "row {i} of a collection of {}", self.len());
+        self.table_mut().edit_feature(i, f)
+    }
+
+    /// [`Self::edit_feature`] for every feature, in order, with its index. A
+    /// feature `f` leaves as it was costs nothing to keep.
+    pub fn for_each_feature_mut(&mut self, f: impl FnMut(usize, &mut Feature)) {
+        self.table_mut().for_each_feature_mut(f);
+    }
+
     /// Replace feature `i`'s native: what its source recorded beyond the
     /// geometry and properties ([`Feature::native`]). Panics when `i` is
     /// not below [`Self::len`].
@@ -378,7 +439,7 @@ impl FeatureCollection {
 
     /// Whether any feature's geometry carries an M (measure) ordinate.
     pub fn has_m(&self) -> bool {
-        self.rows().filter_map(FeatureRef::geometry).any(Geometry::has_m)
+        self.rows().filter_map(FeatureRef::geometry).any(GeometryRef::has_m)
     }
 
     /// A warning to print when converting this collection to `target`, or
@@ -522,7 +583,7 @@ impl FeatureCollection {
     /// `z` untouched (matches Geosetta's own posture), or a caller wanting
     /// a full 3D transform can read/rewrite it inside the closure.
     pub fn for_each_position_mut(&mut self, mut f: impl FnMut(&mut Position)) {
-        self.table_mut().for_each_geometry_mut(|g| g.for_each_position_mut(&mut f));
+        self.table_mut().for_each_position_mut(&mut f);
     }
 
     /// Visit every contiguous run of coordinates across every feature's
@@ -531,7 +592,7 @@ impl FeatureCollection {
     /// [`crate::Geometry::for_each_position_run_mut`] for what counts as a
     /// "run" and why a reprojection backend would want one.
     pub fn for_each_position_run_mut(&mut self, mut f: impl FnMut(&mut [Position])) {
-        self.table_mut().for_each_geometry_mut(|g| g.for_each_position_run_mut(&mut f));
+        self.table_mut().for_each_position_run_mut(&mut f);
     }
 }
 

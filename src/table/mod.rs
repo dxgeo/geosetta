@@ -13,16 +13,19 @@ pub(crate) mod arbitrary;
 mod bitmap;
 mod block;
 mod column;
+mod geometry;
 mod kinds;
 mod value;
 
 use crate::feature::Feature;
 use crate::json::JsonValue;
-use crate::geometry::Geometry;
+use crate::geometry::{Geometry, Position};
 use crate::native::Native;
 use block::{Block, RowBuilder, Slot, TabularBlock};
 pub(crate) use block::{Properties, Sizes};
 pub(crate) use kinds::Kinds;
+pub use geometry::GeometryRef;
+pub(crate) use geometry::{Rings, Run, Shape};
 pub use value::Value;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -278,11 +281,80 @@ impl Table {
         }
     }
 
-    /// Every row's geometry, in place, in physical order. A row a
+    /// Row `i`'s geometry as an owned value to edit, kept as `f` leaves it
+    /// (D-C16).
+    pub(crate) fn edit_geometry<R>(&mut self, i: usize, f: impl FnOnce(&mut Option<Geometry>) -> R) -> R {
+        let (b, row) = self.locate(self.physical(i));
+        self.blocks[b].edit_geometry(row, f)
+    }
+
+    /// Every row's geometry as an owned value to edit, with its logical
+    /// index, in logical order (D-C16).
+    pub(crate) fn for_each_geometry_mut(&mut self, mut f: impl FnMut(usize, &mut Option<Geometry>)) {
+        self.owned_pass(|block, row, i| block.edit_geometry(row, |g| f(i, g)));
+    }
+
+    /// Visit every row, in logical order, as `f(block, row in it, logical
+    /// index)`, with each block's geometry owned while its rows are visited
+    /// and flat again after where it was flat (D-C16). Without a selection,
+    /// one block at a time; with one, rows hop between blocks, so every
+    /// block is owned for the pass -- what the row IR held throughout.
+    fn owned_pass(&mut self, mut f: impl FnMut(&mut Block, usize, usize)) {
+        if self.selection.is_none() {
+            for (b, block) in self.blocks.iter_mut().enumerate() {
+                let was_flat = block.geometry_column_mut().make_owned();
+                for row in 0..block.len() {
+                    f(block, row, self.starts[b] + row);
+                }
+                block.geometry_column_mut().reseal(was_flat);
+            }
+            return;
+        }
+        let was_flat: Vec<bool> = self.blocks.iter_mut().map(|b| b.geometry_column_mut().make_owned()).collect();
+        for i in 0..self.len() {
+            let (b, row) = self.locate(self.physical(i));
+            f(&mut self.blocks[b], row, i);
+        }
+        for (block, was_flat) in self.blocks.iter_mut().zip(was_flat) {
+            block.geometry_column_mut().reseal(was_flat);
+        }
+    }
+
+    /// Row `i`'s properties as an owned list to edit (D-C16).
+    pub(crate) fn edit_properties<R>(
+        &mut self,
+        i: usize,
+        f: impl FnOnce(&mut Vec<(Rc<str>, JsonValue)>) -> R,
+    ) -> R {
+        let (b, row) = self.locate(self.physical(i));
+        self.blocks[b].edit_properties(row, f)
+    }
+
+    /// Row `i` as an owned [`Feature`] to edit (D-C16).
+    pub(crate) fn edit_feature<R>(&mut self, i: usize, f: impl FnOnce(&mut Feature) -> R) -> R {
+        let (b, row) = self.locate(self.physical(i));
+        self.blocks[b].edit_feature(row, f)
+    }
+
+    /// Every row as an owned [`Feature`] to edit, with its logical index, in
+    /// logical order (D-C16).
+    pub(crate) fn for_each_feature_mut(&mut self, mut f: impl FnMut(usize, &mut Feature)) {
+        self.owned_pass(|block, row, i| block.edit_feature(row, |feature| f(i, feature)));
+    }
+
+    /// Every position, in physical order, by mutable reference. A row a
     /// selection has left out is visited too, harmlessly: nothing reads it.
-    pub(crate) fn for_each_geometry_mut(&mut self, mut f: impl FnMut(&mut Geometry)) {
+    pub(crate) fn for_each_position_mut(&mut self, mut f: impl FnMut(&mut Position)) {
         for block in &mut self.blocks {
-            block.geometries_mut().iter_mut().flatten().for_each(&mut f);
+            block.geometry_column_mut().for_each_position_mut(&mut f);
+        }
+    }
+
+    /// Every run of positions, in physical order, by mutable slice
+    /// ([`Geometry::for_each_position_run_mut`]'s runs).
+    pub(crate) fn for_each_position_run_mut(&mut self, mut f: impl FnMut(&mut [Position])) {
+        for block in &mut self.blocks {
+            block.geometry_column_mut().for_each_position_run_mut(&mut f);
         }
     }
 
@@ -528,7 +600,7 @@ pub(crate) struct RowRef<'a> {
 }
 
 impl<'a> RowRef<'a> {
-    pub(crate) fn geometry(self) -> Option<&'a Geometry> {
+    pub(crate) fn geometry(self) -> Option<GeometryRef<'a>> {
         self.block.geometry(self.row)
     }
 
@@ -549,7 +621,7 @@ impl<'a> RowRef<'a> {
 
     pub(crate) fn to_feature(self) -> Feature {
         Feature {
-            geometry: self.geometry().cloned(),
+            geometry: self.geometry().map(GeometryRef::to_geometry),
             properties: self.block.properties(self.row).map(|(k, v)| (k.clone(), v.to_owned())).collect(),
             native: self.native().map(|n| Box::new(n.clone())),
         }
@@ -786,7 +858,7 @@ mod tests {
         let columns: Vec<ColumnRef<'_>> = keys.iter().map(|k| table.column(k)).collect();
         for (i, (view, row)) in table.rows().zip(rows).enumerate() {
             assert!(view.to_feature() == *row, "{what}: row {i}");
-            assert_eq!(view.geometry(), row.geometry.as_ref(), "{what}: row {i}");
+            assert_eq!(view.geometry().map(GeometryRef::to_geometry), row.geometry, "{what}: row {i}");
             assert_eq!(view.native(), row.native.as_deref(), "{what}: row {i}");
             let listed: Vec<(&str, JsonValue)> = view.properties().map(|(k, v)| (&**k, v.to_owned())).collect();
             let expected: Vec<(&str, JsonValue)> = row.properties.iter().map(|(k, v)| (&**k, v.clone())).collect();
@@ -888,6 +960,23 @@ mod tests {
         })
     }
 
+    /// An edit pass that leaves a row as it was patches nothing, and one
+    /// that changes only a sign bit is kept.
+    #[test]
+    fn an_edit_that_changes_nothing_patches_nothing() {
+        let rows: Vec<Feature> = (0..10).map(|i| feature(&[("a", JsonValue::Float(i as f64 - 5.0))])).collect();
+        for layout in LAYOUTS {
+            let mut table = Table::from_features(rows.clone(), layout);
+            table.for_each_feature_mut(|_, _| {});
+            table.edit_properties(0, |ps| ps[0].1 = JsonValue::Float(-5.0));
+            assert!(!table.blocks.iter().any(Block::is_patched), "{layout:?}");
+            table.edit_properties(5, |ps| ps[0].1 = JsonValue::Float(-0.0));
+            assert!(table.blocks.iter().any(Block::is_patched), "{layout:?}");
+            let JsonValue::Float(v) = &table.row(5).to_feature().properties[0].1 else { unreachable!() };
+            assert!(v.is_sign_negative(), "{layout:?}");
+        }
+    }
+
     #[test]
     fn a_fold_seals_every_block_pushes_reached() {
         let mut table = Table::from_features_sized(vec![feature(&[("a", JsonValue::Int(0))])], Layout::Columns, SMALL);
@@ -924,7 +1013,7 @@ mod tests {
                 let mut done = Vec::new();
                 for _ in 0..12 {
                     let n = model.len();
-                    let op = rng.below(if n == 0 { 3 } else { 12 });
+                    let op = rng.below(if n == 0 { 3 } else { 15 });
                     match op {
                         0 => {
                             let added = arbitrary::collection_of(&mut rng, 1).remove(0);
@@ -991,6 +1080,48 @@ mod tests {
                             let key = some_key(&mut rng, &model);
                             table.drop_column(&key);
                             model.iter_mut().for_each(|row| model::remove(row, &key));
+                        }
+                        11 => {
+                            // Any edit to one row's list (D-C16): shuffled, a
+                            // key renamed or repeated, a pair inserted anywhere,
+                            // or none of these.
+                            let i = rng.below(n);
+                            let (key, value) = (some_key(&mut rng, &model), arbitrary::value(&mut rng, 0));
+                            let (how, at) = (rng.below(4), rng.below(model[i].properties.len() + 1));
+                            let mut order: Vec<usize> = (0..model[i].properties.len()).collect();
+                            rng.shuffle(&mut order);
+                            let edit = |ps: &mut Vec<(Rc<str>, JsonValue)>| match how {
+                                0 => {
+                                    let mut slots: Vec<_> = std::mem::take(ps).into_iter().map(Some).collect();
+                                    *ps = order.iter().map(|&j| slots[j].take().unwrap()).collect();
+                                }
+                                1 if !ps.is_empty() => {
+                                    let last = ps.len() - 1;
+                                    ps[at.min(last)].0 = Rc::from(&*key);
+                                }
+                                2 => ps.insert(at, (Rc::from(&*key), value.clone())),
+                                _ => {}
+                            };
+                            table.edit_properties(i, edit);
+                            edit(&mut model[i].properties);
+                        }
+                        12 => {
+                            let i = rng.below(n);
+                            let replacement = arbitrary::collection_of(&mut rng, 1).remove(0);
+                            table.edit_feature(i, |f| *f = replacement.clone());
+                            model[i] = replacement;
+                        }
+                        13 => {
+                            // A pass over every row that edits some.
+                            let (modulus, key) = (2 + rng.below(3), some_key(&mut rng, &model));
+                            let edit = |i: usize, f: &mut Feature| {
+                                if i % modulus == 0 {
+                                    f.properties.push((Rc::from(&*key), JsonValue::Int(i as i64)));
+                                    f.geometry = None;
+                                }
+                            };
+                            table.for_each_feature_mut(edit);
+                            model.iter_mut().enumerate().for_each(|(i, f)| edit(i, f));
                         }
                         10 => {
                             let modulus = 2 + rng.below(4);

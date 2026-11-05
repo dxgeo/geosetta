@@ -21,6 +21,7 @@
 
 use super::{Geometry, Position};
 use crate::error::{Error, Result};
+use crate::table::{GeometryRef, Rings, Run, Shape};
 
 // Little-endian byte-order marker.
 const LE: u8 = 0x01;
@@ -84,67 +85,53 @@ impl Dim {
     }
 }
 
-/// The dimensionality implied by a `Vec<Position>`'s first element, or 2D
-/// if empty — used to pick one WKB type-code suffix for an entire
+/// The dimensionality implied by a run's first position, or 2D if empty —
+/// used to pick one WKB type-code suffix for an entire
 /// `LineString`/`MultiPoint`/ring list, matching how WKB declares
 /// dimensionality once per geometry rather than per point.
-fn dim_of_first(ps: &[Position]) -> Dim {
-    ps.first().copied().map(Dim::of).unwrap_or(Dim::XY)
+fn dim_of_first(ps: Run<'_>) -> Dim {
+    ps.first().map(Dim::of).unwrap_or(Dim::XY)
 }
 
 /// The dimensionality implied by a ring list's first position (its first
 /// ring's first point), or 2D if empty.
-fn dim_of_rings(rings: &[Vec<Position>]) -> Dim {
-    rings.first().map(|r| dim_of_first(r)).unwrap_or(Dim::XY)
-}
-
-/// The dimensionality of a geometry's very first position, found by
-/// recursing into whichever variant it is — used for a `GeometryCollection`
-/// wrapper's own type code (its members each carry their own independently).
-fn dim_of_geometry(g: &Geometry) -> Dim {
-    first_position(g).map(Dim::of).unwrap_or(Dim::XY)
-}
-
-fn first_position(g: &Geometry) -> Option<Position> {
-    match g {
-        Geometry::Point(p) => Some(*p),
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => ps.first().copied(),
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            rings.first().and_then(|r| r.first()).copied()
-        }
-        Geometry::MultiPolygon(polys) => {
-            polys.first().and_then(|p| p.first()).and_then(|r| r.first()).copied()
-        }
-        Geometry::GeometryCollection(geoms) => geoms.first().and_then(first_position),
-    }
+fn dim_of_rings(rings: Rings<'_>) -> Dim {
+    rings.first().map(dim_of_first).unwrap_or(Dim::XY)
 }
 
 /// Encode a geometry to a fresh WKB byte buffer.
 pub fn encode(geom: &Geometry) -> Vec<u8> {
+    encode_ref(GeometryRef::owned(geom))
+}
+
+/// [`encode`], from a view: a flat block's geometry is written from its
+/// buffers, without a copy (`plans/columnar.org` C6 step 4).
+pub(crate) fn encode_ref(geom: GeometryRef<'_>) -> Vec<u8> {
     // Pre-size the buffer to the exact byte length so the write never reallocs
     // (one `Vec` per feature on every GeoParquet/FlatGeobuf write).
-    let mut out = Vec::with_capacity(wkb_size(geom));
-    write_geometry(&mut out, geom);
+    let shape = geom.shape();
+    let mut out = Vec::with_capacity(wkb_size(shape));
+    write_geometry(&mut out, shape);
     out
 }
 
 /// Exact WKB byte length of `geom`, mirroring [`write_geometry`].
-fn wkb_size(geom: &Geometry) -> usize {
+fn wkb_size(geom: Shape<'_>) -> usize {
     const HEADER: usize = 5; // LE marker + u32 type code
     const COUNT: usize = 4; // u32 length prefix
-    let ring = |r: &Vec<Position>, dim: Dim| COUNT + r.len() * dim.coord_size();
-    let poly = |rings: &[Vec<Position>]| {
+    let ring = |r: Run<'_>, dim: Dim| COUNT + r.len() * dim.coord_size();
+    let poly = |rings: Rings<'_>| {
         let dim = dim_of_rings(rings);
         HEADER + COUNT + rings.iter().map(|r| ring(r, dim)).sum::<usize>()
     };
     match geom {
-        Geometry::Point(p) => HEADER + Dim::of(*p).coord_size(),
-        Geometry::LineString(ps) => HEADER + COUNT + ps.len() * dim_of_first(ps).coord_size(),
-        Geometry::Polygon(rings) => poly(rings),
-        Geometry::MultiPoint(ps) => {
-            HEADER + COUNT + ps.iter().map(|p| HEADER + Dim::of(*p).coord_size()).sum::<usize>()
+        Shape::Point(p) => HEADER + Dim::of(p).coord_size(),
+        Shape::LineString(ps) => HEADER + COUNT + ps.len() * dim_of_first(ps).coord_size(),
+        Shape::Polygon(rings) => poly(rings),
+        Shape::MultiPoint(ps) => {
+            HEADER + COUNT + ps.iter().map(|p| HEADER + Dim::of(p).coord_size()).sum::<usize>()
         }
-        Geometry::MultiLineString(lines) => {
+        Shape::MultiLineString(lines) => {
             HEADER
                 + COUNT
                 + lines
@@ -152,64 +139,65 @@ fn wkb_size(geom: &Geometry) -> usize {
                     .map(|l| HEADER + COUNT + l.len() * dim_of_first(l).coord_size())
                     .sum::<usize>()
         }
-        Geometry::MultiPolygon(polys) => {
-            HEADER + COUNT + polys.iter().map(|p| poly(p)).sum::<usize>()
+        Shape::MultiPolygon(polys) => {
+            HEADER + COUNT + polys.iter().map(poly).sum::<usize>()
         }
-        Geometry::GeometryCollection(geoms) => {
-            HEADER + COUNT + geoms.iter().map(wkb_size).sum::<usize>()
+        Shape::Collection(geoms) => {
+            HEADER + COUNT + geoms.iter().map(|g| wkb_size(GeometryRef::owned(g).shape())).sum::<usize>()
         }
     }
 }
 
-fn write_geometry(out: &mut Vec<u8>, geom: &Geometry) {
+fn write_geometry(out: &mut Vec<u8>, geom: Shape<'_>) {
     match geom {
-        Geometry::Point(p) => {
-            let dim = Dim::of(*p);
+        Shape::Point(p) => {
+            let dim = Dim::of(p);
             header(out, WKB_POINT, dim);
-            point(out, *p, dim);
+            point(out, p, dim);
         }
-        Geometry::LineString(ps) => {
+        Shape::LineString(ps) => {
             let dim = dim_of_first(ps);
             header(out, WKB_LINESTRING, dim);
             line(out, ps, dim);
         }
-        Geometry::Polygon(rings) => {
+        Shape::Polygon(rings) => {
             header(out, WKB_POLYGON, dim_of_rings(rings));
             polygon(out, rings);
         }
-        Geometry::MultiPoint(ps) => {
+        Shape::MultiPoint(ps) => {
             header(out, WKB_MULTIPOINT, dim_of_first(ps));
             out.extend_from_slice(&(ps.len() as u32).to_le_bytes());
-            for p in ps {
-                let dim = Dim::of(*p);
+            for p in ps.iter() {
+                let dim = Dim::of(p);
                 header(out, WKB_POINT, dim);
-                point(out, *p, dim);
+                point(out, p, dim);
             }
         }
-        Geometry::MultiLineString(lines) => {
-            let outer_dim = lines.first().map(|l| dim_of_first(l)).unwrap_or(Dim::XY);
+        Shape::MultiLineString(lines) => {
+            let outer_dim = lines.first().map(dim_of_first).unwrap_or(Dim::XY);
             header(out, WKB_MULTILINESTRING, outer_dim);
             out.extend_from_slice(&(lines.len() as u32).to_le_bytes());
-            for l in lines {
+            for l in lines.iter() {
                 let dim = dim_of_first(l);
                 header(out, WKB_LINESTRING, dim);
                 line(out, l, dim);
             }
         }
-        Geometry::MultiPolygon(polys) => {
-            let outer_dim = polys.first().map(|p| dim_of_rings(p)).unwrap_or(Dim::XY);
+        Shape::MultiPolygon(polys) => {
+            let outer_dim = polys.first().map(dim_of_rings).unwrap_or(Dim::XY);
             header(out, WKB_MULTIPOLYGON, outer_dim);
             out.extend_from_slice(&(polys.len() as u32).to_le_bytes());
-            for poly in polys {
+            for poly in polys.iter() {
                 header(out, WKB_POLYGON, dim_of_rings(poly));
                 polygon(out, poly);
             }
         }
-        Geometry::GeometryCollection(geoms) => {
-            header(out, WKB_GEOMETRYCOLLECTION, dim_of_geometry(geom));
+        Shape::Collection(geoms) => {
+            let first = geoms.first().and_then(|g| GeometryRef::owned(g).first_position());
+            header(out, WKB_GEOMETRYCOLLECTION, first.map(Dim::of).unwrap_or(Dim::XY));
             out.extend_from_slice(&(geoms.len() as u32).to_le_bytes());
             for g in geoms {
-                write_geometry(out, g);
+                write_geometry(out, GeometryRef::owned(g).shape());
             }
         }
     }
@@ -240,19 +228,19 @@ fn point(out: &mut Vec<u8>, p: Position, dim: Dim) {
 
 /// A `u32` count of positions followed by the raw coordinate tuples, each at
 /// `dim`'s width.
-fn line(out: &mut Vec<u8>, ps: &[Position], dim: Dim) {
+fn line(out: &mut Vec<u8>, ps: Run<'_>, dim: Dim) {
     out.extend_from_slice(&(ps.len() as u32).to_le_bytes());
-    for p in ps {
-        point(out, *p, dim);
+    for p in ps.iter() {
+        point(out, p, dim);
     }
 }
 
 /// A `u32` ring count, each ring encoded like a linear ring of positions at
 /// the ring list's own (first-position-derived) dimensionality.
-fn polygon(out: &mut Vec<u8>, rings: &[Vec<Position>]) {
+fn polygon(out: &mut Vec<u8>, rings: Rings<'_>) {
     let dim = dim_of_rings(rings);
     out.extend_from_slice(&(rings.len() as u32).to_le_bytes());
-    for ring in rings {
+    for ring in rings.iter() {
         line(out, ring, dim);
     }
 }
@@ -488,7 +476,7 @@ mod tests {
                 Geometry::LineString(vec![Position::new(0.0, 0.0), Position::new(1.0, 1.0)]),
             ]),
         ] {
-            assert_eq!(wkb_size(&g), encode(&g).len(), "size mismatch for {g:?}");
+            assert_eq!(wkb_size(GeometryRef::owned(&g).shape()), encode(&g).len(), "size mismatch for {g:?}");
         }
     }
 

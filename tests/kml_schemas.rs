@@ -125,7 +125,7 @@ fn edited(mut fc: FeatureCollection, extra: &FeatureCollection) -> FeatureCollec
     set(&mut fc, 0, "seaFloorAltitudeMode", Some("clampToSeaFloor"));
     set(&mut fc, 0, "timestamp", None);
     let last = fc.len() - 1;
-    if let Some(mut g) = fc.row(last).geometry().cloned() {
+    if let Some(mut g) = fc.row(last).geometry().map(|g| g.to_geometry()) {
         shift(&mut g);
         fc.set_geometry(last, Some(g));
     }

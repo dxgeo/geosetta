@@ -243,7 +243,7 @@ fn root_element(source: Option<&KmlNative>, version: Option<KmlVersion>, childre
 /// `typed` declares in `<SchemaData>`, and every other property in
 /// `<ExtendedData><Data name="k"><value>v</value></Data></ExtendedData>`.
 pub(crate) fn feature_to_placemark(f: FeatureRef<'_>, version: KmlVersion, typed: &Typed) -> XmlElement {
-    let mut geometry = f.geometry().map(geometry_to_element);
+    let mut geometry = f.geometry_cow().map(|g| geometry_to_element(&g));
     let placement = place(f, KmlElement::Placemark, |member| geometry.as_ref().is_some_and(|g| carries(g, member)));
     let mut children = Vec::new();
     if let Some(name) = placement.name {
@@ -618,7 +618,8 @@ impl Emitter {
 
 /// [`feature_to_placemark`], written as it is built.
 fn placemark(out: &mut Emitter, f: FeatureRef<'_>, version: KmlVersion, typed: &Typed) {
-    let placement = place(f, KmlElement::Placemark, |member| f.geometry().is_some_and(|g| geometry_carries(g, member)));
+    let owned = f.geometry_cow();
+    let placement = place(f, KmlElement::Placemark, |member| owned.as_deref().is_some_and(|g| geometry_carries(g, member)));
     out.start("Placemark");
     if let Some(name) = &placement.name {
         out.leaf("name", name);
@@ -676,7 +677,7 @@ fn placemark(out: &mut Emitter, f: FeatureRef<'_>, version: KmlVersion, typed: &
         }
         out.end();
     }
-    if let Some(g) = f.geometry() {
+    if let Some(g) = owned.as_deref() {
         geometry(out, g, &placement.altitude, version);
     }
     out.end();
@@ -699,7 +700,8 @@ pub(crate) fn null_keys(f: FeatureRef<'_>) -> Vec<&str> {
     if !f.properties().any(|(_, v)| v == Value::Null) {
         return Vec::new();
     }
-    let placement = place(f, KmlElement::Placemark, |member| f.geometry().is_some_and(|g| geometry_carries(g, member)));
+    let owned = f.geometry_cow();
+    let placement = place(f, KmlElement::Placemark, |member| owned.as_deref().is_some_and(|g| geometry_carries(g, member)));
     placement.extended.into_iter().filter(|(_, v)| *v == Value::Null).map(|(k, _)| k).collect()
 }
 

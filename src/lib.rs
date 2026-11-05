@@ -102,7 +102,7 @@ pub use convert::{
     conversion_warnings, convert, convert_with, read_features, read_features_with, reorder_hilbert, write_features,
     write_features_with, Converted, ReadOptions, WriteOptions,
 };
-pub use table::{ColumnRef, ColumnValues, Layout, Value};
+pub use table::{ColumnRef, ColumnValues, GeometryRef, Layout, Value};
 pub use crs::{Crs, NamedCrs, WGS84_CRS_CODE};
 pub use error::{Error, Result};
 pub use feature::{Feature, FeatureCollection, FeatureProperties, FeatureRef, FeatureRefs};

@@ -61,7 +61,7 @@ pub struct Encoded {
 /// `.dbf` can't represent the properties without silently corrupting or
 /// merging data — see `dbf::write`.
 pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
-    let geometries: Vec<Option<Geometry>> = fc.rows().map(|f| f.geometry().cloned()).collect();
+    let geometries: Vec<Option<Geometry>> = fc.rows().map(|f| f.geometry().map(crate::GeometryRef::to_geometry)).collect();
     let (shp, shx) = geometry::write(&geometries)?;
 
     let columns = columns_for(fc);

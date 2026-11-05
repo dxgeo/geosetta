@@ -6,7 +6,8 @@
 use crate::crs::Crs;
 use crate::error::{Error, Result};
 use crate::feature::FeatureCollection;
-use crate::geometry::{to_wkb, Bbox, Geometry};
+use crate::geometry::Bbox;
+use crate::table::GeometryRef;
 use crate::schema::{columns_for, Cell, Column, ColumnType, DeclType};
 use crate::format::Format;
 use crate::native::{GpkgConstraint, GpkgDataColumn, GpkgNative, NativePayload};
@@ -1699,13 +1700,13 @@ fn feature_table(
 /// With `envelope` false the header is exactly what it always was — flags
 /// `0x01`, envelope indicator 0, no envelope bytes — so default output is
 /// unchanged byte for byte.
-fn gpkg_geometry(g: &Geometry, srs_id: i64, envelope: bool) -> Vec<u8> {
+fn gpkg_geometry(g: GeometryRef<'_>, srs_id: i64, envelope: bool) -> Vec<u8> {
     let env = if envelope { gpb_envelope(g) } else { None };
     let (indicator, env_bytes) = match &env {
         Some((i, b)) => (*i, b.as_slice()),
         None => (0u8, &[][..]),
     };
-    let wkb = to_wkb(g);
+    let wkb = crate::geometry::wkb_ref(g);
     let mut out = Vec::with_capacity(8 + env_bytes.len() + wkb.len());
     out.extend_from_slice(b"GP");
     out.push(0); // version
@@ -1753,7 +1754,7 @@ fn gpkg_geometry(g: &Geometry, srs_id: i64, envelope: bool) -> Vec<u8> {
 /// GDAL's *reader* does accept indicators 3 and 4 (it skips the bytes), so
 /// emitting them would not break readers — it simply would not buy anything,
 /// at the cost of a layout no reference implementation could confirm.
-fn gpb_envelope(g: &Geometry) -> Option<(u8, Vec<u8>)> {
+fn gpb_envelope(g: GeometryRef<'_>) -> Option<(u8, Vec<u8>)> {
     let b = g.bbox();
     if b.is_empty() {
         return None;
@@ -1859,7 +1860,7 @@ fn quote(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Position;
+    use crate::geometry::{Geometry, Position};
     use crate::feature::Feature;
     use crate::json::JsonValue;
 

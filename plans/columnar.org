@@ -3,7 +3,7 @@
 
 * A Columnar IR
 
-** STATUS -- C0 through C5 done; C6 next
+** STATUS -- C0 through C5 done; C6 steps 1--3 done, step 4 begun
 C0's harness is built, and C1 (2026-11-02): the =table= module behind the
 collection's private storage, its views, selections and edits, =--layout=,
 and both property tests (§ MILESTONES, C1). C2 the same day: the tabular
@@ -11,8 +11,9 @@ spokes read into column blocks and write from either form (§ MILESTONES,
 C2), and C3: GeoJSON reads into blocks, sealed by D-C13's rule, and
 writes from views (§ MILESTONES, C3); C4: KML the same, after
 =performance.org='s KML step 2 (§ MILESTONES, C4); C5: the hub is only
-blocks, and D-C8's API is public (§ MILESTONES, C5). Next, C6: geometry
-buffers. Written 2026-10-28, after
+blocks, and D-C8's API is public (§ MILESTONES, C5). C6, geometry
+buffers, measured, its edit contract pinned (D-C16) and its flat column
+built; its writers are moving onto views (§ MILESTONES, C6). Written 2026-10-28, after
 =performance.org='s /Memory/ section measured where the hub's bytes go and
 Mem1--Mem5 took the contained wins. What remains is the shape of the IR
 itself, and that is this plan.
@@ -43,6 +44,11 @@ Revised 2026-11-02, after C5: D-C6 decides C6's layout -- GeoArrow-shaped,
 not conformant, for per-position Z and M, mixed types and collections -- and
 that a block holds geometry columns, so multiple geometry columns
 (=multi-geometry-columns.org=) build on it.
+
+Revised 2026-11-05: geometry edits through the API are never worse than
+today's (D-C16). A block's geometry is flat or owned, the API hands out an
+owned =Geometry= to edit, and C6 pins the edit contract before it changes
+any storage, and stops after measuring if geometry is not worth it.
 
 ** WHY
 The hub stores a collection as rows: =FeatureCollection { features:
@@ -184,8 +190,8 @@ column's real type rather than an inferred one.
 Geometry is the other half of the memory story (=Position= is 48 bytes for
 16 of XY, and an =Option<Geometry>= point 56), but it is independent of
 properties and every format already reads and writes it per feature. C6
-replaces each block's =Vec<Option<Geometry>>= with flat coordinate buffers,
-which absorbs =performance.org='s "compact =Position=" item.
+adds flat coordinate buffers as a block's sealed form, beside today's
+=Vec<Option<Geometry>>= as its owned form (D-C16), which absorbs =performance.org='s "compact =Position=" item.
 
 *The layout borrows GeoArrow's idea, not its spec.* Coordinates in one
 buffer, structure in offset arrays, as GeoArrow has them; but the buffers are
@@ -223,8 +229,10 @@ with =to_geometry()=, since nothing in the buffers is a =&Geometry=; this
 breaks callers that match on the reference. =for_each_position_mut= keeps its
 =&mut Position=, built and written back per coordinate.
 =for_each_position_run_mut= cannot hand out a =[Position]= that does not
-exist: it takes the XY run as =&mut [[f64; 2]]= and Z beside it, and its
-one caller (=tests/reproject_pipe.rs=) moves with it.
+exist from a flat block; D-C16 decides what it hands out. It has no caller
+outside its own unit tests (=tests/reproject_pipe.rs= uses
+=for_each_position_mut=), so its signature is free to change. Editing
+geometry through the API is D-C16's.
 
 *** D-C7 -- per-row natives are a sparse side table
 =Vec<(row, Box<Native>)>= sorted by row, or a map. Today's =Option<Box<Native>>=
@@ -498,6 +506,68 @@ impl FeatureCollection {
 
 Rejected: converting from =&self= into a cached second form
 (=OnceCell=/=OnceLock=, § ALTERNATIVES CONSIDERED).
+
+*** D-C16 -- every attribute is editable, and no edit is worse than today's
+Editing what was read, through the API, is a goal of the crate
+(=edit-composability.org= route (a)), for every attribute of a feature --
+its geometry, its properties, its native -- and of the collection, not a
+cost the layout may raise. The collection's own fields (=crs=, =name=,
+=schema=, =native=) are public data. A feature's attributes each had a
+setter, but no way to make an edit the setters do not name -- rename a key
+in its place, reorder, insert anywhere, edit a repeat -- and D-C6 alone
+would have taken away the =&mut Geometry= a block of =Vec<Option<Geometry>>=
+hands out. So every attribute gets an owned hatch, an edit as ordinary Rust
+on the row IR's own types:
+- *=edit_properties(i, |ps: &mut Vec<(Rc<str>, JsonValue)>| ..)=* -- a
+  feature's whole list, in its own order with repeats, through the patch
+  (D-C12), which already holds whole rows. A list left as it was, bit for
+  bit (a float by its bits, so =-0.0= is not =0.0=), is not patched.
+- *=edit_feature(i, |f: &mut Feature| ..)=* and
+  *=for_each_feature_mut(|i, f| ..)=* -- geometry, properties and native
+  together; a pass that changes a few rows patches those few.
+- The setters stay, as the cheap calls for what they do: =set=, =remove=,
+  =set_column=, =map_column=, =drop_column=, =set_geometry=, =set_native=.
+
+For geometry, which C6 changes the storage of:
+- *A block's geometry is flat or owned.* Owned is today's
+  =Vec<Option<Geometry>>=; flat is D-C6's buffers. =GeometryRef= views
+  either, so writers, the bbox, the R-tree and the Hilbert sort read one
+  type. This is D-C13's move made for geometry: the worst a block can be is
+  exactly today's.
+- *Who chooses.* A block seals flat; =--layout rows= keeps every block
+  owned (D-C14, still byte-identical). On a flat block, an edit to one
+  geometry goes to an overlay (D-C12's patch, for geometry) and only when it
+  changed the geometry bit for bit; a pass over every row makes each block
+  owned while its rows are visited and flat again after, so the overlay
+  never holds the collection twice over. A position edit keeps a flat block
+  flat.
+- *The API hands out owned geometry to edit:*
+  - =edit_geometry(i, |g: &mut Option<Geometry>| ..)= -- a row's geometry
+    as an owned value, written back after. =match=, push a ring, change the
+    type: ordinary Rust, at one copy per edited row from a flat block, none
+    from an owned one. This is GDAL's =GetFeature= / =SetFeature=.
+  - =for_each_geometry_mut(|i, g: &mut Option<Geometry>| ..)= -- the same
+    over every row, a block at a time, rebuilding each block once rather
+    than through the patch (the geometry =map_column=).
+  - =set_geometry(i, ..)= -- as today.
+  - =for_each_position_mut= -- as today, and the fast path for edits that
+    keep the shape, such as reprojection.
+  - =for_each_position_run_mut= -- hands out =&mut [Position]= per run, as
+    today: from an owned block directly, from a flat one through a scratch
+    run written back after. Batch transformers keep the call; the strided
+    =[[f64; 2]]= form waits for a caller who measures the copy.
+- *Every edit is any edit.* A position edit that gives one position a Z or
+  M its neighbours lack, or takes one away, holds as it does today: the flat
+  block grows the buffer or the presence bitmap. Edits reach
+  =GeometryCollection=s in the side table (D-C6) as they reach the rest.
+- *The contract is pinned first* (C6 step 2): public-API tests that pass
+  against today's storage and must pass unchanged after C6.
+
+/Built 2026-11-05/, before any storage changes: =edit_geometry=,
+=for_each_geometry_mut=, =edit_properties=, =edit_feature= and
+=for_each_feature_mut= on the blocks as they are, and =tests/edits.rs= (C6
+step 2). C1's edit-sequence property test draws the three new edits among
+the old.
 
 ** HOW EACH FORMAT FITS
 | format      | fit                | notes                                                                                                                                           |
@@ -1100,27 +1170,94 @@ a branchless =Bitmap::push= -- no difference measurable.
   block (C3's =sparse → fgb=, 1.6×).
 
 *** C6 -- geometry buffers
-D-C6: flat coordinate buffers with offsets, replacing =Option<Geometry>= per
-row. Measured separately, because the property milestones above leave
-geometry untouched. In steps, each checked against the corpus:
-1. *Measure.* What geometry costs today, by memprobe, on the points bench and
-   on a polygon-heavy input added for it -- the bench is 80% points and
-   understates the saving.
-2. *The column.* The geometry column, =GeometryRef=, and a builder that
-   flattens a =Geometry=, replacing each block's vector. Readers still push
+D-C6: flat coordinate buffers with offsets, as a block's sealed form beside
+the owned =Option<Geometry>= per row (D-C16). Measured separately, because
+the property milestones above leave geometry untouched. In steps, each
+checked against the corpus:
+1. *Measure, and decide.* What geometry costs today, by memprobe, on the
+   points bench and on a polygon-heavy input added for it -- the bench is
+   80% points and understates the saving. If geometry is a small share of
+   the IR's peak after C5, C6 stops here for =performance.org='s compact
+   =Position= -- smaller, though it too changes =Position=, which editors
+   reach.
+
+   /Measured 2026-11-05/, memprobe, =→ fgb=, IR resident, against the same
+   input with every feature's properties emptied:
+   | input                                     | IR      | per feature | geometry only |
+   |-------------------------------------------+---------+-------------+---------------|
+   | points bench, 200 000 (80% points)        | 24.9 MB | 124 B       | 91 B (73%)    |
+   | polygons, 100 000 (25--64 vertices, 10% a hole) | 301.9 MB | 3 019 B | 2 986 B (99%) |
+   Geometry is most of the IR on both, so C6 goes on. A polygon here
+   averages 45 positions: 2 180 B of =Position= at 48 bytes, the rest of its
+   2 986 is ring headers and the slack of =Vec='s growth while parsing. Flat,
+   the same polygon is about 740 B (16 a position, 4 an offset): the IR
+   about 4× smaller on polygon-heavy input.
+2. *Pin the edit contract* (D-C16), against today's storage, before any
+   storage changes: public-API tests that replace a geometry and change its
+   type; add and remove parts and rings; give one position a Z or M its
+   neighbours lack, and take one away; edit inside a =GeometryCollection=;
+   edit after =retain= and =permute=; read back after each; and write each
+   edited collection through every format under all three layouts. C6
+   passes them unchanged; the one break is =geometry()= returning
+   =GeometryRef=.
+
+   /Done 2026-11-05:/ =tests/edits.rs=, for properties and whole features
+   as well as geometry (D-C16). Each edit is made through the API and to a
+   =Vec<Feature>=; the rows must match, and so must every format's output
+   against a collection built from the edited rows, under each layout (a
+   GeoPackage compared by what it reads back as, since its header records
+   when it was written).
+
+   /Done 2026-11-05/ (step 3): =table/geometry.rs=. A block's
+   =GeometryColumn= is =Owned= or =Flat=: a tag a row, three levels of
+   =u32= offsets (row → part → ring → position) shared by every type, XY in
+   one buffer, Z and M each a buffer with a presence bitmap only once some
+   position lacks one, collections whole in a side table, and an overlay of
+   edited rows. Blocks seal flat (trimmed to length), except under =--layout
+   rows=; readers still push =Geometry=. =FeatureRef::geometry()= returns
+   =GeometryRef= (=to_geometry=, =type_name=, =bbox=, =extend_bbox=,
+   =has_m=, equality); four tests that matched on the =&Geometry= moved to
+   =to_geometry()=, the documented break. Property tests: a flat column
+   rebuilds 500 seeds of arbitrary geometry bit for bit -- every type, empty
+   parts and rings, per-position Z and M, nested collections, -0.0, NaN
+   payloads, infinities -- and its views agree with the geometry's own
+   =type_name=, =has_m= and =bbox=; the position editors visit the same
+   positions and runs as on owned geometry and keep what they leave,
+   overlay included; and C1's property tests now draw arbitrary geometry
+   too. memprobe, =→ fgb=, IR resident: points 24.9 → 13.8 MB (124 → 69 B
+   a feature), polygons 301.9 → 77.3 MB (3 019 → 773, 3.9×), read peak
+   426 → 219 MB. =LAYOUTS=auto,rows,columns= =equiv.py=: 8 991 identical.
+
+   /Begun 2026-11-05/ (step 4): =GeometryRef::shape= gives a geometry's
+   structure as =Run=, =Rings= and =Parts= over either form, and WKB
+   (GeoParquet, GeoPackage, and its envelope), GeoJSON and FlatGeobuf
+   encode from it, one code path for both forms; the bbox, R-tree and
+   Hilbert sort read views. KML (writer and reconcile), WKT, CSV and
+   Shapefile still copy each geometry out (=FeatureRef::geometry_cow=):
+   correct, and costs time, not peak. A test writes 300 seeds of arbitrary
+   geometry through every format held owned and flat, and compares.
+   =LAYOUTS=auto,rows,columns= =equiv.py=: 8 991 identical. Whole-process
+   time against the C5 pin, best of 3, on the step 1 inputs: 0--9% slower
+   across =geojson→{parquet,fgb,gpkg,kml,csv}=, =parquet→geojson=,
+   =fgb→geojson= and =parquet→fgb=, the last 17% on polygons (306 → 358
+   ms). The cost is the flatten at seal, which a reader copies every
+   geometry through; step 5 removes it.
+3. *The column.* The geometry column, =GeometryRef= over its flat and owned
+   forms, and a builder that flattens a =Geometry=. Readers still push
    =Geometry=, so every format works from the first step. A property test
    rebuilds every geometry exactly: per-position Z and M, empty parts and
    rings, collections, mixed types in a block, and -0.0 and NaN bit for bit.
-3. *Writers read views.* WKB (Parquet, GeoPackage), FlatGeobuf, Shapefile,
+4. *Writers read views.* WKB (Parquet, GeoPackage), FlatGeobuf, Shapefile,
    GeoJSON, KML, WKT and CSV encode from =GeometryRef=, and so do the bbox,
    the R-tree and the Hilbert sort. KML's reconcile materializes only the
    rows it edits.
-4. *Hot readers write coordinates.* GeoJSON, WKB, FlatGeobuf and Shapefile
+5. *Hot readers write coordinates.* GeoJSON, WKB, FlatGeobuf and Shapefile
    push straight into the buffers; KML, WKT and CSV may keep flattening a
    =Geometry= a feature, which costs time but not peak.
-5. *Edits.* =set_geometry= goes through the patch (D-C12), and the position
-   editors walk the buffers (D-C6's API).
-6. *Verify.* The corpus identical under all three layouts, budgets lowered
+6. *Edits.* =edit_geometry= and =for_each_geometry_mut= (D-C16); a
+   structural edit turns a flat block owned, and the position editors walk
+   the buffers, growing Z or M where an edit adds one.
+7. *Verify.* The corpus identical under all three layouts, budgets lowered
    in =tests/budgets.rs=, =compare.py= within noise of C5.
 
 *Risk:* geometry fidelity is what the property tests have never aimed at.
@@ -1136,6 +1273,9 @@ drift, and step 2's test aims at it directly.
   ~80 MB estimate; narrow IR roughly halved before C6.
 - Every guarantee in § WHAT A ROW IR GIVES has a named test, and holds
   after every kind of edit in D-C12.
+- Every attribute of a feature is editable through the public API as
+  ordinary Rust on owned data, every edit today's API allows is still
+  possible after C6, and =tests/edits.rs= passes unchanged (D-C16).
 
 ** RISKS
 - *Scope.* 79 uses of =.features= in =convert.rs= alone, every spoke's

@@ -66,6 +66,24 @@ pub enum JsonValue {
 }
 
 impl JsonValue {
+    /// Whether `self` and `other` are the same value bit for bit: a float
+    /// by its bits, so `-0.0` is not `0.0` and a NaN is itself, where `==`
+    /// says otherwise. What an edit compares to tell whether it changed
+    /// anything.
+    pub(crate) fn identical(&self, other: &JsonValue) -> bool {
+        match (self, other) {
+            (JsonValue::Float(a), JsonValue::Float(b)) => a.to_bits() == b.to_bits(),
+            (JsonValue::Array(a), JsonValue::Array(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.identical(b))
+            }
+            (JsonValue::Object(a), JsonValue::Object(b)) => {
+                a.len() == b.len() && a.iter().zip(b).all(|((ka, a), (kb, b))| ka == kb && a.identical(b))
+            }
+            (JsonValue::Float(_) | JsonValue::Array(_) | JsonValue::Object(_), _) => false,
+            _ => self == other,
+        }
+    }
+
     /// Members of an object, or `None` if this is not an object.
     pub fn as_object(&self) -> Option<&[(String, JsonValue)]> {
         match self {

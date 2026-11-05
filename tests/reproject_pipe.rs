@@ -284,7 +284,7 @@ fn composes_with_wbprojection_library() {
 
     let points: Vec<(f64, f64)> = fc
         .rows()
-        .map(|f| match f.geometry().unwrap() {
+        .map(|f| match f.geometry().unwrap().to_geometry() {
             geosetta::Geometry::Point(p) => (p.x, p.y),
             other => panic!("expected Point, got {other:?}"),
         })

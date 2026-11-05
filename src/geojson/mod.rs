@@ -6,7 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::feature::{Collecting, Feature, FeatureCollection, FeatureRef};
-use crate::table::Layout;
+use crate::table::{GeometryRef, Layout, Rings, Run, Shape};
 use crate::format::Format;
 use crate::geometry::{Geometry, Position};
 use crate::json::{self, JsonValue, Parser};
@@ -597,35 +597,35 @@ impl Writer {
         self.close('}');
     }
 
-    fn geometry(&mut self, g: &Geometry) {
+    fn geometry(&mut self, g: GeometryRef<'_>) {
         self.open('{');
         self.member("type");
         self.out.push('"');
         self.out.push_str(g.type_name());
         self.out.push('"');
-        if let Geometry::GeometryCollection(geoms) = g {
+        if let Shape::Collection(geoms) = g.shape() {
             self.member("geometries");
             self.open('[');
             for sub in geoms {
                 self.item();
-                self.geometry(sub);
+                self.geometry(GeometryRef::owned(sub));
             }
             self.close(']');
         } else {
             self.member("coordinates");
-            write_coordinates(&mut self.out, g);
+            write_coordinates(&mut self.out, g.shape());
         }
         self.close('}');
     }
 }
 
 /// A geometry's `coordinates` value, compact.
-fn write_coordinates(out: &mut String, g: &Geometry) {
+fn write_coordinates(out: &mut String, g: Shape<'_>) {
     match g {
-        Geometry::Point(p) => write_position(out, *p),
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => write_positions(out, ps),
-        Geometry::Polygon(r) | Geometry::MultiLineString(r) => write_rings(out, r),
-        Geometry::MultiPolygon(polys) => {
+        Shape::Point(p) => write_position(out, p),
+        Shape::LineString(ps) | Shape::MultiPoint(ps) => write_positions(out, ps),
+        Shape::Polygon(r) | Shape::MultiLineString(r) => write_rings(out, r),
+        Shape::MultiPolygon(polys) => {
             out.push('[');
             for (i, p) in polys.iter().enumerate() {
                 if i > 0 {
@@ -635,7 +635,7 @@ fn write_coordinates(out: &mut String, g: &Geometry) {
             }
             out.push(']');
         }
-        Geometry::GeometryCollection(_) => unreachable!("a collection has geometries, not coordinates"),
+        Shape::Collection(_) => unreachable!("a collection has geometries, not coordinates"),
     }
 }
 
@@ -655,18 +655,18 @@ fn write_position(out: &mut String, p: Position) {
     out.push(']');
 }
 
-fn write_positions(out: &mut String, ps: &[Position]) {
+fn write_positions(out: &mut String, ps: Run<'_>) {
     out.push('[');
     for (i, p) in ps.iter().enumerate() {
         if i > 0 {
             out.push(',');
         }
-        write_position(out, *p);
+        write_position(out, p);
     }
     out.push(']');
 }
 
-fn write_rings(out: &mut String, rings: &[Vec<Position>]) {
+fn write_rings(out: &mut String, rings: Rings<'_>) {
     out.push('[');
     for (i, r) in rings.iter().enumerate() {
         if i > 0 {

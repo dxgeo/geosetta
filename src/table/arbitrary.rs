@@ -93,6 +93,53 @@ fn column_value(rng: &mut Rng, key: usize) -> JsonValue {
 
 /// A collection of up to a few hundred rows, now and then one of many
 /// blocks of `block_rows`.
+/// An ordinate: ordinary now and then, and now and then a value `==` gets
+/// wrong -- `-0.0`, or with `nan`, a NaN with a payload of its own -- or an
+/// infinity.
+fn ordinate(rng: &mut Rng, nan: bool) -> f64 {
+    match rng.below(12) {
+        0 => -0.0,
+        1 if nan => f64::from_bits(0x7ff8_0000_0000_0000 | (rng.next() & 0xffff)),
+        2 => f64::INFINITY,
+        _ => (rng.below(2_000) as f64 - 1_000.0) / 8.0,
+    }
+}
+
+/// A position whose Z and M are each there or not, independently of its
+/// neighbours'.
+fn position(rng: &mut Rng, nan: bool, z: bool, m: bool) -> Position {
+    Position {
+        x: ordinate(rng, nan),
+        y: ordinate(rng, nan),
+        z: (z && !rng.one_in(6) || rng.one_in(20)).then(|| ordinate(rng, nan)),
+        m: (m && !rng.one_in(6) || rng.one_in(20)).then(|| ordinate(rng, nan)),
+    }
+}
+
+fn run(rng: &mut Rng, nan: bool, z: bool, m: bool) -> Vec<Position> {
+    (0..rng.below(6)).map(|_| position(rng, nan, z, m)).collect()
+}
+
+fn rings(rng: &mut Rng, nan: bool, z: bool, m: bool) -> Vec<Vec<Position>> {
+    (0..rng.below(4)).map(|_| run(rng, nan, z, m)).collect()
+}
+
+/// Any geometry: every type, empty parts and rings among full ones, Z and M
+/// per position, and collections nested in collections. `nan` lets an
+/// ordinate be a NaN, which only a bitwise comparison can check.
+pub(crate) fn geometry(rng: &mut Rng, nan: bool, depth: u32) -> Geometry {
+    let (z, m) = (rng.one_in(3), rng.one_in(4));
+    match rng.below(if depth < 2 { 8 } else { 7 }) {
+        0 | 1 => Geometry::Point(position(rng, nan, z, m)),
+        2 => Geometry::LineString(run(rng, nan, z, m)),
+        3 => Geometry::Polygon(rings(rng, nan, z, m)),
+        4 => Geometry::MultiPoint(run(rng, nan, z, m)),
+        5 => Geometry::MultiLineString(rings(rng, nan, z, m)),
+        6 => Geometry::MultiPolygon((0..rng.below(3)).map(|_| rings(rng, nan, z, m)).collect()),
+        _ => Geometry::GeometryCollection((0..rng.below(4)).map(|_| geometry(rng, nan, depth + 1)).collect()),
+    }
+}
+
 pub(crate) fn collection(rng: &mut Rng, block_rows: usize) -> Vec<Feature> {
     let rows = match rng.below(10) {
         0 => 0,
@@ -125,7 +172,11 @@ pub(crate) fn collection_of(rng: &mut Rng, rows: usize) -> Vec<Feature> {
                 keys.push(keys[rng.below(keys.len())]);
             }
             Feature {
-                geometry: (!rng.one_in(10)).then(|| Geometry::Point(Position::new(row as f64, -(row as f64)))),
+                geometry: match rng.below(10) {
+                    0 => None,
+                    1..=3 => Some(geometry(rng, false, 0)),
+                    _ => Some(Geometry::Point(Position::new(row as f64, -(row as f64)))),
+                },
                 properties: keys.into_iter().map(|k| (pool[k].clone(), column_value(rng, k))).collect(),
                 native: rng.one_in(20).then(|| {
                     Box::new(Native {
@@ -149,7 +200,11 @@ pub(crate) fn tabular(rng: &mut Rng, rows: usize) -> (Vec<Rc<str>>, Vec<Feature>
     let header: Vec<Rc<str>> = keys.iter().map(|k| Rc::from(format!("k{k}"))).collect();
     let features = (0..rows)
         .map(|row| Feature {
-            geometry: (!rng.one_in(10)).then(|| Geometry::Point(Position::new(row as f64, 0.0))),
+            geometry: match rng.below(10) {
+                0 => None,
+                1..=3 => Some(geometry(rng, false, 0)),
+                _ => Some(Geometry::Point(Position::new(row as f64, 0.0))),
+            },
             properties: keys.iter().zip(&header).map(|(&k, key)| (key.clone(), column_value(rng, k))).collect(),
             native: rng.one_in(20).then(|| {
                 Box::new(Native {

@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 /// One block's geometry column.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum GeometryColumn {
-    /// A geometry a row, as the row IR held them: what a block builds into,
-    /// and what `--layout rows` keeps (D-C16).
+    /// A geometry a row, as the row IR held them: what `--layout rows`
+    /// keeps, and what a bulk edit makes a column for its pass (D-C16).
     Owned(Vec<Option<Geometry>>),
-    /// Flat buffers (D-C6), what a block seals as.
+    /// Flat buffers (D-C6), what a block fills and seals as.
     Flat(Box<Flat>),
 }
 
@@ -31,10 +31,33 @@ impl GeometryColumn {
         }
     }
 
+    /// The column a block fills: flat from its first row, so a reader that
+    /// writes coordinates ([`GeometryBuilder`]) never builds a `Geometry`
+    /// (`plans/columnar.org` C6 step 5). [`Self::seal`] makes it owned for
+    /// `--layout rows`.
+    pub(crate) fn filling() -> GeometryColumn {
+        GeometryColumn::Flat(Box::new(Flat::with_capacity(0)))
+    }
+
     pub(crate) fn push(&mut self, geometry: Option<Geometry>) {
         match self {
             GeometryColumn::Owned(g) => g.push(geometry),
             GeometryColumn::Flat(f) => f.push(geometry),
+        }
+    }
+
+    /// Append a row's geometry as its reader handed it over.
+    pub(crate) fn push_row(&mut self, geometry: RowGeometry<'_>) {
+        match geometry {
+            RowGeometry::Whole(g) => self.push(g),
+            RowGeometry::Built(b) => {
+                match (&mut *self, b.flat.len()) {
+                    (_, 0) => self.push(b.whole.take()),
+                    (GeometryColumn::Owned(g), _) => g.push(Some(b.flat.to_geometry(0))),
+                    (GeometryColumn::Flat(f), _) => f.append(&b.flat),
+                }
+                b.clear();
+            }
         }
     }
 
@@ -48,7 +71,12 @@ impl GeometryColumn {
                 flat.shrink();
                 GeometryColumn::Flat(Box::new(flat))
             }
-            (column, _) => column,
+            (GeometryColumn::Flat(mut flat), Layout::Auto | Layout::Columns) => {
+                flat.shrink();
+                GeometryColumn::Flat(flat)
+            }
+            (GeometryColumn::Flat(flat), Layout::Rows) => GeometryColumn::Owned(flat.into_owned()),
+            (column, Layout::Rows) => column,
         }
     }
 
@@ -167,6 +195,7 @@ struct Ordinate {
 }
 
 impl Ordinate {
+    #[inline]
     fn get(&self, i: usize) -> Option<f64> {
         if self.values.is_empty() || self.present.as_ref().is_some_and(|p| !p.get(i)) {
             return None;
@@ -278,6 +307,42 @@ impl Flat {
         self.m.values.shrink_to_fit();
     }
 
+    /// Empty the column, keeping what its buffers hold room for.
+    fn clear(&mut self) {
+        self.tags.clear();
+        self.parts.truncate(1);
+        self.rings.truncate(1);
+        self.coords.truncate(1);
+        self.xy.clear();
+        for o in [&mut self.z, &mut self.m] {
+            o.values.clear();
+            o.present = None;
+        }
+        self.collections.clear();
+        self.edited.clear();
+    }
+
+    /// Append `src`'s one row, as [`Self::push`] would have pushed the
+    /// geometry it holds: its offsets moved past this column's, its
+    /// coordinates copied.
+    fn append(&mut self, src: &Flat) {
+        debug_assert!(src.len() == 1 && src.collections.is_empty() && src.edited.is_empty());
+        let xy = self.xy.len() as u32;
+        let coords = (self.coords.len() - 1) as u32;
+        let rings = (self.rings.len() - 1) as u32;
+        for (to, from) in [(&mut self.z, &src.z), (&mut self.m, &src.m)] {
+            // Neither holding one is every 2D row: nothing to do.
+            if !(to.values.is_empty() && from.values.is_empty()) {
+                (0..src.xy.len()).for_each(|i| to.push(xy as usize + i, from.get(i)));
+            }
+        }
+        self.xy.extend_from_slice(&src.xy);
+        self.coords.extend(src.coords[1..].iter().map(|c| c + xy));
+        self.rings.extend(src.rings[1..].iter().map(|r| r + coords));
+        self.parts.push(src.parts[1] + rings);
+        self.tags.push(src.tags[0]);
+    }
+
     fn position(&mut self, p: &Position) {
         let len = self.xy.len();
         self.z.push(len, p.z);
@@ -350,6 +415,13 @@ impl Flat {
         &self.collections[i].1
     }
 
+    /// Whether no position holds a Z or an M.
+    #[inline]
+    fn is_2d(&self) -> bool {
+        self.z.values.is_empty() && self.m.values.is_empty()
+    }
+
+    #[inline]
     fn pos(&self, i: usize) -> Position {
         let [x, y] = self.xy[i];
         Position { x, y, z: self.z.get(i), m: self.m.get(i) }
@@ -484,6 +556,177 @@ impl Flat {
     }
 }
 
+/// A geometry's type, as a reader writing one into a [`GeometryBuilder`]
+/// names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Kind {
+    Point,
+    LineString,
+    Polygon,
+    MultiPoint,
+    MultiLineString,
+    MultiPolygon,
+}
+
+/// One row's geometry as a reader writes it (`plans/columnar.org` C6 step
+/// 5): positions, then the ring, part and row they close, straight into
+/// buffers a block's flat column copies from, so no `Geometry` is built.
+/// Reused row after row; pushing it to a block empties it.
+///
+/// The structure is [`Flat`]'s, the same three levels for every type: a
+/// point, a line or a multipoint is one part of one ring; a polygon or a
+/// multilinestring one part of a ring each; a multipolygon a part a
+/// polygon. A geometry it does not write -- a collection, or one a reader
+/// already holds -- is handed over whole ([`Self::whole`]).
+#[derive(Debug)]
+pub(crate) struct GeometryBuilder {
+    /// No row, or the row being written.
+    flat: Flat,
+    /// The geometry handed over whole, when `flat` holds no row.
+    whole: Option<Geometry>,
+}
+
+impl Default for GeometryBuilder {
+    fn default() -> GeometryBuilder {
+        GeometryBuilder { flat: Flat::with_capacity(1), whole: None }
+    }
+}
+
+impl GeometryBuilder {
+    /// Forget whatever has been written: the row is no geometry.
+    pub(crate) fn clear(&mut self) {
+        self.flat.clear();
+        self.whole = None;
+    }
+
+    pub(crate) fn position(&mut self, p: Position) {
+        self.flat.position(&p);
+    }
+
+    /// The X and Y of the positions written since the last ring closed.
+    pub(crate) fn open_ring(&self) -> &[[f64; 2]] {
+        &self.flat.xy[*self.flat.coords.last().expect("never empty") as usize..]
+    }
+
+    pub(crate) fn end_ring(&mut self) {
+        self.flat.coords.push(self.flat.xy.len() as u32);
+    }
+
+    /// How many rings have closed since the last part did.
+    pub(crate) fn rings_in_open_part(&self) -> usize {
+        self.flat.coords.len() - 1 - *self.flat.rings.last().expect("never empty") as usize
+    }
+
+    pub(crate) fn end_part(&mut self) {
+        self.flat.rings.push((self.flat.coords.len() - 1) as u32);
+    }
+
+    /// How many parts have closed.
+    pub(crate) fn parts(&self) -> usize {
+        self.flat.rings.len() - 1
+    }
+
+    /// Close the row as a `kind`.
+    pub(crate) fn finish(&mut self, kind: Kind) {
+        debug_assert!(self.flat.tags.is_empty() && self.whole.is_none(), "one row a geometry");
+        self.flat.tags.push(match kind {
+            Kind::Point => Tag::Point,
+            Kind::LineString => Tag::LineString,
+            Kind::Polygon => Tag::Polygon,
+            Kind::MultiPoint => Tag::MultiPoint,
+            Kind::MultiLineString => Tag::MultiLineString,
+            Kind::MultiPolygon => Tag::MultiPolygon,
+        });
+        self.flat.parts.push((self.flat.rings.len() - 1) as u32);
+    }
+
+    /// A point: one position, one ring, one part.
+    pub(crate) fn point(&mut self, p: Position) {
+        self.position(p);
+        self.end_ring();
+        self.end_part();
+        self.finish(Kind::Point);
+    }
+
+    /// Hand the row's geometry over whole, in place of anything written.
+    pub(crate) fn whole(&mut self, geometry: Option<Geometry>) {
+        self.clear();
+        self.whole = geometry;
+    }
+
+    /// Write `geometry` as a reader would: through the positions, rings and
+    /// parts, unless it is a collection.
+    #[cfg(test)]
+    pub(crate) fn write(&mut self, geometry: Option<&Geometry>) {
+        self.clear();
+        let run = |b: &mut GeometryBuilder, ps: &[Position]| {
+            ps.iter().for_each(|p| b.position(*p));
+            b.end_ring();
+        };
+        let part = |b: &mut GeometryBuilder, rings: &[Vec<Position>]| {
+            rings.iter().for_each(|r| run(b, r));
+            b.end_part();
+        };
+        let kind = match geometry {
+            None => return,
+            Some(Geometry::Point(p)) => return self.point(*p),
+            Some(Geometry::LineString(ps)) => {
+                run(self, ps);
+                self.end_part();
+                Kind::LineString
+            }
+            Some(Geometry::MultiPoint(ps)) => {
+                run(self, ps);
+                self.end_part();
+                Kind::MultiPoint
+            }
+            Some(Geometry::Polygon(rings)) => {
+                part(self, rings);
+                Kind::Polygon
+            }
+            Some(Geometry::MultiLineString(lines)) => {
+                part(self, lines);
+                Kind::MultiLineString
+            }
+            Some(Geometry::MultiPolygon(polys)) => {
+                polys.iter().for_each(|p| part(self, p));
+                Kind::MultiPolygon
+            }
+            Some(g @ Geometry::GeometryCollection(_)) => return self.whole(Some(g.clone())),
+        };
+        self.finish(kind);
+    }
+
+    /// The geometry written, as an owned value, and the builder emptied.
+    pub(crate) fn take(&mut self) -> Option<Geometry> {
+        let g = match self.flat.len() {
+            0 => self.whole.take(),
+            _ => Some(self.flat.to_geometry(0)),
+        };
+        self.clear();
+        g
+    }
+}
+
+/// A row's geometry as a reader hands it to a block.
+pub(crate) enum RowGeometry<'a> {
+    Whole(Option<Geometry>),
+    /// Written into a builder, which the block empties.
+    Built(&'a mut GeometryBuilder),
+}
+
+impl From<Option<Geometry>> for RowGeometry<'_> {
+    fn from(g: Option<Geometry>) -> Self {
+        RowGeometry::Whole(g)
+    }
+}
+
+impl<'a> From<&'a mut GeometryBuilder> for RowGeometry<'a> {
+    fn from(b: &'a mut GeometryBuilder) -> Self {
+        RowGeometry::Built(b)
+    }
+}
+
 /// A feature's geometry, read in place: what
 /// [`crate::FeatureRef::geometry`] gives. A block may hold it as a
 /// [`Geometry`] or flat (`plans/columnar.org` D-C6), so this is a view of
@@ -553,6 +796,9 @@ impl<'a> GeometryRef<'a> {
     pub fn extend_bbox(self, bbox: &mut Bbox) {
         match self.0 {
             Repr::Owned(g) => g.extend_bbox(bbox),
+            Repr::Flat { flat, row } if flat.is_2d() => {
+                flat.xy[flat.row_coords(row as usize)].iter().for_each(|&[x, y]| bbox.add(Position::new(x, y)))
+            }
             Repr::Flat { flat, row } => flat.row_coords(row as usize).for_each(|i| bbox.add(flat.pos(i))),
         }
     }
@@ -647,12 +893,22 @@ impl<'a> Run<'a> {
         self.iter().next()
     }
 
-    pub(crate) fn iter(self) -> impl Iterator<Item = Position> + 'a {
-        let (slice, flat) = match self {
-            Run::Slice(ps) => (ps, None),
-            Run::Flat(flat, start, end) => (&[][..], Some((flat, start as usize..end as usize))),
-        };
-        slice.iter().copied().chain(flat.into_iter().flat_map(|(flat, range)| range.map(|i| flat.pos(i))))
+    /// The run's X and Y, in place, when it is flat in a column holding no
+    /// Z or M at all: every position is `(x, y)` alone, and a writer can read
+    /// the buffer without building a `Position` a coordinate (C6 step 7).
+    #[inline]
+    pub(crate) fn xy_2d(self) -> Option<&'a [[f64; 2]]> {
+        match self {
+            Run::Flat(flat, start, end) if flat.is_2d() => Some(&flat.xy[start as usize..end as usize]),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn iter(self) -> RunIter<'a> {
+        match self {
+            Run::Slice(ps) => RunIter::Slice(ps.iter()),
+            Run::Flat(flat, start, end) => RunIter::Flat(flat, start as usize..end as usize),
+        }
     }
 }
 
@@ -676,14 +932,11 @@ impl<'a> Rings<'a> {
         self.iter().next()
     }
 
-    pub(crate) fn iter(self) -> impl Iterator<Item = Run<'a>> + 'a {
-        let (slice, flat) = match self {
-            Rings::Slice(r) => (r, None),
-            Rings::Flat(flat, start, end) => (&[][..], Some((flat, start as usize..end as usize))),
-        };
-        slice.iter().map(|r| Run::Slice(r)).chain(
-            flat.into_iter().flat_map(|(flat, range)| range.map(|k| Run::Flat(flat, flat.coords[k], flat.coords[k + 1]))),
-        )
+    pub(crate) fn iter(self) -> RingsIter<'a> {
+        match self {
+            Rings::Slice(r) => RingsIter::Slice(r.iter()),
+            Rings::Flat(flat, start, end) => RingsIter::Flat(flat, start as usize..end as usize),
+        }
     }
 }
 
@@ -707,33 +960,141 @@ impl<'a> Parts<'a> {
         self.iter().next()
     }
 
-    pub(crate) fn iter(self) -> impl Iterator<Item = Rings<'a>> + 'a {
-        let (slice, flat) = match self {
-            Parts::Slice(p) => (p, None),
-            Parts::Flat(flat, start, end) => (&[][..], Some((flat, start as usize..end as usize))),
-        };
-        slice.iter().map(|p| Rings::Slice(p)).chain(
-            flat.into_iter().flat_map(|(flat, range)| range.map(|p| Rings::Flat(flat, flat.rings[p], flat.rings[p + 1]))),
-        )
+    pub(crate) fn iter(self) -> PartsIter<'a> {
+        match self {
+            Parts::Slice(p) => PartsIter::Slice(p.iter()),
+            Parts::Flat(flat, start, end) => PartsIter::Flat(flat, start as usize..end as usize),
+        }
     }
 }
 
-/// Two views are equal when the geometries they show are.
+// The iterators over a `Run`, `Rings` and `Parts`: an enum each rather than
+// a chain of both forms' iterators, which the per-coordinate loops of every
+// writer did not see through (`plans/columnar.org` C6 step 7).
+
+pub(crate) enum RunIter<'a> {
+    Slice(std::slice::Iter<'a, Position>),
+    Flat(&'a Flat, std::ops::Range<usize>),
+}
+
+impl Iterator for RunIter<'_> {
+    type Item = Position;
+
+    #[inline]
+    fn next(&mut self) -> Option<Position> {
+        match self {
+            RunIter::Slice(ps) => ps.next().copied(),
+            RunIter::Flat(flat, range) => range.next().map(|i| flat.pos(i)),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RunIter::Slice(ps) => ps.size_hint(),
+            RunIter::Flat(_, range) => range.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for RunIter<'_> {}
+
+pub(crate) enum RingsIter<'a> {
+    Slice(std::slice::Iter<'a, Vec<Position>>),
+    Flat(&'a Flat, std::ops::Range<usize>),
+}
+
+impl<'a> Iterator for RingsIter<'a> {
+    type Item = Run<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Run<'a>> {
+        match self {
+            RingsIter::Slice(r) => r.next().map(|r| Run::Slice(r)),
+            RingsIter::Flat(flat, range) => range.next().map(|k| Run::Flat(flat, flat.coords[k], flat.coords[k + 1])),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            RingsIter::Slice(r) => r.size_hint(),
+            RingsIter::Flat(_, range) => range.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for RingsIter<'_> {}
+
+pub(crate) enum PartsIter<'a> {
+    Slice(std::slice::Iter<'a, Vec<Vec<Position>>>),
+    Flat(&'a Flat, std::ops::Range<usize>),
+}
+
+impl<'a> Iterator for PartsIter<'a> {
+    type Item = Rings<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<Rings<'a>> {
+        match self {
+            PartsIter::Slice(p) => p.next().map(|p| Rings::Slice(p)),
+            PartsIter::Flat(flat, range) => range.next().map(|p| Rings::Flat(flat, flat.rings[p], flat.rings[p + 1])),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            PartsIter::Slice(p) => p.size_hint(),
+            PartsIter::Flat(_, range) => range.size_hint(),
+        }
+    }
+}
+
+impl ExactSizeIterator for PartsIter<'_> {}
+
+/// Two views are equal when the geometries they show are: compared in
+/// place, position by position, as [`Geometry`]'s own `==` compares.
 impl PartialEq for GeometryRef<'_> {
     fn eq(&self, other: &GeometryRef<'_>) -> bool {
         match (self.as_geometry(), other.as_geometry()) {
             (Some(a), Some(b)) => a == b,
-            _ => self.to_geometry() == other.to_geometry(),
+            _ => self.shape() == other.shape(),
         }
     }
 }
 
 impl PartialEq<Geometry> for GeometryRef<'_> {
     fn eq(&self, other: &Geometry) -> bool {
-        match self.as_geometry() {
-            Some(g) => g == other,
-            None => self.to_geometry() == *other,
+        *self == GeometryRef::owned(other)
+    }
+}
+
+impl PartialEq for Shape<'_> {
+    fn eq(&self, other: &Shape<'_>) -> bool {
+        match (*self, *other) {
+            (Shape::Point(a), Shape::Point(b)) => a == b,
+            (Shape::LineString(a), Shape::LineString(b)) | (Shape::MultiPoint(a), Shape::MultiPoint(b)) => a == b,
+            (Shape::Polygon(a), Shape::Polygon(b)) | (Shape::MultiLineString(a), Shape::MultiLineString(b)) => a == b,
+            (Shape::MultiPolygon(a), Shape::MultiPolygon(b)) => a == b,
+            (Shape::Collection(a), Shape::Collection(b)) => a == b,
+            _ => false,
         }
+    }
+}
+
+impl PartialEq for Run<'_> {
+    fn eq(&self, other: &Run<'_>) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl PartialEq for Rings<'_> {
+    fn eq(&self, other: &Rings<'_>) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl PartialEq for Parts<'_> {
+    fn eq(&self, other: &Parts<'_>) -> bool {
+        self.len() == other.len() && self.iter().eq(other.iter())
     }
 }
 
@@ -809,6 +1170,66 @@ mod tests {
     /// for bit -- every type, empty parts and rings, Z and M per position,
     /// collections, mixed types, -0.0 and NaN -- and its views say what the
     /// geometry they show says.
+    /// A row a reader writes through a builder is the row `push` flattens
+    /// (C6 step 5): the same buffers bit for bit in a flat column, the same
+    /// geometry in an owned one, and the same rows after every seal.
+    #[test]
+    fn built_rows_are_the_rows_push_flattens() {
+        fn bits(o: &Ordinate) -> (Vec<u64>, Option<Bitmap>) {
+            (o.values.iter().map(|v| v.to_bits()).collect(), o.present.clone())
+        }
+        for seed in 0..500 {
+            let mut rng = arbitrary::Rng::new(seed);
+            let n = rng.below(40);
+            let rows = column(&mut rng, n);
+            let mut built = GeometryBuilder::default();
+            let (mut filling, mut owned) = (GeometryColumn::filling(), GeometryColumn::Owned(Vec::new()));
+            for g in &rows {
+                built.write(g.as_ref());
+                assert!(identical(&built.take(), g), "seed {seed}: take");
+                for column in [&mut filling, &mut owned] {
+                    built.write(g.as_ref());
+                    column.push_row(RowGeometry::Built(&mut built));
+                }
+            }
+            assert!(same(&reads(&owned), &rows), "seed {seed}: owned");
+            let (GeometryColumn::Flat(a), GeometryColumn::Flat(b)) = (filling.clone().seal(Layout::Auto), flat(&rows)) else {
+                panic!("seed {seed}: sealed flat");
+            };
+            assert_eq!((&a.tags, &a.parts, &a.rings, &a.coords), (&b.tags, &b.parts, &b.rings, &b.coords), "seed {seed}");
+            let xy = |f: &Flat| f.xy.iter().map(|[x, y]| (x.to_bits(), y.to_bits())).collect::<Vec<_>>();
+            assert_eq!(xy(&a), xy(&b), "seed {seed}: xy");
+            assert_eq!((bits(&a.z), bits(&a.m)), (bits(&b.z), bits(&b.m)), "seed {seed}: z, m");
+            assert_eq!(a.collections.len(), b.collections.len(), "seed {seed}: collections");
+            for layout in [Layout::Auto, Layout::Rows, Layout::Columns] {
+                assert!(same(&reads(&filling.clone().seal(layout)), &rows), "seed {seed}, {layout:?}");
+            }
+            assert!(matches!(filling.seal(Layout::Rows), GeometryColumn::Owned(_)), "seed {seed}: rows stay owned");
+        }
+    }
+
+    #[test]
+    fn a_view_compares_in_place_as_its_geometry_does() {
+        for seed in 0..300 {
+            let mut rng = arbitrary::Rng::new(seed);
+            let n = rng.below(20);
+            let rows = column(&mut rng, n);
+            let column = flat(&rows);
+            for (i, a) in rows.iter().enumerate() {
+                let Some(view) = column.get(i) else { continue };
+                for (j, b) in rows.iter().enumerate() {
+                    let Some(b) = b else { continue };
+                    let want = a.as_ref() == Some(b);
+                    assert_eq!(view == *b, want, "seed {seed}, rows {i} and {j}");
+                    assert_eq!(view == GeometryRef::owned(b), want, "seed {seed}, rows {i} and {j}");
+                    if let Some(other) = column.get(j) {
+                        assert_eq!(view == other, want, "seed {seed}, rows {i} and {j}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn a_flat_column_rebuilds_every_geometry_exactly() {
         for seed in 0..500 {

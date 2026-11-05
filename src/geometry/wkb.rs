@@ -21,7 +21,7 @@
 
 use super::{Geometry, Position};
 use crate::error::{Error, Result};
-use crate::table::{GeometryRef, Rings, Run, Shape};
+use crate::table::{GeometryBuilder, GeometryRef, Kind, Rings, Run, Shape};
 
 // Little-endian byte-order marker.
 const LE: u8 = 0x01;
@@ -230,6 +230,13 @@ fn point(out: &mut Vec<u8>, p: Position, dim: Dim) {
 /// `dim`'s width.
 fn line(out: &mut Vec<u8>, ps: Run<'_>, dim: Dim) {
     out.extend_from_slice(&(ps.len() as u32).to_le_bytes());
+    if let (Dim::XY, Some(xy)) = (dim, ps.xy_2d()) {
+        for [x, y] in xy {
+            out.extend_from_slice(&x.to_le_bytes());
+            out.extend_from_slice(&y.to_le_bytes());
+        }
+        return;
+    }
     for p in ps.iter() {
         point(out, p, dim);
     }
@@ -307,7 +314,92 @@ fn truncated() -> Error {
     Error::Convert("truncated WKB geometry".into())
 }
 
-fn read_geometry(r: &mut Reader) -> Result<Geometry> {
+/// [`decode`], into `out` (`plans/columnar.org` C6 step 5): the positions
+/// go straight into the buffers a block's flat column copies, with no
+/// `Geometry` built. A collection is decoded whole. Errors as [`decode`]
+/// does, on the same input.
+pub(crate) fn decode_into(bytes: &[u8], out: &mut GeometryBuilder) -> Result<()> {
+    out.clear();
+    let mut r = Reader { buf: bytes, pos: 0 };
+    let (base_type, dim) = read_header(&mut r)?;
+    match base_type {
+        WKB_POINT => out.point(read_point(&mut r, dim)?),
+        WKB_LINESTRING => {
+            line_into(&mut r, dim, out)?;
+            out.end_part();
+            out.finish(Kind::LineString);
+        }
+        WKB_POLYGON => {
+            polygon_into(&mut r, dim, out)?;
+            out.finish(Kind::Polygon);
+        }
+        WKB_MULTIPOINT => {
+            let n = r.count(MIN_GEOMETRY_SIZE)?;
+            for _ in 0..n {
+                let dim = member(&mut r, WKB_POINT, "MultiPoint", "Point")?;
+                out.position(read_point(&mut r, dim)?);
+            }
+            out.end_ring();
+            out.end_part();
+            out.finish(Kind::MultiPoint);
+        }
+        WKB_MULTILINESTRING => {
+            let n = r.count(MIN_GEOMETRY_SIZE)?;
+            for _ in 0..n {
+                let dim = member(&mut r, WKB_LINESTRING, "MultiLineString", "LineString")?;
+                line_into(&mut r, dim, out)?;
+            }
+            out.end_part();
+            out.finish(Kind::MultiLineString);
+        }
+        WKB_MULTIPOLYGON => {
+            let n = r.count(MIN_GEOMETRY_SIZE)?;
+            for _ in 0..n {
+                let dim = member(&mut r, WKB_POLYGON, "MultiPolygon", "Polygon")?;
+                polygon_into(&mut r, dim, out)?;
+            }
+            out.finish(Kind::MultiPolygon);
+        }
+        WKB_GEOMETRYCOLLECTION => out.whole(Some(decode(bytes)?)),
+        other => return Err(Error::Convert(format!("unknown WKB type code {other}"))),
+    }
+    Ok(())
+}
+
+/// A multi-geometry's member's header, which must be a `want`: its
+/// dimensionality. One that is not is read through first, so a malformed
+/// member errors as [`read_geometry`] would have.
+fn member(r: &mut Reader, want: u32, parent: &str, expected: &str) -> Result<Dim> {
+    let (base_type, dim) = read_header(r)?;
+    if base_type != want {
+        read_body(r, base_type, dim)?;
+        return Err(sub_mismatch(parent, expected));
+    }
+    Ok(dim)
+}
+
+/// A line's positions, as a ring.
+fn line_into(r: &mut Reader, dim: Dim, out: &mut GeometryBuilder) -> Result<()> {
+    let n = r.count(dim.coord_size())?;
+    for _ in 0..n {
+        out.position(read_point(r, dim)?);
+    }
+    out.end_ring();
+    Ok(())
+}
+
+/// A polygon's rings, as a part.
+fn polygon_into(r: &mut Reader, dim: Dim, out: &mut GeometryBuilder) -> Result<()> {
+    let n = r.count(MIN_RING_SIZE)?;
+    for _ in 0..n {
+        line_into(r, dim, out)?;
+    }
+    out.end_part();
+    Ok(())
+}
+
+/// A geometry's byte order and type code: its base type and dimensionality.
+fn read_header(r: &mut Reader) -> Result<(u32, Dim)> {
     let order = r.u8()?;
     if order != LE {
         return Err(Error::Convert(
@@ -316,7 +408,15 @@ fn read_geometry(r: &mut Reader) -> Result<Geometry> {
     }
     let code = r.u32()?;
     let base_type = code % 1000;
-    let dim = Dim::from_offset(code - base_type)?;
+    Ok((base_type, Dim::from_offset(code - base_type)?))
+}
+
+fn read_geometry(r: &mut Reader) -> Result<Geometry> {
+    let (base_type, dim) = read_header(r)?;
+    read_body(r, base_type, dim)
+}
+
+fn read_body(r: &mut Reader, base_type: u32, dim: Dim) -> Result<Geometry> {
     let geom = match base_type {
         WKB_POINT => Geometry::Point(read_point(r, dim)?),
         WKB_LINESTRING => Geometry::LineString(read_line(r, dim)?),
@@ -430,6 +530,32 @@ mod tests {
 
     fn round_trip(g: Geometry) {
         assert_eq!(decode(&encode(&g)).unwrap(), g);
+    }
+
+    /// `decode_into` reads what `decode` reads, and refuses what it refuses
+    /// with the same error: arbitrary geometry, whole, cut short, and with a
+    /// byte changed (C6 step 5).
+    #[test]
+    fn decoding_into_a_builder_is_decoding() {
+        use crate::table::arbitrary;
+        let mut built = GeometryBuilder::default();
+        // Compared by their bytes, so a NaN a changed byte makes is itself.
+        let mut into = |bytes: &[u8]| {
+            decode_into(bytes, &mut built).map(|()| built.take().map(|g| encode(&g))).map_err(|e| e.to_string())
+        };
+        for seed in 0..2_000 {
+            let mut rng = arbitrary::Rng::new(seed);
+            let wkb = encode(&arbitrary::geometry(&mut rng, false, 0));
+            let mut inputs = vec![wkb.clone(), wkb[..rng.below(wkb.len() + 1)].to_vec()];
+            let mut changed = wkb.clone();
+            let i = rng.below(changed.len());
+            changed[i] = rng.next() as u8;
+            inputs.push(changed);
+            for bytes in inputs {
+                let want = decode(&bytes).map(|g| Some(encode(&g))).map_err(|e| e.to_string());
+                assert_eq!(into(&bytes), want, "seed {seed}");
+            }
+        }
     }
 
     #[test]

@@ -17,7 +17,7 @@
 use crate::error::{Error, Result};
 use crate::feature::{FeatureCollection, Tabular};
 use crate::table::Layout;
-use crate::geometry::{from_wkt, to_wkt};
+use crate::geometry::{from_wkt, wkt_ref};
 use crate::json::JsonValue;
 use crate::schema::Cell;
 use std::rc::Rc;
@@ -95,7 +95,7 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     for feat in fc.rows() {
         let mut fields: Vec<String> =
             cells.iter_mut().map(|c| field(&cell_text(&c.next().expect("a cell per row")))).collect();
-        let wkt = feat.geometry_cow().map(|g| to_wkt(&g)).unwrap_or_default();
+        let wkt = feat.geometry().map(wkt_ref).unwrap_or_default();
         fields.push(field(&wkt));
         out.push_str(&fields.join(","));
         out.push('\n');

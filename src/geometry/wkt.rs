@@ -14,6 +14,7 @@
 
 use super::{Geometry, Position};
 use crate::error::{Error, Result};
+use crate::table::{GeometryRef, Rings, Run, Shape};
 
 fn err<T>(msg: &str) -> Result<T> {
     Err(Error::Convert(format!("wkt: {msg}")))
@@ -37,68 +38,55 @@ impl Dim {
     }
 }
 
-fn dim_of_first(ps: &[Position]) -> Dim {
-    ps.first().copied().map(Dim::of).unwrap_or(Dim::XY)
+fn dim_of_first(ps: Run<'_>) -> Dim {
+    ps.first().map(Dim::of).unwrap_or(Dim::XY)
 }
 
-fn dim_of_rings(rings: &[Vec<Position>]) -> Dim {
-    rings.first().map(|r| dim_of_first(r)).unwrap_or(Dim::XY)
-}
-
-fn dim_of_geometry(g: &Geometry) -> Dim {
-    first_position(g).map(Dim::of).unwrap_or(Dim::XY)
-}
-
-fn first_position(g: &Geometry) -> Option<Position> {
-    match g {
-        Geometry::Point(p) => Some(*p),
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => ps.first().copied(),
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            rings.first().and_then(|r| r.first()).copied()
-        }
-        Geometry::MultiPolygon(polys) => {
-            polys.first().and_then(|p| p.first()).and_then(|r| r.first()).copied()
-        }
-        Geometry::GeometryCollection(geoms) => geoms.first().and_then(first_position),
-    }
+fn dim_of_rings(rings: Rings<'_>) -> Dim {
+    rings.first().map(dim_of_first).unwrap_or(Dim::XY)
 }
 
 // --- encoding --------------------------------------------------------------
 
 /// Render a geometry as WKT (e.g. `POINT (1 2)`, `POINT Z (1 2 3)`).
 pub fn encode(g: &Geometry) -> String {
+    encode_ref(GeometryRef::owned(g))
+}
+
+/// [`encode`], from a view: a flat block's geometry is written from its
+/// buffers, without a copy (`plans/columnar.org` C6 step 4).
+pub(crate) fn encode_ref(g: GeometryRef<'_>) -> String {
     let mut s = String::new();
     write_geometry(&mut s, g);
     s
 }
 
-fn write_geometry(s: &mut String, g: &Geometry) {
-    match g {
-        Geometry::Point(p) => {
-            write_header(s, "POINT", Dim::of(*p));
+fn write_geometry(s: &mut String, g: GeometryRef<'_>) {
+    match g.shape() {
+        Shape::Point(p) => {
+            write_header(s, "POINT", Dim::of(p));
             s.push('(');
-            write_coord(s, *p);
+            write_coord(s, p);
             s.push(')');
         }
-        Geometry::LineString(ps) => {
+        Shape::LineString(ps) => {
             write_header(s, "LINESTRING", dim_of_first(ps));
             write_coord_list(s, ps);
         }
-        Geometry::Polygon(rings) => {
+        Shape::Polygon(rings) => {
             write_header(s, "POLYGON", dim_of_rings(rings));
             write_rings(s, rings);
         }
-        Geometry::MultiPoint(ps) => {
+        Shape::MultiPoint(ps) => {
             write_header(s, "MULTIPOINT", dim_of_first(ps));
             write_coord_list(s, ps);
         }
-        Geometry::MultiLineString(lines) => {
-            let dim = lines.first().map(|l| dim_of_first(l)).unwrap_or(Dim::XY);
-            write_header(s, "MULTILINESTRING", dim);
+        Shape::MultiLineString(lines) => {
+            write_header(s, "MULTILINESTRING", dim_of_rings(lines));
             write_rings(s, lines);
         }
-        Geometry::MultiPolygon(polys) => {
-            let dim = polys.first().map(|p| dim_of_rings(p)).unwrap_or(Dim::XY);
+        Shape::MultiPolygon(polys) => {
+            let dim = polys.first().map(dim_of_rings).unwrap_or(Dim::XY);
             write_header(s, "MULTIPOLYGON", dim);
             s.push('(');
             for (i, poly) in polys.iter().enumerate() {
@@ -109,14 +97,14 @@ fn write_geometry(s: &mut String, g: &Geometry) {
             }
             s.push(')');
         }
-        Geometry::GeometryCollection(geoms) => {
-            write_header(s, "GEOMETRYCOLLECTION", dim_of_geometry(g));
+        Shape::Collection(geoms) => {
+            write_header(s, "GEOMETRYCOLLECTION", g.first_position().map(Dim::of).unwrap_or(Dim::XY));
             s.push('(');
             for (i, g) in geoms.iter().enumerate() {
                 if i > 0 {
                     s.push_str(", ");
                 }
-                write_geometry(s, g);
+                write_geometry(s, GeometryRef::owned(g));
             }
             s.push(')');
         }
@@ -152,18 +140,18 @@ fn write_coord(s: &mut String, p: Position) {
     }
 }
 
-fn write_coord_list(s: &mut String, ps: &[Position]) {
+fn write_coord_list(s: &mut String, ps: Run<'_>) {
     s.push('(');
     for (i, p) in ps.iter().enumerate() {
         if i > 0 {
             s.push_str(", ");
         }
-        write_coord(s, *p);
+        write_coord(s, p);
     }
     s.push(')');
 }
 
-fn write_rings(s: &mut String, rings: &[Vec<Position>]) {
+fn write_rings(s: &mut String, rings: Rings<'_>) {
     s.push('(');
     for (i, r) in rings.iter().enumerate() {
         if i > 0 {

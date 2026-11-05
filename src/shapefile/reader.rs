@@ -6,7 +6,7 @@
 use crate::crs::Crs;
 use crate::error::{Error, Result};
 use crate::feature::{FeatureCollection, Tabular};
-use crate::table::Layout;
+use crate::table::{GeometryBuilder, Layout};
 use crate::shapefile::{dbf, geometry};
 
 /// Read a Shapefile from its sibling files' bytes. `.dbf` is required (a
@@ -34,26 +34,48 @@ pub(crate) fn read_as(
     warnings: &mut Vec<String>,
     layout: Layout,
 ) -> Result<FeatureCollection> {
-    let geometries = geometry::read(shp)?;
+    let shapes = geometry::records(shp)?;
     let encoding = dbf::encoding_from_cpg(cpg);
     let mut losses = dbf::TextLosses::default();
     // .dbf and .shp are zipped by row position; a deleted .dbf record drops
     // its paired .shp record too (.shp has no deletion flag of its own).
     // Every record holds every field, in the header's order, and goes
-    // straight into the table as it is decoded.
-    let shapes = geometries.len();
-    let mut geometries = geometries.into_iter();
+    // straight into the table as it is decoded, its shape decoded straight
+    // into the block's buffers (`plans/columnar.org` C6 step 5).
+    let mut contents = shapes.iter();
+    let mut geometry = GeometryBuilder::default();
+    // The first shape that failed to decode: no row is pushed after it.
+    let mut failed = None;
     let (mut table, mut records) = (None, 0);
     dbf::read_each(dbf_bytes, encoding, cpg.is_some(), &mut losses, |keys, deleted, values| {
         records += 1;
-        let geometry = geometries.next().flatten();
+        if failed.is_some() {
+            return;
+        }
+        // A deleted record's shape is decoded too, so a malformed one
+        // errors whether or not its row is kept.
+        match contents.next() {
+            Some(content) => {
+                if let Err(e) = geometry::decode_into(content, &mut geometry) {
+                    failed = Some(e);
+                    return;
+                }
+            }
+            None => geometry.clear(),
+        }
         let table = table.get_or_insert_with(|| Tabular::new(keys.to_vec(), layout));
-        if !deleted {
-            table.push(geometry, values.drain(..), None);
+        if deleted {
+            geometry.clear();
+        } else {
+            table.push(&mut geometry, values.drain(..), None);
         }
     })?;
+    if let Some(e) = failed {
+        return Err(e);
+    }
     report_text_losses(&losses, cpg, warnings);
 
+    let shapes = shapes.len();
     if shapes != records {
         return Err(Error::Convert(format!(
             "shapefile: .shp has {shapes} record(s) but .dbf has {records} — the sibling files disagree"
@@ -169,7 +191,7 @@ mod tests {
         let columns = infer_columns(&rows);
         // A .dbf with zero records paired against a one-record .shp.
         let (empty_dbf, _warnings) = dbf::write(&columns[..0]).unwrap();
-        let (shp, _shx) = crate::shapefile::geometry::write(&[Some(Geometry::Point(Position::new(0.0, 0.0)))]).unwrap();
+        let (shp, _shx) = crate::shapefile::geometry::write(&[Some(crate::GeometryRef::owned(&Geometry::Point(Position::new(0.0, 0.0))))]).unwrap();
         assert!(read(&shp, &empty_dbf, None, None, &mut Vec::new()).is_err());
     }
 

@@ -6,7 +6,7 @@
 
 use crate::error::{Error, Result};
 use crate::feature::{Collecting, Feature, FeatureCollection, FeatureRef};
-use crate::table::{GeometryRef, Layout, Rings, Run, Shape};
+use crate::table::{GeometryBuilder, GeometryRef, Kind, Layout, Rings, Run, Shape};
 use crate::format::Format;
 use crate::geometry::{Geometry, Position};
 use crate::json::{self, JsonValue, Parser};
@@ -210,10 +210,13 @@ fn stream_features(p: &mut Parser, layout: Layout) -> Result<FeatureCollection> 
     let mut keys = KeyInterner::default();
     // The previous feature's property count: the next one's, in a table.
     let mut width = 0;
+    // Each feature's geometry, parsed straight into the block's buffers
+    // (`plans/columnar.org` C6 step 5).
+    let mut geometry = GeometryBuilder::default();
     loop {
-        let feature = stream_feature(p, &mut keys, width)?;
-        width = feature.properties.len();
-        features.push(feature);
+        let (properties, native) = stream_feature(p, &mut keys, width, &mut geometry)?;
+        width = properties.len();
+        features.push_built(&mut geometry, properties, native);
         p.skip_ws();
         match p.bump() {
             Some(b',') => continue,
@@ -224,20 +227,29 @@ fn stream_features(p: &mut Parser, layout: Layout) -> Result<FeatureCollection> 
     Ok(features.finish())
 }
 
-/// Stream one Feature object into a [`Feature`], dispatching on member key so
-/// member order doesn't matter. `geometry` is parsed typed; `properties` stay
-/// arbitrary JSON; every other member (`type`, `id`, `bbox`, …) is skipped.
-/// `width` is how many properties to expect.
-fn stream_feature(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Result<Feature> {
+/// A feature's properties and native, as [`stream_feature`] reads them.
+type FeatureRest = (Vec<(Rc<str>, JsonValue)>, Option<Box<Native>>);
+
+/// Stream one Feature object, dispatching on member key so member order
+/// doesn't matter. `geometry` is parsed typed, into `geometry`, which is left
+/// empty for a feature without one; `properties` stay arbitrary JSON; every
+/// other member (`type`, `id`, `bbox`, …) is skipped. `width` is how many
+/// properties to expect.
+fn stream_feature(
+    p: &mut Parser,
+    keys: &mut KeyInterner,
+    width: usize,
+    geometry: &mut GeometryBuilder,
+) -> Result<FeatureRest> {
     p.skip_ws();
     p.expect(b'{')?;
-    let mut geometry = None;
+    geometry.clear();
     let mut properties: Vec<(Rc<str>, JsonValue)> = Vec::new();
     let mut unmodelled: Vec<(Rc<str>, JsonValue)> = Vec::new();
     p.skip_ws();
     if p.peek() == Some(b'}') {
         p.bump();
-        return Ok(Feature { geometry, properties, native: None });
+        return Ok((properties, None));
     }
     loop {
         p.skip_ws();
@@ -250,7 +262,7 @@ fn stream_feature(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Resul
                 if p.peek() == Some(b'n') {
                     p.skip_value()?; // null geometry
                 } else {
-                    geometry = Some(stream_geometry(p)?);
+                    stream_geometry_into(p, geometry)?;
                 }
             }
             // Properties are arbitrary JSON; a non-object (incl. null) means none.
@@ -275,7 +287,7 @@ fn stream_feature(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Resul
             _ => return Err(p.err("expected ',' or '}' in feature")),
         }
     }
-    Ok(Feature { geometry, properties, native: native_from(unmodelled).map(Box::new) })
+    Ok((properties, native_from(unmodelled).map(Box::new)))
 }
 
 /// Stream a `properties` object straight into a feature's members, holding
@@ -320,10 +332,20 @@ fn stream_properties(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Re
 /// before `type`, they are buffered as a `JsonValue` and reshaped once the type
 /// is known.
 fn stream_geometry(p: &mut Parser) -> Result<Geometry> {
+    let mut geometry = GeometryBuilder::default();
+    stream_geometry_into(p, &mut geometry)?;
+    Ok(geometry.take().expect("a geometry object read is a geometry"))
+}
+
+/// [`stream_geometry`], into `out` (`plans/columnar.org` C6 step 5): the
+/// positions go straight into the buffers a block's flat column copies. A
+/// collection, or coordinates given before their `type`, are handed over
+/// whole. A second `coordinates` replaces the first, as it did.
+fn stream_geometry_into(p: &mut Parser, out: &mut GeometryBuilder) -> Result<()> {
     p.skip_ws();
     p.expect(b'{')?;
     let mut ty: Option<String> = None;
-    let mut geom: Option<Geometry> = None;
+    let mut streamed = false;
     let mut deferred: Option<JsonValue> = None;
     let mut geoms: Option<Vec<Geometry>> = None;
     p.skip_ws();
@@ -342,7 +364,10 @@ fn stream_geometry(p: &mut Parser) -> Result<Geometry> {
                 ty = Some(p.parse_string()?);
             }
             "coordinates" => match &ty {
-                Some(t) => geom = Some(stream_coordinates(p, t)?),
+                Some(t) => {
+                    stream_coordinates_into(p, t, out)?;
+                    streamed = true;
+                }
                 None => deferred = Some(p.parse_value()?),
             },
             "geometries" => geoms = Some(stream_geometry_array(p)?),
@@ -358,13 +383,15 @@ fn stream_geometry(p: &mut Parser) -> Result<Geometry> {
     let ty = ty.ok_or_else(|| p.err("geometry missing \"type\""))?;
     if ty == "GeometryCollection" {
         let geoms = geoms.ok_or_else(|| Error::GeoJson("GeometryCollection missing \"geometries\"".into()))?;
-        return Ok(Geometry::GeometryCollection(geoms));
+        out.whole(Some(Geometry::GeometryCollection(geoms)));
+        return Ok(());
     }
-    if let Some(g) = geom {
-        return Ok(g);
+    if streamed {
+        return Ok(());
     }
     if let Some(coords) = deferred {
-        return geometry_from_coords(&ty, &coords);
+        out.whole(Some(geometry_from_coords(&ty, &coords)?));
+        return Ok(());
     }
     Err(Error::GeoJson(format!("{ty} missing \"coordinates\"")))
 }
@@ -390,18 +417,68 @@ fn stream_geometry_array(p: &mut Parser) -> Result<Vec<Geometry>> {
     Ok(out)
 }
 
-/// Parse a `coordinates` value into the shape implied by `ty`.
-fn stream_coordinates(p: &mut Parser, ty: &str) -> Result<Geometry> {
+/// Parse a `coordinates` value into `out`, in the shape implied by `ty`.
+fn stream_coordinates_into(p: &mut Parser, ty: &str, out: &mut GeometryBuilder) -> Result<()> {
+    out.clear();
     p.skip_ws();
-    match ty {
-        "Point" => Ok(Geometry::Point(stream_position(p)?)),
-        "LineString" => Ok(Geometry::LineString(stream_positions(p)?)),
-        "MultiPoint" => Ok(Geometry::MultiPoint(stream_positions(p)?)),
-        "Polygon" => Ok(Geometry::Polygon(stream_rings(p)?)),
-        "MultiLineString" => Ok(Geometry::MultiLineString(stream_rings(p)?)),
-        "MultiPolygon" => Ok(Geometry::MultiPolygon(stream_polygons(p)?)),
-        other => Err(Error::GeoJson(format!("unknown geometry type \"{other}\""))),
+    let kind = match ty {
+        "Point" => {
+            out.point(stream_position(p)?);
+            return Ok(());
+        }
+        "LineString" | "MultiPoint" => {
+            stream_run(p, out)?;
+            out.end_part();
+            if ty == "LineString" { Kind::LineString } else { Kind::MultiPoint }
+        }
+        "Polygon" | "MultiLineString" => {
+            stream_each(p, |p| stream_run(p, out))?;
+            out.end_part();
+            if ty == "Polygon" { Kind::Polygon } else { Kind::MultiLineString }
+        }
+        "MultiPolygon" => {
+            stream_each(p, |p| {
+                stream_each(p, |p| stream_run(p, out))?;
+                out.end_part();
+                Ok(())
+            })?;
+            Kind::MultiPolygon
+        }
+        other => return Err(Error::GeoJson(format!("unknown geometry type \"{other}\""))),
+    };
+    out.finish(kind);
+    Ok(())
+}
+
+/// An array of positions into `out`, as a ring.
+fn stream_run(p: &mut Parser, out: &mut GeometryBuilder) -> Result<()> {
+    stream_each(p, |p| {
+        out.position(stream_position(p)?);
+        Ok(())
+    })?;
+    out.end_ring();
+    Ok(())
+}
+
+/// Parse a JSON array, applying `elem` to each element.
+fn stream_each(p: &mut Parser, mut elem: impl FnMut(&mut Parser) -> Result<()>) -> Result<()> {
+    p.skip_ws();
+    p.expect(b'[')?;
+    p.skip_ws();
+    if p.peek() == Some(b']') {
+        p.bump();
+        return Ok(());
     }
+    loop {
+        elem(p)?;
+        p.skip_ws();
+        match p.bump() {
+            Some(b',') => continue,
+            Some(b']') => break,
+            _ => return Err(p.err("expected ',' or ']' in array")),
+        }
+    }
+    Ok(())
 }
 
 /// A single `[x, y, z?]` position, matching the tree reader: a third
@@ -436,40 +513,6 @@ fn stream_position(p: &mut Parser) -> Result<Position> {
         Some(z) => Position::with_z(x, y, z),
         None => Position::new(x, y),
     })
-}
-
-fn stream_positions(p: &mut Parser) -> Result<Vec<Position>> {
-    stream_array(p, stream_position)
-}
-
-fn stream_rings(p: &mut Parser) -> Result<Vec<Vec<Position>>> {
-    stream_array(p, stream_positions)
-}
-
-fn stream_polygons(p: &mut Parser) -> Result<Vec<Vec<Vec<Position>>>> {
-    stream_array(p, stream_rings)
-}
-
-/// Parse a JSON array, applying `elem` to each element.
-fn stream_array<T>(p: &mut Parser, elem: fn(&mut Parser) -> Result<T>) -> Result<Vec<T>> {
-    p.skip_ws();
-    p.expect(b'[')?;
-    let mut out = Vec::new();
-    p.skip_ws();
-    if p.peek() == Some(b']') {
-        p.bump();
-        return Ok(out);
-    }
-    loop {
-        out.push(elem(p)?);
-        p.skip_ws();
-        match p.bump() {
-            Some(b',') => continue,
-            Some(b']') => break,
-            _ => return Err(p.err("expected ',' or ']' in array")),
-        }
-    }
-    Ok(out)
 }
 
 // --- serialization ---------------------------------------------------------
@@ -657,6 +700,16 @@ fn write_position(out: &mut String, p: Position) {
 
 fn write_positions(out: &mut String, ps: Run<'_>) {
     out.push('[');
+    if let Some(xy) = ps.xy_2d() {
+        for (i, &[x, y]) in xy.iter().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            write_position(out, Position::new(x, y));
+        }
+        out.push(']');
+        return;
+    }
     for (i, p) in ps.iter().enumerate() {
         if i > 0 {
             out.push(',');

@@ -4,7 +4,8 @@ use crate::crs::Crs;
 use crate::error::{Error, Result};
 use crate::feature::{FeatureCollection, Tabular};
 use crate::table::Layout;
-use crate::geometry::from_wkb;
+use crate::geometry::wkb_into;
+use crate::table::GeometryBuilder;
 use crate::json::JsonValue;
 use crate::format::Format;
 use crate::native::{
@@ -176,13 +177,16 @@ fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>, layout: Lay
         .map(|i| table.column_types.get(i).and_then(|t| t.as_deref()).and_then(decl_type))
         .collect();
 
+    // Each row's geometry decoded straight into the block's buffers
+    // (`plans/columnar.org` C6 step 5).
+    let mut geometry = GeometryBuilder::default();
     for (position, row) in db.read_rows(table)?.into_iter().enumerate() {
-        let geometry = match geom_idx.and_then(|i| row.get(i)) {
-            Some(Value::Blob(b)) => Some(from_wkb(strip_gpkg_header(b)?)?),
-            _ => None,
-        };
+        match geom_idx.and_then(|i| row.get(i)) {
+            Some(Value::Blob(b)) => wkb_into(strip_gpkg_header(b)?, &mut geometry)?,
+            _ => geometry.clear(),
+        }
         let values = properties.iter().map(|&i| value_to_json(&row[i], decl_types[i]));
-        rows.push(geometry, values, carried_fid(&row, rowid_alias, position).map(Box::new));
+        rows.push(&mut geometry, values, carried_fid(&row, rowid_alias, position).map(Box::new));
     }
     // Carry each column's declared type into the IR, so it survives to a
     // target that can express it. The geometry and rowid-alias columns are

@@ -9,9 +9,11 @@ mod wkt;
 
 pub use wkb::decode as from_wkb;
 pub use wkb::encode as to_wkb;
+pub(crate) use wkb::decode_into as wkb_into;
 pub(crate) use wkb::encode_ref as wkb_ref;
 pub use wkt::decode as from_wkt;
 pub use wkt::encode as to_wkt;
+pub(crate) use wkt::encode_ref as wkt_ref;
 
 /// A single coordinate. `x`/`y` are always present; `z` (elevation) and `m`
 /// (measure) are per-position, since some formats (e.g. Shapefile's M

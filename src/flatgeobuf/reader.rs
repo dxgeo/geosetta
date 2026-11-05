@@ -3,7 +3,7 @@
 use crate::crs::Crs;
 use crate::error::{Error, Result};
 use crate::feature::{FeatureCollection, Tabular};
-use crate::table::Layout;
+use crate::table::{GeometryBuilder, Kind, Layout};
 use crate::flatbuffers::{Table, Vector};
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
@@ -170,6 +170,9 @@ pub(crate) fn read_as(data: &[u8], layout: Layout) -> Result<FeatureCollection> 
     let mut table = Tabular::new(keys, layout);
     // One row's cells, by column, reused row after row.
     let mut values = vec![JsonValue::Null; columns.len()];
+    // Each feature's geometry, decoded straight into the block's buffers
+    // (`plans/columnar.org` C6 step 5).
+    let mut geometry = GeometryBuilder::default();
     while pos < data.len() {
         let feat_len = u32_at(data, pos)? as usize;
         pos += 4;
@@ -179,10 +182,10 @@ pub(crate) fn read_as(data: &[u8], layout: Layout) -> Result<FeatureCollection> 
         pos += feat_len;
 
         let feature_table = Table::root(feat_buf)?;
-        let geometry = match feature_table.read_table(feature::GEOMETRY)? {
-            Some(g) => Some(decode_geometry(&g, default_geom_type)?),
-            None => None,
-        };
+        match feature_table.read_table(feature::GEOMETRY)? {
+            Some(g) => decode_geometry_into(&g, default_geom_type, &mut geometry)?,
+            None => geometry.clear(),
+        }
         // An absent properties vector is not "no properties": a row whose
         // every cell is null encodes as an *empty* blob, and the writer omits
         // an empty vector altogether. The columns still stand in the header,
@@ -191,7 +194,7 @@ pub(crate) fn read_as(data: &[u8], layout: Layout) -> Result<FeatureCollection> 
             Some(v) => decode_properties(v.bytes()?, &columns, &mut values)?,
             None => decode_properties(&[], &columns, &mut values)?,
         }
-        table.push(geometry, values.iter_mut().map(|v| std::mem::replace(v, JsonValue::Null)), None);
+        table.push(&mut geometry, values.iter_mut().map(|v| std::mem::replace(v, JsonValue::Null)), None);
     }
 
     let schema = columns.iter().filter_map(|c| c.decl.clone()).collect();
@@ -377,6 +380,85 @@ fn index_size(num_items: usize, node_size: usize) -> Option<usize> {
 
 // --- geometry --------------------------------------------------------------
 
+/// [`decode_geometry`], into `out` (`plans/columnar.org` C6 step 5): the
+/// positions go straight into the buffers a block's flat column copies. A
+/// collection is decoded whole. Errors as [`decode_geometry`] does, on the
+/// same input.
+fn decode_geometry_into(g: &Table, default_type: u8, out: &mut GeometryBuilder) -> Result<()> {
+    out.clear();
+    let ty = g.read_u8(geometry::TYPE, default_type)?;
+    let xy = g.read_vector(geometry::XY)?;
+    let z = g.read_vector(geometry::Z)?;
+    let m = g.read_vector(geometry::M)?;
+    let ends = g.read_vector(geometry::ENDS)?;
+
+    match ty {
+        gtype::POINT => {
+            let c = coords(xy, z, m)?;
+            if c.n == 0 {
+                return Err(no_point());
+            }
+            out.point(c.get(0)?);
+        }
+        gtype::LINESTRING | gtype::MULTIPOINT => {
+            let c = coords(xy, z, m)?;
+            for i in 0..c.n {
+                out.position(c.get(i)?);
+            }
+            out.end_ring();
+            out.end_part();
+            out.finish(if ty == gtype::LINESTRING { Kind::LineString } else { Kind::MultiPoint });
+        }
+        gtype::POLYGON | gtype::MULTILINESTRING => {
+            rings_into(coords(xy, z, m)?, ends, out)?;
+            out.finish(if ty == gtype::POLYGON { Kind::Polygon } else { Kind::MultiLineString });
+        }
+        gtype::MULTIPOLYGON => {
+            for part in parts(g)? {
+                if part.read_u8(geometry::TYPE, gtype::POLYGON)? != gtype::POLYGON {
+                    // Read through, so a malformed part errors as it did.
+                    decode_geometry(&part, gtype::POLYGON)?;
+                    return Err(Error::FlatGeobuf("MultiPolygon part is not a Polygon".into()));
+                }
+                let c = coords(part.read_vector(geometry::XY)?, part.read_vector(geometry::Z)?, part.read_vector(geometry::M)?)?;
+                rings_into(c, part.read_vector(geometry::ENDS)?, out)?;
+            }
+            out.finish(Kind::MultiPolygon);
+        }
+        gtype::GEOMETRYCOLLECTION => out.whole(Some(decode_geometry(g, default_type)?)),
+        other => return Err(Error::FlatGeobuf(format!("unsupported geometry type {other}"))),
+    }
+    Ok(())
+}
+
+/// [`split_rings`], into `out`: each ring closed, then the part.
+fn rings_into(c: Coords<'_>, ends: Option<Vector>, out: &mut GeometryBuilder) -> Result<()> {
+    match ends {
+        Some(ends) if !ends.is_empty() => {
+            let mut start = 0usize;
+            for i in 0..ends.len() {
+                let end = ends.get_u32(i)? as usize;
+                if start > end || end > c.n {
+                    return Err(Error::FlatGeobuf("ring end out of range".into()));
+                }
+                for k in start..end {
+                    out.position(c.get(k)?);
+                }
+                out.end_ring();
+                start = end;
+            }
+        }
+        _ => {
+            for k in 0..c.n {
+                out.position(c.get(k)?);
+            }
+            out.end_ring();
+        }
+    }
+    out.end_part();
+    Ok(())
+}
+
 fn decode_geometry(g: &Table, default_type: u8) -> Result<Geometry> {
     let ty = g.read_u8(geometry::TYPE, default_type)?;
     let xy = g.read_vector(geometry::XY)?;
@@ -415,9 +497,34 @@ fn decode_geometry(g: &Table, default_type: u8) -> Result<Geometry> {
 /// Flat `xy` doubles, plus optional parallel `z`/`m` vectors (same length as
 /// the point count), into positions.
 fn positions(xy: Option<Vector>, z: Option<Vector>, m: Option<Vector>) -> Result<Vec<Position>> {
-    let xy = match xy {
-        Some(v) => v,
-        None => return Ok(Vec::new()),
+    let c = coords(xy, z, m)?;
+    (0..c.n).map(|i| c.get(i)).collect()
+}
+
+/// A geometry's coordinate vectors, checked against each other: `n`
+/// positions, none when there is no `xy`.
+#[derive(Clone, Copy)]
+struct Coords<'a> {
+    xy: Option<Vector<'a>>,
+    z: Option<Vector<'a>>,
+    m: Option<Vector<'a>>,
+    n: usize,
+}
+
+impl Coords<'_> {
+    fn get(&self, i: usize) -> Result<Position> {
+        let xy = self.xy.expect("a position is read only when there is xy");
+        let x = xy.get_f64(2 * i)?;
+        let y = xy.get_f64(2 * i + 1)?;
+        let z = self.z.map(|v| v.get_f64(i)).transpose()?;
+        let m = self.m.map(|v| v.get_f64(i)).transpose()?;
+        Ok(Position { x, y, z, m })
+    }
+}
+
+fn coords<'a>(xy: Option<Vector<'a>>, z: Option<Vector<'a>>, m: Option<Vector<'a>>) -> Result<Coords<'a>> {
+    let Some(xy) = xy else {
+        return Ok(Coords { xy: None, z, m, n: 0 });
     };
     if xy.len() % 2 != 0 {
         return Err(Error::FlatGeobuf("odd number of xy coordinates".into()));
@@ -433,21 +540,15 @@ fn positions(xy: Option<Vector>, z: Option<Vector>, m: Option<Vector>) -> Result
             )));
         }
     }
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let x = xy.get_f64(2 * i)?;
-        let y = xy.get_f64(2 * i + 1)?;
-        let z = z.map(|v| v.get_f64(i)).transpose()?;
-        let m = m.map(|v| v.get_f64(i)).transpose()?;
-        out.push(Position { x, y, z, m });
-    }
-    Ok(out)
+    Ok(Coords { xy: Some(xy), z, m, n })
 }
 
 fn point_at(ps: &[Position], i: usize) -> Result<Position> {
-    ps.get(i)
-        .copied()
-        .ok_or_else(|| Error::FlatGeobuf("point has no coordinates".into()))
+    ps.get(i).copied().ok_or_else(no_point)
+}
+
+fn no_point() -> Error {
+    Error::FlatGeobuf("point has no coordinates".into())
 }
 
 /// Split a flat position list into rings/lines at the `ends` boundaries

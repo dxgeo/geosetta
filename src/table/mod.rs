@@ -1,11 +1,14 @@
 //! The columnar hub (`plans/columnar.org`): a collection's rows as a sequence
-//! of blocks, each held as shaped rows or as columns.
+//! of blocks, each held as shaped rows or as columns, with its geometry in
+//! flat coordinate buffers (`geometry.rs`, D-C6).
 //!
 //! Every [`crate::FeatureCollection`] holds one (C5). Every guarantee in
 //! § WHAT A ROW IR GIVES holds through `from_features` and the views. The
 //! tabular readers fill a table a column per key ([`TableBuilder`],
 //! [`Table::from_columns`]), the schemaless ones a row at a time
-//! ([`RowTableBuilder`]).
+//! ([`RowTableBuilder`]); the readers of GeoJSON, WKB, FlatGeobuf and
+//! Shapefile write each row's coordinates through a [`GeometryBuilder`]
+//! (C6 step 5).
 
 
 #[cfg(test)]
@@ -25,7 +28,7 @@ use block::{Block, RowBuilder, Slot, TabularBlock};
 pub(crate) use block::{Properties, Sizes};
 pub(crate) use kinds::Kinds;
 pub use geometry::GeometryRef;
-pub(crate) use geometry::{Rings, Run, Shape};
+pub(crate) use geometry::{GeometryBuilder, Kind, RowGeometry, Rings, Run, Shape};
 pub use value::Value;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -99,23 +102,27 @@ impl Table {
         builder.finish()
     }
 
-    /// A tabular reader's rows, given a column at a time: `geometry` is
-    /// every row's, and `columns` yields key `i`'s value for every row when
-    /// called with `i`. Each column is spread over the blocks and dropped
-    /// before the next is asked for, so the reader never holds two.
+    /// A tabular reader's `rows` rows, given a column at a time: `geometry`
+    /// writes the next row's geometry each time it is called, and `columns`
+    /// yields key `i`'s value for every row when called with `i`. Each
+    /// column is spread over the blocks and dropped before the next is asked
+    /// for, so the reader never holds two.
     pub(crate) fn from_columns<E>(
         keys: Vec<Rc<str>>,
-        geometry: Vec<Option<Geometry>>,
+        rows: usize,
+        mut geometry: impl FnMut(&mut GeometryBuilder) -> Result<(), E>,
         mut columns: impl FnMut(usize) -> Result<Vec<JsonValue>, E>,
         layout: Layout,
         sizes: Sizes,
     ) -> Result<Table, E> {
-        let mut blocks: Vec<TabularBlock> = Vec::with_capacity(geometry.len().div_ceil(sizes.block_rows));
-        for (row, geometry) in geometry.into_iter().enumerate() {
+        let mut blocks: Vec<TabularBlock> = Vec::new();
+        let mut built = GeometryBuilder::default();
+        for row in 0..rows {
             if row % sizes.block_rows == 0 {
                 blocks.push(TabularBlock::new(&keys));
             }
-            blocks.last_mut().expect("pushed above").push_geometry(geometry);
+            geometry(&mut built)?;
+            blocks.last_mut().expect("pushed above").push_geometry(RowGeometry::Built(&mut built));
         }
         for i in 0..keys.len() {
             let mut values = columns(i)?.into_iter();
@@ -475,9 +482,19 @@ impl RowTableBuilder {
     }
 
     pub(crate) fn push(&mut self, feature: Feature) {
+        let Feature { geometry, properties, native } = feature;
+        self.push_row(geometry.into(), properties, native);
+    }
+
+    /// [`Self::push`], the row's geometry as its reader handed it over.
+    pub(crate) fn push_row(
+        &mut self,
+        geometry: RowGeometry<'_>,
+        properties: Vec<(Rc<str>, JsonValue)>,
+        native: Option<Box<Native>>,
+    ) {
         match &mut self.block {
-            Filling::Regular { keys, block } if holds(keys, &feature) => {
-                let Feature { geometry, properties, native } = feature;
+            Filling::Regular { keys, block } if holds(keys, &properties) => {
                 block.push(geometry, properties.into_iter().map(|(_, value)| value), native);
             }
             Filling::Regular { .. } => {
@@ -487,20 +504,19 @@ impl RowTableBuilder {
                     unreachable!("the block was regular, and is now rows")
                 };
                 block.into_rows(rows);
-                rows.push(feature);
+                rows.push_row(geometry, properties, native);
             }
             Filling::Rows(rows) if rows.len() == 0 && self.layout != Layout::Rows => {
-                let keys: Box<[Rc<str>]> = feature.properties.iter().map(|(key, _)| key.clone()).collect();
+                let keys: Box<[Rc<str>]> = properties.iter().map(|(key, _)| key.clone()).collect();
                 if are_distinct(&keys) {
                     let mut block = TabularBlock::new(&keys);
-                    let Feature { geometry, properties, native } = feature;
                     block.push(geometry, properties.into_iter().map(|(_, value)| value), native);
                     self.block = Filling::Regular { keys, block };
                 } else {
-                    rows.push(feature);
+                    rows.push_row(geometry, properties, native);
                 }
             }
-            Filling::Rows(rows) => rows.push(feature),
+            Filling::Rows(rows) => rows.push_row(geometry, properties, native),
         }
         let len = match &self.block {
             Filling::Regular { block, .. } => block.len(),
@@ -530,11 +546,10 @@ impl RowTableBuilder {
     }
 }
 
-/// Whether `feature` holds exactly `keys`, in order. A reader that interns
+/// Whether `properties` hold exactly `keys`, in order. A reader that interns
 /// its keys hands back the same `Rc`, which compares without reading text.
-fn holds(keys: &[Rc<str>], feature: &Feature) -> bool {
-    keys.len() == feature.properties.len()
-        && keys.iter().zip(&feature.properties).all(|(a, (b, _))| Rc::ptr_eq(a, b) || a == b)
+fn holds(keys: &[Rc<str>], properties: &[(Rc<str>, JsonValue)]) -> bool {
+    keys.len() == properties.len() && keys.iter().zip(properties).all(|(a, (b, _))| Rc::ptr_eq(a, b) || a == b)
 }
 
 /// Builds a table from a tabular reader's rows (C2): every row holds every
@@ -561,13 +576,13 @@ impl TableBuilder {
 
     /// Append a row: its geometry, a value for each key in declared order,
     /// and its native.
-    pub(crate) fn push(
+    pub(crate) fn push<'g>(
         &mut self,
-        geometry: Option<Geometry>,
+        geometry: impl Into<RowGeometry<'g>>,
         values: impl IntoIterator<Item = JsonValue>,
         native: Option<Box<Native>>,
     ) {
-        self.block.push(geometry, values, native);
+        self.block.push(geometry.into(), values, native);
         if self.block.len() == self.sizes.block_rows {
             self.seal();
         }
@@ -837,11 +852,16 @@ mod tests {
                 if features.iter().any(|f| f.native.is_some()) {
                     continue;
                 }
-                let geometry = features.iter().map(|f| f.geometry.clone()).collect();
+                // Each geometry written as a reader writes one (C6 step 5).
+                let mut geometries = features.iter().map(|f| f.geometry.as_ref());
+                let geometry = |built: &mut GeometryBuilder| -> Result<(), ()> {
+                    built.write(geometries.next().expect("a geometry a row"));
+                    Ok(())
+                };
                 let column = |i: usize| -> Result<Vec<JsonValue>, ()> {
                     Ok(features.iter().map(|f| f.properties[i].1.clone()).collect())
                 };
-                let built = Table::from_columns(keys.clone(), geometry, column, layout, sizes).unwrap();
+                let built = Table::from_columns(keys.clone(), features.len(), geometry, column, layout, sizes).unwrap();
                 assert!(built == expected, "columns: seed {seed}, {sizes:?}, {layout:?}");
             }
         }

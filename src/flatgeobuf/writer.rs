@@ -115,18 +115,28 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     // z/m vectors written correctly — see `dim_of_first`/`dim_of_rings`/
     // `dim_of_geometry` below, mirroring `wkb.rs`'s per-geometry dimension
     // derivation).
+    //
+    // One pass reads each geometry for all of it, and for the packed
+    // R-tree's per-feature boxes below: a flat block's view is found and
+    // walked once, not three times (`plans/columnar.org` C6 step 7).
     let mut bbox = Bbox::empty();
     let mut types = std::collections::BTreeSet::new();
     let mut has_z = false;
     let mut has_m = false;
+    let mut feature_bboxes: Vec<Bbox> = Vec::with_capacity(fc.len());
+    let mut indexed = !fc.is_empty();
     for f in fc.rows() {
-        if let Some(g) = f.geometry() {
-            g.extend_bbox(&mut bbox);
-            types.insert(fgb_geometry_type(g));
-            let dim = dim_of_geometry(g);
-            has_z |= dim.0;
-            has_m |= dim.1;
-        }
+        let Some(g) = f.geometry() else {
+            feature_bboxes.push(Bbox::empty());
+            indexed = false;
+            continue;
+        };
+        g.extend_bbox(&mut bbox);
+        feature_bboxes.push(g.bbox());
+        types.insert(fgb_geometry_type(g));
+        let dim = dim_of_geometry(g);
+        has_z |= dim.0;
+        has_m |= dim.1;
     }
     // A single shared type if uniform, else Unknown (per-feature type is always
     // written too).
@@ -154,8 +164,6 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     // advertised it as opt-in, and opt-in for GeoPackage's `--rtree` right
     // beside it. So locality is now the caller's request and the index is
     // unconditional, which is the combination that spends nothing.
-    let feature_bboxes: Vec<Bbox> = fc.rows().map(|f| feature_bbox(f.geometry())).collect();
-    let indexed = !fc.is_empty() && fc.rows().all(|f| f.geometry().is_some());
     let node_size = if indexed { NODE_SIZE } else { 0 };
 
     // Encode features in input order, recording each framed feature's byte
@@ -181,10 +189,6 @@ pub fn write(fc: &FeatureCollection) -> Vec<u8> {
     }
     out.extend_from_slice(&feature_section);
     out
-}
-
-fn feature_bbox(geometry: Option<GeometryRef<'_>>) -> Bbox {
-    geometry.map(|g| g.bbox()).unwrap_or_else(Bbox::empty)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -573,11 +577,24 @@ fn decl_column_type(d: DeclType) -> u8 {
 }
 
 fn flatten(ps: Run<'_>) -> Vec<f64> {
-    ps.iter().flat_map(|p| [p.x, p.y]).collect()
+    let mut xy = Vec::with_capacity(2 * ps.len());
+    flatten_into(&mut xy, ps);
+    xy
 }
 
 fn flatten_rings(rings: Rings<'_>) -> Vec<f64> {
-    rings.iter().flat_map(|r| r.iter().flat_map(|p| [p.x, p.y])).collect()
+    let mut xy = Vec::new();
+    rings.iter().for_each(|r| flatten_into(&mut xy, r));
+    xy
+}
+
+/// Append a run's X and Y, copied straight from a 2D flat block's buffer
+/// where it is one (C6 step 7).
+fn flatten_into(xy: &mut Vec<f64>, ps: Run<'_>) {
+    match ps.xy_2d() {
+        Some(flat) => xy.extend_from_slice(flat.as_flattened()),
+        None => xy.extend(ps.iter().flat_map(|p| [p.x, p.y])),
+    }
 }
 
 /// A position list's `z`/`m` values, in the same order as `flatten`'s `xy`.

@@ -8,7 +8,10 @@ use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
 use crate::native::Native;
 use crate::schema::FieldDecl;
-use crate::table::{ColumnRef, GeometryRef, Layout, Properties, RowRef, RowTableBuilder, Sizes, Table, TableBuilder, Value};
+use crate::table::{
+    ColumnRef, GeometryBuilder, GeometryRef, Layout, Properties, RowGeometry, RowRef, RowTableBuilder, Sizes, Table,
+    TableBuilder, Value,
+};
 use std::rc::Rc;
 
 /// A vector feature: an optional geometry plus ordered properties.
@@ -36,11 +39,14 @@ pub struct Feature {
 /// A collection of features.
 ///
 /// The features are held in blocks, each as columns or as rows of shared
-/// shapes (`plans/columnar.org` D-C10, D-C13), and are read in place through
-/// [`Self::row`], [`Self::rows`] and [`Self::column`], built with
-/// [`Self::from_features`] and [`Self::push`], and edited through
-/// [`Self::set`] and the other edits. How the blocks hold them is never
-/// visible: every [`Layout`] reads and writes the same features.
+/// shapes, with its geometry in flat coordinate buffers (`plans/columnar.org`
+/// D-C6, D-C10, D-C13). They are read in place through [`Self::row`],
+/// [`Self::rows`] and [`Self::column`], built with [`Self::from_features`]
+/// and [`Self::push`], and edited through [`Self::set`] and the other edits:
+/// every attribute, as ordinary Rust on owned values ([`Self::edit_geometry`],
+/// [`Self::edit_properties`], [`Self::edit_feature`] and their bulk forms;
+/// D-C16). How the blocks hold them is never visible: every [`Layout`] reads
+/// and writes the same features.
 #[derive(Debug, Clone, Default)]
 pub struct FeatureCollection {
     table: Table,
@@ -94,13 +100,6 @@ impl<'a> FeatureRef<'a> {
     /// copies it out; [`FeatureCollection::edit_geometry`] edits it.
     pub fn geometry(self) -> Option<GeometryRef<'a>> {
         self.0.geometry()
-    }
-
-    /// The geometry as a [`Geometry`]: borrowed where the block holds one,
-    /// copied out where it is flat. What a writer that walks a `Geometry`
-    /// reads (`plans/columnar.org` C6 step 4).
-    pub(crate) fn geometry_cow(self) -> Option<std::borrow::Cow<'a, Geometry>> {
-        self.geometry().map(GeometryRef::to_cow)
     }
 
     /// What the feature's source recorded beyond its geometry and
@@ -180,6 +179,17 @@ impl Collecting {
         self.0.push(feature);
     }
 
+    /// Append a feature whose geometry its reader wrote into `geometry`
+    /// (`plans/columnar.org` C6 step 5), emptying it.
+    pub(crate) fn push_built(
+        &mut self,
+        geometry: &mut GeometryBuilder,
+        properties: Vec<(Rc<str>, JsonValue)>,
+        native: Option<Box<Native>>,
+    ) {
+        self.0.push_row(RowGeometry::Built(geometry), properties, native);
+    }
+
     pub(crate) fn finish(self) -> FeatureCollection {
         FeatureCollection::from_table(self.0.finish())
     }
@@ -194,11 +204,12 @@ impl Tabular {
         Tabular(TableBuilder::new(keys, layout))
     }
 
-    /// Append a row: its geometry, a value for each key in declared order,
-    /// and its native.
-    pub(crate) fn push(
+    /// Append a row: its geometry -- whole, or written into a
+    /// [`GeometryBuilder`], which this empties -- a value for each key in
+    /// declared order, and its native.
+    pub(crate) fn push<'g>(
         &mut self,
-        geometry: Option<Geometry>,
+        geometry: impl Into<RowGeometry<'g>>,
         values: impl IntoIterator<Item = JsonValue>,
         native: Option<Box<Native>>,
     ) {
@@ -209,17 +220,19 @@ impl Tabular {
         FeatureCollection::from_table(self.0.finish())
     }
 
-    /// A collection read a column at a time: `geometry` is every row's, and
-    /// `columns` yields key `i`'s value for every row when called with `i`.
-    /// Each column is moved into the blocks and dropped before the next is
-    /// asked for, so the reader never holds two.
+    /// A collection of `rows` rows read a column at a time: `geometry`
+    /// writes the next row's geometry each time it is called, and `columns`
+    /// yields key `i`'s value for every row when called with `i`. Each
+    /// column is moved into the blocks and dropped before the next is asked
+    /// for, so the reader never holds two.
     pub(crate) fn from_columns(
         keys: Vec<Rc<str>>,
-        geometry: Vec<Option<Geometry>>,
+        rows: usize,
+        geometry: impl FnMut(&mut GeometryBuilder) -> crate::Result<()>,
         columns: impl FnMut(usize) -> crate::Result<Vec<JsonValue>>,
         layout: Layout,
     ) -> crate::Result<FeatureCollection> {
-        let table = Table::from_columns(keys, geometry, columns, layout, Sizes::DEFAULT)?;
+        let table = Table::from_columns(keys, rows, geometry, columns, layout, Sizes::DEFAULT)?;
         Ok(FeatureCollection::from_table(table))
     }
 }

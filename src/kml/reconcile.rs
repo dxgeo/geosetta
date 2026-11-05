@@ -26,10 +26,11 @@ use crate::kml::project::{
     self, can_carry, carriers, project, Context, LatLonBox, Vertical, ALTITUDE_MEMBERS,
 };
 use crate::kml::writer::{
-    altitude_element, feature_to_placemark, geometry_rank, geometry_to_element, property_text, time_element, Typed,
+    altitude_element, coordinates_element, feature_to_placemark, geometry_rank, geometry_to_element, property_text,
+    time_element, Typed,
 };
 use crate::native::{Native, NativePayload};
-use crate::table::Value;
+use crate::table::{GeometryRef, Run, Value};
 use crate::tally::Tally;
 use crate::xml::{Content, XmlElement};
 
@@ -155,9 +156,9 @@ impl Writing<'_> {
             return self.fresh(f, lead);
         };
         let unedited = projected.properties.iter().map(|(k, v)| (&**k, Value::of(v))).eq(f.properties().map(|(k, v)| (&**k, v)));
-        let geometry = f.geometry_cow();
-        let geometry = geometry.as_deref();
-        if unedited && projected.geometry.as_ref() == geometry {
+        let geometry = f.geometry();
+        let geometry_edited = !same_geometry(projected.geometry.as_ref(), geometry);
+        if unedited && !geometry_edited {
             return stored.clone();
         }
         let element = stored.element().expect("a projected feature is a KML element");
@@ -166,7 +167,10 @@ impl Writing<'_> {
         let mut node = stored.clone();
         // The geometry first, so the properties are placed against the
         // geometry that will be written.
-        if projected.geometry.as_ref() != geometry && reconcile_geometry(&mut node, geometry, self.version, b).is_err() {
+        // Only an edited geometry is copied out of its block (C6 step 4).
+        if geometry_edited
+            && reconcile_geometry(&mut node, geometry.map(GeometryRef::to_cow).as_deref(), self.version, b).is_err()
+        {
             // What the overlay was is gone with its geometry; the feature is
             // a Placemark now, and `drop_warnings` says so.
             return self.fresh(f, lead);
@@ -441,7 +445,7 @@ fn reconcile_geometry(
     {
         return Ok(());
     }
-    let fresh = b.node(&geometry_to_element(geometry));
+    let fresh = b.node(&geometry_to_element(GeometryRef::owned(geometry)));
     match at {
         Some(i) => node.replace_child(i, fresh, b.layout),
         None => {
@@ -551,7 +555,7 @@ fn reconcile_photo_point(node: &mut Node, geometry: Option<&Geometry>, b: Build<
             }
         }
         (Some(g @ Geometry::Point(_)), None) => {
-            insert_in_order(node, b, b.node(&geometry_to_element(g)));
+            insert_in_order(node, b, b.node(&geometry_to_element(GeometryRef::owned(g))));
         }
         (Some(_), _) => return Err(Unwritable),
     }
@@ -591,12 +595,7 @@ fn set_coordinates(existing: &mut Node, points: &[Position]) -> bool {
 
 /// `<coordinates>`'s text for `points`, as the writer spells it.
 fn coordinates_text(points: &[Position]) -> String {
-    geometry_to_element(&Geometry::LineString(points.to_vec()))
-        .children
-        .into_iter()
-        .find(|c| c.name == "coordinates")
-        .map(|c| c.text().to_string())
-        .unwrap_or_default()
+    coordinates_element(Run::Slice(points)).text().to_string()
 }
 
 /// A track coordinate: `lon lat alt`, space-separated.
@@ -723,11 +722,11 @@ pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format, carried: boo
                 causes.add(Cause::Vertical);
             }
         } else {
-            let geometry = f.geometry_cow();
-            if unprojected.contains(&project::Unprojected::TrackData) && track_edit_drops_data(&m.node, geometry.as_deref()) {
+            let geometry = f.geometry();
+            if unprojected.contains(&project::Unprojected::TrackData) && track_edit_drops_data(&m.node, geometry) {
                 causes.add(Cause::EditedTrack);
             }
-            if overlay_edit_unwritable(&m.node, geometry.as_deref()) {
+            if overlay_edit_unwritable(&m.node, geometry) {
                 causes.add(Cause::EditedOverlay);
             }
         }
@@ -770,13 +769,15 @@ pub(crate) fn drop_warnings(fc: &FeatureCollection, target: Format, carried: boo
 
 /// Whether reconciling `f` into its stored element will replace a track
 /// rather than update it in place.
-fn track_edit_drops_data(stored: &Node, geometry: Option<&Geometry>) -> bool {
+fn track_edit_drops_data(stored: &Node, geometry: Option<GeometryRef<'_>>) -> bool {
     let Ok(projected) = project(stored, &Context::default()) else {
         return false;
     };
-    if projected.geometry.as_ref() == geometry {
+    if same_geometry(projected.geometry.as_ref(), geometry) {
         return false;
     }
+    let geometry = geometry.map(GeometryRef::to_cow);
+    let geometry = geometry.as_deref();
     let Some(track) = stored.children.iter().find(|c| c.element().is_some_and(KmlElement::is_geometry)) else {
         return false;
     };
@@ -786,16 +787,31 @@ fn track_edit_drops_data(stored: &Node, geometry: Option<&Geometry>) -> bool {
 
 /// Whether reconciling `f` into its stored overlay leaves it a geometry the
 /// overlay cannot hold.
-fn overlay_edit_unwritable(stored: &Node, geometry: Option<&Geometry>) -> bool {
+fn overlay_edit_unwritable(stored: &Node, geometry: Option<GeometryRef<'_>>) -> bool {
     if !stored.element().is_some_and(KmlElement::is_overlay) {
         return false;
     }
     let Ok(projected) = project(stored, &Context::default()) else {
         return false;
     };
-    projected.geometry.as_ref() != geometry
-        && reconcile_geometry(&mut stored.clone(), geometry, KmlVersion::V2_3, Build { prefix: None, layout: None })
-            .is_err()
+    !same_geometry(projected.geometry.as_ref(), geometry)
+        && reconcile_geometry(
+            &mut stored.clone(),
+            geometry.map(GeometryRef::to_cow).as_deref(),
+            KmlVersion::V2_3,
+            Build { prefix: None, layout: None },
+        )
+        .is_err()
+}
+
+/// Whether the feature's geometry is still the one its stored element
+/// projects to, read in place: an unedited row is never copied out.
+fn same_geometry(projected: Option<&Geometry>, geometry: Option<GeometryRef<'_>>) -> bool {
+    match (projected, geometry) {
+        (None, None) => true,
+        (Some(p), Some(g)) => g == *p,
+        _ => false,
+    }
 }
 
 #[cfg(test)]

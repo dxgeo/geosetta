@@ -7,7 +7,7 @@
 
 use crate::feature::{FeatureCollection, FeatureRef};
 use crate::format::{Format, KmlVersion};
-use crate::geometry::{Geometry, Position};
+use crate::geometry::Position;
 use crate::kml::document::Skeleton;
 use crate::kml::{lower, raise};
 use crate::kml::model::{self, KmlElement, GX_NS, GX_PREFIX, KML_NS};
@@ -15,7 +15,7 @@ use crate::kml::place::{place, Time};
 use crate::kml::project::{self, can_carry, FieldType};
 use crate::kml::reconcile;
 use crate::native::{KmlNative, NativePayload};
-use crate::table::Value;
+use crate::table::{GeometryRef, Rings, Run, Shape, Value};
 use crate::xml::{self, XmlElement};
 use std::collections::HashSet;
 
@@ -243,7 +243,7 @@ fn root_element(source: Option<&KmlNative>, version: Option<KmlVersion>, childre
 /// `typed` declares in `<SchemaData>`, and every other property in
 /// `<ExtendedData><Data name="k"><value>v</value></Data></ExtendedData>`.
 pub(crate) fn feature_to_placemark(f: FeatureRef<'_>, version: KmlVersion, typed: &Typed) -> XmlElement {
-    let mut geometry = f.geometry_cow().map(|g| geometry_to_element(&g));
+    let mut geometry = f.geometry().map(geometry_to_element);
     let placement = place(f, KmlElement::Placemark, |member| geometry.as_ref().is_some_and(|g| carries(g, member)));
     let mut children = Vec::new();
     if let Some(name) = placement.name {
@@ -373,54 +373,50 @@ pub(crate) fn property_text(value: Value<'_>) -> String {
     }
 }
 
-pub(crate) fn geometry_to_element(g: &Geometry) -> XmlElement {
-    match g {
-        Geometry::Point(p) => point_element(p),
-        Geometry::LineString(pts) => line_string_element(pts),
-        Geometry::Polygon(rings) => polygon_element(rings),
-        Geometry::MultiPoint(pts) => {
-            XmlElement::with_children("MultiGeometry", pts.iter().map(point_element).collect())
+pub(crate) fn geometry_to_element(g: GeometryRef<'_>) -> XmlElement {
+    match g.shape() {
+        Shape::Point(p) => point_element(p),
+        Shape::LineString(pts) => line_string_element(pts),
+        Shape::Polygon(rings) => polygon_element(rings),
+        Shape::MultiPoint(pts) => XmlElement::with_children("MultiGeometry", pts.iter().map(point_element).collect()),
+        Shape::MultiLineString(lines) => {
+            XmlElement::with_children("MultiGeometry", lines.iter().map(line_string_element).collect())
         }
-        Geometry::MultiLineString(lines) => XmlElement::with_children(
+        Shape::MultiPolygon(polys) => {
+            XmlElement::with_children("MultiGeometry", polys.iter().map(polygon_element).collect())
+        }
+        Shape::Collection(geoms) => XmlElement::with_children(
             "MultiGeometry",
-            lines.iter().map(|l| line_string_element(l)).collect(),
+            geoms.iter().map(|g| geometry_to_element(GeometryRef::owned(g))).collect(),
         ),
-        Geometry::MultiPolygon(polys) => {
-            XmlElement::with_children("MultiGeometry", polys.iter().map(|p| polygon_element(p)).collect())
-        }
-        Geometry::GeometryCollection(geoms) => {
-            XmlElement::with_children("MultiGeometry", geoms.iter().map(geometry_to_element).collect())
-        }
     }
 }
 
-fn point_element(p: &Position) -> XmlElement {
-    XmlElement::with_children("Point", vec![coordinates_element(std::slice::from_ref(p))])
+fn point_element(p: Position) -> XmlElement {
+    XmlElement::with_children("Point", vec![coordinates_element(Run::Slice(std::slice::from_ref(&p)))])
 }
 
-fn line_string_element(pts: &[Position]) -> XmlElement {
+fn line_string_element(pts: Run<'_>) -> XmlElement {
     XmlElement::with_children("LineString", vec![coordinates_element(pts)])
 }
 
-fn polygon_element(rings: &[Vec<Position>]) -> XmlElement {
-    let mut children = Vec::new();
-    if let Some(outer) = rings.first() {
-        children.push(boundary_element("outerBoundaryIs", outer));
-    }
-    for inner in rings.iter().skip(1) {
-        children.push(boundary_element("innerBoundaryIs", inner));
-    }
+fn polygon_element(rings: Rings<'_>) -> XmlElement {
+    let children = rings
+        .iter()
+        .enumerate()
+        .map(|(i, ring)| boundary_element(if i == 0 { "outerBoundaryIs" } else { "innerBoundaryIs" }, ring))
+        .collect();
     XmlElement::with_children("Polygon", children)
 }
 
-fn boundary_element(tag: &str, ring: &[Position]) -> XmlElement {
+fn boundary_element(tag: &str, ring: Run<'_>) -> XmlElement {
     XmlElement::with_children(
         tag,
         vec![XmlElement::with_children("LinearRing", vec![coordinates_element(ring)])],
     )
 }
 
-fn coordinates_element(points: &[Position]) -> XmlElement {
+pub(crate) fn coordinates_element(points: Run<'_>) -> XmlElement {
     use std::fmt::Write;
     let mut text = String::new();
     for (i, p) in points.iter().enumerate() {
@@ -618,8 +614,8 @@ impl Emitter {
 
 /// [`feature_to_placemark`], written as it is built.
 fn placemark(out: &mut Emitter, f: FeatureRef<'_>, version: KmlVersion, typed: &Typed) {
-    let owned = f.geometry_cow();
-    let placement = place(f, KmlElement::Placemark, |member| owned.as_deref().is_some_and(|g| geometry_carries(g, member)));
+    let view = f.geometry();
+    let placement = place(f, KmlElement::Placemark, |member| view.is_some_and(|g| geometry_carries(g, member)));
     out.start("Placemark");
     if let Some(name) = &placement.name {
         out.leaf("name", name);
@@ -677,18 +673,18 @@ fn placemark(out: &mut Emitter, f: FeatureRef<'_>, version: KmlVersion, typed: &
         }
         out.end();
     }
-    if let Some(g) = owned.as_deref() {
+    if let Some(g) = view {
         geometry(out, g, &placement.altitude, version);
     }
     out.end();
 }
 
 /// The element a geometry is written as.
-fn geometry_kind(g: &Geometry) -> KmlElement {
+fn geometry_kind(g: Shape<'_>) -> KmlElement {
     match g {
-        Geometry::Point(_) => KmlElement::Point,
-        Geometry::LineString(_) => KmlElement::LineString,
-        Geometry::Polygon(_) => KmlElement::Polygon,
+        Shape::Point(_) => KmlElement::Point,
+        Shape::LineString(_) => KmlElement::LineString,
+        Shape::Polygon(_) => KmlElement::Polygon,
         _ => KmlElement::MultiGeometry,
     }
 }
@@ -700,55 +696,56 @@ pub(crate) fn null_keys(f: FeatureRef<'_>) -> Vec<&str> {
     if !f.properties().any(|(_, v)| v == Value::Null) {
         return Vec::new();
     }
-    let owned = f.geometry_cow();
-    let placement = place(f, KmlElement::Placemark, |member| owned.as_deref().is_some_and(|g| geometry_carries(g, member)));
+    let view = f.geometry();
+    let placement = place(f, KmlElement::Placemark, |member| view.is_some_and(|g| geometry_carries(g, member)));
     placement.extended.into_iter().filter(|(_, v)| *v == Value::Null).map(|(k, _)| k).collect()
 }
 
 /// [`carries`], for a geometry not yet built.
-fn geometry_carries(g: &Geometry, member: KmlElement) -> bool {
+fn geometry_carries(g: GeometryRef<'_>, member: KmlElement) -> bool {
     let point = |member| can_carry(KmlElement::Point, member);
-    can_carry(geometry_kind(g), member)
-        || match g {
-            Geometry::MultiPoint(pts) => !pts.is_empty() && point(member),
-            Geometry::MultiLineString(lines) => !lines.is_empty() && can_carry(KmlElement::LineString, member),
-            Geometry::MultiPolygon(polys) => !polys.is_empty() && can_carry(KmlElement::Polygon, member),
-            Geometry::GeometryCollection(geoms) => geoms.iter().any(|g| geometry_carries(g, member)),
+    let shape = g.shape();
+    can_carry(geometry_kind(shape), member)
+        || match shape {
+            Shape::MultiPoint(pts) => pts.len() > 0 && point(member),
+            Shape::MultiLineString(lines) => lines.len() > 0 && can_carry(KmlElement::LineString, member),
+            Shape::MultiPolygon(polys) => polys.len() > 0 && can_carry(KmlElement::Polygon, member),
+            Shape::Collection(geoms) => geoms.iter().any(|g| geometry_carries(GeometryRef::owned(g), member)),
             _ => false,
         }
 }
 
 /// [`geometry_to_element`] with [`add_altitude`]'s members, written as built.
-fn geometry(out: &mut Emitter, g: &Geometry, altitude: &[(KmlElement, String)], version: KmlVersion) {
-    match g {
-        Geometry::Point(p) => point(out, p, altitude, version),
-        Geometry::LineString(pts) => line_string(out, pts, altitude, version),
-        Geometry::Polygon(rings) => polygon(out, rings, altitude, version),
-        Geometry::MultiPoint(pts) => {
+fn geometry(out: &mut Emitter, g: GeometryRef<'_>, altitude: &[(KmlElement, String)], version: KmlVersion) {
+    match g.shape() {
+        Shape::Point(p) => point(out, p, altitude, version),
+        Shape::LineString(pts) => line_string(out, pts, altitude, version),
+        Shape::Polygon(rings) => polygon(out, rings, altitude, version),
+        Shape::MultiPoint(pts) => {
             out.start("MultiGeometry");
-            for p in pts {
+            for p in pts.iter() {
                 point(out, p, altitude, version);
             }
             out.end();
         }
-        Geometry::MultiLineString(lines) => {
+        Shape::MultiLineString(lines) => {
             out.start("MultiGeometry");
-            for l in lines {
+            for l in lines.iter() {
                 line_string(out, l, altitude, version);
             }
             out.end();
         }
-        Geometry::MultiPolygon(polys) => {
+        Shape::MultiPolygon(polys) => {
             out.start("MultiGeometry");
-            for p in polys {
+            for p in polys.iter() {
                 polygon(out, p, altitude, version);
             }
             out.end();
         }
-        Geometry::GeometryCollection(geoms) => {
+        Shape::Collection(geoms) => {
             out.start("MultiGeometry");
             for g in geoms {
-                geometry(out, g, altitude, version);
+                geometry(out, GeometryRef::owned(g), altitude, version);
             }
             out.end();
         }
@@ -765,21 +762,21 @@ fn altitude_members(out: &mut Emitter, kind: KmlElement, altitude: &[(KmlElement
     }
 }
 
-fn point(out: &mut Emitter, p: &Position, altitude: &[(KmlElement, String)], version: KmlVersion) {
+fn point(out: &mut Emitter, p: Position, altitude: &[(KmlElement, String)], version: KmlVersion) {
     out.start("Point");
     altitude_members(out, KmlElement::Point, altitude, version);
-    coordinates(out, std::slice::from_ref(p));
+    coordinates(out, Run::Slice(std::slice::from_ref(&p)));
     out.end();
 }
 
-fn line_string(out: &mut Emitter, pts: &[Position], altitude: &[(KmlElement, String)], version: KmlVersion) {
+fn line_string(out: &mut Emitter, pts: Run<'_>, altitude: &[(KmlElement, String)], version: KmlVersion) {
     out.start("LineString");
     altitude_members(out, KmlElement::LineString, altitude, version);
     coordinates(out, pts);
     out.end();
 }
 
-fn polygon(out: &mut Emitter, rings: &[Vec<Position>], altitude: &[(KmlElement, String)], version: KmlVersion) {
+fn polygon(out: &mut Emitter, rings: Rings<'_>, altitude: &[(KmlElement, String)], version: KmlVersion) {
     out.start("Polygon");
     altitude_members(out, KmlElement::Polygon, altitude, version);
     for (i, ring) in rings.iter().enumerate() {
@@ -793,10 +790,10 @@ fn polygon(out: &mut Emitter, rings: &[Vec<Position>], altitude: &[(KmlElement, 
 }
 
 /// [`coordinates_element`], formatted straight into the output.
-fn coordinates(out: &mut Emitter, points: &[Position]) {
+fn coordinates(out: &mut Emitter, points: Run<'_>) {
     use std::fmt::Write;
     out.start("coordinates");
-    if !points.is_empty() {
+    if points.len() > 0 {
         out.seal();
         for (i, p) in points.iter().enumerate() {
             if i > 0 {
@@ -815,6 +812,7 @@ fn coordinates(out: &mut Emitter, points: &[Position]) {
 mod tests {
     use super::*;
     use crate::feature::Feature;
+    use crate::geometry::Geometry;
     use crate::json::JsonValue;
     use crate::kml::reader;
     use std::rc::Rc;

@@ -10,7 +10,7 @@ use crate::format::{Format, KmlVersion};
 use crate::error::{Error, Result};
 use crate::feature::{Feature, FeatureCollection, Tabular};
 use crate::table::{GeometryRef, Layout};
-use crate::geometry::{from_wkb, from_wkt, to_wkt, Bbox};
+use crate::geometry::{from_wkt, wkt_ref, Bbox};
 use crate::{csv, flatgeobuf, geojson, kml, parquet};
 // `json` is only needed by the test helpers below (the read path streams
 // GeoJSON directly rather than through a JsonValue tree).
@@ -343,8 +343,8 @@ fn read_wkt_lines(input: &[u8]) -> Result<FeatureCollection> {
 fn write_wkt_lines(fc: &FeatureCollection) -> Vec<u8> {
     let mut out = String::new();
     for f in fc.rows() {
-        if let Some(g) = f.geometry_cow() {
-            out.push_str(&to_wkt(&g));
+        if let Some(g) = f.geometry() {
+            out.push_str(&wkt_ref(g));
         }
         out.push('\n');
     }
@@ -430,18 +430,17 @@ fn parquet_to_features_as(bytes: &[u8], layout: Layout) -> Result<FeatureCollect
     let file = parquet::open_geoparquet(bytes)?;
     let rows = file.num_rows();
 
-    // Every row's geometry, freeing each row's WKB once it is decoded.
-    // `num_rows` is the file's own claim; reserve no more than its bytes.
-    let mut geometry = Vec::with_capacity(rows.min(bytes.len()));
+    // Every row's geometry, decoded straight into the blocks' buffers
+    // (`plans/columnar.org` C6 step 5), each row's WKB freed once it is.
     let mut wkbs = file.geometry()?.into_iter();
-    for _ in 0..rows {
-        geometry.push(match wkbs.next() {
-            Some(Some(wkb)) => Some(from_wkb(&wkb)?),
-            Some(None) => None,
-            None => return Err(Error::Parquet("the geometry column has fewer values than the file has rows".into())),
-        });
-    }
-    drop(wkbs);
+    let geometry = |built: &mut crate::table::GeometryBuilder| match wkbs.next() {
+        Some(Some(wkb)) => crate::geometry::wkb_into(&wkb, built),
+        Some(None) => {
+            built.clear();
+            Ok(())
+        }
+        None => Err(Error::Parquet("the geometry column has fewer values than the file has rows".into())),
+    };
 
     // Built a column at a time: each is decoded, moved into the rows or the
     // blocks, and dropped before the next is decoded, so the values are
@@ -469,7 +468,7 @@ fn parquet_to_features_as(bytes: &[u8], layout: Layout) -> Result<FeatureCollect
         values.truncate(rows);
         Ok(values)
     };
-    let mut fc = Tabular::from_columns(keys.clone(), geometry, column, layout)?;
+    let mut fc = Tabular::from_columns(keys.clone(), rows, geometry, column, layout)?;
     let (crs, native) = file.into_parts();
     fc.crs = crs;
     fc.schema = schema;

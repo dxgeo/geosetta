@@ -3,7 +3,7 @@
 
 * A Columnar IR
 
-** STATUS -- C0 through C5 done; C6 steps 1--3 done, step 4 begun
+** STATUS -- C0 through C6 done
 C0's harness is built, and C1 (2026-11-02): the =table= module behind the
 collection's private storage, its views, selections and edits, =--layout=,
 and both property tests (§ MILESTONES, C1). C2 the same day: the tabular
@@ -11,9 +11,10 @@ spokes read into column blocks and write from either form (§ MILESTONES,
 C2), and C3: GeoJSON reads into blocks, sealed by D-C13's rule, and
 writes from views (§ MILESTONES, C3); C4: KML the same, after
 =performance.org='s KML step 2 (§ MILESTONES, C4); C5: the hub is only
-blocks, and D-C8's API is public (§ MILESTONES, C5). C6, geometry
-buffers, measured, its edit contract pinned (D-C16) and its flat column
-built; its writers are moving onto views (§ MILESTONES, C6). Written 2026-10-28, after
+blocks, and D-C8's API is public (§ MILESTONES, C5). C6 (2026-11-05):
+geometry in flat buffers, every attribute editable (D-C16), every writer
+reading views and the hot readers writing coordinates; polygons faster
+than C5 and points a few percent slower, accepted (§ MILESTONES, C6). Written 2026-10-28, after
 =performance.org='s /Memory/ section measured where the hub's bytes go and
 Mem1--Mem5 took the contained wins. What remains is the shape of the IR
 itself, and that is this plan.
@@ -1169,7 +1170,7 @@ a branchless =Bitmap::push= -- no difference measurable.
 - Still slower, outside =compare.py=: a tabular write from a sparse row
   block (C3's =sparse → fgb=, 1.6×).
 
-*** C6 -- geometry buffers
+*** DONE C6 -- geometry buffers
 D-C6: flat coordinate buffers with offsets, as a block's sealed form beside
 the owned =Option<Geometry>= per row (D-C16). Measured separately, because
 the property milestones above leave geometry untouched. In steps, each
@@ -1242,6 +1243,17 @@ checked against the corpus:
    =fgb→geojson= and =parquet→fgb=, the last 17% on polygons (306 → 358
    ms). The cost is the flatten at seal, which a reader copies every
    geometry through; step 5 removes it.
+
+   /Done 2026-11-05/ (step 4): WKT (the =.wkt= writer and CSV's geometry
+   column), KML and Shapefile encode from =shape()= too, and
+   =FeatureRef::geometry_cow= is gone. Two views, or a view and a
+   =Geometry=, compare in place, position by position, as =Geometry='s
+   own =PartialEq= does (a property test pins the agreement); KML's
+   reconcile compares each row's view against what its stored element
+   projects to, and copies out only a row whose geometry was edited. The
+   Shapefile writer holds a view a row rather than an owned copy of every
+   geometry, and fixes each ring's winding in the record it is encoding.
+   =LAYOUTS=auto,rows,columns= =equiv.py=: 8 991 identical.
 3. *The column.* The geometry column, =GeometryRef= over its flat and owned
    forms, and a builder that flattens a =Geometry=. Readers still push
    =Geometry=, so every format works from the first step. A property test
@@ -1254,11 +1266,95 @@ checked against the corpus:
 5. *Hot readers write coordinates.* GeoJSON, WKB, FlatGeobuf and Shapefile
    push straight into the buffers; KML, WKT and CSV may keep flattening a
    =Geometry= a feature, which costs time but not peak.
+
+   /Done 2026-11-05/ (step 5): a block's geometry column is flat from its
+   first row (=GeometryColumn::filling=), and =--layout rows= makes it owned
+   as it seals, so rows still hold =Geometry=. A reader writes a row into a
+   =GeometryBuilder= -- positions, then the ring, part and row they close,
+   in =Flat='s own three levels -- reused row after row, and the block
+   appends that one row to its buffers (=Flat::append=: offsets moved,
+   coordinates copied); a collection, or a geometry a reader already holds,
+   goes in whole. =RowGeometry= is what =Tabular::push=, =Collecting=,
+   =RowTableBuilder= and =TableBuilder= take, an owned =Option<Geometry>=
+   or a builder; =Table::from_columns= takes a row count and a function
+   that writes the next row's geometry, where it took every row's.
+   WKB (=wkb::decode_into=: Parquet, GeoPackage), GeoJSON
+   (=stream_geometry_into=), FlatGeobuf (=decode_geometry_into=) and
+   Shapefile (=geometry::decode_into=) write coordinates; each errors as its
+   owned decoder did on the same input -- a WKB fuzz test compares the two
+   on arbitrary, truncated and corrupted bytes, error text included. The
+   Shapefile reader no longer decodes the whole =.shp= before the =.dbf=: it
+   frames the records up front and decodes each as its =.dbf= row arrives,
+   so a file with a malformed shape /and/ a malformed =.dbf= reports the
+   =.dbf='s error first, and a shape past the =.dbf='s last record is not
+   decoded (the record-count mismatch still refuses the file). Its ring
+   classification is the same shoelace sum over the ring as written. A
+   property test writes 500 seeds of arbitrary geometry through the builder
+   and finds the buffers =push= flattens bit for bit, under every seal.
+
+   Measured on the step 1 inputs: =LAYOUTS=auto,rows,columns= =equiv.py=:
+   8 991 identical. memprobe, read: polygons =geojson= 298 → 252 ms, read
+   peak 210 → 193 MB; =parquet= 140 → 96 ms, 294 → 213 MB; =fgb= 54 → 43
+   ms; =gpkg= 96 → 73 ms; points unchanged; the IR the same bytes.
+   Shapefile, whole process (=/usr/bin/time -l=), polygons =shp→fgb=: 575
+   → 335 MB (C5: 507). Whole-process time, best of 3, against the C5 pin
+   and step 4: polygons -6% to +8% of C5 (6--16% faster than step 4,
+   =parquet→fgb= 340 → 284 ms against C5's 279); points still +6% to
+   +14% of C5, as at step 4. Sampled on 2 000 000 points (=geojson→fgb=,
+   3% behind C5 there), the difference is the FlatGeobuf writer reading
+   each feature's view four times (bbox and type, its bbox, the
+   all-have-geometry check, the encode): writer-side, for step 7.
 6. *Edits.* =edit_geometry= and =for_each_geometry_mut= (D-C16); a
    structural edit turns a flat block owned, and the position editors walk
    the buffers, growing Z or M where an edit adds one.
+
+   /Done 2026-11-05/, as built with steps 2--3 rather than as planned: a
+   single-row edit on a flat block goes into the column's overlay of
+   edited rows, so one edit does not turn the block owned; a bulk pass
+   (=for_each_geometry_mut=, =for_each_feature_mut=) makes the column owned,
+   edits each row in place and seals it flat again, so the overlay never
+   holds the column twice over; and the position editors walk the buffers,
+   growing Z or M where an edit adds one. Nothing folds the geometry
+   overlay but a bulk pass, as with properties (§ RISKS, /A heavily edited
+   collection/). =tests/edits.rs= and the position-editor property test pin
+   it.
 7. *Verify.* The corpus identical under all three layouts, budgets lowered
    in =tests/budgets.rs=, =compare.py= within noise of C5.
+
+   /Measured 2026-11-05/ (step 7). Three writer-side fixes first, each
+   byte-identical (=equiv.py=, all three layouts: 8 991 identical): the
+   FlatGeobuf writer reads each geometry once for its bbox, type, Z/M and
+   R-tree box, where it walked the collection three times; =Run=, =Rings=
+   and =Parts= iterate through an enum (=RunIter= and kin) where they
+   chained both forms' iterators, which no per-coordinate loop saw through;
+   and a run in a column holding no Z or M at all gives its XY buffer in
+   place (=Run::xy_2d=), which the WKB, GeoJSON and FlatGeobuf writers and
+   =extend_bbox= read without building a =Position= a coordinate.
+   memprobe, write phase, polygons: =→ fgb= 112 → 72 ms against C5,
+   =→ parquet= 5% under C5, =→ geojson= within 2%.
+
+   Budgets reset to 20% over what C6 measures (=performance.org= §
+   BUDGETS, with C5 measured alongside). Whole-process, best of 3, on the
+   step 1 inputs: polygons 4--26% /faster/ than C5 in every conversion;
+   points 1--8% slower. =compare.py=, N = 200 000 (80% points), against the
+   C5 pin: time -2% to +7% (=shp→geojson= +7%, =geojson→shp= +6%; the two
+   small 3857 cases +8% and +11%, about 10 ms), peak RSS 2--12% lower except
+   =geojson→shp=, 7% higher (73 → 78.5 MB) where the heap-counting budget
+   shows 24% lower a feature. Every geosetta output read back right except
+   =gpkg(3857)→parquet=, the same bytes at C5: a GeoPackage FID dropped
+   unsaid, filed under =cross-format-audit.org= F6.
+
+   /What is left/ is points: a point costs five offset and buffer pushes to
+   write flat and three dependent offset loads to read back, where owned it
+   was one 56-byte value. The profile finds no other cause. Closing it
+   would mean a layout for single-position rows (a row's coordinate index
+   held directly, or points in their own buffer as GeoArrow does) -- a
+   change to D-C6, not a fix.
+
+   /Accepted 2026-11-05/ by the owner, and C6 closed: polygons and memory
+   gained far more than points lost, and points are a few percent behind.
+   A points layout stays available as a later change to D-C6 if a
+   point-heavy workload makes the difference matter.
 
 *Risk:* geometry fidelity is what the property tests have never aimed at.
 Per-position Z and M, empty rings, Shapefile's ring classification and each
@@ -1269,6 +1365,8 @@ drift, and step 2's test aims at it directly.
 - The equivalence corpus is byte-identical at every milestone, under each
   of =--layout auto=, =rows= and =columns= (D-C14).
 - No =compare.py= case slower than before C1, by more than noise.
+  /Met but for points after C6/, which trail C5 by 1--8% whole-process;
+  accepted 2026-11-05 (§ MILESTONES, C6 step 7).
 - Wide =geojson→parquet= and =parquet→geojson= IR within 2× of the
   ~80 MB estimate; narrow IR roughly halved before C6.
 - Every guarantee in § WHAT A ROW IR GIVES has a named test, and holds

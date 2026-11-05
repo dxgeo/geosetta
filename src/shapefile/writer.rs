@@ -6,7 +6,6 @@
 use crate::crs::Crs;
 use crate::error::Result;
 use crate::feature::FeatureCollection;
-use crate::geometry::Geometry;
 use crate::schema::columns_for;
 use crate::shapefile::{dbf, geometry};
 
@@ -61,7 +60,7 @@ pub struct Encoded {
 /// `.dbf` can't represent the properties without silently corrupting or
 /// merging data — see `dbf::write`.
 pub fn write(fc: &FeatureCollection) -> Result<Encoded> {
-    let geometries: Vec<Option<Geometry>> = fc.rows().map(|f| f.geometry().map(crate::GeometryRef::to_geometry)).collect();
+    let geometries: Vec<_> = fc.rows().map(|f| f.geometry()).collect();
     let (shp, shx) = geometry::write(&geometries)?;
 
     let columns = columns_for(fc);
@@ -96,7 +95,7 @@ const WGS84_WKT1: &str = "GEOGCS[\"GCS_WGS_1984\",DATUM[\"D_WGS_1984\",SPHEROID[
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::geometry::Position;
+    use crate::geometry::{Geometry, Position};
     use crate::crs::NamedCrs;
     use crate::feature::Feature;
 

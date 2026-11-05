@@ -156,6 +156,13 @@ it cross-format. GeoPackage's feature id is an integer key and could hold an
 integer =id=; whether another target has a slot needs checking. Decide here
 whether this plan owns it.
 
+/Its twin, found 2026-11-05/ by =bench/compare.py='s read-back: a GeoPackage
+feature id goes the same way. =ogr2ogr= writing GeoJSON with an =id=
+property into a GeoPackage makes =id= the FID column; geosetta reads the
+rowid alias as the feature's carried id (=geopackage/reader.rs=
+=carried_fid=), not a property, so =gpkg → parquet= writes no =id= column,
+with no warning (the same bytes at C5). terrio drops it too.
+
 *** F7 -- the CRS text changes dialect
 Into GeoParquet a WKT definition becomes PROJJSON: =lossy-conversion-warnings.org=
 § OWED WARNING, decided and not built, and the audit confirms it is still

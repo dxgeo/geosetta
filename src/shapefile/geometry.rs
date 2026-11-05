@@ -14,7 +14,10 @@
 //! containment test) is the implemented heuristic — see `plans/shapefile.org`.
 
 use crate::error::{Error, Result};
-use crate::geometry::{Bbox, Geometry, Position};
+use crate::geometry::{Bbox, Position};
+#[cfg(test)]
+use crate::geometry::Geometry;
+use crate::table::{GeometryBuilder, GeometryRef, Kind, Rings, Run, Shape};
 
 mod gtype {
     pub const NULL: i32 = 0;
@@ -87,10 +90,10 @@ fn m_variant(base: i32) -> i32 {
 
 // --- reader ------------------------------------------------------------
 
-/// Parse a `.shp` file into one `Option<Geometry>` per record, in file order
-/// (`None` for a Null-shape record). Reads sequentially to EOF using each
-/// record's own content-length prefix — `.shx` is not consulted.
-pub fn read(data: &[u8]) -> Result<Vec<Option<Geometry>>> {
+/// A `.shp` file's records' contents, one per record, in file order. Reads
+/// sequentially to EOF using each record's own content-length prefix --
+/// `.shx` is not consulted. [`decode_into`] decodes each.
+pub fn records(data: &[u8]) -> Result<Vec<&[u8]>> {
     if data.len() < 100 {
         return Err(Error::Convert("shapefile: .shp file shorter than its header".into()));
     }
@@ -98,23 +101,41 @@ pub fn read(data: &[u8]) -> Result<Vec<Option<Geometry>>> {
         return Err(Error::Convert("shapefile: bad .shp file code (expected 9994)".into()));
     }
 
-    let mut geometries = Vec::new();
+    let mut records = Vec::new();
     let mut pos = 100usize;
     while pos + 8 <= data.len() {
         let content_len = as_len(i32_be(data, pos + 4)?, "record content length")? * 2;
         let content = data
             .get(pos + 8..pos + 8 + content_len)
             .ok_or_else(|| Error::Convert("shapefile: truncated .shp record".into()))?;
-        geometries.push(decode_shape(content)?);
+        records.push(content);
         pos += 8 + content_len;
     }
-    Ok(geometries)
+    Ok(records)
 }
 
-fn decode_shape(content: &[u8]) -> Result<Option<Geometry>> {
+/// Parse a `.shp` file into one `Option<Geometry>` per record, in file order
+/// (`None` for a Null-shape record).
+#[cfg(test)]
+pub fn read(data: &[u8]) -> Result<Vec<Option<Geometry>>> {
+    let mut built = GeometryBuilder::default();
+    records(data)?
+        .into_iter()
+        .map(|content| {
+            decode_into(content, &mut built)?;
+            Ok(built.take())
+        })
+        .collect()
+}
+
+/// Decode one record's content into `out` (`plans/columnar.org` C6 step 5):
+/// the positions go straight into the buffers a block's flat column copies,
+/// with no `Geometry` built. A Null shape leaves it empty.
+pub fn decode_into(content: &[u8], out: &mut GeometryBuilder) -> Result<()> {
+    out.clear();
     let shape_type = i32_le(content, 0)?;
-    Ok(match shape_type {
-        gtype::NULL => None,
+    match shape_type {
+        gtype::NULL => {}
         // `POINT_M`'s M sits exactly where a plain `POINT` record simply
         // ends (offset 20), so a real 2D `POINT` record (20 bytes, no room
         // for `content.len() >= 28`) and a real `POINT_M` record share this
@@ -123,60 +144,116 @@ fn decode_shape(content: &[u8]) -> Result<Option<Geometry>> {
             let x = f64_le(content, 4)?;
             let y = f64_le(content, 12)?;
             let m = if content.len() >= 28 { m_or_none(f64_le(content, 20)?) } else { None };
-            Some(Geometry::Point(Position { x, y, z: None, m }))
+            out.point(Position { x, y, z: None, m });
         }
         gtype::POINT_Z => {
             let x = f64_le(content, 4)?;
             let y = f64_le(content, 12)?;
             let z = f64_le(content, 20)?;
             let m = if content.len() >= 36 { m_or_none(f64_le(content, 28)?) } else { None };
-            Some(Geometry::Point(Position { x, y, z: Some(z), m }))
+            out.point(Position { x, y, z: Some(z), m });
         }
-        gtype::MULTIPOINT | gtype::MULTIPOINT_M => {
-            let n = backed_len(content, 36, 40, 16, "MultiPoint numPoints")?;
-            let xy_off = 40;
-            let points = apply_m_if_present(read_points(content, xy_off, n)?, content, xy_off + 16 * n, n)?;
-            Some(Geometry::MultiPoint(points))
+        gtype::MULTIPOINT | gtype::MULTIPOINT_M | gtype::MULTIPOINT_Z => {
+            let has_z = shape_type == gtype::MULTIPOINT_Z;
+            let what = if has_z { "MultiPointZ numPoints" } else { "MultiPoint numPoints" };
+            let n = backed_len(content, 36, 40, 16, what)?;
+            let points = Points::new(content, 40, n, has_z)?;
+            for i in 0..n {
+                out.position(points.get(i)?);
+            }
+            out.end_ring();
+            out.end_part();
+            out.finish(Kind::MultiPoint);
         }
-        gtype::MULTIPOINT_Z => {
-            let n = backed_len(content, 36, 40, 16, "MultiPointZ numPoints")?;
-            let xy_off = 40;
-            let points = apply_z(read_points(content, xy_off, n)?, content, xy_off + 16 * n)?;
-            let after_z = xy_off + 16 * n + 16 + 8 * n;
-            let points = apply_m_if_present(points, content, after_z, n)?;
-            Some(Geometry::MultiPoint(points))
+        gtype::POLYLINE | gtype::POLYLINE_M | gtype::POLYLINE_Z => {
+            let parts = parts_into(content, shape_type == gtype::POLYLINE_Z, out, |_| {})?;
+            out.end_part();
+            out.finish(if parts == 1 { Kind::LineString } else { Kind::MultiLineString });
         }
-        gtype::POLYLINE | gtype::POLYLINE_M => {
-            let parts = read_parts(content, false)?;
-            Some(if parts.len() == 1 {
-                Geometry::LineString(parts.into_iter().next().unwrap())
-            } else {
-                Geometry::MultiLineString(parts)
-            })
+        gtype::POLYGON | gtype::POLYGON_M | gtype::POLYGON_Z => {
+            // Ring classification (Polygon vs MultiPolygon), by winding and
+            // appearance order: a clockwise ring starts a new shell; a
+            // counter-clockwise ring joins the most recent shell as a hole
+            // (or starts one itself if none precedes it — a malformed input,
+            // handled gracefully rather than panicking).
+            parts_into(content, shape_type == gtype::POLYGON_Z, out, |out| {
+                let first = out.parts() == 0 && out.rings_in_open_part() == 0;
+                if !first && is_clockwise_xy(out.open_ring()) {
+                    out.end_part();
+                }
+            })?;
+            out.end_part();
+            out.finish(if out.parts() <= 1 { Kind::Polygon } else { Kind::MultiPolygon });
         }
-        gtype::POLYLINE_Z => {
-            let parts = read_parts(content, true)?;
-            Some(if parts.len() == 1 {
-                Geometry::LineString(parts.into_iter().next().unwrap())
-            } else {
-                Geometry::MultiLineString(parts)
-            })
-        }
-        gtype::POLYGON | gtype::POLYGON_M => Some(classify_rings(read_parts(content, false)?)),
-        gtype::POLYGON_Z => Some(classify_rings(read_parts(content, true)?)),
         other => return Err(Error::Convert(format!("shapefile: unsupported shape type {other} (MultiPatch out of scope)"))),
-    })
+    }
+    Ok(())
 }
 
-/// Split a PolyLine/Polygon body into its parts (rings/lines): bbox, numParts,
-/// numPoints, part start-indices, and a flat point array, plus (if `has_z`) a
-/// trailing Zmin/Zmax/Z-array section — same layout for both the 2D and Z
-/// shape types, confirmed via real `ogr2ogr`-written `.shp` bytes before
-/// implementing (see M7 of `plans/zm-geometry.org`). An M section (present
-/// or not, regardless of `has_z` — the M-only shape types share this same
-/// tail shape minus the Z section) is detected purely by remaining content
-/// length, not by the declared shape type — see `apply_m_if_present`.
-fn read_parts(content: &[u8], has_z: bool) -> Result<Vec<Vec<Position>>> {
+/// A record's points: X and Y at `xy`, and a Z and an M section after them
+/// where the record has one.
+struct Points<'a> {
+    content: &'a [u8],
+    xy: usize,
+    /// The Z array, past `Zmin`/`Zmax`.
+    z: Option<usize>,
+    /// The M array, past `Mmin`/`Mmax`, when the record has room for one.
+    m: Option<usize>,
+}
+
+impl<'a> Points<'a> {
+    /// `n` points from `xy`, checked to lie within the record: the same
+    /// checks, in the same order, as reading every point would make.
+    ///
+    /// An M section (present or not, regardless of `has_z` — the M-only
+    /// shape types share this same tail shape minus the Z section) is
+    /// detected purely by remaining content length, not by the declared
+    /// shape type, confirmed via real `ogr2ogr`-written `.shp` bytes: an
+    /// M-bearing WKT source writes the full section, while a Z-only
+    /// (unmeasured) source writes zero trailing bytes at all, not a
+    /// sentinel-filled placeholder.
+    fn new(content: &'a [u8], xy: usize, n: usize, has_z: bool) -> Result<Points<'a>> {
+        let mut after = xy + 16 * n;
+        if n > 0 {
+            f64_le(content, after - 8)?;
+        }
+        let z = has_z.then(|| after + 16); // skip Zmin/Zmax
+        if let Some(z) = z {
+            if n > 0 {
+                f64_le(content, z + 8 * (n - 1))?;
+            }
+            after += 16 + 8 * n;
+        }
+        let m = (content.len() >= after + 16 + 8 * n).then_some(after + 16); // skip Mmin/Mmax
+        Ok(Points { content, xy, z, m })
+    }
+
+    /// Point `i`. A raw M at or below the ESRI "no data" threshold is
+    /// `None` even when the section is present, marking that one point
+    /// unmeasured within an otherwise M-bearing shape.
+    fn get(&self, i: usize) -> Result<Position> {
+        Ok(Position {
+            x: f64_le(self.content, self.xy + 16 * i)?,
+            y: f64_le(self.content, self.xy + 16 * i + 8)?,
+            z: self.z.map(|z| f64_le(self.content, z + 8 * i)).transpose()?,
+            m: self.m.map(|m| f64_le(self.content, m + 8 * i).map(m_or_none)).transpose()?.flatten(),
+        })
+    }
+}
+
+/// Write a PolyLine/Polygon body's parts (rings/lines) into `out`, each a
+/// ring, returning how many: bbox, numParts, numPoints, part
+/// start-indices, and a flat point array, plus (if `has_z`) a trailing
+/// Zmin/Zmax/Z-array section — same layout for both the 2D and Z shape
+/// types, confirmed via real `ogr2ogr`-written `.shp` bytes before
+/// implementing (see M7 of `plans/zm-geometry.org`). `before_close` sees
+/// each ring's positions written and the ring not yet closed.
+fn parts_into(
+    content: &[u8],
+    has_z: bool,
+    out: &mut GeometryBuilder,
+    mut before_close: impl FnMut(&mut GeometryBuilder),
+) -> Result<usize> {
     let num_parts = backed_len(content, 36, 44, 4, "numParts")?;
     let parts_off = 44;
     let num_points = backed_len(content, 40, parts_off + 4 * num_parts, 16, "numPoints")?;
@@ -184,119 +261,43 @@ fn read_parts(content: &[u8], has_z: bool) -> Result<Vec<Vec<Position>>> {
     for i in 0..num_parts {
         starts.push(as_len(i32_le(content, parts_off + 4 * i)?, "part start index")?);
     }
-    let xy_off = parts_off + 4 * num_parts;
-    let mut points = read_points(content, xy_off, num_points)?;
-    let mut m_off = xy_off + 16 * num_points;
-    if has_z {
-        points = apply_z(points, content, m_off)?;
-        m_off += 16 + 8 * num_points;
-    }
-    points = apply_m_if_present(points, content, m_off, num_points)?;
-
-    let mut parts = Vec::with_capacity(num_parts);
+    let points = Points::new(content, parts_off + 4 * num_parts, num_points, has_z)?;
     for i in 0..num_parts {
         let start = starts[i];
         let end = starts.get(i + 1).copied().unwrap_or(num_points);
-        let part = points
-            .get(start..end)
-            .ok_or_else(|| Error::Convert("shapefile: part index out of range".into()))?;
-        parts.push(part.to_vec());
+        if start > end || end > num_points {
+            return Err(Error::Convert("shapefile: part index out of range".into()));
+        }
+        for k in start..end {
+            out.position(points.get(k)?);
+        }
+        before_close(out);
+        out.end_ring();
     }
-    Ok(parts)
+    Ok(num_parts)
 }
 
-fn read_points(content: &[u8], offset: usize, n: usize) -> Result<Vec<Position>> {
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        out.push(Position::new(f64_le(content, offset + 16 * i)?, f64_le(content, offset + 16 * i + 8)?));
-    }
-    Ok(out)
-}
+// --- ring winding --------------------------------------------------------
 
-/// Fill in each position's `z` from a Z section starting at `z_off`
-/// (`Zmin`, `Zmax`, then one `f64` per point in the same order as `points`).
-fn apply_z(mut points: Vec<Position>, content: &[u8], z_off: usize) -> Result<Vec<Position>> {
-    let z_array_off = z_off + 16; // skip Zmin/Zmax
-    for (i, p) in points.iter_mut().enumerate() {
-        p.z = Some(f64_le(content, z_array_off + 8 * i)?);
-    }
-    Ok(points)
-}
-
-/// Fill in each position's `m` from an M section starting at `m_off`
-/// (`Mmin`, `Mmax`, then one `f64` per point), *if the record actually has
-/// room for one*. The M section is always optional, disambiguated purely by
-/// the record's own content length — confirmed via real `ogr2ogr`-written
-/// `.shp` bytes: an M-bearing WKT source writes the full section, while a
-/// Z-only (unmeasured) source writes zero trailing bytes at all, not a
-/// sentinel-filled placeholder. A raw value at or below the ESRI "no data"
-/// threshold becomes `None` even when the section is present, marking that
-/// one point unmeasured within an otherwise M-bearing shape.
-fn apply_m_if_present(mut points: Vec<Position>, content: &[u8], m_off: usize, n: usize) -> Result<Vec<Position>> {
-    if content.len() < m_off + 16 + 8 * n {
-        return Ok(points);
-    }
-    let m_array_off = m_off + 16; // skip Mmin/Mmax
-    for (i, p) in points.iter_mut().enumerate() {
-        p.m = m_or_none(f64_le(content, m_array_off + 8 * i)?);
-    }
-    Ok(points)
-}
-
-// --- ring classification (Polygon vs MultiPolygon) ----------------------
-
-/// Signed area via the shoelace formula: positive => counter-clockwise
-/// (a hole), negative => clockwise (a shell).
-fn signed_area(ring: &[Position]) -> f64 {
+/// Signed area via the shoelace formula over `n` points, point `i` at
+/// `at(i)`: positive => counter-clockwise (a hole), negative => clockwise
+/// (a shell).
+fn signed_area(n: usize, at: impl Fn(usize) -> (f64, f64)) -> f64 {
     let mut sum = 0.0;
-    for i in 0..ring.len() {
-        let p0 = ring[i];
-        let p1 = ring[(i + 1) % ring.len()];
-        sum += p0.x * p1.y - p1.x * p0.y;
+    for i in 0..n {
+        let (x0, y0) = at(i);
+        let (x1, y1) = at((i + 1) % n);
+        sum += x0 * y1 - x1 * y0;
     }
     sum / 2.0
 }
 
 fn is_clockwise(ring: &[Position]) -> bool {
-    signed_area(ring) < 0.0
+    signed_area(ring.len(), |i| (ring[i].x, ring[i].y)) < 0.0
 }
 
-/// Group parsed rings into one or more polygons by winding + appearance order:
-/// a clockwise ring starts a new shell; a counter-clockwise ring joins the
-/// most recent shell as a hole (or starts one itself if none precedes it — a
-/// malformed input, handled gracefully rather than panicking).
-fn classify_rings(rings: Vec<Vec<Position>>) -> Geometry {
-    let mut polys: Vec<Vec<Vec<Position>>> = Vec::new();
-    for ring in rings {
-        if polys.is_empty() || is_clockwise(&ring) {
-            polys.push(vec![ring]);
-        } else {
-            polys.last_mut().unwrap().push(ring);
-        }
-    }
-    if polys.len() <= 1 {
-        Geometry::Polygon(polys.into_iter().next().unwrap_or_default())
-    } else {
-        Geometry::MultiPolygon(polys)
-    }
-}
-
-/// Force a polygon's own rings to the Shapefile winding convention: shell
-/// (index 0) clockwise, holes counter-clockwise. Used on write, since Geosetta
-/// controls what it emits even when it can't guarantee an arbitrary input
-/// geometry's winding.
-fn polygon_rings(rings: &[Vec<Position>]) -> Vec<Vec<Position>> {
-    rings.iter().enumerate().map(|(i, r)| ensure_winding(r, i == 0)).collect()
-}
-
-fn ensure_winding(ring: &[Position], want_clockwise: bool) -> Vec<Position> {
-    if is_clockwise(ring) == want_clockwise {
-        ring.to_vec()
-    } else {
-        let mut r = ring.to_vec();
-        r.reverse();
-        r
-    }
+fn is_clockwise_xy(ring: &[[f64; 2]]) -> bool {
+    signed_area(ring.len(), |i| (ring[i][0], ring[i][1])) < 0.0
 }
 
 // --- writer --------------------------------------------------------------
@@ -305,7 +306,11 @@ fn ensure_winding(ring: &[Position], want_clockwise: bool) -> Vec<Position> {
 /// geometries mix incompatible Shapefile shape families (e.g. Point and
 /// Polygon) — a single `.shp` can only declare one shape type — or contain a
 /// `GeometryCollection`, which Shapefile cannot represent at all.
-pub fn write(geometries: &[Option<Geometry>]) -> Result<(Vec<u8>, Vec<u8>)> {
+///
+/// Read through views, so a flat block is written from its buffers: the
+/// writer holds a view a row, not a copy of every geometry
+/// (`plans/columnar.org` C6 step 4).
+pub fn write(geometries: &[Option<GeometryRef<'_>>]) -> Result<(Vec<u8>, Vec<u8>)> {
     let base_shape_type = header_shape_type(geometries)?;
     // A `.shp` declares one shape type for the whole file, so any Z-bearing
     // geometry promotes every record to the Z-variant shape type — a
@@ -316,8 +321,8 @@ pub fn write(geometries: &[Option<Geometry>]) -> Result<(Vec<u8>, Vec<u8>)> {
     // promotes to the M-only shape type instead; M alongside Z stays on the
     // Z-variant type code with an extra trailing section, matching real
     // `ogr2ogr`-written `POINT ZM`/`LINESTRING ZM`/etc. bytes.
-    let has_z = geometries.iter().flatten().any(geometry_has_z);
-    let has_m = geometries.iter().flatten().any(geometry_has_m);
+    let has_z = geometries.iter().flatten().any(|g| geometry_has_z(*g));
+    let has_m = geometries.iter().flatten().any(|g| geometry_has_m(*g));
     let shape_type = match (has_z, has_m) {
         (true, _) => z_variant(base_shape_type),
         (false, true) => m_variant(base_shape_type),
@@ -334,7 +339,7 @@ pub fn write(geometries: &[Option<Geometry>]) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut shp = vec![0u8; 100];
     let mut shx = vec![0u8; 100];
     for (i, g) in geometries.iter().enumerate() {
-        let content = encode_shape(g.as_ref(), has_z, has_m)?;
+        let content = encode_shape(*g, has_z, has_m)?;
         let content_words = (content.len() / 2) as i32;
         let record_offset_words = (shp.len() / 2) as i32;
 
@@ -352,9 +357,9 @@ pub fn write(geometries: &[Option<Geometry>]) -> Result<(Vec<u8>, Vec<u8>)> {
 }
 
 fn fold_range(
-    geometries: &[Option<Geometry>],
+    geometries: &[Option<GeometryRef<'_>>],
     present: bool,
-    fold: impl Fn(&Geometry, &mut f64, &mut f64),
+    fold: impl Fn(GeometryRef<'_>, &mut f64, &mut f64),
 ) -> (f64, f64) {
     if !present {
         return (0.0, 0.0);
@@ -362,79 +367,53 @@ fn fold_range(
     let mut lo = f64::INFINITY;
     let mut hi = f64::NEG_INFINITY;
     for g in geometries.iter().flatten() {
-        fold(g, &mut lo, &mut hi);
+        fold(*g, &mut lo, &mut hi);
     }
     (lo, hi)
 }
 
+/// Every position of `g`, a collection's members' included, in order.
+fn positions(g: GeometryRef<'_>, f: &mut impl FnMut(Position)) {
+    match g.shape() {
+        Shape::Point(p) => f(p),
+        Shape::LineString(ps) | Shape::MultiPoint(ps) => ps.iter().for_each(f),
+        Shape::Polygon(rings) | Shape::MultiLineString(rings) => rings.iter().flat_map(Run::iter).for_each(f),
+        Shape::MultiPolygon(polys) => polys.iter().flat_map(Rings::iter).flat_map(Run::iter).for_each(f),
+        Shape::Collection(geoms) => geoms.iter().for_each(|g| positions(GeometryRef::owned(g), f)),
+    }
+}
+
+/// Whether `g` holds a position satisfying `test`.
+fn any_position(g: GeometryRef<'_>, test: impl Fn(Position) -> bool) -> bool {
+    let mut found = false;
+    positions(g, &mut |p| found |= test(p));
+    found
+}
+
 /// Whether any position in `g` carries Z — used to decide, file-wide,
 /// whether to promote the whole `.shp` to its Z-variant shape type.
-fn geometry_has_z(g: &Geometry) -> bool {
-    match g {
-        Geometry::Point(p) => p.z.is_some(),
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => ps.iter().any(|p| p.z.is_some()),
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            rings.iter().flatten().any(|p| p.z.is_some())
-        }
-        Geometry::MultiPolygon(polys) => polys.iter().flatten().flatten().any(|p| p.z.is_some()),
-        Geometry::GeometryCollection(geoms) => geoms.iter().any(geometry_has_z),
-    }
+fn geometry_has_z(g: GeometryRef<'_>) -> bool {
+    any_position(g, |p| p.z.is_some())
 }
 
 /// Whether any position in `g` carries M — used to decide, file-wide,
 /// whether to promote the whole `.shp` to an M-bearing shape type (either
 /// the Z-variant with an extra M section, or the M-only variant if Z is
 /// absent — see `write()`).
-fn geometry_has_m(g: &Geometry) -> bool {
-    match g {
-        Geometry::Point(p) => p.m.is_some(),
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => ps.iter().any(|p| p.m.is_some()),
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            rings.iter().flatten().any(|p| p.m.is_some())
-        }
-        Geometry::MultiPolygon(polys) => polys.iter().flatten().flatten().any(|p| p.m.is_some()),
-        Geometry::GeometryCollection(geoms) => geoms.iter().any(geometry_has_m),
-    }
+fn geometry_has_m(g: GeometryRef<'_>) -> bool {
+    any_position(g, |p| p.m.is_some())
 }
 
 /// Fold `g`'s Z values (0.0 fallback for a position missing Z) into a
 /// running `[lo, hi]` range — used for the file header's Zmin/Zmax, matching
 /// `extend_bbox`'s own traversal shape but kept independent since `Bbox`
 /// itself stays 2D-only (see `plans/zm-geometry.org`'s OPEN QUESTIONS).
-fn fold_z(g: &Geometry, lo: &mut f64, hi: &mut f64) {
-    match g {
-        Geometry::Point(p) => {
-            let z = p.z.unwrap_or(0.0);
-            *lo = lo.min(z);
-            *hi = hi.max(z);
-        }
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => {
-            for p in ps {
-                let z = p.z.unwrap_or(0.0);
-                *lo = lo.min(z);
-                *hi = hi.max(z);
-            }
-        }
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            for p in rings.iter().flatten() {
-                let z = p.z.unwrap_or(0.0);
-                *lo = lo.min(z);
-                *hi = hi.max(z);
-            }
-        }
-        Geometry::MultiPolygon(polys) => {
-            for p in polys.iter().flatten().flatten() {
-                let z = p.z.unwrap_or(0.0);
-                *lo = lo.min(z);
-                *hi = hi.max(z);
-            }
-        }
-        Geometry::GeometryCollection(geoms) => {
-            for g in geoms {
-                fold_z(g, lo, hi);
-            }
-        }
-    }
+fn fold_z(g: GeometryRef<'_>, lo: &mut f64, hi: &mut f64) {
+    positions(g, &mut |p| {
+        let z = p.z.unwrap_or(0.0);
+        *lo = lo.min(z);
+        *hi = hi.max(z);
+    });
 }
 
 /// Fold `g`'s M values into a running `[lo, hi]` range — *skipping* any
@@ -442,50 +421,19 @@ fn fold_z(g: &Geometry, lo: &mut f64, hi: &mut f64) {
 /// an unmeasured point shouldn't drag the header's summary range toward the
 /// sentinel; matches ESRI's own convention that only genuinely measured
 /// points extend Mmin/Mmax.
-fn fold_m(g: &Geometry, lo: &mut f64, hi: &mut f64) {
-    match g {
-        Geometry::Point(p) => {
-            if let Some(m) = p.m {
-                *lo = lo.min(m);
-                *hi = hi.max(m);
-            }
+fn fold_m(g: GeometryRef<'_>, lo: &mut f64, hi: &mut f64) {
+    positions(g, &mut |p| {
+        if let Some(m) = p.m {
+            *lo = lo.min(m);
+            *hi = hi.max(m);
         }
-        Geometry::LineString(ps) | Geometry::MultiPoint(ps) => {
-            for p in ps {
-                if let Some(m) = p.m {
-                    *lo = lo.min(m);
-                    *hi = hi.max(m);
-                }
-            }
-        }
-        Geometry::Polygon(rings) | Geometry::MultiLineString(rings) => {
-            for p in rings.iter().flatten() {
-                if let Some(m) = p.m {
-                    *lo = lo.min(m);
-                    *hi = hi.max(m);
-                }
-            }
-        }
-        Geometry::MultiPolygon(polys) => {
-            for p in polys.iter().flatten().flatten() {
-                if let Some(m) = p.m {
-                    *lo = lo.min(m);
-                    *hi = hi.max(m);
-                }
-            }
-        }
-        Geometry::GeometryCollection(geoms) => {
-            for g in geoms {
-                fold_m(g, lo, hi);
-            }
-        }
-    }
+    });
 }
 
-fn header_shape_type(geometries: &[Option<Geometry>]) -> Result<i32> {
+fn header_shape_type(geometries: &[Option<GeometryRef<'_>>]) -> Result<i32> {
     let mut found: Option<i32> = None;
     for g in geometries.iter().flatten() {
-        let t = base_shape_type(g)?;
+        let t = base_shape_type(g.shape())?;
         match found {
             None => found = Some(t),
             Some(prev) if prev != t => {
@@ -500,33 +448,41 @@ fn header_shape_type(geometries: &[Option<Geometry>]) -> Result<i32> {
     Ok(found.unwrap_or(gtype::NULL))
 }
 
-fn base_shape_type(g: &Geometry) -> Result<i32> {
+fn base_shape_type(g: Shape<'_>) -> Result<i32> {
     Ok(match g {
-        Geometry::Point(_) => gtype::POINT,
-        Geometry::MultiPoint(_) => gtype::MULTIPOINT,
-        Geometry::LineString(_) | Geometry::MultiLineString(_) => gtype::POLYLINE,
-        Geometry::Polygon(_) | Geometry::MultiPolygon(_) => gtype::POLYGON,
-        Geometry::GeometryCollection(_) => {
+        Shape::Point(_) => gtype::POINT,
+        Shape::MultiPoint(_) => gtype::MULTIPOINT,
+        Shape::LineString(_) | Shape::MultiLineString(_) => gtype::POLYLINE,
+        Shape::Polygon(_) | Shape::MultiPolygon(_) => gtype::POLYGON,
+        Shape::Collection(_) => {
             return Err(Error::Convert("shapefile: GeometryCollection cannot be represented in a .shp".into()));
         }
     })
 }
 
-fn encode_shape(g: Option<&Geometry>, has_z: bool, has_m: bool) -> Result<Vec<u8>> {
+/// A part of a record, and the winding it is written in: `Some(clockwise)`
+/// for a polygon's ring -- a shell (index 0) clockwise, a hole
+/// counter-clockwise, whatever the source's winding, since Geosetta controls
+/// what it emits -- and `None` for a line, written as it is.
+type Part<'a> = (Run<'a>, Option<bool>);
+
+/// A polygon's rings, each with the winding Shapefile wants for it.
+fn polygon_parts(rings: Rings<'_>) -> impl Iterator<Item = Part<'_>> {
+    rings.iter().enumerate().map(|(i, r)| (r, Some(i == 0)))
+}
+
+fn encode_shape(g: Option<GeometryRef<'_>>, has_z: bool, has_m: bool) -> Result<Vec<u8>> {
     let Some(g) = g else {
         return Ok(gtype::NULL.to_le_bytes().to_vec());
     };
-    Ok(match g {
-        Geometry::Point(p) => encode_point(*p, has_z, has_m),
-        Geometry::MultiPoint(ps) => encode_multipoint(ps, has_z, has_m),
-        Geometry::LineString(ps) => encode_parts(gtype::POLYLINE, std::slice::from_ref(ps), has_z, has_m),
-        Geometry::MultiLineString(parts) => encode_parts(gtype::POLYLINE, parts, has_z, has_m),
-        Geometry::Polygon(rings) => encode_parts(gtype::POLYGON, &polygon_rings(rings), has_z, has_m),
-        Geometry::MultiPolygon(polys) => {
-            let rings: Vec<Vec<Position>> = polys.iter().flat_map(|r| polygon_rings(r)).collect();
-            encode_parts(gtype::POLYGON, &rings, has_z, has_m)
-        }
-        Geometry::GeometryCollection(_) => unreachable!("rejected by base_shape_type"),
+    Ok(match g.shape() {
+        Shape::Point(p) => encode_point(p, has_z, has_m),
+        Shape::MultiPoint(ps) => encode_multipoint(&ps.iter().collect::<Vec<_>>(), has_z, has_m),
+        Shape::LineString(ps) => encode_parts(gtype::POLYLINE, [(ps, None)], has_z, has_m),
+        Shape::MultiLineString(parts) => encode_parts(gtype::POLYLINE, parts.iter().map(|l| (l, None)), has_z, has_m),
+        Shape::Polygon(rings) => encode_parts(gtype::POLYGON, polygon_parts(rings), has_z, has_m),
+        Shape::MultiPolygon(polys) => encode_parts(gtype::POLYGON, polys.iter().flat_map(polygon_parts), has_z, has_m),
+        Shape::Collection(_) => unreachable!("rejected by base_shape_type"),
     })
 }
 
@@ -576,17 +532,26 @@ fn encode_multipoint(points: &[Position], has_z: bool, has_m: bool) -> Vec<u8> {
     out
 }
 
-fn encode_parts(shape_type: i32, parts: &[Vec<Position>], has_z: bool, has_m: bool) -> Vec<u8> {
+fn encode_parts<'a>(shape_type: i32, parts: impl IntoIterator<Item = Part<'a>>, has_z: bool, has_m: bool) -> Vec<u8> {
+    // The record's points, end to end, each ring in the winding it is
+    // written in, and where each part starts among them.
+    let mut all_points: Vec<Position> = Vec::new();
+    let mut starts: Vec<i32> = Vec::new();
+    for (run, clockwise) in parts {
+        let start = all_points.len();
+        starts.push(start as i32);
+        all_points.extend(run.iter());
+        if clockwise.is_some_and(|cw| is_clockwise(&all_points[start..]) != cw) {
+            all_points[start..].reverse();
+        }
+    }
     let mut out = Vec::new();
     out.extend_from_slice(&dim_shape_type(shape_type, has_z, has_m).to_le_bytes());
-    let all_points: Vec<Position> = parts.iter().flatten().copied().collect();
     write_bbox_le(&mut out, &points_bbox(&all_points));
-    out.extend_from_slice(&(parts.len() as i32).to_le_bytes());
+    out.extend_from_slice(&(starts.len() as i32).to_le_bytes());
     out.extend_from_slice(&(all_points.len() as i32).to_le_bytes());
-    let mut start = 0i32;
-    for part in parts {
+    for start in &starts {
         out.extend_from_slice(&start.to_le_bytes());
-        start += part.len() as i32;
     }
     for p in &all_points {
         out.extend_from_slice(&p.x.to_le_bytes());
@@ -728,6 +693,11 @@ fn backed_len(content: &[u8], count_at: usize, items_at: usize, size: usize, wha
 mod tests {
     use super::*;
 
+    /// [`super::write`], from owned geometries.
+    fn write(geoms: &[Option<Geometry>]) -> Result<(Vec<u8>, Vec<u8>)> {
+        super::write(&geoms.iter().map(|g| g.as_ref().map(GeometryRef::owned)).collect::<Vec<_>>())
+    }
+
     fn round_trip(geoms: Vec<Option<Geometry>>) -> Vec<Option<Geometry>> {
         let (shp, _shx) = write(&geoms).unwrap();
         read(&shp).unwrap()
@@ -783,6 +753,15 @@ mod tests {
         let shell2 = vec![Position::new(10.0, 10.0), Position::new(10.0, 11.0), Position::new(11.0, 11.0), Position::new(11.0, 10.0), Position::new(10.0, 10.0)]; // CW
         let multi = Geometry::MultiPolygon(vec![vec![shell1, hole1], vec![shell2]]);
         assert_eq!(round_trip(vec![Some(multi.clone())]), vec![Some(multi)]);
+    }
+
+    /// `rings`, in their own winding, as a Polygon record's parts, read
+    /// back: what the reader's ring classification makes of them.
+    fn classify_rings(rings: Vec<Vec<Position>>) -> Geometry {
+        let content = encode_parts(gtype::POLYGON, rings.iter().map(|r| (Run::Slice(r), None)), false, false);
+        let mut built = GeometryBuilder::default();
+        decode_into(&content, &mut built).unwrap();
+        built.take().unwrap()
     }
 
     #[test]

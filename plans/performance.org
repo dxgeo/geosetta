@@ -45,6 +45,14 @@ less, and the wide cases fell by half to two thirds (=geojson → parquet=
 16 061 to 5 934). Allocation budgets fell where the measurement did; the
 three wide ones stay as they were, already within 20%.
 
+/Lowered 2026-11-05/, after =columnar.org= C6 (geometry in flat buffers,
+written from views and read into them): reset the same way. Reads into
+GeoJSON fell from 470--518 to 450--460 bytes a feature (WKT 280 → 225),
+and the writes further, the geometry no longer copied out per feature:
+=geojson → shapefile= 215 → 163, =→ wkt= 182 → 124, =→ csv= 223 → 164,
+=→ gpkg= 705 → 607, =→ parquet= 375 → 317. Each wide case's peak is 20%
+over its measurement; their allocation budgets stay, still within 20%.
+
 ** BENCHMARKS
 =tests/perf.rs= drives the real =geosetta= binary end-to-end (whole-pipeline
 timing, including process startup and file I/O). It generates a synthetic GeoJSON
@@ -119,7 +127,8 @@ path), and the JSON string parser bulk-copies runs of ordinary bytes with one
 ** DONE — GeoJSON reader bypasses the JsonValue tree
 =geojson::from_geojson_str= streams a FeatureCollection's =features= array
 straight into the =Feature= IR: coordinates parse directly into =Vec<Position>=
-(no 2-element =Vec<JsonValue>= per coordinate), driving the JSON =Parser=
+(since =columnar.org= C6, into the block's flat buffers through a
+=GeometryBuilder=) (no 2-element =Vec<JsonValue>= per coordinate), driving the JSON =Parser=
 primitives (now =pub(crate)=) by hand and dipping into =parse_value= only for
 =properties= (arbitrary JSON). Member order is handled by dispatching on key,
 with a =JsonValue= fallback if =coordinates= precede =type=. The rare, tiny
@@ -596,9 +605,12 @@ Contained:
 Larger:
 - *Compact =Position=* (XY in 16 bytes, Z/M tracked per geometry). The bench is
   80% points and understates it; on polygon-heavy data coordinates dominate.
+  /Done another way 2026-11-05/: =columnar.org= C6 holds geometry in flat
+  buffers, XY in 16 bytes a position, Z and M only where present; the IR
+  on polygon-heavy input is 3.9× smaller.
 - *Columnar properties in the IR*: the only route near duckdb on wide tables
   without streaming, and likely faster, but it breaks =Feature::properties= and
-  touches every spoke.
+  touches every spoke. /Done 2026-11-02/ (=columnar.org= C1--C5).
 - *A streaming, batched pipeline*. Blocked wherever the whole collection is
   needed first: schema inference over schemaless input (two passes, which stdin
   cannot give), =--sort-hilbert=, FlatGeobuf's index and header count, the

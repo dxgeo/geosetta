@@ -2,7 +2,7 @@
 //! (`plans/columnar.org` D-C10, D-C13).
 
 use super::column::Column;
-use super::geometry::{GeometryColumn, GeometryRef};
+use super::geometry::{GeometryColumn, GeometryRef, RowGeometry};
 use super::kinds::Kinds;
 use super::value::Value;
 use super::Layout;
@@ -491,7 +491,8 @@ pub(crate) struct RowBuilder {
 
 impl RowBuilder {
     pub(crate) fn new(intern_sample: usize) -> RowBuilder {
-        RowBuilder { interning: true, intern_sample, ..RowBuilder::default() }
+        let block = RowBlock { geometry: GeometryColumn::filling(), ..RowBlock::default() };
+        RowBuilder { block, interning: true, intern_sample, ..RowBuilder::default() }
     }
 
     /// Append to a sealed row block. Without its index there is nothing to
@@ -506,15 +507,31 @@ impl RowBuilder {
     }
 
     pub(crate) fn push(&mut self, feature: Feature) {
-        let row = self.len() as u32;
+        let Feature { geometry, properties, native } = feature;
+        self.push_row(geometry.into(), properties, native);
+    }
+
+    /// [`Self::push`], the row's geometry as its reader handed it over.
+    pub(crate) fn push_row(
+        &mut self,
+        geometry: RowGeometry<'_>,
+        properties: Vec<(Rc<str>, JsonValue)>,
+        native: Option<Box<Native>>,
+    ) {
+        self.block.geometry.push_row(geometry);
+        self.push_properties(properties, native);
+    }
+
+    /// The row's properties and native, its geometry already in the block.
+    fn push_properties(&mut self, properties: Vec<(Rc<str>, JsonValue)>, native: Option<Box<Native>>) {
         let b = &mut self.block;
-        b.geometry.push(feature.geometry);
-        if let Some(native) = feature.native {
+        let row = b.starts.len() as u32;
+        if let Some(native) = native {
             b.natives.push((row, native));
         }
         b.starts.push(b.values.len() as u32);
         self.keys.clear();
-        for (key, value) in feature.properties {
+        for (key, value) in properties {
             self.keys.push(key);
             b.values.push(value);
         }
@@ -567,7 +584,7 @@ impl RowBuilder {
 /// every key, in the reader's declared order, so each value goes straight
 /// into its column with no shape to intern and nothing to transpose.
 pub(crate) struct TabularBlock {
-    geometry: Vec<Option<Geometry>>,
+    geometry: GeometryColumn,
     /// One per declared key, repeats included, in declared order.
     columns: Vec<Column>,
     natives: RowNatives,
@@ -575,7 +592,11 @@ pub(crate) struct TabularBlock {
 
 impl TabularBlock {
     pub(crate) fn new(keys: &[Rc<str>]) -> TabularBlock {
-        TabularBlock { geometry: Vec::new(), columns: keys.iter().cloned().map(Column::new).collect(), natives: Vec::new() }
+        TabularBlock {
+            geometry: GeometryColumn::filling(),
+            columns: keys.iter().cloned().map(Column::new).collect(),
+            natives: Vec::new(),
+        }
     }
 
     pub(crate) fn len(&self) -> usize {
@@ -586,14 +607,14 @@ impl TabularBlock {
     /// and its native.
     pub(crate) fn push(
         &mut self,
-        geometry: Option<Geometry>,
+        geometry: RowGeometry<'_>,
         values: impl IntoIterator<Item = JsonValue>,
         native: Option<Box<Native>>,
     ) {
         if let Some(native) = native {
             self.natives.push((self.len() as u32, native));
         }
-        self.geometry.push(geometry);
+        self.geometry.push_row(geometry);
         let mut values = values.into_iter();
         for column in &mut self.columns {
             column.push(Some(values.next().expect("a tabular row holds a value for every key")));
@@ -603,8 +624,8 @@ impl TabularBlock {
 
     /// Append the rows' geometry alone, for a reader that then fills the
     /// columns one at a time ([`Self::column`]).
-    pub(crate) fn push_geometry(&mut self, geometry: Option<Geometry>) {
-        self.geometry.push(geometry);
+    pub(crate) fn push_geometry(&mut self, geometry: RowGeometry<'_>) {
+        self.geometry.push_row(geometry);
     }
 
     /// Key `i`'s column, to fill with a value per row.
@@ -625,7 +646,7 @@ impl TabularBlock {
         if distinct && layout != Layout::Rows {
             let first_seen = (0..self.columns.len() as u32).collect();
             return Block::Columns(ColumnBlock {
-                geometry: GeometryColumn::Owned(self.geometry).seal(layout),
+                geometry: self.geometry.seal(layout),
                 columns: self.columns,
                 shapes: Vec::new(),
                 natives: self.natives,
@@ -638,14 +659,18 @@ impl TabularBlock {
         builder.seal(layout)
     }
 
-    /// Push every row to `builder`, as the features they were.
+    /// Push every row to `builder`, an empty one, as the features they
+    /// were: the geometry column moves over whole.
     pub(crate) fn into_rows(self, builder: &mut RowBuilder) {
         let TabularBlock { geometry, mut columns, natives } = self;
+        debug_assert_eq!(builder.len(), 0, "rows move into an empty builder");
+        let rows = geometry.len();
+        builder.block.geometry = geometry;
         let mut natives = natives.into_iter().peekable();
-        for (row, geometry) in geometry.into_iter().enumerate() {
+        for row in 0..rows {
             let properties = columns.iter_mut().map(|c| (c.name.clone(), c.take(row))).collect();
             let native = natives.next_if(|(r, _)| *r as usize == row).map(|(_, n)| n);
-            builder.push(Feature { geometry, properties, native });
+            builder.push_properties(properties, native);
         }
     }
 }

@@ -151,12 +151,13 @@ terminal; it is not safe to pipe. See
 ### The library
 
 ```rust
-use geosetta::{conversion_warnings, read_features, write_features, Format, WriteOptions};
+use geosetta::{conversion_warnings, read_features, write_features, Format, JsonValue, WriteOptions};
 
 let input = std::fs::read("places.geojson")?;
 let mut warnings = Vec::new();
 let mut fc = read_features(Format::GeoJson, &input, &mut warnings)?;
 fc.for_each_position_mut(|p| p.x += 1.0);    // edit coordinates in place
+fc.set(0, "name", JsonValue::String("renamed".into()));  // or one property
 warnings.extend(conversion_warnings(&fc, Format::GeoJson, Format::Parquet, WriteOptions::default()));
 let output = write_features(Format::Parquet, &fc)?;
 ```
@@ -165,11 +166,21 @@ let output = write_features(Format::Parquet, &fc)?;
 `conversion_warnings` is the list of checks the CLI prints, and
 `write_features` itself reports nothing. With no edit in between,
 `convert_with` does all three in one call and returns the bytes with the
-warnings. GeoPackage and Shapefile span more
-than one buffer and have their own entry points: `geopackage::read_layers`,
+warnings. GeoPackage and Shapefile span more than one buffer and have their
+own entry points: `geopackage::read_layers`,
 `geopackage::writer::write_layers`, `shapefile::read` and `shapefile::write`.
 A collection held in memory between a read and a write is never serialised,
 so none of the same-format losses below apply to it.
+
+Every attribute read can be edited through the collection, as ordinary Rust
+on owned values: `edit_geometry` and `for_each_geometry_mut` hand over a
+feature's `Option<Geometry>`, `edit_properties` its properties, and
+`edit_feature` and `for_each_feature_mut` the whole `Feature`; `set`,
+`remove`, `set_column` and `map_column` change one property or a column.
+Reading never copies: `fc.rows()` gives each feature as a view, and
+`row.geometry()` is a `GeometryRef`, whose `to_geometry()` makes an owned
+copy. Geosetta makes no edits of its own: the change is always the
+caller's, and Geosetta holds it and writes it out.
 
 
 ## SUPPORTED
@@ -312,8 +323,9 @@ items in [plans/todo.org](plans/todo.org).
 Every format is implemented from its specification:
 
 -   **`feature.rs`, `table/`:** the feature model (`Feature`,
-    `FeatureCollection`), held as blocks of columns or of shaped rows. Every
-    format depends on it and none on each other.
+    `FeatureCollection`), held as blocks of columns or of shaped rows, with
+    each block's geometry in flat coordinate buffers. Every format depends
+    on it and none on each other.
 -   **`format.rs`:** the `Format` enum and each format's capabilities. Its
     module doc lists what adding a format requires.
 -   **`json/`, `geojson/`:** a JSON parser and GeoJSON.

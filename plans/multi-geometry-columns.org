@@ -30,6 +30,13 @@ waits on columnar C6 and is redesigned then; M2--M5 keep their intent, and
 gain from it: M2 decodes WKB straight into a column, M3's WKT fallback and
 M4's per-column WKB both encode from the same =GeometryRef= as the primary.
 
+/C6 done 2026-11-05/, so M1 is unblocked and due its redesign. What C6
+built for it: a block's geometry is a =GeometryColumn= (=table/geometry.rs=)
+held flat, a reader writes a row through a =GeometryBuilder=
+(=wkb::decode_into= is M2's decode straight into a column), and every
+writer encodes from =GeometryRef::shape=. An extra column is another
+=GeometryColumn= beside the primary in each block.
+
 ** BACKGROUND
 
 *** Where this actually shows up: only GeoParquet, in practice

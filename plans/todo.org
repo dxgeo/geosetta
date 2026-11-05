@@ -257,9 +257,9 @@ check it off and remove it once the item ships or is shelved.
   (2026-11-02): a KML read for another format keeps no feature's element.
   Step 3, undecided: carry a KML feature back as a byte span re-parsed at
   write time, or accept GeoJSON's weaker promise.
-- [ ] [[file:columnar.org][columnar.org]] — the hub as a table rather than
-  rows, keeping every same-format guarantee the row IR gives. Milestones
-  C0--C6. C0 is built (=bench/equiv.py=, =bench/memprobe/=, 2026-10-29), and
+- [X] [[file:columnar.org][columnar.org]] — *DONE 2026-11-05.* The hub as a
+  table rather than rows, keeping every same-format guarantee the row IR
+  gives. Milestones C0--C6. C0 is built (=bench/equiv.py=, =bench/memprobe/=, 2026-10-29), and
   the smoke test chose the hybrid (D-C13). C1 is built (2026-11-02): the
   table behind private storage (D-C15), views, selections, edits,
   =--layout=, both property tests. C2 is built (2026-11-02): the tabular
@@ -268,8 +268,13 @@ check it off and remove it once the item ships or is shelved.
   write from views, and a KML read for another format keeps no feature's
   element (=performance.org=, KML's read, step 2). C5 is built
   (2026-11-02): the collection is only blocks, read and edited through
-  D-C8's public views, and back to the pin's speed or better. Next: C6,
-  geometry buffers.
+  D-C8's public views, and back to the pin's speed or better. C6 is built
+  (2026-11-05): geometry in flat buffers -- the IR on polygon-heavy input
+  about 4× smaller -- every attribute editable through the API (D-C16),
+  every writer reading views and the hot readers writing coordinates.
+  Polygons are faster than before C6, points a few percent slower;
+  accepted, and a points layout left to a later change of D-C6 if it
+  matters.
 - [ ] [[file:cross-format-audit.org][cross-format-audit.org]] — what a
   write loses without saying, found by round trip. Next: A1, F1's fix -- a
   KML or KMZ source written to GeoPackage prints none of the KML spoke's

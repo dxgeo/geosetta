@@ -119,6 +119,19 @@ ISO-vs-EWKB, WKT's keyword-vs-bare-tuple) was confirmed against real
 DuckDB/GDAL output before implementing
 ([[file:plans/zm-geometry.org][plans/zm-geometry.org]]).
 
+*The IR is a table, and every attribute can be edited.* A
+=FeatureCollection= is a sequence of blocks, each holding its properties as
+typed columns or as rows of shared shapes and its geometry in flat
+coordinate buffers, chosen as each block seals (=--layout= forces one; the
+output never changes). Polygon-heavy input holds about a quarter of what one
+=Geometry= a feature did. Reading is through views that copy nothing; every
+attribute -- geometry, properties, native, and the collection's own fields
+-- is editable through the API as ordinary Rust on owned values, and
+=tests/edits.rs= holds every layout to that
+([[file:plans/columnar.org][plans/columnar.org]], D-C16). Geosetta makes no
+edits of its own: the change is always its caller's, and geosetta holds it
+and writes it out.
+
 *Lossy conversions warn; they never succeed silently.* Whenever the target
 format cannot represent something the source carries — a CRS it has no channel
 for, M ordinates bound for GeoJSON/KML, a =.dbf= field name or value past
@@ -210,7 +223,9 @@ specification rather than pulled from a crate:
   =FeatureCollection=) — the IR every format converts to and from; all spokes
   depend on it, not on each other
 - =table/= :: the collection's storage: blocks, each held as typed columns or
-  as rows of shared shapes, read through views (=plans/columnar.org=)
+  as rows of shared shapes, its geometry in flat coordinate buffers, read
+  through views (=GeometryRef=) and edited through the collection's own
+  methods (=plans/columnar.org=)
 - =format.rs= :: the =Format= enum every entry point is keyed by — extension and
   name parsing, plus each format's capability answers (=display_name= for the one
   spelling used in every user-facing message, =supports_m=). Its module doc
@@ -406,7 +421,9 @@ produce in practice (see STATUS). The next steps, in rough priority:
   another list (single-level lists of scalars are done); and multiple geometry
   columns in one file, today detected and rejected with a clear error — actually
   decoding one needs an IR change the reader alone can't make, scoped separately
-  in [[file:plans/multi-geometry-columns.org][plans/multi-geometry-columns.org]].
+  in [[file:plans/multi-geometry-columns.org][plans/multi-geometry-columns.org]],
+  whose IR half is now a second geometry column in each block, beside the one
+  =plans/columnar.org= built.
 
 *** CRS pass-through (implemented), not reprojection
 Geosetta deliberately does *not* transform coordinates between coordinate

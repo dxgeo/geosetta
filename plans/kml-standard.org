@@ -387,7 +387,9 @@ needs it.
 **Write.** From a source whose vertical datum is not EGM96 -- =EPSG:4979='s
 ellipsoidal heights, say -- Z is written unchanged *with a named loss warning*:
 the heights are now labelled EGM96 and are not. The transform is logged as a
-cross-repo item in =geocore/todo.org=, against geoscribe's reprojection. It is
+cross-repo item in =geocore/todo.org=, against geoscribe's reprojection;
+EGM96 itself is planned as embedded data there
+(=geoscribe/plans/transformation-data.org= D-T1, T3, 2026-11-05). It is
 composed by a caller or a pipe, never by geosetta depending on geoscribe
 (=architecture.org=
 § THE COMPOSITION MODEL), and the warning names that composition.

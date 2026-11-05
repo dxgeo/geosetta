@@ -379,7 +379,7 @@ fn positions(g: GeometryRef<'_>, f: &mut impl FnMut(Position)) {
         Shape::LineString(ps) | Shape::MultiPoint(ps) => ps.iter().for_each(f),
         Shape::Polygon(rings) | Shape::MultiLineString(rings) => rings.iter().flat_map(Run::iter).for_each(f),
         Shape::MultiPolygon(polys) => polys.iter().flat_map(Rings::iter).flat_map(Run::iter).for_each(f),
-        Shape::Collection(geoms) => geoms.iter().for_each(|g| positions(GeometryRef::owned(g), f)),
+        Shape::GeometryCollection(geoms) => geoms.iter().for_each(|g| positions(g, f)),
     }
 }
 
@@ -454,7 +454,7 @@ fn base_shape_type(g: Shape<'_>) -> Result<i32> {
         Shape::MultiPoint(_) => gtype::MULTIPOINT,
         Shape::LineString(_) | Shape::MultiLineString(_) => gtype::POLYLINE,
         Shape::Polygon(_) | Shape::MultiPolygon(_) => gtype::POLYGON,
-        Shape::Collection(_) => {
+        Shape::GeometryCollection(_) => {
             return Err(Error::Convert("shapefile: GeometryCollection cannot be represented in a .shp".into()));
         }
     })
@@ -482,7 +482,7 @@ fn encode_shape(g: Option<GeometryRef<'_>>, has_z: bool, has_m: bool) -> Result<
         Shape::MultiLineString(parts) => encode_parts(gtype::POLYLINE, parts.iter().map(|l| (l, None)), has_z, has_m),
         Shape::Polygon(rings) => encode_parts(gtype::POLYGON, polygon_parts(rings), has_z, has_m),
         Shape::MultiPolygon(polys) => encode_parts(gtype::POLYGON, polys.iter().flat_map(polygon_parts), has_z, has_m),
-        Shape::Collection(_) => unreachable!("rejected by base_shape_type"),
+        Shape::GeometryCollection(_) => unreachable!("rejected by base_shape_type"),
     })
 }
 
@@ -758,7 +758,7 @@ mod tests {
     /// `rings`, in their own winding, as a Polygon record's parts, read
     /// back: what the reader's ring classification makes of them.
     fn classify_rings(rings: Vec<Vec<Position>>) -> Geometry {
-        let content = encode_parts(gtype::POLYGON, rings.iter().map(|r| (Run::Slice(r), None)), false, false);
+        let content = encode_parts(gtype::POLYGON, rings.iter().map(|r| (Run::slice(r), None)), false, false);
         let mut built = GeometryBuilder::default();
         decode_into(&content, &mut built).unwrap();
         built.take().unwrap()

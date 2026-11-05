@@ -142,8 +142,8 @@ fn wkb_size(geom: Shape<'_>) -> usize {
         Shape::MultiPolygon(polys) => {
             HEADER + COUNT + polys.iter().map(poly).sum::<usize>()
         }
-        Shape::Collection(geoms) => {
-            HEADER + COUNT + geoms.iter().map(|g| wkb_size(GeometryRef::owned(g).shape())).sum::<usize>()
+        Shape::GeometryCollection(geoms) => {
+            HEADER + COUNT + geoms.iter().map(|g| wkb_size(g.shape())).sum::<usize>()
         }
     }
 }
@@ -192,12 +192,12 @@ fn write_geometry(out: &mut Vec<u8>, geom: Shape<'_>) {
                 polygon(out, poly);
             }
         }
-        Shape::Collection(geoms) => {
-            let first = geoms.first().and_then(|g| GeometryRef::owned(g).first_position());
+        Shape::GeometryCollection(geoms) => {
+            let first = geoms.first().and_then(GeometryRef::first_position);
             header(out, WKB_GEOMETRYCOLLECTION, first.map(Dim::of).unwrap_or(Dim::XY));
             out.extend_from_slice(&(geoms.len() as u32).to_le_bytes());
             for g in geoms {
-                write_geometry(out, GeometryRef::owned(g).shape());
+                write_geometry(out, g.shape());
             }
         }
     }

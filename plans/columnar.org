@@ -46,6 +46,9 @@ not conformant, for per-position Z and M, mixed types and collections -- and
 that a block holds geometry columns, so multiple geometry columns
 (=multi-geometry-columns.org=) build on it.
 
+Revised 2026-11-05, after C6: a geometry is read in place through public
+views (D-C17), for nazca's =Sink=.
+
 Revised 2026-11-05: geometry edits through the API are never worse than
 today's (D-C16). A block's geometry is flat or owned, the API hands out an
 owned =Geometry= to edit, and C6 pins the edit contract before it changes
@@ -261,8 +264,9 @@ explicit:
 stopgap accessors of D-C15; C5 replaces those with the views above, and
 =Feature::properties= as a field of the collection goes. The intermediate
 API is internal to the work and never released on its own. Nothing in the
-workspace links geosetta (geoscribe and nazca compose over pipes, by
-=../architecture.org=), and the published crate has no users who need a
+workspace links geosetta (the three compose through a caller that links
+them or through pipes, never a dependency, by =../architecture.org=), and
+the published crate has no users who need a
 break avoided; under 1.0 it takes the next minor.
 
 *** D-C9 -- the API never exposes a whole buffer
@@ -569,6 +573,27 @@ For geometry, which C6 changes the storage of:
 =for_each_feature_mut= on the blocks as they are, and =tests/edits.rs= (C6
 step 2). C1's edit-sequence property test draws the three new edits among
 the old.
+
+*** D-C17 -- a geometry is read in place through public views
+/Decided 2026-11-05 (user decision)./ D-C16 makes every attribute editable
+as owned data; this is its read side. =GeometryRef::shape()= is public, and
+gives the structure =Geometry= has -- =Shape= (=#[non_exhaustive]=), whose
+=Run=, =Rings= and =Parts= are a part's rings and a ring's positions, and
+=Members=, a collection's geometries as =GeometryRef=s -- so a caller reads
+coordinates from either form of a block without =to_geometry='s copy. The
+views are opaque: their =Flat= and slice forms are private, so D-C9 holds,
+and the choice to keep collections whole (D-C6) stays the column's.
+=Run::xy_2d= is public too: =Option<&[[f64; 2]]>=, a fast path that
+promises only that when a slice is handed out it is the run's X and Y. It
+can answer =None= whenever the layout changes.
+
+The consumer it was made for is nazca, whose =Sink= names geosetta's IR as
+one of the sources an adapter drives it from, and whose =points= takes
+=&[[f64; 2]]=, which is =xy_2d='s answer: a flat 2D block reaches nazca with
+no per-coordinate work. =tests/nazca_sink.rs= is that adapter, checked
+against nazca's own WKB reader under every layout and after edits, with
+nazca a dev-dependency of the test only (=../architecture.org=). Exported
+from =geosetta::geometry=, beside =Geometry= and =Position=.
 
 ** HOW EACH FORMAT FITS
 | format      | fit                | notes                                                                                                                                           |
@@ -1439,28 +1464,52 @@ drift, and step 2's test aims at it directly.
   not materialized rows, so it costs time, not memory.
 
 ** OPEN QUESTIONS
+/Revisited 2026-11-05, with C0--C6 built./ Six of the eight are answered
+by what was built; two stay open.
+
 - =RowShapes= and =RowNatives= as sorted vectors or maps: decide by
   profiling a ragged GeoJSON. Per block (D-C10), and never re-sorted under
   D-C11, a sorted vector is the likely answer.
+  /Answered by C1:/ both are sorted vectors of the irregular rows.
 - =Str= offsets: settled by D-C10 as =u32=. A block past 4 GiB of text is
   not a case to design for; if one ever appears, the reader seals the block
   early.
 - Do blocks alone handle sparse input, or does a column also need a sparse
   form (=rows: Vec<u32>= beside its values) for a key that is rare /within/
   its blocks? Decide on the C0 many-keyed fixture.
+  /Answered by C3: blocks alone./ The sparse fixture (20 000 rows, 2 000
+  keys) seals as rows at 9 MB against the pin's 8, and no column has a
+  sparse form. What it still costs is time, not memory: a tabular write
+  from a sparse row block is 1.6× the pin's (=sparse → fgb=), at an eighth
+  of its peak (§ MILESTONES, C3 and C5).
 - D-C13's seal-time measures and thresholds: density, the share of
   irregular rows, the share of =Mixed= columns, or a combination. Decide on
   the C0 ragged, stretch-ragged and many-keyed fixtures.
+  /Answered by C3:/ § SMOKE TEST's starting rule, kept. On the C0 fixtures
+  it picks the smaller form everywhere but ragged, where it keeps rows at
+  12% over columns; the other side of that threshold is ownorder, where
+  columns cost more.
 - Should D-C13's thresholds or the block size ever be user settings beside
   =--layout=, as duckdb's and polars' are? D-C14 assumes not until asked.
+  /Open; nothing has asked./
 - The block size, and whether it is a row count, a byte budget, or both.
   § SMOKE TEST saw little between 8 192 and 65 536 rows except at a stretch
   boundary, where the smaller block wasted less (88 bytes a row against
   113 on the stretch fixture).
+  /Answered by C1, for now:/ a row count, 8 192, with an interning sample of
+  1 024, carried by the table as =Sizes= so a gather re-seals under the
+  same. Private (D-C9), so it can be retuned or become a byte budget
+  without callers noticing.
 - Does =Value<'_>= replace =JsonValue= in the public API anywhere, or only
   sit beside it? D-C8 assumes beside.
+  /Answered by C5: beside./ Reads hand out =Value<'_>= (=get=,
+  =properties()=, =map_column='s argument); edits take =JsonValue= (=set=,
+  =set_column=, =edit_properties=). Whether that split is the one to
+  release with is part of the public-API review before the breaking
+  release.
 - Should =FieldDecl= move onto =Column= (a column's declaration is a fact
   about the column), or stay matched by name as =columns_for= does?
+  /Open./ =columns_for= still matches by name (=schema.rs=).
 
 ** ALTERNATIVES CONSIDERED
 *** Keep the row IR

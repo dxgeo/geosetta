@@ -28,8 +28,8 @@ attribute has an owned hatch: an edit as ordinary Rust on the row IR's own
 types. This is D-C16; =tests/edits.rs= pins it and must pass unchanged
 through every later step.
 
-** STATE -- items 1--5 committed as 3027e09; items 6--9 not
-Items 6--9 are not committed (the owner commits). The working tree builds,
+** STATE -- items 1--5 committed as 3027e09; items 6--9 as 6e7d651 and 2491146
+All nine items are committed and pushed to =origin/columnar-ir=. The tree builds,
 all tests pass, and =LAYOUTS=auto,rows,columns python3 bench/equiv.py= gives
 8 991 identical against 3027e09, which was identical to the C5 pin. Clippy shows six warnings, all on lines this
 session did not touch (a newer clippy's lints: manual =is_multiple_of=,
@@ -65,7 +65,7 @@ What was done, in order:
 5. *C6 step 4.* =GeometryRef::shape()= (=Shape=, =Run=, =Rings=,
    =Parts=) reads either form; WKB (GeoParquet, GeoPackage blob and
    envelope), GeoJSON and FlatGeobuf encode from it.
-6. *C6 step 4, finished* (uncommitted, on top of 3027e09). WKT and CSV
+6. *C6 step 4, finished* (6e7d651). WKT and CSV
    (=geometry::wkt_ref=), KML (writer and =reconcile.rs=) and Shapefile
    encode from =shape()=; =geometry_cow= is gone. =GeometryRef='s
    =PartialEq= compares in place (=Shape=, =Run=, =Rings=, =Parts= gained
@@ -73,7 +73,7 @@ What was done, in order:
    writer's =geometry::write= takes =&[Option<GeometryRef>]=; its tests
    keep an owned-input wrapper. Tests, clippy (same six) and =equiv.py=
    (8 991 identical) all clean.
-7. *C6 step 5* (uncommitted). Blocks fill flat; readers write a row into a
+7. *C6 step 5* (6e7d651). Blocks fill flat; readers write a row into a
    =GeometryBuilder= (=table/geometry.rs=) that the block appends
    (=Flat::append=); =RowGeometry= is what the builders take. WKB
    (Parquet, GeoPackage), GeoJSON, FlatGeobuf and Shapefile write
@@ -82,12 +82,12 @@ What was done, in order:
    identical; measurements in =columnar.org= C6 step 5. One behaviour
    change on doubly-broken input only: a Shapefile with a bad shape and a
    bad =.dbf= now reports the =.dbf= first.
-8. *C6 step 7* (uncommitted). FlatGeobuf writer's pre-passes merged; enum
+8. *C6 step 7* (6e7d651). FlatGeobuf writer's pre-passes merged; enum
    iterators for =Run=/=Rings=/=Parts=; =Run::xy_2d= fast path in WKB,
    GeoJSON, FlatGeobuf and =extend_bbox=; budgets in =tests/budgets.rs=
    lowered (=performance.org= § BUDGETS); =compare.py= run against C5;
    a GeoPackage-FID drop found and filed (=cross-format-audit.org= F6).
-9. *C6 closed* (uncommitted). The owner accepted the points residual (1--8%
+9. *C6 closed* (6e7d651, docs 2491146). The owner accepted the points residual (1--8%
    behind C5) on 2026-11-05; =columnar.org= C6 and the plan are DONE, step 6
    recorded as built (overlay for single-row edits, an owned pass for bulk
    ones). Doc sweep: =plans/todo.org= checks columnar off,
@@ -104,17 +104,23 @@ What was done, in order:
    =summary.org= is a dated record and is left as it was.
 
 ** NEXT
+- Merging =columnar-ir= into =main=, and the breaking release it implies,
+  are the owner's (=columnar.org= C5, /Open/).
 - The open list is =plans/todo.org=. Its next entry is
-  =cross-format-audit.org= A1: a KML or KMZ source written to GeoPackage
-  prints none of the KML spoke's warnings. F6 there now holds a GeoPackage
-  FID dropped going to Parquet beside the GeoJSON =id= case, both silent;
+  =cross-format-audit.org= A2 (=bench/audit.py=); A1 was built 2026-10-31
+  with =library-warnings.org= L1. F6 there now holds a GeoPackage FID
+  dropped going to Parquet beside the GeoJSON =id= case, both silent;
   whether the audit owns them is still its call.
 - =multi-geometry-columns.org= M1 is unblocked by C6 and due its redesign
   against =GeometryColumn= and =GeometryBuilder=.
-- Not decided: =GeometryRef='s public reading surface beyond =to_geometry=,
-  =type_name=, =bbox=, =extend_bbox=, =has_m=. =Shape= and friends are
-  crate-internal; making them public would let a dependent read coordinates
-  without a copy.
+- Decided and built, uncommitted: =GeometryRef='s public reading surface
+  (=columnar.org= D-C17). =shape()= and opaque =Shape=/=Run=/=Rings=/
+  =Parts=/=Members= views, exported from =geosetta::geometry=, with
+  =tests/nazca_sink.rs= driving nazca's =Sink= through them (nazca a
+  dev-dependency of that test). =Shape::Collection= is now
+  =GeometryCollection=, its members =GeometryRef=s.
+  =LAYOUTS=auto,rows,columns python3 bench/equiv.py= against 2491146:
+  8 991 identical.
 - Left open on purpose: a layout for single-position rows, which is what
   the points residual would take (=columnar.org= C6 step 7). Only if a
   point-heavy workload makes it matter.

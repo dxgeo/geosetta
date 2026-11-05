@@ -813,31 +813,32 @@ impl<'a> GeometryRef<'a> {
 }
 
 impl<'a> GeometryRef<'a> {
-    /// The geometry's structure, read in place from either form: what an
-    /// encoder walks, so a flat block is written without a copy (C6 step 4).
-    pub(crate) fn shape(self) -> Shape<'a> {
+    /// The geometry's structure, read in place from either form: what every
+    /// encoder walks, so a flat block is written without a copy (C6 step 4),
+    /// and what a caller walks to read coordinates without one.
+    pub fn shape(self) -> Shape<'a> {
         match self.0 {
             Repr::Owned(g) => match g {
                 Geometry::Point(p) => Shape::Point(*p),
-                Geometry::LineString(ps) => Shape::LineString(Run::Slice(ps)),
-                Geometry::MultiPoint(ps) => Shape::MultiPoint(Run::Slice(ps)),
-                Geometry::Polygon(r) => Shape::Polygon(Rings::Slice(r)),
-                Geometry::MultiLineString(r) => Shape::MultiLineString(Rings::Slice(r)),
-                Geometry::MultiPolygon(p) => Shape::MultiPolygon(Parts::Slice(p)),
-                Geometry::GeometryCollection(g) => Shape::Collection(g),
+                Geometry::LineString(ps) => Shape::LineString(Run::slice(ps)),
+                Geometry::MultiPoint(ps) => Shape::MultiPoint(Run::slice(ps)),
+                Geometry::Polygon(r) => Shape::Polygon(Rings(RingsRepr::Slice(r))),
+                Geometry::MultiLineString(r) => Shape::MultiLineString(Rings(RingsRepr::Slice(r))),
+                Geometry::MultiPolygon(p) => Shape::MultiPolygon(Parts(PartsRepr::Slice(p))),
+                Geometry::GeometryCollection(g) => Shape::GeometryCollection(Members(g)),
             },
             Repr::Flat { flat, row } => {
                 let row = row as usize;
                 let first = flat.parts[row] as usize;
-                let ring = || Run::Flat(flat, flat.coords[flat.rings[first] as usize], flat.coords[flat.rings[first] as usize + 1]);
-                let rings = || Rings::Flat(flat, flat.rings[first], flat.rings[first + 1]);
+                let ring = || Run(RunRepr::Flat(flat, flat.coords[flat.rings[first] as usize], flat.coords[flat.rings[first] as usize + 1]));
+                let rings = || Rings(RingsRepr::Flat(flat, flat.rings[first], flat.rings[first + 1]));
                 match flat.tags[row] {
                     Tag::Point => Shape::Point(flat.pos(flat.coords[flat.rings[first] as usize] as usize)),
                     Tag::LineString => Shape::LineString(ring()),
                     Tag::MultiPoint => Shape::MultiPoint(ring()),
                     Tag::Polygon => Shape::Polygon(rings()),
                     Tag::MultiLineString => Shape::MultiLineString(rings()),
-                    Tag::MultiPolygon => Shape::MultiPolygon(Parts::Flat(flat, flat.parts[row], flat.parts[row + 1])),
+                    Tag::MultiPolygon => Shape::MultiPolygon(Parts(PartsRepr::Flat(flat, flat.parts[row], flat.parts[row + 1]))),
                     Tag::Collection | Tag::None => unreachable!("held whole, or no view"),
                 }
             }
@@ -855,116 +856,207 @@ impl GeometryRef<'_> {
             Shape::LineString(ps) | Shape::MultiPoint(ps) => ps.first(),
             Shape::Polygon(r) | Shape::MultiLineString(r) => r.first().and_then(Run::first),
             Shape::MultiPolygon(p) => p.first().and_then(Rings::first).and_then(Run::first),
-            Shape::Collection(g) => g.first().and_then(|g| GeometryRef::owned(g).first_position()),
+            Shape::GeometryCollection(g) => g.first().and_then(GeometryRef::first_position),
         }
     }
 }
 
-/// A geometry's structure, borrowed from whichever form holds it
-/// ([`GeometryRef::shape`]).
-#[derive(Clone, Copy)]
-pub(crate) enum Shape<'a> {
+/// A geometry's structure, read in place from whichever form holds it
+/// ([`GeometryRef::shape`]): what a caller walks to read coordinates without
+/// the copy [`GeometryRef::to_geometry`] makes. The same three levels as
+/// [`Geometry`] -- parts, rings, positions -- and none of the buffers behind
+/// them (`plans/columnar.org` D-C9).
+#[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
+pub enum Shape<'a> {
     Point(Position),
     LineString(Run<'a>),
     Polygon(Rings<'a>),
     MultiPoint(Run<'a>),
     MultiLineString(Rings<'a>),
     MultiPolygon(Parts<'a>),
-    Collection(&'a [Geometry]),
+    GeometryCollection(Members<'a>),
 }
 
 /// A run of positions: a line, a ring, a multipoint's points.
 #[derive(Clone, Copy)]
-pub(crate) enum Run<'a> {
+pub struct Run<'a>(RunRepr<'a>);
+
+#[derive(Clone, Copy)]
+enum RunRepr<'a> {
     Slice(&'a [Position]),
     /// Positions `start..end` of a flat column.
     Flat(&'a Flat, u32, u32),
 }
 
 impl<'a> Run<'a> {
-    pub(crate) fn len(self) -> usize {
-        match self {
-            Run::Slice(ps) => ps.len(),
-            Run::Flat(_, start, end) => (end - start) as usize,
+    pub(crate) fn slice(ps: &'a [Position]) -> Run<'a> {
+        Run(RunRepr::Slice(ps))
+    }
+
+    pub fn len(self) -> usize {
+        match self.0 {
+            RunRepr::Slice(ps) => ps.len(),
+            RunRepr::Flat(_, start, end) => (end - start) as usize,
         }
     }
 
-    pub(crate) fn first(self) -> Option<Position> {
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn first(self) -> Option<Position> {
         self.iter().next()
     }
 
-    /// The run's X and Y, in place, when it is flat in a column holding no
-    /// Z or M at all: every position is `(x, y)` alone, and a writer can read
-    /// the buffer without building a `Position` a coordinate (C6 step 7).
+    /// The run's X and Y in place, when it is held flat in a column with no
+    /// Z or M at all: every position is `(x, y)` alone, and a reader can take
+    /// the slice without building a `Position` a coordinate (C6 step 7).
+    /// `None` says only that no such slice exists -- an owned geometry has
+    /// none, 2D or not -- so a caller falls back to [`Self::iter`].
     #[inline]
-    pub(crate) fn xy_2d(self) -> Option<&'a [[f64; 2]]> {
-        match self {
-            Run::Flat(flat, start, end) if flat.is_2d() => Some(&flat.xy[start as usize..end as usize]),
+    pub fn xy_2d(self) -> Option<&'a [[f64; 2]]> {
+        match self.0 {
+            RunRepr::Flat(flat, start, end) if flat.is_2d() => Some(&flat.xy[start as usize..end as usize]),
             _ => None,
         }
     }
 
-    pub(crate) fn iter(self) -> RunIter<'a> {
-        match self {
-            Run::Slice(ps) => RunIter::Slice(ps.iter()),
-            Run::Flat(flat, start, end) => RunIter::Flat(flat, start as usize..end as usize),
+    pub fn iter(self) -> RunIter<'a> {
+        match self.0 {
+            RunRepr::Slice(ps) => RunIter(RunIterRepr::Slice(ps.iter())),
+            RunRepr::Flat(flat, start, end) => RunIter(RunIterRepr::Flat(flat, start as usize..end as usize)),
         }
     }
 }
 
 /// A list of runs: a polygon's rings, a multilinestring's lines.
 #[derive(Clone, Copy)]
-pub(crate) enum Rings<'a> {
+pub struct Rings<'a>(RingsRepr<'a>);
+
+#[derive(Clone, Copy)]
+enum RingsRepr<'a> {
     Slice(&'a [Vec<Position>]),
     /// Rings `start..end` of a flat column.
     Flat(&'a Flat, u32, u32),
 }
 
 impl<'a> Rings<'a> {
-    pub(crate) fn len(self) -> usize {
-        match self {
-            Rings::Slice(r) => r.len(),
-            Rings::Flat(_, start, end) => (end - start) as usize,
+    pub fn len(self) -> usize {
+        match self.0 {
+            RingsRepr::Slice(r) => r.len(),
+            RingsRepr::Flat(_, start, end) => (end - start) as usize,
         }
     }
 
-    pub(crate) fn first(self) -> Option<Run<'a>> {
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn first(self) -> Option<Run<'a>> {
         self.iter().next()
     }
 
-    pub(crate) fn iter(self) -> RingsIter<'a> {
-        match self {
-            Rings::Slice(r) => RingsIter::Slice(r.iter()),
-            Rings::Flat(flat, start, end) => RingsIter::Flat(flat, start as usize..end as usize),
+    pub fn iter(self) -> RingsIter<'a> {
+        match self.0 {
+            RingsRepr::Slice(r) => RingsIter(RingsIterRepr::Slice(r.iter())),
+            RingsRepr::Flat(flat, start, end) => RingsIter(RingsIterRepr::Flat(flat, start as usize..end as usize)),
         }
     }
 }
 
 /// A multipolygon's polygons, each a list of rings.
 #[derive(Clone, Copy)]
-pub(crate) enum Parts<'a> {
+pub struct Parts<'a>(PartsRepr<'a>);
+
+#[derive(Clone, Copy)]
+enum PartsRepr<'a> {
     Slice(&'a [Vec<Vec<Position>>]),
     /// Parts `start..end` of a flat column.
     Flat(&'a Flat, u32, u32),
 }
 
 impl<'a> Parts<'a> {
-    pub(crate) fn len(self) -> usize {
-        match self {
-            Parts::Slice(p) => p.len(),
-            Parts::Flat(_, start, end) => (end - start) as usize,
+    pub fn len(self) -> usize {
+        match self.0 {
+            PartsRepr::Slice(p) => p.len(),
+            PartsRepr::Flat(_, start, end) => (end - start) as usize,
         }
     }
 
-    pub(crate) fn first(self) -> Option<Rings<'a>> {
+    pub fn is_empty(self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn first(self) -> Option<Rings<'a>> {
         self.iter().next()
     }
 
-    pub(crate) fn iter(self) -> PartsIter<'a> {
-        match self {
-            Parts::Slice(p) => PartsIter::Slice(p.iter()),
-            Parts::Flat(flat, start, end) => PartsIter::Flat(flat, start as usize..end as usize),
+    pub fn iter(self) -> PartsIter<'a> {
+        match self.0 {
+            PartsRepr::Slice(p) => PartsIter(PartsIterRepr::Slice(p.iter())),
+            PartsRepr::Flat(flat, start, end) => PartsIter(PartsIterRepr::Flat(flat, start as usize..end as usize)),
         }
+    }
+}
+
+/// A `GeometryCollection`'s members, each a view of its own. A flat column
+/// keeps collections whole (D-C6), but that is the column's business: a
+/// member is read as any geometry is.
+#[derive(Clone, Copy)]
+pub struct Members<'a>(&'a [Geometry]);
+
+impl<'a> Members<'a> {
+    pub fn len(self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn first(self) -> Option<GeometryRef<'a>> {
+        self.0.first().map(GeometryRef::owned)
+    }
+
+    pub fn iter(self) -> MembersIter<'a> {
+        MembersIter(self.0.iter())
+    }
+}
+
+impl<'a> IntoIterator for Run<'a> {
+    type Item = Position;
+    type IntoIter = RunIter<'a>;
+
+    fn into_iter(self) -> RunIter<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for Rings<'a> {
+    type Item = Run<'a>;
+    type IntoIter = RingsIter<'a>;
+
+    fn into_iter(self) -> RingsIter<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for Parts<'a> {
+    type Item = Rings<'a>;
+    type IntoIter = PartsIter<'a>;
+
+    fn into_iter(self) -> PartsIter<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for Members<'a> {
+    type Item = GeometryRef<'a>;
+    type IntoIter = MembersIter<'a>;
+
+    fn into_iter(self) -> MembersIter<'a> {
+        self.iter()
     }
 }
 
@@ -972,7 +1064,10 @@ impl<'a> Parts<'a> {
 // a chain of both forms' iterators, which the per-coordinate loops of every
 // writer did not see through (`plans/columnar.org` C6 step 7).
 
-pub(crate) enum RunIter<'a> {
+/// A [`Run`]'s positions, in order.
+pub struct RunIter<'a>(RunIterRepr<'a>);
+
+enum RunIterRepr<'a> {
     Slice(std::slice::Iter<'a, Position>),
     Flat(&'a Flat, std::ops::Range<usize>),
 }
@@ -982,23 +1077,26 @@ impl Iterator for RunIter<'_> {
 
     #[inline]
     fn next(&mut self) -> Option<Position> {
-        match self {
-            RunIter::Slice(ps) => ps.next().copied(),
-            RunIter::Flat(flat, range) => range.next().map(|i| flat.pos(i)),
+        match &mut self.0 {
+            RunIterRepr::Slice(ps) => ps.next().copied(),
+            RunIterRepr::Flat(flat, range) => range.next().map(|i| flat.pos(i)),
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            RunIter::Slice(ps) => ps.size_hint(),
-            RunIter::Flat(_, range) => range.size_hint(),
+        match &self.0 {
+            RunIterRepr::Slice(ps) => ps.size_hint(),
+            RunIterRepr::Flat(_, range) => range.size_hint(),
         }
     }
 }
 
 impl ExactSizeIterator for RunIter<'_> {}
 
-pub(crate) enum RingsIter<'a> {
+/// A [`Rings`]' runs, in order.
+pub struct RingsIter<'a>(RingsIterRepr<'a>);
+
+enum RingsIterRepr<'a> {
     Slice(std::slice::Iter<'a, Vec<Position>>),
     Flat(&'a Flat, std::ops::Range<usize>),
 }
@@ -1008,23 +1106,28 @@ impl<'a> Iterator for RingsIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Run<'a>> {
-        match self {
-            RingsIter::Slice(r) => r.next().map(|r| Run::Slice(r)),
-            RingsIter::Flat(flat, range) => range.next().map(|k| Run::Flat(flat, flat.coords[k], flat.coords[k + 1])),
+        match &mut self.0 {
+            RingsIterRepr::Slice(r) => r.next().map(|r| Run::slice(r)),
+            RingsIterRepr::Flat(flat, range) => {
+                range.next().map(|k| Run(RunRepr::Flat(flat, flat.coords[k], flat.coords[k + 1])))
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            RingsIter::Slice(r) => r.size_hint(),
-            RingsIter::Flat(_, range) => range.size_hint(),
+        match &self.0 {
+            RingsIterRepr::Slice(r) => r.size_hint(),
+            RingsIterRepr::Flat(_, range) => range.size_hint(),
         }
     }
 }
 
 impl ExactSizeIterator for RingsIter<'_> {}
 
-pub(crate) enum PartsIter<'a> {
+/// A [`Parts`]' polygons, in order.
+pub struct PartsIter<'a>(PartsIterRepr<'a>);
+
+enum PartsIterRepr<'a> {
     Slice(std::slice::Iter<'a, Vec<Vec<Position>>>),
     Flat(&'a Flat, std::ops::Range<usize>),
 }
@@ -1034,21 +1137,41 @@ impl<'a> Iterator for PartsIter<'a> {
 
     #[inline]
     fn next(&mut self) -> Option<Rings<'a>> {
-        match self {
-            PartsIter::Slice(p) => p.next().map(|p| Rings::Slice(p)),
-            PartsIter::Flat(flat, range) => range.next().map(|p| Rings::Flat(flat, flat.rings[p], flat.rings[p + 1])),
+        match &mut self.0 {
+            PartsIterRepr::Slice(p) => p.next().map(|p| Rings(RingsRepr::Slice(p))),
+            PartsIterRepr::Flat(flat, range) => {
+                range.next().map(|p| Rings(RingsRepr::Flat(flat, flat.rings[p], flat.rings[p + 1])))
+            }
         }
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
-        match self {
-            PartsIter::Slice(p) => p.size_hint(),
-            PartsIter::Flat(_, range) => range.size_hint(),
+        match &self.0 {
+            PartsIterRepr::Slice(p) => p.size_hint(),
+            PartsIterRepr::Flat(_, range) => range.size_hint(),
         }
     }
 }
 
 impl ExactSizeIterator for PartsIter<'_> {}
+
+/// A [`Members`]' geometries, in order.
+pub struct MembersIter<'a>(std::slice::Iter<'a, Geometry>);
+
+impl<'a> Iterator for MembersIter<'a> {
+    type Item = GeometryRef<'a>;
+
+    #[inline]
+    fn next(&mut self) -> Option<GeometryRef<'a>> {
+        self.0.next().map(GeometryRef::owned)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for MembersIter<'_> {}
 
 /// Two views are equal when the geometries they show are: compared in
 /// place, position by position, as [`Geometry`]'s own `==` compares.
@@ -1074,7 +1197,7 @@ impl PartialEq for Shape<'_> {
             (Shape::LineString(a), Shape::LineString(b)) | (Shape::MultiPoint(a), Shape::MultiPoint(b)) => a == b,
             (Shape::Polygon(a), Shape::Polygon(b)) | (Shape::MultiLineString(a), Shape::MultiLineString(b)) => a == b,
             (Shape::MultiPolygon(a), Shape::MultiPolygon(b)) => a == b,
-            (Shape::Collection(a), Shape::Collection(b)) => a == b,
+            (Shape::GeometryCollection(a), Shape::GeometryCollection(b)) => a.0 == b.0,
             _ => false,
         }
     }
@@ -1095,6 +1218,30 @@ impl PartialEq for Rings<'_> {
 impl PartialEq for Parts<'_> {
     fn eq(&self, other: &Parts<'_>) -> bool {
         self.len() == other.len() && self.iter().eq(other.iter())
+    }
+}
+
+impl std::fmt::Debug for Run<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl std::fmt::Debug for Rings<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl std::fmt::Debug for Parts<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl std::fmt::Debug for Members<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.0).finish()
     }
 }
 

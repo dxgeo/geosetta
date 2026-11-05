@@ -29,6 +29,12 @@ path = "src/main.rs"
 # file) it's linked directly instead. `default-features = false` skips the
 # `parallel` (rayon) feature, which the tests don't need.
 wbprojection = { version = "0.3.3", default-features = false }
+# Used only by tests/nazca_sink.rs, to prove the read seam
+# (`GeometryRef::shape`) composes with the renderer that names geosetta's IR
+# as a source: an adapter drives nazca's `Sink`, checked against nazca's own
+# WKB reader. A dev-dependency of a test, not an edge between the libraries
+# (../architecture.org); path-only, so `cargo publish` drops it.
+nazca = { path = "../nazca" }
 
 # Intra-doc links are part of the docs staying true: a link that silently stops
 # resolving (a renamed item, a module demoted to `pub(crate)`) is the same class

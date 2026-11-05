@@ -178,8 +178,9 @@ feature's `Option<Geometry>`, `edit_properties` its properties, and
 `edit_feature` and `for_each_feature_mut` the whole `Feature`; `set`,
 `remove`, `set_column` and `map_column` change one property or a column.
 Reading never copies: `fc.rows()` gives each feature as a view, and
-`row.geometry()` is a `GeometryRef`, whose `to_geometry()` makes an owned
-copy. Geosetta makes no edits of its own: the change is always the
+`row.geometry()` is a `GeometryRef`: its `shape()` walks the geometry's
+parts, rings and positions in place (`geosetta::geometry::Shape`), and
+`to_geometry()` makes an owned copy. Geosetta makes no edits of its own: the change is always the
 caller's, and Geosetta holds it and writes it out.
 
 

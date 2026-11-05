@@ -97,14 +97,14 @@ fn write_geometry(s: &mut String, g: GeometryRef<'_>) {
             }
             s.push(')');
         }
-        Shape::Collection(geoms) => {
+        Shape::GeometryCollection(geoms) => {
             write_header(s, "GEOMETRYCOLLECTION", g.first_position().map(Dim::of).unwrap_or(Dim::XY));
             s.push('(');
             for (i, g) in geoms.iter().enumerate() {
                 if i > 0 {
                     s.push_str(", ");
                 }
-                write_geometry(s, GeometryRef::owned(g));
+                write_geometry(s, g);
             }
             s.push(')');
         }

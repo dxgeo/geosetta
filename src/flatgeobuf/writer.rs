@@ -388,8 +388,8 @@ fn encode_geometry(b: &mut Builder, g: GeometryRef<'_>) -> usize {
             let parts = b.create_offset_vector(&part_offsets);
             geom_table(b, ty, None, None, Some(parts), None, None)
         }
-        Shape::Collection(geoms) => {
-            let part_offsets: Vec<usize> = geoms.iter().map(|g| encode_geometry(b, GeometryRef::owned(g))).collect();
+        Shape::GeometryCollection(geoms) => {
+            let part_offsets: Vec<usize> = geoms.iter().map(|g| encode_geometry(b, g)).collect();
             let parts = b.create_offset_vector(&part_offsets);
             geom_table(b, ty, None, None, Some(parts), None, None)
         }
@@ -490,7 +490,7 @@ fn fgb_geometry_type(g: GeometryRef<'_>) -> u8 {
         Shape::MultiPoint(_) => gtype::MULTIPOINT,
         Shape::MultiLineString(_) => gtype::MULTILINESTRING,
         Shape::MultiPolygon(_) => gtype::MULTIPOLYGON,
-        Shape::Collection(_) => gtype::GEOMETRYCOLLECTION,
+        Shape::GeometryCollection(_) => gtype::GEOMETRYCOLLECTION,
     }
 }
 

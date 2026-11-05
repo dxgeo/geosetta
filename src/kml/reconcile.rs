@@ -595,7 +595,7 @@ fn set_coordinates(existing: &mut Node, points: &[Position]) -> bool {
 
 /// `<coordinates>`'s text for `points`, as the writer spells it.
 fn coordinates_text(points: &[Position]) -> String {
-    coordinates_element(Run::Slice(points)).text().to_string()
+    coordinates_element(Run::slice(points)).text().to_string()
 }
 
 /// A track coordinate: `lon lat alt`, space-separated.

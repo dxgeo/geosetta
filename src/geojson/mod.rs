@@ -646,12 +646,12 @@ impl Writer {
         self.out.push('"');
         self.out.push_str(g.type_name());
         self.out.push('"');
-        if let Shape::Collection(geoms) = g.shape() {
+        if let Shape::GeometryCollection(geoms) = g.shape() {
             self.member("geometries");
             self.open('[');
             for sub in geoms {
                 self.item();
-                self.geometry(GeometryRef::owned(sub));
+                self.geometry(sub);
             }
             self.close(']');
         } else {
@@ -678,7 +678,7 @@ fn write_coordinates(out: &mut String, g: Shape<'_>) {
             }
             out.push(']');
         }
-        Shape::Collection(_) => unreachable!("a collection has geometries, not coordinates"),
+        Shape::GeometryCollection(_) => unreachable!("a collection has geometries, not coordinates"),
     }
 }
 

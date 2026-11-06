@@ -6,7 +6,7 @@ use crate::format::Format;
 use crate::geometry::{Geometry, Position};
 use crate::json::JsonValue;
 use crate::native::{Native, NativePayload};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// xorshift64*: small, and enough to vary shapes.
 pub(crate) struct Rng(u64);
@@ -151,8 +151,8 @@ pub(crate) fn collection(rng: &mut Rng, block_rows: usize) -> Vec<Feature> {
 
 pub(crate) fn collection_of(rng: &mut Rng, rows: usize) -> Vec<Feature> {
     let style = [Style::Regular, Style::Ragged, Style::Sparse, Style::Stretches, Style::OwnOrder][rng.below(5)];
-    let pool: Vec<Rc<str>> = (0..if matches!(style, Style::Sparse) { 80 } else { 8 })
-        .map(|i| Rc::from(format!("k{i}")))
+    let pool: Vec<Arc<str>> = (0..if matches!(style, Style::Sparse) { 80 } else { 8 })
+        .map(|i| Arc::from(format!("k{i}")))
         .collect();
     (0..rows)
         .map(|row| {
@@ -192,12 +192,12 @@ pub(crate) fn collection_of(rng: &mut Rng, rows: usize) -> Vec<Feature> {
 /// A tabular reader's rows: every row holds every key of a header, in the
 /// header's order, which now and then declares a key twice. Returned with
 /// the header.
-pub(crate) fn tabular(rng: &mut Rng, rows: usize) -> (Vec<Rc<str>>, Vec<Feature>) {
+pub(crate) fn tabular(rng: &mut Rng, rows: usize) -> (Vec<Arc<str>>, Vec<Feature>) {
     let mut keys: Vec<usize> = (0..rng.below(9)).collect();
     if !keys.is_empty() && rng.one_in(6) {
         keys.insert(rng.below(keys.len() + 1), keys[rng.below(keys.len())]);
     }
-    let header: Vec<Rc<str>> = keys.iter().map(|k| Rc::from(format!("k{k}"))).collect();
+    let header: Vec<Arc<str>> = keys.iter().map(|k| Arc::from(format!("k{k}"))).collect();
     let features = (0..rows)
         .map(|row| Feature {
             geometry: match rng.below(10) {

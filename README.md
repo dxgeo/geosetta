@@ -151,13 +151,13 @@ terminal; it is not safe to pipe. See
 ### The library
 
 ```rust
-use geosetta::{conversion_warnings, read_features, write_features, Format, JsonValue, WriteOptions};
+use geosetta::{conversion_warnings, read_features, write_features, Format, WriteOptions};
 
 let input = std::fs::read("places.geojson")?;
 let mut warnings = Vec::new();
 let mut fc = read_features(Format::GeoJson, &input, &mut warnings)?;
 fc.for_each_position_mut(|p| p.x += 1.0);    // edit coordinates in place
-fc.set(0, "name", JsonValue::String("renamed".into()));  // or one property
+fc.set(0, "name", "renamed");                // or one property
 warnings.extend(conversion_warnings(&fc, Format::GeoJson, Format::Parquet, WriteOptions::default()));
 let output = write_features(Format::Parquet, &fc)?;
 ```
@@ -177,10 +177,12 @@ on owned values: `edit_geometry` and `for_each_geometry_mut` hand over a
 feature's `Option<Geometry>`, `edit_properties` its properties, and
 `edit_feature` and `for_each_feature_mut` the whole `Feature`; `set`,
 `remove`, `set_column` and `map_column` change one property or a column.
-Reading never copies: `fc.rows()` gives each feature as a view, and
-`row.geometry()` is a `GeometryRef`: its `shape()` walks the geometry's
-parts, rings and positions in place (`geosetta::geometry::Shape`), and
-`to_geometry()` makes an owned copy. Geosetta makes no edits of its own: the change is always the
+Reading never copies: `fc.rows()` gives each feature as a view, `fc.keys()`
+lists the keys the features hold and `fc.column(key)` reads one down every
+feature, and `row.geometry()` is a `GeometryRef`: its `shape()` walks the
+geometry's parts, rings and positions in place (`geosetta::Shape`), and
+`to_geometry()` makes an owned copy. A collection is `Send` and `Sync`, so it
+can move between threads and be read from several. Geosetta makes no edits of its own: the change is always the
 caller's, and Geosetta holds it and writes it out.
 
 

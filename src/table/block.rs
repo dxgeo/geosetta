@@ -11,7 +11,7 @@ use crate::geometry::Geometry;
 use crate::json::JsonValue;
 use crate::native::Native;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// D-C7: the few rows that carry a per-feature native, sorted by row.
 pub(crate) type RowNatives = Vec<(u32, Box<Native>)>;
@@ -21,7 +21,7 @@ pub(crate) type RowNatives = Vec<(u32, Box<Native>)>;
 /// promotes at most once per block however many edits reach it. Whole rows
 /// rather than D-C12's `(row, key)` cells: an edit is then the row IR's own
 /// edit to a `Vec`, and every guarantee about order and repeats holds by it.
-type Patch = BTreeMap<u32, Vec<(Rc<str>, JsonValue)>>;
+type Patch = BTreeMap<u32, Vec<(Arc<str>, JsonValue)>>;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Block {
@@ -36,7 +36,7 @@ pub(crate) enum Block {
 pub(crate) struct RowBlock {
     geometry: GeometryColumn,
     /// Key lists, in order, repeats kept.
-    shapes: Vec<Box<[Rc<str>]>>,
+    shapes: Vec<Box<[Arc<str>]>>,
     row_shape: Vec<u32>,
     /// Row `i`'s values start at `starts[i]`.
     starts: Vec<u32>,
@@ -67,7 +67,7 @@ pub(crate) enum Member {
     /// The value is in this column.
     Column(u32),
     /// A key the row repeats (guarantee 3): the extra pair itself.
-    Extra(Rc<str>, JsonValue),
+    Extra(Arc<str>, JsonValue),
 }
 
 impl Block {
@@ -199,7 +199,7 @@ impl Block {
 
     /// The block's keys in the order its rows first use them. Read off its
     /// shapes or its recorded order; a patched row's new keys are not in it.
-    pub(crate) fn first_seen(&self) -> Vec<&Rc<str>> {
+    pub(crate) fn first_seen(&self) -> Vec<&Arc<str>> {
         match self {
             Block::Rows(b) => {
                 let mut seen = HashSet::new();
@@ -211,7 +211,7 @@ impl Block {
 
     /// Report each key's kinds of value to `found`, a column at a time where
     /// the block is columns; a row block, or a patched one, row by row.
-    pub(crate) fn kinds<'a>(&'a self, found: &mut dyn FnMut(&'a Rc<str>, Kinds)) {
+    pub(crate) fn kinds<'a>(&'a self, found: &mut dyn FnMut(&'a Arc<str>, Kinds)) {
         match self {
             Block::Columns(b) if b.patch.is_empty() => {
                 for column in &b.columns {
@@ -263,9 +263,9 @@ impl Block {
     }
 
     /// Change row `row`'s properties as `edit` says, through the patch.
-    fn edit(&mut self, row: usize, edit: impl FnOnce(&mut Vec<(Rc<str>, JsonValue)>)) {
+    fn edit(&mut self, row: usize, edit: impl FnOnce(&mut Vec<(Arc<str>, JsonValue)>)) {
         if !self.is_row_patched(row) {
-            let whole = self.properties(row).map(|(k, v)| (k.clone(), v.to_owned())).collect();
+            let whole = self.properties(row).map(|(k, v)| (k.clone(), v.to_json_value())).collect();
             self.patch_mut().insert(row as u32, whole);
         }
         edit(self.patch_mut().get_mut(&(row as u32)).expect("inserted above"));
@@ -275,9 +275,9 @@ impl Block {
     /// insert anywhere, repeat a key -- kept as `f` leaves them (D-C16). A
     /// list `f` leaves as it was is not patched, so a pass over every row
     /// that changes a few costs a patch entry for those few.
-    pub(crate) fn edit_properties<R>(&mut self, row: usize, f: impl FnOnce(&mut Vec<(Rc<str>, JsonValue)>) -> R) -> R {
-        let mut members: Vec<(Rc<str>, JsonValue)> =
-            self.properties(row).map(|(k, v)| (k.clone(), v.to_owned())).collect();
+    pub(crate) fn edit_properties<R>(&mut self, row: usize, f: impl FnOnce(&mut Vec<(Arc<str>, JsonValue)>) -> R) -> R {
+        let mut members: Vec<(Arc<str>, JsonValue)> =
+            self.properties(row).map(|(k, v)| (k.clone(), v.to_json_value())).collect();
         let r = f(&mut members);
         if !self.has_properties(row, &members) {
             self.patch_mut().insert(row as u32, members);
@@ -286,7 +286,7 @@ impl Block {
     }
 
     /// Whether row `row`'s properties are `members`, bit for bit.
-    fn has_properties(&self, row: usize, members: &[(Rc<str>, JsonValue)]) -> bool {
+    fn has_properties(&self, row: usize, members: &[(Arc<str>, JsonValue)]) -> bool {
         let mut held = self.properties(row);
         members.iter().all(|(k, v)| held.next().is_some_and(|(hk, hv)| hk == k && hv.identical(v)))
             && held.next().is_none()
@@ -335,7 +335,7 @@ impl Block {
         }
         self.edit(row, |members| match members.iter_mut().find(|(k, _)| &**k == key) {
             Some((_, held)) => *held = value,
-            None => members.push((Rc::from(key), value)),
+            None => members.push((Arc::from(key), value)),
         });
     }
 
@@ -422,17 +422,18 @@ pub(crate) struct ShapeSlots {
 }
 
 /// [`Block::properties`]: one row's members, whichever form holds them.
+#[derive(Clone)]
 pub(crate) enum Properties<'a> {
     /// A row an edit changed, read from the patch.
-    Patched(std::slice::Iter<'a, (Rc<str>, JsonValue)>),
-    Shaped { keys: std::slice::Iter<'a, Rc<str>>, values: std::slice::Iter<'a, JsonValue> },
+    Patched(std::slice::Iter<'a, (Arc<str>, JsonValue)>),
+    Shaped { keys: std::slice::Iter<'a, Arc<str>>, values: std::slice::Iter<'a, JsonValue> },
     /// A regular row of a column block: its present columns, in order.
     Regular { columns: std::slice::Iter<'a, Column>, row: usize },
     Irregular { members: std::slice::Iter<'a, Member>, columns: &'a [Column], row: usize },
 }
 
 impl<'a> Iterator for Properties<'a> {
-    type Item = (&'a Rc<str>, Value<'a>);
+    type Item = (&'a Arc<str>, Value<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
@@ -448,6 +449,16 @@ impl<'a> Iterator for Properties<'a> {
                 }
                 Member::Extra(key, value) => (key, Value::of(value)),
             }),
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        match self {
+            Properties::Patched(members) => members.size_hint(),
+            Properties::Shaped { values, .. } => values.size_hint(),
+            // A regular row skips the columns it does not hold.
+            Properties::Regular { columns, .. } => (0, Some(columns.len())),
+            Properties::Irregular { members, .. } => members.size_hint(),
         }
     }
 }
@@ -481,12 +492,12 @@ impl Default for Sizes {
 #[derive(Default)]
 pub(crate) struct RowBuilder {
     block: RowBlock,
-    index: HashMap<Box<[Rc<str>]>, u32>,
+    index: HashMap<Box<[Arc<str>]>, u32>,
     /// Stops hashing once shapes stop repeating (D-C13): on sparse input
     /// every row's keys are its own, and interning bought 2% for 4× the time.
     interning: bool,
     intern_sample: usize,
-    keys: Vec<Rc<str>>,
+    keys: Vec<Arc<str>>,
 }
 
 impl RowBuilder {
@@ -515,7 +526,7 @@ impl RowBuilder {
     pub(crate) fn push_row(
         &mut self,
         geometry: RowGeometry<'_>,
-        properties: Vec<(Rc<str>, JsonValue)>,
+        properties: Vec<(Arc<str>, JsonValue)>,
         native: Option<Box<Native>>,
     ) {
         self.block.geometry.push_row(geometry);
@@ -523,7 +534,7 @@ impl RowBuilder {
     }
 
     /// The row's properties and native, its geometry already in the block.
-    fn push_properties(&mut self, properties: Vec<(Rc<str>, JsonValue)>, native: Option<Box<Native>>) {
+    fn push_properties(&mut self, properties: Vec<(Arc<str>, JsonValue)>, native: Option<Box<Native>>) {
         let b = &mut self.block;
         let row = b.starts.len() as u32;
         if let Some(native) = native {
@@ -547,7 +558,7 @@ impl RowBuilder {
             Some(&shape) => shape,
             None => {
                 let shape = b.shapes.len() as u32;
-                let keys: Box<[Rc<str>]> = self.keys.as_slice().into();
+                let keys: Box<[Arc<str>]> = self.keys.as_slice().into();
                 if self.interning {
                     self.index.insert(keys.clone(), shape);
                 }
@@ -591,7 +602,7 @@ pub(crate) struct TabularBlock {
 }
 
 impl TabularBlock {
-    pub(crate) fn new(keys: &[Rc<str>]) -> TabularBlock {
+    pub(crate) fn new(keys: &[Arc<str>]) -> TabularBlock {
         TabularBlock {
             geometry: GeometryColumn::filling(),
             columns: keys.iter().cloned().map(Column::new).collect(),
@@ -679,7 +690,7 @@ impl TabularBlock {
 struct ColumnPlan {
     /// The block's column order (D-C4): its modal shape's keys, then every
     /// other key in first-seen order.
-    names: Vec<Rc<str>>,
+    names: Vec<Arc<str>>,
     /// Per shape, whether it is regular: its keys are columns in column order,
     /// each once.
     regular: Vec<bool>,
@@ -698,7 +709,7 @@ impl ColumnPlan {
         // Shapes are interned in the order rows first use them, so walking
         // them in index order meets keys in first-seen order.
         let modal = (0..rows_of.len()).max_by_key(|&s| (rows_of[s], std::cmp::Reverse(s)));
-        let mut index: HashMap<Rc<str>, u32> = HashMap::new();
+        let mut index: HashMap<Arc<str>, u32> = HashMap::new();
         let mut names = Vec::new();
         for s in modal.into_iter().chain(0..block.shapes.len()) {
             for key in &block.shapes[s] {

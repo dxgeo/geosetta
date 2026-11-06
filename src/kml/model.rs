@@ -23,7 +23,7 @@
 
 use std::borrow::Cow;
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::Result;
 use crate::xml::{self, Builder, Content, Parsed, Tree, XmlAttr, XmlElement};
@@ -174,7 +174,7 @@ pub(crate) struct KmlDocument {
     pub after: Vec<Content>,
     /// The root element's namespace URI, which version detection reads. Not
     /// written: the root's declarations are among its attributes.
-    pub root_ns: Option<Rc<str>>,
+    pub root_ns: Option<Arc<str>>,
 }
 
 impl Node {
@@ -252,7 +252,7 @@ impl Node {
         let at = self.content.iter().position(|(_, c)| matches!(c, Content::Text(_)));
         self.content.retain(|(_, c)| !matches!(c, Content::Text(_)));
         if !text.is_empty() {
-            self.content.insert(at.unwrap_or(0), (0, Content::Text(Rc::from(text))));
+            self.content.insert(at.unwrap_or(0), (0, Content::Text(Arc::from(text))));
         }
     }
 
@@ -290,7 +290,7 @@ impl Node {
     }
 
     /// The text run at `index` in [`Node::content`], shared.
-    fn run(&self, index: usize) -> &Rc<str> {
+    fn run(&self, index: usize) -> &Arc<str> {
         match &self.content[index].1 {
             Content::Text(t) => t,
             _ => unreachable!("a lead is a text run"),
@@ -341,7 +341,7 @@ impl Node {
     /// inside is laid out too: a sibling's indentation, and its habit — a
     /// sibling that keeps its inside on one line is copied in that — or,
     /// with no sibling indented, one unit past this node's end tag.
-    pub fn lead_at(&self, at: usize, layout: &Layout) -> Option<(Rc<str>, bool)> {
+    pub fn lead_at(&self, at: usize, layout: &Layout) -> Option<(Arc<str>, bool)> {
         let len = self.children.len();
         let sibling = [at, at.wrapping_sub(1)]
             .into_iter()
@@ -352,7 +352,7 @@ impl Node {
             return Some((self.run(run).clone(), !self.children[i].keeps_inside_on_one_line()));
         }
         let closing = self.content.last().filter(|(i, c)| *i == len && c.is_space())?.1.text()?;
-        closing.contains('\n').then(|| (Rc::from(format!("{closing}{}", layout.unit)), true))
+        closing.contains('\n').then(|| (Arc::from(format!("{closing}{}", layout.unit)), true))
     }
 
     /// Put this node and every KML node under it in `prefix` — for a node
@@ -483,7 +483,7 @@ fn identify(name: &str, prefix: Option<&str>, ns: Option<&str>) -> Option<(KmlEl
 /// The [`Builder`] behind [`parse_with`].
 struct Raiser<'s, 'f> {
     source: &'s str,
-    last_ns: Option<Rc<str>>,
+    last_ns: Option<Arc<str>>,
     /// The elements open, from the root down to the one being read, each
     /// identified as its start tag is.
     open: Vec<Option<(KmlElement, Spelling)>>,

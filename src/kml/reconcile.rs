@@ -13,7 +13,7 @@
 //! parent puts it, which 2.3's unordered groups also accept.
 
 use std::fmt::Write as _;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::crs::Crs;
 use crate::feature::{FeatureCollection, FeatureRef};
@@ -73,12 +73,12 @@ pub(crate) fn assemble<'f>(
         .or_else(|| features.iter().find_map(|(_, m)| Layout::of(&(*m)?.node)))
         .filter(|_| !compact);
     let w = Writing { prefix: skeleton.doc.root.prefix.as_deref(), version, ctx: &ctx, layout: layout.as_ref() };
-    let lead_of = |m: &FeatureModel| m.leading.last().filter(|c| c.is_space()).and_then(Content::text).map(Rc::from);
+    let lead_of = |m: &FeatureModel| m.leading.last().filter(|c| c.is_space()).and_then(Content::text).map(Arc::from);
     // How a feature added since the read is indented, and whether its inside
     // is laid out: as the last feature of the container it joins was, else
     // as the container lays out what it kept.
     let joins = document::default_container(&skeleton.doc.root);
-    let new_lead: Option<(Rc<str>, bool)> = layout.as_ref().and_then(|l| {
+    let new_lead: Option<(Arc<str>, bool)> = layout.as_ref().and_then(|l| {
         let sibling = features.iter().rev().filter_map(|(_, m)| *m).find(|m| m.address.container == joins);
         match sibling.and_then(|m| Some((lead_of(m)?, m))) {
             Some((lead, m)) => Some((lead, !m.node.keeps_inside_on_one_line())),
@@ -820,7 +820,7 @@ mod tests {
     use crate::feature::Feature;
     use crate::format::KmlVersion;
     use crate::json::JsonValue;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     const DOC: &str = r#"<kml xmlns="http://www.opengis.net/kml/2.2" xmlns:x="urn:x"><Document>
         <Style id="s"><LineStyle><width>3</width></LineStyle></Style>
@@ -855,7 +855,7 @@ mod tests {
         let at = f.properties.iter().position(|(k, _)| &**k == key);
         match (value, at) {
             (Some(v), Some(i)) => f.properties[i].1 = JsonValue::String(v.into()),
-            (Some(v), None) => f.properties.push((Rc::from(key), JsonValue::String(v.into()))),
+            (Some(v), None) => f.properties.push((Arc::from(key), JsonValue::String(v.into()))),
             (None, Some(i)) => {
                 f.properties.remove(i);
             }
@@ -947,7 +947,7 @@ mod tests {
         let mut fc = read(r#"<k:kml xmlns:k="http://www.opengis.net/kml/2.2"><k:Document><k:name>d</k:name></k:Document></k:kml>"#);
         fc.push(Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
-            properties: vec![(Rc::from("name"), JsonValue::String("new".into()))],
+            properties: vec![(Arc::from("name"), JsonValue::String("new".into()))],
             native: None,
         });
         let written = write_back(&fc);

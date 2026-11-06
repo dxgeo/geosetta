@@ -103,9 +103,19 @@ What was done, in order:
    =table/=, and =../architecture.org='s caller-linked seam.
    =summary.org= is a dated record and is left as it was.
 
+** THE API REVIEW -- 2026-11-06
+The review owed before the breaking release, and all nine of its changes, are
+=columnar.org= D-C18: keys are =Arc<str>= so a collection is =Send= and =Sync=,
+=Value::to_owned= is =to_json_value=, =ColumnRef= and =ColumnValues= borrow only
+the collection, =set= takes =impl Into<JsonValue>=, =keys()= exists, =Debug=
+hides the blocks, and the missing exports and standard traits are in.
+=tests/public_api.rs= pins each. Not reviewed: =pipeline=, =cli=, the =Native=
+payloads, =Error= and =Format=. =cli= is public and worth a look before release.
+
 ** NEXT
 - Merging =columnar-ir= into =main=, and the breaking release it implies,
-  are the owner's (=columnar.org= C5, /Open/).
+  are the owner's (=columnar.org= C5, /Open/). The release wants the migration
+  note § RISKS asks for, covering D-C18's breaks too.
 - The open list is =plans/todo.org=. Its next entry is
   =cross-format-audit.org= A2 (=bench/audit.py=); A1 was built 2026-10-31
   with =library-warnings.org= L1. F6 there now holds a GeoPackage FID
@@ -113,11 +123,12 @@ What was done, in order:
   whether the audit owns them is still its call.
 - =multi-geometry-columns.org= M1 is unblocked by C6 and due its redesign
   against =GeometryColumn= and =GeometryBuilder=.
-- Decided and built, uncommitted: =GeometryRef='s public reading surface
-  (=columnar.org= D-C17). =shape()= and opaque =Shape=/=Run=/=Rings=/
+- Decided and built, committed as c8f7ba5: =GeometryRef='s public reading
+  surface (=columnar.org= D-C17). =shape()= and opaque =Shape=/=Run=/=Rings=/
   =Parts=/=Members= views, exported from =geosetta::geometry=, with
   =tests/nazca_sink.rs= driving nazca's =Sink= through them (nazca a
-  dev-dependency of that test). =Shape::Collection= is now
+  dev-dependency of that test, from crates.io, so that a clone of this repo
+  alone builds). =Shape::Collection= is now
   =GeometryCollection=, its members =GeometryRef=s.
   =LAYOUTS=auto,rows,columns python3 bench/equiv.py= against 2491146:
   8 991 identical.
@@ -141,5 +152,11 @@ What was done, in order:
 - =tests/budgets.rs= prints what each case measures only with
   =GEOSETTA_BUDGET_REPORT=1= /and/ =-- --nocapture=; the numbers are the
   same in debug and release.
+- =tests/nazca_sink.rs= runs against nazca from crates.io, even inside the
+  workspace, not the =../nazca= beside it: a change there reaches the test
+  only after a release, or through a =[patch.crates-io]= in the workspace root.
+- =equiv.py= cannot build a pin at c8f7ba5: that commit's manifest names
+  =../nazca= by path, which a =git archive= does not hold. Pin 2491146 or
+  anything after the manifest moved to crates.io instead.
 - =compare.py= takes =BIN== for another binary; run it with =VERIFY=0= for a
   pin to save the =ogr2ogr= read-back, and never two runs at once.

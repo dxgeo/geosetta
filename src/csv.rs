@@ -20,7 +20,7 @@ use crate::table::Layout;
 use crate::geometry::{from_wkt, wkt_ref};
 use crate::json::JsonValue;
 use crate::schema::Cell;
-use std::rc::Rc;
+use std::sync::Arc;
 
 const GEOMETRY_NAMES: [&str; 4] = ["geometry", "geom", "wkt", "the_geom"];
 
@@ -37,8 +37,8 @@ pub fn read(bytes: &[u8], layout: Layout) -> Result<FeatureCollection> {
         .iter()
         .position(|h| GEOMETRY_NAMES.contains(&h.trim().to_ascii_lowercase().as_str()));
 
-    // Intern each property column's key once so every row shares one `Rc`.
-    let keys: Vec<Rc<str>> = header.iter().map(|name| Rc::from(name.as_str())).collect();
+    // Intern each property column's key once so every row shares one `Arc`.
+    let keys: Vec<Arc<str>> = header.iter().map(|name| Arc::from(name.as_str())).collect();
 
     // D17's gate decides per *column*, not per cell: one cell whose text this
     // spoke's writer cannot reproduce types the whole column as text. A ZIP
@@ -59,7 +59,7 @@ pub fn read(bytes: &[u8], layout: Layout) -> Result<FeatureCollection> {
         .collect();
 
     let properties: Vec<usize> = (0..keys.len()).filter(|&i| Some(i) != geom_col).collect();
-    let mut table = Tabular::new(properties.iter().map(|&i| Rc::clone(&keys[i])).collect(), layout);
+    let mut table = Tabular::new(properties.iter().map(|&i| Arc::clone(&keys[i])).collect(), layout);
     for row in &rows[1..] {
         if row.iter().all(|f| f.is_empty()) {
             continue; // blank line

@@ -54,6 +54,9 @@ today's (D-C16). A block's geometry is flat or owned, the API hands out an
 owned =Geometry= to edit, and C6 pins the edit contract before it changes
 any storage, and stops after measuring if geometry is not worth it.
 
+Revised 2026-11-06: the public-API review owed before the breaking release
+is done (D-C18). Keys are =Arc<str>=, so a collection is =Send= and =Sync=.
+
 ** WHY
 The hub stores a collection as rows: =FeatureCollection { features:
 Vec<Feature> }=, and each =Feature= owns =properties: Vec<(Rc<str>,
@@ -258,7 +261,8 @@ explicit:
   =set_geometry(row, ..)=, =retain(|row| ..)=, =permute(&order)=, and the
   column-sized and per-block edits of D-C12.
 - =Value<'_>= is a borrowed cell (=Null=, =Bool=, =Int=, =Float=, =Str(&str)=,
-  =Binary(&[u8])=, =Json(&JsonValue)=) with =to_owned() -> JsonValue=.
+  =Binary(&[u8])=, =Json(&JsonValue)=) with =to_owned() -> JsonValue=
+  (=to_json_value= since D-C18, which also has =set= take =impl Into<JsonValue>=).
 
 *This is a breaking release.* =fc.features= goes private in C1, behind the
 stopgap accessors of D-C15; C5 replaces those with the views above, and
@@ -594,6 +598,76 @@ no per-coordinate work. =tests/nazca_sink.rs= is that adapter, checked
 against nazca's own WKB reader under every layout and after edits, with
 nazca a dev-dependency of the test only (=../architecture.org=). Exported
 from =geosetta::geometry=, beside =Geometry= and =Position=.
+
+*** D-C18 -- the API as released: the review before the breaking release
+/Decided 2026-11-06 (user decision)./ The review C5 and § OPEN QUESTIONS owed,
+over the collection, its views and the geometry views, with each problem first
+compiled from a crate outside this one. =pipeline=, =cli=, the =Native= payloads,
+=Error= and =Format= were not part of it.
+
+/Kept:/
+- *=Value<'_>= for reads, =JsonValue= for edits.* Borrowed reads are what the
+  views are for, and an edit has to own what it stores; only the conversion
+  between them was wanting.
+- *=FieldDecl= matched by name.* A column's type can differ from block to block
+  (D-C10), so there is no one =Column= to hold a declaration, and =schema= is a
+  public field a caller edits, in which an entry naming no property is inert.
+- *=Feature= open to struct literals*, which is how a caller builds one, without
+  =#[non_exhaustive]=. =multi-geometry-columns.org='s =extra_geometries= will be
+  a break of its own, which costs nothing before 1.0.
+- =retain= without an index, as =Vec::retain=; =row(i)= and =set= panicking out
+  of bounds, as documented.
+
+/Changed, breaking:/
+1. *=Rc<str>= became =Arc<str>= throughout*, in =Feature::properties=,
+   =edit_properties= and =FeatureProperties= among others, along with KML's
+   =Rc<FeatureModel>=. A collection was neither =Send= nor =Sync=, so a caller
+   could not read one on a worker thread and hand it back, scan one in parallel,
+   or hold one across an =.await= on a multithreaded runtime. =Rc= was chosen when
+   every row cloned its keys; the keys now live per column or per shape.
+   =tests/edits.rs= changed by the one line naming the type, the one exception to
+   D-C16's "passes unchanged".
+2. *=Value::to_owned= became =to_json_value=*, as =to_feature= and =to_geometry=
+   are named. =Value= is =Clone=, so =vs.iter().map(|v| v.to_owned())= found
+   =ToOwned= and gave another =Value=.
+3. *=column(key)= no longer borrows =key=.* =ColumnRef= owns it, and shares its
+   slots, so a clone is two reference counts.
+4. *=ColumnValues= no longer borrows its =ColumnRef=* and has one lifetime, so
+   =let v = fc.column("n").values();= compiles. =ColumnRef= and =&ColumnRef= are
+   =IntoIterator=. A block's slot is looked up per cell rather than held.
+
+/Added:/
+5. =set= takes =impl Into<JsonValue>=, from =bool=, =i32=, =u32=, =i64=, =f64=,
+   =&str=, =String=, =&[u8]=, =Vec<u8>= and =Value=: only what is exact, so no
+   =u64=, which could outrun =Int=.
+6. *=keys()=*: every key any feature holds, once, in first-seen order. Nothing
+   could list them, and =column("nope")= looks like a column every feature lacks.
+   It is =Table::key_kinds=, the writers' own, whose row scan after an edit or a
+   selection is what keeps it true; =tests/public_api.rs= checks it against the
+   rows after each kind of edit, under each layout.
+7. =Debug= for =FeatureCollection= and =ColumnRef= prints features and values,
+   not blocks, so every layout prints the same (D-C9).
+8. =GeometryRef= is also exported from =geosetta::geometry=, and =Shape=, =Run=,
+   =Rings=, =Parts= and =Members= from the crate root.
+9. =&FeatureCollection: IntoIterator=, =FromIterator<Feature>=, =Extend<Feature>=;
+   =FeatureRefs= is =DoubleEndedIterator= and =Clone=; =FeatureProperties= is
+   =Clone= and =Debug= and has a =size_hint=.
+
+/Measured/, the same machine, 15 runs each, interleaved, medians against the same
+tree before these changes; output identical (=LAYOUTS=auto,rows,columns=
+=equiv.py= against 2491146: 8 991 identical; =cargo test=: 881):
+| conversion                     | before (ms) | after (ms) |     |
+|--------------------------------+-------------+------------+-----|
+| narrow =geojson→parquet=       |       273.1 |      267.6 | -2.0% |
+| wide =geojson→parquet=         |       593.0 |      582.5 | -1.8% |
+| ragged =geojson→parquet=       |       373.1 |      369.2 | -1.0% |
+| ragged =geojson→fgb=           |       454.9 |      452.3 | -0.6% |
+| wide =parquet→geojson=         |       356.6 |      361.2 | +1.3% |
+| narrow =parquet→geojson=       |       173.8 |      174.2 | +0.2% |
+| narrow =geojson→geojson=       |       335.3 |      330.7 | -1.4% |
+Within noise (narrow is 300 000 rows of 4 properties, wide 30 000 of 200, ragged
+300 000 with one row in four shuffled). Not timed: what clones keys for every
+row, =to_feature= and =edit_feature=, where an atomic count would show first.
 
 ** HOW EACH FORMAT FITS
 | format      | fit                | notes                                                                                                                                           |
@@ -1398,7 +1472,8 @@ drift, and step 2's test aims at it directly.
   after every kind of edit in D-C12.
 - Every attribute of a feature is editable through the public API as
   ordinary Rust on owned data, every edit today's API allows is still
-  possible after C6, and =tests/edits.rs= passes unchanged (D-C16).
+  possible after C6, and =tests/edits.rs= passes unchanged (D-C16), but for
+  the one line naming =Arc= (D-C18).
 
 ** RISKS
 - *Scope.* 79 uses of =.features= in =convert.rs= alone, every spoke's
@@ -1464,8 +1539,8 @@ drift, and step 2's test aims at it directly.
   not materialized rows, so it costs time, not memory.
 
 ** OPEN QUESTIONS
-/Revisited 2026-11-05, with C0--C6 built./ Six of the eight are answered
-by what was built; two stay open.
+/Revisited 2026-11-05, with C0--C6 built, and 2026-11-06 (D-C18)./ Seven of
+the eight are answered; one stays open.
 
 - =RowShapes= and =RowNatives= as sorted vectors or maps: decide by
   profiling a ragged GeoJSON. Per block (D-C10), and never re-sorted under
@@ -1504,12 +1579,12 @@ by what was built; two stay open.
   sit beside it? D-C8 assumes beside.
   /Answered by C5: beside./ Reads hand out =Value<'_>= (=get=,
   =properties()=, =map_column='s argument); edits take =JsonValue= (=set=,
-  =set_column=, =edit_properties=). Whether that split is the one to
-  release with is part of the public-API review before the breaking
-  release.
+  =set_column=, =edit_properties=). Kept for the release by D-C18, with a
+  =From= between them.
 - Should =FieldDecl= move onto =Column= (a column's declaration is a fact
   about the column), or stay matched by name as =columns_for= does?
-  /Open./ =columns_for= still matches by name (=schema.rs=).
+  /Answered by D-C18: by name./ =columns_for= matches so (=schema.rs=), and a
+  column's type can differ from block to block.
 
 ** ALTERNATIVES CONSIDERED
 *** Keep the row IR

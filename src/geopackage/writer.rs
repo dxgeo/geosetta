@@ -3446,7 +3446,7 @@ mod tests {
         // Read it back the way a pipeline would, drop the middle feature, and
         // write it into the same GeoPackage using only the name the IR carries.
         let mut edited = read_layers(&bytes).unwrap().remove(0).1;
-        edited.retain(|f| f.properties().next().unwrap().1.to_owned().as_f64() != Some(2.0));
+        edited.retain(|f| f.properties().next().unwrap().1.to_json_value().as_f64() != Some(2.0));
         let name = edited.name.clone().expect("the reader names the layer");
         let after = write_layers(Some(&bytes), &[(name, edited)], &Carried::default(), false, false).unwrap();
 

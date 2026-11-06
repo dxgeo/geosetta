@@ -31,7 +31,7 @@ pub use geometry::{GeometryRef, Members, MembersIter, Parts, PartsIter, Rings, R
 pub(crate) use geometry::{GeometryBuilder, Kind, RowGeometry};
 pub use value::Value;
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Which form a table's blocks take (`plans/columnar.org` D-C14).
 ///
@@ -108,7 +108,7 @@ impl Table {
     /// column is spread over the blocks and dropped before the next is asked
     /// for, so the reader never holds two.
     pub(crate) fn from_columns<E>(
-        keys: Vec<Rc<str>>,
+        keys: Vec<Arc<str>>,
         rows: usize,
         mut geometry: impl FnMut(&mut GeometryBuilder) -> Result<(), E>,
         mut columns: impl FnMut(usize) -> Result<Vec<JsonValue>, E>,
@@ -191,14 +191,14 @@ impl Table {
     /// the rows are as sealed. Once a selection reorders them or a patch
     /// changes them, row by row in logical order, which is what the row
     /// inference costs.
-    pub(crate) fn key_kinds(&self) -> Vec<(&Rc<str>, Kinds)> {
+    pub(crate) fn key_kinds(&self) -> Vec<(&Arc<str>, Kinds)> {
         #[derive(Default)]
         struct Keys<'a> {
             index: HashMap<&'a str, usize>,
-            keys: Vec<(&'a Rc<str>, Kinds)>,
+            keys: Vec<(&'a Arc<str>, Kinds)>,
         }
         impl<'a> Keys<'a> {
-            fn note(&mut self, key: &'a Rc<str>, kinds: Kinds) {
+            fn note(&mut self, key: &'a Arc<str>, kinds: Kinds) {
                 let next = self.keys.len();
                 let at = *self.index.entry(&**key).or_insert(next);
                 if at == next {
@@ -225,13 +225,13 @@ impl Table {
         keys.keys
     }
 
-    pub(crate) fn column<'a>(&'a self, key: &'a str) -> ColumnRef<'a> {
+    pub(crate) fn column(&self, key: &str) -> ColumnRef<'_> {
         self.columns(&[key]).pop().expect("one key, one column")
     }
 
     /// One [`ColumnRef`] for each of `keys`, located in every block in one
     /// pass over it, rather than a pass per key.
-    pub(crate) fn columns<'a>(&'a self, keys: &[&'a str]) -> Vec<ColumnRef<'a>> {
+    pub(crate) fn columns(&self, keys: &[&str]) -> Vec<ColumnRef<'_>> {
         let index: HashMap<&str, usize> = keys.iter().enumerate().map(|(i, &k)| (k, i)).collect();
         let mut slots: Vec<Vec<Slot>> = keys.iter().map(|_| Vec::with_capacity(self.blocks.len())).collect();
         for block in &self.blocks {
@@ -239,7 +239,7 @@ impl Table {
                 slots[k].push(slot);
             }
         }
-        keys.iter().zip(slots).map(|(&key, slots)| ColumnRef { table: self, key, slots }).collect()
+        keys.iter().zip(slots).map(|(&key, slots)| ColumnRef { table: self, key: key.into(), slots: slots.into() }).collect()
     }
 
     /// Keep the rows `keep` says to, in order. Records a selection (D-C11);
@@ -331,7 +331,7 @@ impl Table {
     pub(crate) fn edit_properties<R>(
         &mut self,
         i: usize,
-        f: impl FnOnce(&mut Vec<(Rc<str>, JsonValue)>) -> R,
+        f: impl FnOnce(&mut Vec<(Arc<str>, JsonValue)>) -> R,
     ) -> R {
         let (b, row) = self.locate(self.physical(i));
         self.blocks[b].edit_properties(row, f)
@@ -468,7 +468,7 @@ pub(crate) struct RowTableBuilder {
 /// The block a [`RowTableBuilder`] is filling.
 enum Filling {
     /// Every row so far holds `keys`, distinct, in this order.
-    Regular { keys: Box<[Rc<str>]>, block: TabularBlock },
+    Regular { keys: Box<[Arc<str>]>, block: TabularBlock },
     Rows(RowBuilder),
 }
 
@@ -490,7 +490,7 @@ impl RowTableBuilder {
     pub(crate) fn push_row(
         &mut self,
         geometry: RowGeometry<'_>,
-        properties: Vec<(Rc<str>, JsonValue)>,
+        properties: Vec<(Arc<str>, JsonValue)>,
         native: Option<Box<Native>>,
     ) {
         match &mut self.block {
@@ -507,7 +507,7 @@ impl RowTableBuilder {
                 rows.push_row(geometry, properties, native);
             }
             Filling::Rows(rows) if rows.len() == 0 && self.layout != Layout::Rows => {
-                let keys: Box<[Rc<str>]> = properties.iter().map(|(key, _)| key.clone()).collect();
+                let keys: Box<[Arc<str>]> = properties.iter().map(|(key, _)| key.clone()).collect();
                 if are_distinct(&keys) {
                     let mut block = TabularBlock::new(&keys);
                     block.push(geometry, properties.into_iter().map(|(_, value)| value), native);
@@ -547,16 +547,16 @@ impl RowTableBuilder {
 }
 
 /// Whether `properties` hold exactly `keys`, in order. A reader that interns
-/// its keys hands back the same `Rc`, which compares without reading text.
-fn holds(keys: &[Rc<str>], properties: &[(Rc<str>, JsonValue)]) -> bool {
-    keys.len() == properties.len() && keys.iter().zip(properties).all(|(a, (b, _))| Rc::ptr_eq(a, b) || a == b)
+/// its keys hands back the same `Arc`, which compares without reading text.
+fn holds(keys: &[Arc<str>], properties: &[(Arc<str>, JsonValue)]) -> bool {
+    keys.len() == properties.len() && keys.iter().zip(properties).all(|(a, (b, _))| Arc::ptr_eq(a, b) || a == b)
 }
 
 /// Builds a table from a tabular reader's rows (C2): every row holds every
 /// key, in declared order, so each block is filled a column per key and,
 /// its keys distinct, sealed as columns without a row ever being built.
 pub(crate) struct TableBuilder {
-    keys: Vec<Rc<str>>,
+    keys: Vec<Arc<str>>,
     distinct: bool,
     layout: Layout,
     sizes: Sizes,
@@ -565,11 +565,11 @@ pub(crate) struct TableBuilder {
 }
 
 impl TableBuilder {
-    pub(crate) fn new(keys: Vec<Rc<str>>, layout: Layout) -> TableBuilder {
+    pub(crate) fn new(keys: Vec<Arc<str>>, layout: Layout) -> TableBuilder {
         TableBuilder::sized(keys, layout, Sizes::DEFAULT)
     }
 
-    pub(crate) fn sized(keys: Vec<Rc<str>>, layout: Layout, sizes: Sizes) -> TableBuilder {
+    pub(crate) fn sized(keys: Vec<Arc<str>>, layout: Layout, sizes: Sizes) -> TableBuilder {
         let block = TabularBlock::new(&keys);
         TableBuilder { distinct: are_distinct(&keys), keys, layout, sizes, blocks: Vec::new(), block }
     }
@@ -602,7 +602,7 @@ impl TableBuilder {
 }
 
 /// Whether no key is declared twice.
-fn are_distinct(keys: &[Rc<str>]) -> bool {
+fn are_distinct(keys: &[Arc<str>]) -> bool {
     let mut seen = std::collections::HashSet::new();
     keys.iter().all(|k| seen.insert(&**k))
 }
@@ -637,7 +637,7 @@ impl<'a> RowRef<'a> {
     pub(crate) fn to_feature(self) -> Feature {
         Feature {
             geometry: self.geometry().map(GeometryRef::to_geometry),
-            properties: self.block.properties(self.row).map(|(k, v)| (k.clone(), v.to_owned())).collect(),
+            properties: self.block.properties(self.row).map(|(k, v)| (k.clone(), v.to_json_value())).collect(),
             native: self.native().map(|n| Box::new(n.clone())),
         }
     }
@@ -646,12 +646,15 @@ impl<'a> RowRef<'a> {
 /// One key down every row of a table (D-C8). A block's column for it may be
 /// typed differently from the next block's, or absent, or the block may be
 /// rows; this hides which.
-#[derive(Debug, Clone)]
+///
+/// It owns its key and shares its slots, so it borrows only the collection,
+/// and a clone costs two reference counts.
+#[derive(Clone)]
 pub struct ColumnRef<'a> {
     table: &'a Table,
-    key: &'a str,
+    key: Arc<str>,
     /// Per block, where it holds the key.
-    slots: Vec<Slot>,
+    slots: Arc<[Slot]>,
 }
 
 impl<'a> ColumnRef<'a> {
@@ -669,55 +672,82 @@ impl<'a> ColumnRef<'a> {
     pub fn get(&self, i: usize) -> Option<Value<'a>> {
         assert!(i < self.len(), "row {i} of a column of {}", self.len());
         let (b, row) = self.table.locate(self.table.physical(i));
-        self.table.blocks[b].value_at(row, &self.slots[b], self.key)
+        self.table.blocks[b].value_at(row, &self.slots[b], &self.key)
     }
 
     /// [`Self::get`] for every row, in order: a block at a time where the
     /// table has no selection, so a cell costs neither a search for its
     /// block nor, in a block no edit has reached, a look at the patch.
-    pub fn values(&self) -> ColumnValues<'_, 'a> {
-        ColumnValues { column: self, i: 0, len: self.len(), block: 0, current: None, row: 0 }
+    pub fn values(&self) -> ColumnValues<'a> {
+        self.clone().into_iter()
+    }
+}
+
+impl std::fmt::Debug for ColumnRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ColumnRef")
+            .field("key", &self.key)
+            .field("values", &self.values().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl<'a> IntoIterator for ColumnRef<'a> {
+    type Item = Option<Value<'a>>;
+    type IntoIter = ColumnValues<'a>;
+
+    fn into_iter(self) -> ColumnValues<'a> {
+        let len = self.len();
+        ColumnValues { column: self, i: 0, len, block: 0, current: None, row: 0 }
+    }
+}
+
+impl<'a> IntoIterator for &ColumnRef<'a> {
+    type Item = Option<Value<'a>>;
+    type IntoIter = ColumnValues<'a>;
+
+    fn into_iter(self) -> ColumnValues<'a> {
+        self.values()
     }
 }
 
 /// [`ColumnRef::values`].
 #[derive(Clone)]
-pub struct ColumnValues<'c, 'a> {
-    column: &'c ColumnRef<'a>,
+pub struct ColumnValues<'a> {
+    column: ColumnRef<'a>,
     /// The next logical row, and how many there are.
     i: usize,
     len: usize,
-    /// Without a selection: the block being read, as its index, the block,
-    /// where it holds the key and whether an edit has reached it; and the
-    /// row in it next.
+    /// Without a selection: the block being read, as its index, the block
+    /// and whether an edit has reached it; and the row in it next.
     block: usize,
-    current: Option<(&'a Block, &'c Slot, bool)>,
+    current: Option<(&'a Block, bool)>,
     row: usize,
 }
 
-impl ExactSizeIterator for ColumnValues<'_, '_> {}
+impl ExactSizeIterator for ColumnValues<'_> {}
 
-impl<'a> Iterator for ColumnValues<'_, 'a> {
+impl<'a> Iterator for ColumnValues<'a> {
     type Item = Option<Value<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let column = self.column;
-        let table = column.table;
+        let table = self.column.table;
         if self.i == self.len {
             return None;
         }
         self.i += 1;
         if table.selection.is_some() {
-            return Some(column.get(self.i - 1));
+            return Some(self.column.get(self.i - 1));
         }
         loop {
-            if let Some((block, slot, patched)) = self.current
+            if let Some((block, patched)) = self.current
                 && self.row < block.len()
             {
                 let row = self.row;
                 self.row += 1;
+                let slot = &self.column.slots[self.block];
                 return Some(match patched {
-                    true => block.value_at(row, slot, column.key),
+                    true => block.value_at(row, slot, &self.column.key),
                     false => block.sealed_value_at(row, slot),
                 });
             }
@@ -725,7 +755,7 @@ impl<'a> Iterator for ColumnValues<'_, 'a> {
                 self.block += 1;
             }
             let block = &table.blocks[self.block];
-            self.current = Some((block, &column.slots[self.block], block.is_patched()));
+            self.current = Some((block, block.is_patched()));
             self.row = 0;
         }
     }
@@ -743,12 +773,12 @@ mod tests {
     use crate::json::JsonValue;
     use crate::native::{Native, NativePayload};
     use crate::format::Format;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     fn feature(props: &[(&str, JsonValue)]) -> Feature {
         Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
-            properties: props.iter().map(|(k, v)| (Rc::from(*k), v.clone())).collect(),
+            properties: props.iter().map(|(k, v)| (Arc::from(*k), v.clone())).collect(),
             native: None,
         }
     }
@@ -880,14 +910,14 @@ mod tests {
             assert!(view.to_feature() == *row, "{what}: row {i}");
             assert_eq!(view.geometry().map(GeometryRef::to_geometry), row.geometry, "{what}: row {i}");
             assert_eq!(view.native(), row.native.as_deref(), "{what}: row {i}");
-            let listed: Vec<(&str, JsonValue)> = view.properties().map(|(k, v)| (&**k, v.to_owned())).collect();
+            let listed: Vec<(&str, JsonValue)> = view.properties().map(|(k, v)| (&**k, v.to_json_value())).collect();
             let expected: Vec<(&str, JsonValue)> = row.properties.iter().map(|(k, v)| (&**k, v.clone())).collect();
             assert!(listed == expected, "{what}: row {i}");
             for (key, column) in keys.iter().zip(&columns) {
                 // The first value under the key, as `schema.rs` reads a repeat.
                 let first = row.properties.iter().find(|(k, _)| &**k == *key).map(|(_, v)| v.clone());
-                assert!(view.get(key).map(Value::to_owned) == first, "{what}: row {i} get {key}");
-                assert!(column.get(i).map(Value::to_owned) == first, "{what}: row {i} column {key}");
+                assert!(view.get(key).map(Value::to_json_value) == first, "{what}: row {i} get {key}");
+                assert!(column.get(i).map(Value::to_json_value) == first, "{what}: row {i} column {key}");
             }
         }
         // The cursor a writer reads a column through says what `get` does.
@@ -957,7 +987,7 @@ mod tests {
         pub(super) fn set(row: &mut Feature, key: &str, value: JsonValue) {
             match row.properties.iter_mut().find(|(k, _)| &**k == key) {
                 Some((_, held)) => *held = value,
-                None => row.properties.push((Rc::from(key), value)),
+                None => row.properties.push((Arc::from(key), value)),
             }
         }
 
@@ -1088,7 +1118,7 @@ mod tests {
                                 Some(other) => Some(other),
                                 None => (i % 2 == 0).then_some(JsonValue::Int(1)),
                             };
-                            table.map_column(&key, |i, old| f(i, old.map(Value::to_owned)));
+                            table.map_column(&key, |i, old| f(i, old.map(Value::to_json_value)));
                             for (i, row) in model.iter_mut().enumerate() {
                                 match f(i, model::get(row, &key).cloned()) {
                                     Some(value) => model::set(row, &key, value),
@@ -1110,16 +1140,16 @@ mod tests {
                             let (how, at) = (rng.below(4), rng.below(model[i].properties.len() + 1));
                             let mut order: Vec<usize> = (0..model[i].properties.len()).collect();
                             rng.shuffle(&mut order);
-                            let edit = |ps: &mut Vec<(Rc<str>, JsonValue)>| match how {
+                            let edit = |ps: &mut Vec<(Arc<str>, JsonValue)>| match how {
                                 0 => {
                                     let mut slots: Vec<_> = std::mem::take(ps).into_iter().map(Some).collect();
                                     *ps = order.iter().map(|&j| slots[j].take().unwrap()).collect();
                                 }
                                 1 if !ps.is_empty() => {
                                     let last = ps.len() - 1;
-                                    ps[at.min(last)].0 = Rc::from(&*key);
+                                    ps[at.min(last)].0 = Arc::from(&*key);
                                 }
-                                2 => ps.insert(at, (Rc::from(&*key), value.clone())),
+                                2 => ps.insert(at, (Arc::from(&*key), value.clone())),
                                 _ => {}
                             };
                             table.edit_properties(i, edit);
@@ -1136,7 +1166,7 @@ mod tests {
                             let (modulus, key) = (2 + rng.below(3), some_key(&mut rng, &model));
                             let edit = |i: usize, f: &mut Feature| {
                                 if i % modulus == 0 {
-                                    f.properties.push((Rc::from(&*key), JsonValue::Int(i as i64)));
+                                    f.properties.push((Arc::from(&*key), JsonValue::Int(i as i64)));
                                     f.geometry = None;
                                 }
                             };

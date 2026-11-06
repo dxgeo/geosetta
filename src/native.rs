@@ -39,7 +39,7 @@
 
 use crate::format::{Format, KmlVersion};
 use crate::json::JsonValue;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Verbatim, unmodelled content recovered by a reader, tagged with the format
 /// that produced it.
@@ -98,9 +98,9 @@ pub enum NativePayload {
     /// GeoJSON members the reader skipped, in source order: `id`, `bbox`, and
     /// any foreign member, at whichever level the [`Native`] is attached to.
     ///
-    /// Keys are `Rc<str>` to match [`crate::Feature::properties`], since a
+    /// Keys are `Arc<str>` to match [`crate::Feature::properties`], since a
     /// foreign member repeated across every feature is the common shape.
-    GeoJson(Vec<(Rc<str>, JsonValue)>),
+    GeoJson(Vec<(Arc<str>, JsonValue)>),
     /// FlatGeobuf header and sub-table members with no IR slot. Collection
     /// level only — FlatGeobuf's per-*feature* unmodelled surface is the
     /// `Feature.columns` schema override, which nothing observed emits.
@@ -164,7 +164,7 @@ pub struct KmlNative {
     /// index into this skeleton, so a caller changing it could send features
     /// to the wrong folder without a word. Unlike the other natives, which
     /// are flat members with nothing to keep consistent.
-    pub(crate) document: Option<Rc<crate::kml::document::Skeleton>>,
+    pub(crate) document: Option<Arc<crate::kml::document::Skeleton>>,
     /// A layered `.kmz`'s other documents — GDAL's `layers/*.kml` beside a
     /// `doc.kml` of network links — each with its own skeleton, so a `.kmz`
     /// write gives every document back (`plans/same-format-fidelity.org`
@@ -173,7 +173,7 @@ pub struct KmlNative {
     /// The archive a `.kmz` read came from (`plans/same-format-fidelity.org`
     /// M3c): its overlay images, icons and model files, so a `.kmz` write
     /// gives them back. `None` for a `.kml` read.
-    pub archive: Option<Rc<KmzArchive>>,
+    pub archive: Option<Arc<KmzArchive>>,
     /// What the features' elements held that a write to another format
     /// cannot carry, tallied as a read that kept none of them left each out
     /// (`plans/performance.org`, KML's read). Zero for a read that kept them,
@@ -233,7 +233,7 @@ pub struct KmzEntry {
 /// Opaque, for the reason [`KmlNative`]'s `document` is.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KmlFeatureNative {
-    pub(crate) feature: Rc<crate::kml::document::FeatureModel>,
+    pub(crate) feature: Arc<crate::kml::document::FeatureModel>,
     /// Which of the source's documents it was read from: 0 for the first, `n`
     /// for `KmlNative`'s `layers[n - 1]`.
     pub(crate) document: usize,
@@ -518,7 +518,7 @@ mod tests {
         Native::new(
             Format::GeoJson,
             NativePayload::GeoJson(vec![(
-                Rc::from("id"),
+                Arc::from("id"),
                 JsonValue::Int(42),
             )]),
         )

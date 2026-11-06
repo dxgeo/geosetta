@@ -12,18 +12,20 @@ use crate::table::{
     ColumnRef, GeometryBuilder, GeometryRef, Layout, Properties, RowGeometry, RowRef, RowTableBuilder, Sizes, Table,
     TableBuilder, Value,
 };
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// A vector feature: an optional geometry plus ordered properties.
 ///
-/// Property keys are `Rc<str>` rather than `String` so that a column name
+/// Property keys are `Arc<str>` rather than `String` so that a column name
 /// repeated across every row is allocated once and shared (a refcount bump per
 /// cell), not re-allocated per feature — the dominant cost on wide tables.
+/// `Arc` rather than `Rc`, so a collection can move between threads and be read
+/// from several (`plans/columnar.org` D-C18).
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Feature {
     pub geometry: Option<Geometry>,
     /// Property members, in order. Empty when there are no properties.
-    pub properties: Vec<(Rc<str>, JsonValue)>,
+    pub properties: Vec<(Arc<str>, JsonValue)>,
     /// What this feature's source recorded that the two fields above cannot
     /// hold — a GeoJSON `id`, a foreign member — kept verbatim and tagged with
     /// the format that produced it, so only that format's writer replays it.
@@ -47,7 +49,7 @@ pub struct Feature {
 /// [`Self::edit_properties`], [`Self::edit_feature`] and their bulk forms;
 /// D-C16). How the blocks hold them is never visible: every [`Layout`] reads
 /// and writes the same features.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct FeatureCollection {
     table: Table,
     /// The coordinate reference system the geometries are expressed in, as
@@ -136,17 +138,29 @@ impl std::fmt::Debug for FeatureRef<'_> {
 }
 
 /// [`FeatureRef::properties`]: each key and its value, borrowed.
+#[derive(Clone)]
 pub struct FeatureProperties<'a>(Properties<'a>);
 
 impl<'a> Iterator for FeatureProperties<'a> {
-    type Item = (&'a Rc<str>, Value<'a>);
+    type Item = (&'a Arc<str>, Value<'a>);
 
     fn next(&mut self) -> Option<Self::Item> {
         self.0.next()
     }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl std::fmt::Debug for FeatureProperties<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list().entries(self.clone()).finish()
+    }
 }
 
 /// [`FeatureCollection::rows`].
+#[derive(Clone)]
 pub struct FeatureRefs<'a> {
     table: &'a Table,
     rows: std::ops::Range<usize>,
@@ -164,7 +178,50 @@ impl<'a> Iterator for FeatureRefs<'a> {
     }
 }
 
+impl DoubleEndedIterator for FeatureRefs<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.rows.next_back().map(|i| FeatureRef(self.table.row(i)))
+    }
+}
+
 impl ExactSizeIterator for FeatureRefs<'_> {}
+
+impl<'a> IntoIterator for &'a FeatureCollection {
+    type Item = FeatureRef<'a>;
+    type IntoIter = FeatureRefs<'a>;
+
+    fn into_iter(self) -> FeatureRefs<'a> {
+        self.rows()
+    }
+}
+
+impl FromIterator<Feature> for FeatureCollection {
+    fn from_iter<I: IntoIterator<Item = Feature>>(features: I) -> FeatureCollection {
+        FeatureCollection::from_features(features.into_iter().collect())
+    }
+}
+
+impl Extend<Feature> for FeatureCollection {
+    fn extend<I: IntoIterator<Item = Feature>>(&mut self, features: I) {
+        for feature in features {
+            self.push(feature);
+        }
+    }
+}
+
+/// The collection's features and its own fields, however its blocks hold
+/// them: every [`Layout`] prints the same (`plans/columnar.org` D-C9).
+impl std::fmt::Debug for FeatureCollection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FeatureCollection")
+            .field("features", &self.rows().collect::<Vec<_>>())
+            .field("crs", &self.crs)
+            .field("name", &self.name)
+            .field("schema", &self.schema)
+            .field("native", &self.native)
+            .finish()
+    }
+}
 
 /// What a reader with no schema fills (C3): its features, one at a time,
 /// into blocks sealed under the layout asked for.
@@ -184,7 +241,7 @@ impl Collecting {
     pub(crate) fn push_built(
         &mut self,
         geometry: &mut GeometryBuilder,
-        properties: Vec<(Rc<str>, JsonValue)>,
+        properties: Vec<(Arc<str>, JsonValue)>,
         native: Option<Box<Native>>,
     ) {
         self.0.push_row(RowGeometry::Built(geometry), properties, native);
@@ -200,7 +257,7 @@ impl Collecting {
 pub(crate) struct Tabular(TableBuilder);
 
 impl Tabular {
-    pub(crate) fn new(keys: Vec<Rc<str>>, layout: Layout) -> Tabular {
+    pub(crate) fn new(keys: Vec<Arc<str>>, layout: Layout) -> Tabular {
         Tabular(TableBuilder::new(keys, layout))
     }
 
@@ -226,7 +283,7 @@ impl Tabular {
     /// column is moved into the blocks and dropped before the next is asked
     /// for, so the reader never holds two.
     pub(crate) fn from_columns(
-        keys: Vec<Rc<str>>,
+        keys: Vec<Arc<str>>,
         rows: usize,
         geometry: impl FnMut(&mut GeometryBuilder) -> crate::Result<()>,
         columns: impl FnMut(usize) -> crate::Result<Vec<JsonValue>>,
@@ -267,8 +324,16 @@ impl FeatureCollection {
 
     /// Every feature's first value for `key`, in order: a column, whichever
     /// features hold the key and however each block holds it.
-    pub fn column<'a>(&'a self, key: &'a str) -> ColumnRef<'a> {
+    pub fn column(&self, key: &str) -> ColumnRef<'_> {
         self.table.column(key)
+    }
+
+    /// Every key any feature holds, once each, in the order the features
+    /// first use them. A [`Self::column`] of a key not listed here is every
+    /// feature's `None`. Reads the blocks once, more slowly after an edit or
+    /// a reorder, when it reads every feature: hold on to the result.
+    pub fn keys(&self) -> Vec<&Arc<str>> {
+        self.table.key_kinds().into_iter().map(|(key, _)| key).collect()
     }
 
     /// A collection holding `features`, in order, with no recorded CRS,
@@ -295,9 +360,9 @@ impl FeatureCollection {
     /// Give feature `i`'s first `key` the value `value`, in its place; a
     /// feature without the key gains it last. Panics when `i` is not below
     /// [`Self::len`].
-    pub fn set(&mut self, i: usize, key: &str, value: JsonValue) {
+    pub fn set(&mut self, i: usize, key: &str, value: impl Into<JsonValue>) {
         assert!(i < self.len(), "row {i} of a collection of {}", self.len());
-        self.table_mut().set(i, key, value);
+        self.table_mut().set(i, key, value.into());
     }
 
     /// Take every `key` out of feature `i`. Panics when `i` is not below
@@ -343,7 +408,7 @@ impl FeatureCollection {
     /// (`plans/columnar.org` D-C16); [`Self::set`] and [`Self::remove`] are
     /// the cheaper calls for the edits they make, and [`Self::map_column`]
     /// for a key every feature has.
-    pub fn edit_properties<R>(&mut self, i: usize, f: impl FnOnce(&mut Vec<(Rc<str>, JsonValue)>) -> R) -> R {
+    pub fn edit_properties<R>(&mut self, i: usize, f: impl FnOnce(&mut Vec<(Arc<str>, JsonValue)>) -> R) -> R {
         assert!(i < self.len(), "row {i} of a collection of {}", self.len());
         self.table_mut().edit_properties(i, f)
     }

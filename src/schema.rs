@@ -284,10 +284,10 @@ impl<'a> Column<'a> {
     }
 
     /// Every cell, in row order.
-    pub fn cells(&self) -> Cells<'_, 'a> {
+    pub fn cells(&self) -> Cells<'a> {
         match &self.source {
             #[cfg(test)]
-            Source::Rows { .. } => Cells::Rows(self, 0..self.len()),
+            Source::Rows { .. } => Cells::Rows((0..self.len()).map(|row| self.cell(row)).collect::<Vec<_>>().into_iter()),
             Source::Table(column) => Cells::Table(self.ty, column.values()),
         }
     }
@@ -295,19 +295,19 @@ impl<'a> Column<'a> {
 
 /// [`Column::cells`]: a table's column read a block at a time.
 #[derive(Clone)]
-pub enum Cells<'c, 'a> {
+pub enum Cells<'a> {
     #[cfg(test)]
-    Rows(&'c Column<'a>, std::ops::Range<usize>),
-    Table(ColumnType, ColumnValues<'c, 'a>),
+    Rows(std::vec::IntoIter<Cell<'a>>),
+    Table(ColumnType, ColumnValues<'a>),
 }
 
-impl<'a> Iterator for Cells<'_, 'a> {
+impl<'a> Iterator for Cells<'a> {
     type Item = Cell<'a>;
 
     fn next(&mut self) -> Option<Cell<'a>> {
         match self {
             #[cfg(test)]
-            Cells::Rows(column, rows) => rows.next().map(|row| column.cell(row)),
+            Cells::Rows(cells) => cells.next(),
             Cells::Table(ty, values) => values.next().map(|v| materialize(*ty, v)),
         }
     }
@@ -701,7 +701,7 @@ fn materialize(ty: ColumnType, value: Option<Value<'_>>) -> Cell<'_> {
             // string column is exactly where a byte column goes when the target
             // has no byte-level type of its own.
             Value::Json(other) => Cell::Str(Cow::Owned(other.to_json_string())),
-            other => Cell::Str(Cow::Owned(other.to_owned().to_json_string())),
+            other => Cell::Str(Cow::Owned(other.to_json_value().to_json_string())),
         },
         ColumnType::Binary => match value {
             Value::Binary(bytes) => Cell::Bytes(Cow::Borrowed(bytes)),
@@ -780,7 +780,7 @@ mod tests {
                     .as_object()
                     .unwrap()
                     .iter()
-                    .map(|(k, v)| (std::rc::Rc::from(k.as_str()), v.clone()))
+                    .map(|(k, v)| (std::sync::Arc::from(k.as_str()), v.clone()))
                     .collect(),
                 native: None,
             })

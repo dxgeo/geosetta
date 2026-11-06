@@ -32,7 +32,7 @@
 //! `kml22gx.xsd` (`d929409bfc6846c8430317c1c31435e65027882dd87610fc99489b71a1ac013e`)
 //! by `tests/fixtures/gen_kml22_order.py`.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::format::KmlVersion;
 use crate::kml::model::{Foreign, KmlDocument, KmlElement, Kind, Node, Spelling, GX_NS, GX_PREFIX, KML_NS};
@@ -201,7 +201,7 @@ pub(crate) fn lower(doc: &mut KmlDocument) -> Changes {
     }
     if doc.root_ns.is_none() {
         root.attrs.insert(0, ns_decl(None, KML_NS));
-        doc.root_ns = Some(Rc::from(KML_NS));
+        doc.root_ns = Some(Arc::from(KML_NS));
     }
     let prefixes = Prefixes { kml: root.prefix.clone(), gx: gx_prefix(&root.attrs) };
     let declared = prefixes.gx_declared(&root.attrs);
@@ -289,7 +289,7 @@ pub(crate) fn ns_decl(prefix: Option<&str>, uri: &str) -> XmlAttr {
         None => (None, "xmlns".to_string()),
         Some(p) => (Some("xmlns".to_string()), p.to_string()),
     };
-    XmlAttr { prefix, name, ns: Some(Rc::from(XMLNS_NS)), value: uri.to_string() }
+    XmlAttr { prefix, name, ns: Some(Arc::from(XMLNS_NS)), value: uri.to_string() }
 }
 
 /// Lower `node`'s children, `node` being `parent` as 2.2 spells it: respell

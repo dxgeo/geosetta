@@ -907,7 +907,7 @@ mod tests {
     fn every_descriptive_header_and_column_member_round_trips() {
         let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
-            properties: vec![(std::rc::Rc::from("a"), crate::json::JsonValue::String("x".into()))],
+            properties: vec![(std::sync::Arc::from("a"), crate::json::JsonValue::String("x".into()))],
             native: None,
         }]);
         let native = crate::native::FgbNative {
@@ -938,7 +938,7 @@ mod tests {
         let mut fc = FeatureCollection::from_features(vec![Feature::default()]);
         fc.native = Some(crate::Native::new(
             Format::GeoJson,
-            NativePayload::GeoJson(vec![(std::rc::Rc::from("id"), crate::json::JsonValue::Null)]),
+            NativePayload::GeoJson(vec![(std::sync::Arc::from("id"), crate::json::JsonValue::Null)]),
         ));
         assert_eq!(crate::flatgeobuf::read(&write(&fc)).unwrap().native, None);
     }
@@ -963,8 +963,8 @@ mod tests {
         let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
             properties: vec![
-                (std::rc::Rc::from("name"), crate::json::JsonValue::String("Zürich".into())),
-                (std::rc::Rc::from("price"), crate::json::JsonValue::Float(1.5)),
+                (std::sync::Arc::from("name"), crate::json::JsonValue::String("Zürich".into())),
+                (std::sync::Arc::from("price"), crate::json::JsonValue::Float(1.5)),
             ],
             native: None,
         }]);
@@ -1005,7 +1005,7 @@ mod tests {
     fn an_undeclared_column_writes_no_declaration_slots() {
         let fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
-            properties: vec![(std::rc::Rc::from("name"), crate::json::JsonValue::String("x".into()))],
+            properties: vec![(std::sync::Arc::from("name"), crate::json::JsonValue::String("x".into()))],
             native: None,
         }]);
         let bytes = write(&fc);

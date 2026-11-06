@@ -303,7 +303,7 @@ fn an_edit_reads_back_at_once_and_edits_compose() {
     assert_eq!(rows, want);
 }
 
-type Members = Vec<(std::rc::Rc<str>, JsonValue)>;
+type Members = Vec<(std::sync::Arc<str>, JsonValue)>;
 
 /// The property edits, each to one feature's list, shared as
 /// [`structural`] is.

@@ -815,7 +815,7 @@ mod tests {
     use crate::geometry::Geometry;
     use crate::json::JsonValue;
     use crate::kml::reader;
-    use std::rc::Rc;
+    use std::sync::Arc;
 
     /// `bytes` with the house layout's whitespace between tags taken out, so
     /// a test of what is written reads it on one line;
@@ -922,7 +922,7 @@ mod tests {
     fn feature(geometry: Option<Geometry>, properties: Vec<(&str, JsonValue)>) -> Feature {
         Feature {
             geometry,
-            properties: properties.into_iter().map(|(k, v)| (Rc::from(k), v)).collect(),
+            properties: properties.into_iter().map(|(k, v)| (Arc::from(k), v)).collect(),
             native: None,
         }
     }
@@ -1096,7 +1096,7 @@ mod tests {
         );
         assert!(out.contains("<TimeSpan><begin>2026-01</begin></TimeSpan><LineString><tessellate>1</tessellate><coordinates>"), "{out}");
         let back = reader::read(out.as_bytes(), &mut Vec::new()).unwrap();
-        assert_eq!(back.to_features()[0].properties[2], (Rc::from("extrude"), text("true")));
+        assert_eq!(back.to_features()[0].properties[2], (Arc::from("extrude"), text("true")));
     }
 
     #[test]
@@ -1164,8 +1164,8 @@ mod tests {
         let back = reader::read(out.as_bytes(), &mut Vec::new()).unwrap();
         let decls: Vec<_> = back.schema.iter().map(|d| (d.name.as_str(), d.ty.unwrap())).collect();
         assert_eq!(decls, [("n", DeclType::Int16), ("big", DeclType::String)]);
-        assert_eq!(back.to_features()[0].properties[1], (Rc::from("free"), text("x")));
-        assert_eq!(back.to_features()[0].properties[2], (Rc::from("n"), JsonValue::Int(7)));
+        assert_eq!(back.to_features()[0].properties[1], (Arc::from("free"), text("x")));
+        assert_eq!(back.to_features()[0].properties[2], (Arc::from("n"), JsonValue::Int(7)));
     }
 
     /// `plans/kml-standard.org` D-K17: KML has no null, so a null is left out
@@ -1192,7 +1192,7 @@ mod tests {
         assert!(!out.contains(r#"<SimpleData name="n"/>"#) && !out.contains(r#"<Data name="free""#), "{out}");
 
         let back = reader::read(out.as_bytes(), &mut Vec::new()).unwrap();
-        assert_eq!(back.to_features()[0].properties, vec![(Rc::from("e"), text(""))]);
+        assert_eq!(back.to_features()[0].properties, vec![(Arc::from("e"), text(""))]);
         assert!(back.to_features()[1].properties.is_empty());
 
         assert_eq!(null_keys(fc.rows().next().unwrap()), ["n", "s", "free"]);
@@ -1224,7 +1224,7 @@ mod tests {
 <Placemark><ExtendedData><SchemaData schemaUrl="#t"><SimpleData name="n"/></SchemaData></ExtendedData><Point><coordinates>1,2</coordinates></Point></Placemark>
 </Document></kml>"##;
         let mut fc = reader::read(source, &mut Vec::new()).unwrap();
-        assert_eq!(fc.to_features()[0].properties, vec![(Rc::from("n"), JsonValue::Null)]);
+        assert_eq!(fc.to_features()[0].properties, vec![(Arc::from("n"), JsonValue::Null)]);
         assert!(crate::kml::null_warning(&fc, Format::Kml).is_none());
         assert!(squeezed(&write(&fc, None, false)).contains(r#"<SimpleData name="n"/>"#));
 

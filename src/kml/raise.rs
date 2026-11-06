@@ -30,7 +30,7 @@
 //! `5222be3703c634add22c0bfa0f90df8935cb01c4a1c60b287d33dc88fc695bcd`) by
 //! `tests/fixtures/gen_kml23_children.py`.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::kml::lower::{is_decl, ns_decl, Changes, SCHEMA_2_2, SCHEMA_2_3, XSI_NS};
 use crate::kml::model::{KmlDocument, KmlElement, Kind, Node, Spelling, GOOGLE_KML_2_2_NS, KML_NS};
@@ -52,7 +52,7 @@ pub(crate) fn raise(doc: &mut KmlDocument) -> Changes {
     if doc.root_ns.is_none() {
         root.attrs.insert(0, ns_decl(None, KML_NS));
     }
-    doc.root_ns = Some(Rc::from(KML_NS));
+    doc.root_ns = Some(Arc::from(KML_NS));
     let kml_prefix = root.prefix.clone();
     rebind_google(root);
     raise_children(root, KmlElement::Kml, kml_prefix.as_deref(), &mut report);

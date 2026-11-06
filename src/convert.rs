@@ -4,7 +4,7 @@
 //! pair then composes automatically (hub-and-spoke).
 
 use std::collections::BTreeSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::format::{Format, KmlVersion};
 use crate::error::{Error, Result};
@@ -455,7 +455,7 @@ fn parquet_to_features_as(bytes: &[u8], layout: Layout) -> Result<FeatureCollect
         if let Some(ty) = decl {
             schema.push(crate::schema::FieldDecl { name: name.to_string(), ty: Some(ty), ..Default::default() });
         }
-        keys.push(Rc::<str>::from(name));
+        keys.push(Arc::<str>::from(name));
     }
     let column = |i: usize| -> Result<Vec<crate::json::JsonValue>> {
         let mut values = file.property(i)?;
@@ -1782,7 +1782,7 @@ mod tests {
     fn declared(name: &str, ty: crate::schema::DeclType, value: json::JsonValue) -> FeatureCollection {
         let mut fc = FeatureCollection::from_features(vec![Feature {
             geometry: Some(Geometry::Point(Position::new(1.0, 2.0))),
-            properties: vec![(Rc::from(name), value)],
+            properties: vec![(Arc::from(name), value)],
             native: None,
         }]);
         fc.schema =

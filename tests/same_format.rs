@@ -410,7 +410,7 @@ fn every_format_converts_to_itself() {
         let back = geosetta::read_features(format, &std::fs::read(&dst).unwrap(), &mut Vec::new()).unwrap();
         assert_eq!(back.len(), 1, "{format:?}");
         assert_eq!(
-            back.row(0).get("name").map(|v| v.to_owned()),
+            back.row(0).get("name").map(|v| v.to_json_value()),
             Some(JsonValue::String("København".into())),
             "{format:?} lost the property value"
         );

@@ -4,7 +4,7 @@ use super::bitmap::Bitmap;
 use super::kinds::Kinds;
 use super::value::Value;
 use crate::json::JsonValue;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// A column: a typed buffer with a slot for every row of its block, which
 /// rows are null (`valid`), and which rows hold the key at all (`present`).
@@ -14,7 +14,7 @@ use std::rc::Rc;
 /// are different bitmaps because they are different documents (guarantee 1).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Column {
-    pub(crate) name: Rc<str>,
+    pub(crate) name: Arc<str>,
     data: ColumnData,
     valid: Bitmap,
     present: Option<Bitmap>,
@@ -130,7 +130,7 @@ fn slice(offsets: &[u32], row: usize) -> std::ops::Range<usize> {
 }
 
 impl Column {
-    pub(crate) fn new(name: Rc<str>) -> Column {
+    pub(crate) fn new(name: Arc<str>) -> Column {
         Column { name, data: ColumnData::Null, valid: Bitmap::default(), present: None }
     }
 
@@ -226,7 +226,7 @@ impl Column {
 
     /// [`Self::value`], owned.
     pub(crate) fn get(&self, row: usize) -> JsonValue {
-        self.value(row).to_owned()
+        self.value(row).to_json_value()
     }
 
     /// [`Self::get`], moving a `Mixed` cell out rather than cloning it. The

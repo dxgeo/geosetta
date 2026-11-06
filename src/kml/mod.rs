@@ -12,7 +12,7 @@ use crate::feature::{Collecting, FeatureCollection};
 use crate::table::Layout;
 use crate::format::{Format, KmlVersion};
 use crate::native::{KmzArchive, KmzEntry};
-use std::rc::Rc;
+use std::sync::Arc;
 
 pub(crate) mod model;
 pub(crate) mod document;
@@ -232,7 +232,7 @@ pub(crate) fn read_kmz_with(
                 layers.push(document::Layer {
                     entry: *entry_at,
                     version: document.native.version,
-                    skeleton: Rc::new(document.skeleton),
+                    skeleton: Arc::new(document.skeleton),
                 });
             }
         }
@@ -241,7 +241,7 @@ pub(crate) fn read_kmz_with(
     let facts = facts.expect("at least one .kml entry was read");
     drop(kml_entries);
     native.layers = layers;
-    native.archive = Some(Rc::new(archive_of(archive)));
+    native.archive = Some(Arc::new(archive_of(archive)));
     Ok(reader::finish(features, native, Some(skeleton), facts, Format::Kmz))
 }
 

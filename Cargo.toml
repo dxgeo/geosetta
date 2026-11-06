@@ -33,8 +33,9 @@ wbprojection = { version = "0.3.3", default-features = false }
 # (`GeometryRef::shape`) composes with the renderer that names geosetta's IR
 # as a source: an adapter drives nazca's `Sink`, checked against nazca's own
 # WKB reader. A dev-dependency of a test, not an edge between the libraries
-# (../architecture.org); path-only, so `cargo publish` drops it.
-nazca = { path = "../nazca" }
+# (../architecture.org); from the registry, so a clone of this repo alone
+# builds without a nazca checkout beside it.
+nazca = "0.1.0"
 
 # Intra-doc links are part of the docs staying true: a link that silently stops
 # resolving (a renamed item, a module demoted to `pub(crate)`) is the same class

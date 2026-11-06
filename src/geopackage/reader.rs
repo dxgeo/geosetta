@@ -13,7 +13,7 @@ use crate::native::{
 };
 use crate::schema::{DeclType, FieldDecl};
 use crate::sqlite::{Database, Table, Value};
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Read every feature layer from a GeoPackage as `(layer_name, features)`.
 pub fn read_layers(bytes: &[u8]) -> Result<Vec<(String, FeatureCollection)>> {
@@ -165,12 +165,12 @@ fn carried_fid(row: &[Value], rowid_alias: Option<usize>, position: usize) -> Op
 
 fn read_layer(db: &Database, table: &Table, geom_idx: Option<usize>, layout: Layout) -> Result<FeatureCollection> {
     let rowid_alias = table.rowid_alias();
-    // Intern each column's key once so every row shares one `Rc`.
-    let keys: Vec<Rc<str>> = table.columns.iter().map(|n| Rc::from(n.as_str())).collect();
+    // Intern each column's key once so every row shares one `Arc`.
+    let keys: Vec<Arc<str>> = table.columns.iter().map(|n| Arc::from(n.as_str())).collect();
     // Every column except the geometry and the rowid-alias becomes a property.
     let properties: Vec<usize> =
         (0..keys.len()).filter(|&i| Some(i) != geom_idx && Some(i) != rowid_alias).collect();
-    let mut rows = Tabular::new(properties.iter().map(|&i| Rc::clone(&keys[i])).collect(), layout);
+    let mut rows = Tabular::new(properties.iter().map(|&i| Arc::clone(&keys[i])).collect(), layout);
     // Resolved once per layer rather than per cell: the DDL does not change
     // between rows, and `decl_type` does string work.
     let decl_types: Vec<Option<DeclType>> = (0..table.columns.len())

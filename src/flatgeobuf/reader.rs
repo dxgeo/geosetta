@@ -10,7 +10,7 @@ use crate::json::JsonValue;
 use crate::format::Format;
 use crate::native::{FgbColumnNative, FgbNative, Native, NativePayload};
 use crate::schema::{DeclType, FieldDecl};
-use std::rc::Rc;
+use std::sync::Arc;
 
 const MAGIC_LEN: usize = 8;
 const NODE_ITEM_SIZE: usize = 40; // 4 * f64 bbox + u64 offset
@@ -147,8 +147,8 @@ pub(crate) fn read_as(data: &[u8], layout: Layout) -> Result<FeatureCollection> 
     let index_node_size = header.read_u16(header::INDEX_NODE_SIZE, 16)?;
     let (crs, crs_extras) = read_crs_and_extras(&header)?;
     let columns = read_columns(&header)?;
-    // Intern each column's key once so every feature shares one `Rc`.
-    let keys: Vec<Rc<str>> = columns.iter().map(|c| Rc::from(c.name.as_str())).collect();
+    // Intern each column's key once so every feature shares one `Arc`.
+    let keys: Vec<Arc<str>> = columns.iter().map(|c| Arc::from(c.name.as_str())).collect();
 
     // Skip the packed R-tree spatial index, if present. The size comes from
     // the declared feature count, so it must still land inside the file:

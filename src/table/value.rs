@@ -5,7 +5,7 @@ use crate::json::JsonValue;
 
 /// A property value, borrowed from the collection holding it: what
 /// [`crate::FeatureRef`] and [`crate::ColumnRef`] hand out. A
-/// [`JsonValue`] without the copy; [`Self::to_owned`] makes one.
+/// [`JsonValue`] without the copy; [`Self::to_json_value`] makes one.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[non_exhaustive]
 pub enum Value<'a> {
@@ -17,6 +17,12 @@ pub enum Value<'a> {
     Binary(&'a [u8]),
     /// An array or object, which only a `Mixed` column or a row block holds.
     Json(&'a JsonValue),
+}
+
+impl From<Value<'_>> for JsonValue {
+    fn from(value: Value<'_>) -> JsonValue {
+        value.to_json_value()
+    }
 }
 
 impl<'a> Value<'a> {
@@ -79,8 +85,7 @@ impl<'a> Value<'a> {
     }
 
     /// The value as an owned [`JsonValue`], copied.
-    #[allow(clippy::wrong_self_convention, clippy::should_implement_trait)]
-    pub fn to_owned(self) -> JsonValue {
+    pub fn to_json_value(self) -> JsonValue {
         match self {
             Value::Null => JsonValue::Null,
             Value::Bool(b) => JsonValue::Bool(b),

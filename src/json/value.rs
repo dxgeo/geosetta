@@ -65,6 +65,62 @@ pub enum JsonValue {
     Binary(Vec<u8>),
 }
 
+// What a caller writes for a value (`FeatureCollection::set`). Only what is
+// exact: a `u64` could outrun `Int`.
+impl From<bool> for JsonValue {
+    fn from(value: bool) -> JsonValue {
+        JsonValue::Bool(value)
+    }
+}
+
+impl From<i32> for JsonValue {
+    fn from(value: i32) -> JsonValue {
+        JsonValue::Int(value.into())
+    }
+}
+
+impl From<u32> for JsonValue {
+    fn from(value: u32) -> JsonValue {
+        JsonValue::Int(value.into())
+    }
+}
+
+impl From<i64> for JsonValue {
+    fn from(value: i64) -> JsonValue {
+        JsonValue::Int(value)
+    }
+}
+
+impl From<f64> for JsonValue {
+    fn from(value: f64) -> JsonValue {
+        JsonValue::Float(value)
+    }
+}
+
+impl From<&str> for JsonValue {
+    fn from(value: &str) -> JsonValue {
+        JsonValue::String(value.to_owned())
+    }
+}
+
+impl From<String> for JsonValue {
+    fn from(value: String) -> JsonValue {
+        JsonValue::String(value)
+    }
+}
+
+impl From<&[u8]> for JsonValue {
+    fn from(value: &[u8]) -> JsonValue {
+        JsonValue::Binary(value.to_vec())
+    }
+}
+
+impl From<Vec<u8>> for JsonValue {
+    fn from(value: Vec<u8>) -> JsonValue {
+        JsonValue::Binary(value)
+    }
+}
+
 impl JsonValue {
     /// Whether `self` and `other` are the same value bit for bit: a float
     /// by its bits, so `-0.0` is not `0.0` and a NaN is itself, where `==`

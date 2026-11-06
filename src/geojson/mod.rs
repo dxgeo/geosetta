@@ -12,24 +12,24 @@ use crate::geometry::{Geometry, Position};
 use crate::json::{self, JsonValue, Parser};
 use crate::native::{Native, NativePayload};
 use std::collections::HashSet;
-use std::rc::Rc;
+use std::sync::Arc;
 
 /// Interns property keys within one collection so a name repeated across
-/// features is allocated once and shared as an `Rc`, not re-allocated per
-/// feature. Lookups borrow the key as `&str` (via `Rc<str>: Borrow<str>`), so a
+/// features is allocated once and shared as an `Arc`, not re-allocated per
+/// feature. Lookups borrow the key as `&str` (via `Arc<str>: Borrow<str>`), so a
 /// hit costs only a refcount bump.
 #[derive(Default)]
 struct KeyInterner {
-    seen: HashSet<Rc<str>>,
+    seen: HashSet<Arc<str>>,
 }
 
 impl KeyInterner {
-    fn intern(&mut self, key: &str) -> Rc<str> {
+    fn intern(&mut self, key: &str) -> Arc<str> {
         if let Some(rc) = self.seen.get(key) {
-            return Rc::clone(rc);
+            return Arc::clone(rc);
         }
-        let rc: Rc<str> = Rc::from(key);
-        self.seen.insert(Rc::clone(&rc));
+        let rc: Arc<str> = Arc::from(key);
+        self.seen.insert(Arc::clone(&rc));
         rc
     }
 }
@@ -81,7 +81,7 @@ fn wgs84(features: Vec<Feature>) -> FeatureCollection {
 fn wgs84_with(
     mut fc: FeatureCollection,
     name: Option<String>,
-    unmodelled: Vec<(Rc<str>, JsonValue)>,
+    unmodelled: Vec<(Arc<str>, JsonValue)>,
 ) -> FeatureCollection {
     fc.crs = Some(crate::crs::Crs::Wgs84);
     fc.name = name;
@@ -91,7 +91,7 @@ fn wgs84_with(
 
 /// Tag skipped members as a GeoJSON native, or `None` when there were none —
 /// the common case, which must not allocate.
-fn native_from(unmodelled: Vec<(Rc<str>, JsonValue)>) -> Option<Native> {
+fn native_from(unmodelled: Vec<(Arc<str>, JsonValue)>) -> Option<Native> {
     (!unmodelled.is_empty())
         .then(|| Native::new(Format::GeoJson, NativePayload::GeoJson(unmodelled)))
 }
@@ -149,7 +149,7 @@ fn stream_collection(p: &mut Parser, layout: Layout) -> Result<Option<FeatureCol
     p.expect(b'{')?;
     let mut features: Option<FeatureCollection> = None;
     let mut name: Option<String> = None;
-    let mut unmodelled: Vec<(Rc<str>, JsonValue)> = Vec::new();
+    let mut unmodelled: Vec<(Arc<str>, JsonValue)> = Vec::new();
     p.skip_ws();
     if p.peek() == Some(b'}') {
         p.bump();
@@ -169,12 +169,12 @@ fn stream_collection(p: &mut Parser, layout: Layout) -> Result<Option<FeatureCol
                     // A non-string `name` is not the member RFC 7946 tooling
                     // writes; keep it verbatim rather than coercing it.
                     other => {
-                        unmodelled.push((Rc::from(key.as_str()), other));
+                        unmodelled.push((Arc::from(key.as_str()), other));
                         None
                     }
                 };
             } else if is_replayable(&key) {
-                unmodelled.push((Rc::from(key.as_str()), p.parse_value()?));
+                unmodelled.push((Arc::from(key.as_str()), p.parse_value()?));
             } else {
                 p.skip_value()?;
             }
@@ -228,7 +228,7 @@ fn stream_features(p: &mut Parser, layout: Layout) -> Result<FeatureCollection> 
 }
 
 /// A feature's properties and native, as [`stream_feature`] reads them.
-type FeatureRest = (Vec<(Rc<str>, JsonValue)>, Option<Box<Native>>);
+type FeatureRest = (Vec<(Arc<str>, JsonValue)>, Option<Box<Native>>);
 
 /// Stream one Feature object, dispatching on member key so member order
 /// doesn't matter. `geometry` is parsed typed, into `geometry`, which is left
@@ -244,8 +244,8 @@ fn stream_feature(
     p.skip_ws();
     p.expect(b'{')?;
     geometry.clear();
-    let mut properties: Vec<(Rc<str>, JsonValue)> = Vec::new();
-    let mut unmodelled: Vec<(Rc<str>, JsonValue)> = Vec::new();
+    let mut properties: Vec<(Arc<str>, JsonValue)> = Vec::new();
+    let mut unmodelled: Vec<(Arc<str>, JsonValue)> = Vec::new();
     p.skip_ws();
     if p.peek() == Some(b'}') {
         p.bump();
@@ -298,7 +298,7 @@ fn stream_feature(
 /// elements — for the life of the feature: a 200-property feature held 256
 /// slots of 56 bytes (`plans/performance.org`, *Memory*). Errors as the
 /// parser's own object does.
-fn stream_properties(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Result<Vec<(Rc<str>, JsonValue)>> {
+fn stream_properties(p: &mut Parser, keys: &mut KeyInterner, width: usize) -> Result<Vec<(Arc<str>, JsonValue)>> {
     p.expect(b'{')?;
     let mut members = Vec::with_capacity(width);
     p.skip_ws();

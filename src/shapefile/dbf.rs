@@ -9,7 +9,7 @@
 use crate::error::{Error, Result};
 use crate::json::JsonValue;
 use crate::schema::{Cell, Column, ColumnType, DeclType, FieldDecl, declared_or};
-use std::rc::Rc;
+use std::sync::Arc;
 
 const HEADER_LEN: usize = 32;
 const FIELD_DESCRIPTOR_LEN: usize = 32;
@@ -31,7 +31,7 @@ struct Field {
 #[cfg(test)]
 pub struct Record {
     pub deleted: bool,
-    pub properties: Vec<(Rc<str>, JsonValue)>,
+    pub properties: Vec<(Arc<str>, JsonValue)>,
 }
 
 /// The text encoding to decode `C` (character) field bytes with.
@@ -99,7 +99,7 @@ pub fn read_each(
     encoding: Encoding,
     cpg_declared: bool,
     losses: &mut TextLosses,
-    mut each: impl FnMut(&[Rc<str>], bool, &mut Vec<JsonValue>),
+    mut each: impl FnMut(&[Arc<str>], bool, &mut Vec<JsonValue>),
 ) -> Result<()> {
     if data.len() < HEADER_LEN {
         return Err(Error::Convert("shapefile: dbf file shorter than its header".into()));
@@ -109,7 +109,7 @@ pub fn read_each(
     let record_size = u16_at(data, 10)? as usize;
 
     let fields = read_fields(data)?;
-    let keys: Vec<Rc<str>> = fields.iter().map(|f| Rc::from(f.name.as_str())).collect();
+    let keys: Vec<Arc<str>> = fields.iter().map(|f| Arc::from(f.name.as_str())).collect();
 
     // Every record starts with its deletion-flag byte; a zero size would
     // index an empty record below.
@@ -675,7 +675,7 @@ mod tests {
             .iter()
             .map(|p| Feature {
                 geometry: None,
-                properties: p.iter().map(|(k, v)| (Rc::from(*k), v.clone())).collect(),
+                properties: p.iter().map(|(k, v)| (Arc::from(*k), v.clone())).collect(),
                 native: None,
             })
             .collect()
@@ -800,7 +800,7 @@ mod tests {
         assert_eq!(records.len(), 2);
         assert!(!records[0].deleted);
 
-        let get = |props: &[(Rc<str>, JsonValue)], k: &str| {
+        let get = |props: &[(Arc<str>, JsonValue)], k: &str| {
             props.iter().find(|(name, _)| &**name == k).map(|(_, v)| v.clone()).unwrap()
         };
         assert_eq!(get(&records[0].properties, "name").as_str(), Some("Alice"));
@@ -821,7 +821,7 @@ mod tests {
         let columns = infer_columns(&feats);
         let (bytes, _warnings) = write(&columns).unwrap();
         let records = read(&bytes, Encoding::Utf8, false, &mut TextLosses::default()).unwrap();
-        let get = |props: &[(Rc<str>, JsonValue)], k: &str| {
+        let get = |props: &[(Arc<str>, JsonValue)], k: &str| {
             props.iter().find(|(name, _)| &**name == k).map(|(_, v)| v.clone()).unwrap()
         };
         assert_eq!(get(&records[1].properties, "a"), JsonValue::Null);

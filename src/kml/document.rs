@@ -15,7 +15,7 @@
 //! holds them within each place. Comments that sat immediately before a
 //! feature travel with it, so they are written back before it.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::kml::model::{KmlDocument, KmlElement, Layout, Node};
 use crate::xml::Content;
@@ -53,7 +53,7 @@ pub(crate) struct FeatureModel {
 pub(crate) struct Layer {
     pub entry: usize,
     pub version: crate::format::KmlVersion,
-    pub skeleton: std::rc::Rc<Skeleton>,
+    pub skeleton: std::sync::Arc<Skeleton>,
 }
 
 /// A feature to put back: where it was read from (`None` for one added since),
@@ -153,7 +153,7 @@ pub(crate) fn assemble(skeleton: &Skeleton, features: Vec<Placed>) -> KmlDocumen
 /// How a feature added since the read is indented at the end of the
 /// container it joins, and whether its inside is laid out
 /// ([`Node::lead_at`]).
-pub(crate) fn lead_for_new(skeleton: &Skeleton, layout: &Layout) -> Option<(Rc<str>, bool)> {
+pub(crate) fn lead_for_new(skeleton: &Skeleton, layout: &Layout) -> Option<(Arc<str>, bool)> {
     let container = container_at(&skeleton.doc.root, &default_container(&skeleton.doc.root))?;
     container.lead_at(container.children.len(), layout)
 }

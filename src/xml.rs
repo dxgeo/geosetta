@@ -31,7 +31,7 @@
 
 use std::borrow::Cow;
 use std::ops::Range;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 
@@ -51,7 +51,7 @@ pub(crate) struct XmlElement {
     pub prefix: Option<String>,
     /// The namespace URI the element is in, resolved from the declarations in
     /// scope; `None` for no namespace, including an unbound prefix.
-    pub ns: Option<Rc<str>>,
+    pub ns: Option<Arc<str>>,
     /// In document order, namespace declarations included (as attributes in
     /// [`XMLNS_NS`]), so a writer reproduces them where they were.
     pub attrs: Vec<XmlAttr>,
@@ -87,7 +87,7 @@ impl PartialEq for XmlElement {
 pub(crate) struct XmlAttr {
     pub prefix: Option<String>,
     pub name: String,
-    pub ns: Option<Rc<str>>,
+    pub ns: Option<Arc<str>>,
     pub value: String,
 }
 
@@ -97,7 +97,7 @@ pub(crate) enum Content {
     /// Character data, entity references decoded. Adjacent text and CDATA are
     /// one run. Shared, because the whitespace runs that indent a document
     /// repeat by the thousand (see [`Parser::run`]).
-    Text(Rc<str>),
+    Text(Arc<str>),
     /// The text between `<!--` and `-->`, verbatim.
     Comment(Box<str>),
     /// `<?target data?>`; `data` has its leading whitespace removed.
@@ -184,7 +184,7 @@ impl XmlElement {
     /// A leaf element with only text content, e.g. `<name>A Point</name>`.
     pub fn leaf(name: &str, text: impl Into<String>) -> XmlElement {
         let text: String = text.into();
-        let content = if text.is_empty() { Vec::new() } else { vec![(0, Content::Text(Rc::from(text)))] };
+        let content = if text.is_empty() { Vec::new() } else { vec![(0, Content::Text(Arc::from(text)))] };
         XmlElement::built(name, Vec::new(), content)
     }
 
@@ -213,7 +213,7 @@ impl XmlElement {
             None => (None, "xmlns".to_string()),
             Some(p) => (Some("xmlns".to_string()), p.to_string()),
         };
-        self.attrs.push(XmlAttr { prefix: attr_prefix, name, ns: Some(Rc::from(XMLNS_NS)), value: uri.to_string() });
+        self.attrs.push(XmlAttr { prefix: attr_prefix, name, ns: Some(Arc::from(XMLNS_NS)), value: uri.to_string() });
         self
     }
 }
@@ -253,7 +253,7 @@ pub(crate) fn merge_leaf_text(content: &mut Vec<(usize, Content)>) {
         i += usize::from(keep);
         keep
     });
-    content.insert(first.unwrap_or(0), (0, Content::Text(Rc::from(text))));
+    content.insert(first.unwrap_or(0), (0, Content::Text(Arc::from(text))));
 }
 
 /// A tree [`lay_out`] can indent: [`XmlElement`], and the KML model's node.
@@ -286,14 +286,14 @@ pub(crate) fn lay_out<T: Tree>(node: &mut T, newline: &str, indent: &str, unit: 
         return;
     }
     let inner = format!("{indent}{unit}");
-    let lead: Rc<str> = Rc::from(format!("{newline}{inner}"));
+    let lead: Arc<str> = Arc::from(format!("{newline}{inner}"));
     let mut laid = Vec::with_capacity(content.len() + children.len() + 1);
     let mut old = std::mem::take(content).into_iter().peekable();
     for i in 0..=children.len() {
         while let Some(c) = old.next_if(|(at, _)| *at <= i) {
             laid.push(c);
         }
-        let run = if i < children.len() { lead.clone() } else { Rc::from(format!("{newline}{indent}")) };
+        let run = if i < children.len() { lead.clone() } else { Arc::from(format!("{newline}{indent}")) };
         laid.push((i, Content::Text(run)));
     }
     *content = laid;
@@ -411,7 +411,7 @@ pub(crate) fn parse_document(input: &str) -> Result<XmlDocument> {
 pub(crate) struct Parsed<'a, N> {
     pub name: &'a str,
     pub prefix: Option<&'a str>,
-    pub ns: Option<Rc<str>>,
+    pub ns: Option<Arc<str>>,
     pub attrs: Vec<XmlAttr>,
     pub children: Vec<N>,
     pub content: Vec<(usize, Content)>,
@@ -584,11 +584,11 @@ struct Parser<'a> {
     /// Namespace bindings in scope, innermost last: `(prefix, uri)`, with
     /// `prefix: None` for the default namespace and `uri: None` for
     /// `xmlns=""`, which undeclares it.
-    scopes: Vec<(Option<String>, Option<Rc<str>>)>,
-    xml_ns: Rc<str>,
-    xmlns_ns: Rc<str>,
+    scopes: Vec<(Option<String>, Option<Arc<str>>)>,
+    xml_ns: Arc<str>,
+    xmlns_ns: Arc<str>,
     /// The whitespace runs read so far, shared ([`Parser::run`]).
-    spaces: Vec<Rc<str>>,
+    spaces: Vec<Arc<str>>,
     /// A spare buffer for the text run being read.
     text: String,
 }
@@ -599,8 +599,8 @@ impl<'a> Parser<'a> {
             bytes: input.as_bytes(),
             pos: 0,
             scopes: Vec::new(),
-            xml_ns: Rc::from(XML_NS),
-            xmlns_ns: Rc::from(XMLNS_NS),
+            xml_ns: Arc::from(XML_NS),
+            xmlns_ns: Arc::from(XMLNS_NS),
             spaces: Vec::new(),
             text: String::new(),
         }
@@ -666,14 +666,14 @@ impl<'a> Parser<'a> {
     /// A text run as stored: whitespace shared with every equal run before
     /// it, so a document's indentation is a handful of strings however many
     /// elements it lays out; anything else its own.
-    fn run(&mut self, text: &str) -> Rc<str> {
+    fn run(&mut self, text: &str) -> Arc<str> {
         if text.len() > 128 || !text.bytes().all(is_space) {
-            return Rc::from(text);
+            return Arc::from(text);
         }
         if let Some(r) = self.spaces.iter().find(|r| ***r == *text) {
             return r.clone();
         }
-        let r: Rc<str> = Rc::from(text);
+        let r: Arc<str> = Arc::from(text);
         if self.spaces.len() < 64 {
             self.spaces.push(r.clone());
         }
@@ -742,7 +742,7 @@ impl<'a> Parser<'a> {
 
     /// The namespace a prefix (or, for `None`, the default namespace) is bound
     /// to in the current scope.
-    fn resolve(&self, prefix: Option<&str>) -> Option<Rc<str>> {
+    fn resolve(&self, prefix: Option<&str>) -> Option<Arc<str>> {
         if prefix == Some("xml") {
             return Some(self.xml_ns.clone());
         }
@@ -773,7 +773,7 @@ impl<'a> Parser<'a> {
                     };
                     let ns = match declared {
                         Some(declared) => {
-                            let uri = if value.is_empty() { None } else { Some(Rc::from(value.as_str())) };
+                            let uri = if value.is_empty() { None } else { Some(Arc::from(value.as_str())) };
                             self.scopes.push((declared, uri));
                             Some(self.xmlns_ns.clone())
                         }
@@ -1050,7 +1050,7 @@ mod tests {
         .unwrap();
         assert_eq!(doc.root.name, "kml");
         assert_eq!(doc.root.children.len(), 1);
-        let nl = || Content::Text(Rc::from("\n"));
+        let nl = || Content::Text(Arc::from("\n"));
         assert_eq!(
             doc.before,
             vec![Content::Doctype(r#"<!DOCTYPE kml [ <!ENTITY foo "bar"> ]>"#.into()), nl(), Content::Comment(" a comment ".into())]
@@ -1074,7 +1074,7 @@ mod tests {
     fn keeps_whitespace_runs_where_they_were() {
         let src = "<a>\n  <b>x</b>\n  <!--c-->\n  <d/>\n</a>";
         let root = parse(src).unwrap();
-        let ws = |s: &str| Content::Text(Rc::from(s));
+        let ws = |s: &str| Content::Text(Arc::from(s));
         assert_eq!(
             root.content,
             vec![(0, ws("\n  ")), (1, ws("\n  ")), (1, Content::Comment("c".into())), (1, ws("\n  ")), (2, ws("\n"))]
@@ -1088,7 +1088,7 @@ mod tests {
         let (Content::Text(first), Content::Text(second)) = (&root.content[0].1, &root.content[1].1) else {
             panic!("{:?}", root.content)
         };
-        assert!(Rc::ptr_eq(first, second));
+        assert!(Arc::ptr_eq(first, second));
     }
 
     #[test]

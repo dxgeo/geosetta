@@ -16,7 +16,7 @@ pub use wkt::encode as to_wkt;
 pub(crate) use wkt::encode_ref as wkt_ref;
 // A [`crate::GeometryRef`]'s structure, read in place (`plans/columnar.org`
 // D-C6): the counterpart of matching on a [`Geometry`].
-pub use crate::table::{Members, MembersIter, Parts, PartsIter, Rings, RingsIter, Run, RunIter, Shape};
+pub use crate::table::{GeometryRef, Members, MembersIter, Parts, PartsIter, Rings, RingsIter, Run, RunIter, Shape};
 
 /// A single coordinate. `x`/`y` are always present; `z` (elevation) and `m`
 /// (measure) are per-position, since some formats (e.g. Shapefile's M

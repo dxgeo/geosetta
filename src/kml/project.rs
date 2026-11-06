@@ -14,7 +14,7 @@
 //! `<ExtendedData>`, typed by its `<Schema>` where it has one (D-K9).
 
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::error::{Error, Result};
 use crate::geometry::{Geometry, Position};
@@ -30,7 +30,7 @@ fn err(message: &str) -> Error {
 /// them, and its geometry.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Projection {
-    pub properties: Vec<(Rc<str>, JsonValue)>,
+    pub properties: Vec<(Arc<str>, JsonValue)>,
     pub geometry: Option<Geometry>,
 }
 
@@ -276,8 +276,8 @@ impl FieldType {
 /// `Data`/`SimpleData` with no `name` attribute has no key to attach to, so it
 /// is left to the model rather than guessed at.
 pub(crate) fn project(feature: &Node, ctx: &Context) -> Result<Projection> {
-    let mut properties: Vec<(Rc<str>, JsonValue)> = Vec::new();
-    let mut push = |key: &str, value: JsonValue| properties.push((Rc::from(key), value));
+    let mut properties: Vec<(Arc<str>, JsonValue)> = Vec::new();
+    let mut push = |key: &str, value: JsonValue| properties.push((Arc::from(key), value));
     if let Some(name) = feature.child(KmlElement::Name) {
         push(NAME, JsonValue::String(name.text_trimmed().to_string()));
     }

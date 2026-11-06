@@ -13,7 +13,7 @@
 //! or in none when the document declares none (D-K13), and an extension's
 //! element that shares a KML local name is not read as KML.
 
-use std::rc::Rc;
+use std::sync::Arc;
 
 use crate::crs::Crs;
 use crate::error::{Error, Result};
@@ -180,7 +180,7 @@ pub(crate) fn read_document(
         let native = match elements {
             Elements::Keep => Some(Box::new(Native::new(
                 format,
-                NativePayload::KmlFeature(KmlFeatureNative { feature: Rc::new(m), document: index }),
+                NativePayload::KmlFeature(KmlFeatureNative { feature: Arc::new(m), document: index }),
             ))),
             Elements::Leave => {
                 native.unkept.add(&m.node, heights);
@@ -266,7 +266,7 @@ pub(crate) fn finish(
     facts: Facts,
     format: Format,
 ) -> FeatureCollection {
-    document.document = skeleton.map(Rc::new);
+    document.document = skeleton.map(Arc::new);
     let mut fc = features.finish();
     fc.crs = Some(match facts.vertical {
         Vertical::Absolute => Crs::wgs84_egm96(),

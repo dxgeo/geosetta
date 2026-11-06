@@ -4,9 +4,9 @@
 * Handoff
 Written 2026-11-05 and brought up to date 2026-11-06, on the =columnar-ir= branch. What is open lives in
 [[file:plans/todo.org][plans/todo.org]], and why each piece is shaped the way it is lives in the plan it
-links to. This session's work is [[file:plans/columnar.org][plans/columnar.org]] C6 and D-C16, and
-it closed C6 and with it the plan; § MILESTONES C6 holds what each step
-built and measured.
+links to. The work up to the API review is [[file:plans/columnar.org][plans/columnar.org]] C6 and D-C16, which
+closed C6 and with it the plan, and § MILESTONES C6 holds what each step built
+and measured. What followed is § THE CLI REVIEW.
 
 The earlier handoffs are in git, and are what a citation of the form
 "=handoff.org= entry N" or "=handoff.org= § SECTION" means:
@@ -117,7 +117,9 @@ hides the blocks, and the missing exports and standard traits are in.
 binary at c7207fe: nine bugs (C1--C9), led by a layer name writing outside the
 output directory. A second pass corrected several of the first's fixes, the owner
 settled its decisions, and all of it is built, =cli= now private to the binary.
-C9 is committed alone, on =columnar-ir= only: the owner chose not to touch =main=.
+Committed on =columnar-ir= and not pushed: C9 alone as 0501555, the rest as
+0161924, and =bench/compare.py= made importable as eb8b99f. The owner chose not to
+touch =main=, so C9's fix reaches it with the merge.
 =cli-review.org= § BUILT has what to carry into the migration note. =--layer= is
 honoured wherever an output can hold a name (C3's table).
 
@@ -166,5 +168,15 @@ honoured wherever an output can hold a name (C3's table).
 - =equiv.py= cannot build a pin at c8f7ba5: that commit's manifest names
   =../nazca= by path, which a =git archive= does not hold. Pin 2491146 or
   anything after the manifest moved to crates.io instead.
+- =a_file_named_in_no_encoding_converts= in =tests/cli_review.rs= only compiles on
+  Linux, since macOS refuses such a file name (errno 92). No CI runs it. The
+  Podman VM has 1 GB, too little to compile =wide= (through =wbprojection=), so run
+  it from a copy with that and =nazca= removed, source mounted read-only:
+  #+begin_src sh
+    podman run --rm -v "$PWD":/w:ro -e CARGO_BUILD_JOBS=1 docker.io/library/rust:1 sh -c '
+      cp -r /w /tmp/g && cd /tmp/g && rm -rf target tests/nazca_sink.rs tests/reproject_pipe.rs &&
+      sed -i "/^nazca/d;/^wbprojection/d" Cargo.toml && echo "[workspace]" >> Cargo.toml &&
+      cargo test --test cli_review --test layer_file_names --bin geosetta'
+  #+end_src
 - =compare.py= takes =BIN== for another binary; run it with =VERIFY=0= for a
   pin to save the =ogr2ogr= read-back, and never two runs at once.

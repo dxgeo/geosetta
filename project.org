@@ -276,8 +276,8 @@ specification rather than pulled from a crate:
   the same identity lift every reader uses, and =Crs::authority_code=, the
   scriptable =AUTHORITY:CODE= form =--print-crs-code= emits. No registry, and no
   dependency — optional or otherwise — to hold one
-- =cli.rs= / =convert.rs= :: argument parsing and the hub-and-spoke conversion
-  pipeline (=read(from) → FeatureCollection → write(to)=)
+- =cli.rs= / =convert.rs= :: argument parsing, private to the binary, and the
+  hub-and-spoke conversion pipeline (=read(from) → FeatureCollection → write(to)=)
 
 Design choices for the writer: Snappy-compressed Parquet pages (the codec
 implemented from scratch in =compress/snappy.rs=, keeping the zero-crate goal),
@@ -296,13 +296,16 @@ geosetta input.csv     output.parquet   # CSV (WKT)  -> GeoParquet
 geosetta input.fgb     output.csv       # FlatGeobuf -> CSV (WKT)
 geosetta input.gpkg    output.geojson   # GeoPackage -> GeoJSON (--layer NAME to pick one)
 geosetta input.gpkg    out/ --to geojson # multi-layer GeoPackage -> one file per layer
+geosetta input.geojson output.fgb --layer roads # record the name where the output has a slot
 geosetta roads.geojson data.gpkg        # create data.gpkg with layer "roads"
 geosetta rivers.csv    data.gpkg        # append layer "rivers" to data.gpkg
 geosetta roads.geojson data.gpkg --rtree # …with a GeoPackage R*Tree spatial index
 geosetta roads.geojson data.gpkg --envelope # …caching each geometry's bbox in its GPB header
 geosetta big.geojson   big.parquet --sort-hilbert  # cluster rows by spatial locality
 geosetta big.geojson   big.parquet --progress      # report each stage on stderr
-geosetta aus.gpkg      aus.geojson --quiet         # silence lossy-conversion warnings (on by default)
+geosetta aus.gpkg      aus.geojson --quiet         # silence every warning line (on by default)
+geosetta --help                                    # every flag, on stdout
+geosetta -- -dash.geojson out.fgb                  # -- ends the flags
 geosetta parcels.shp   parcels.geojson  # Shapefile  -> GeoJSON (reads sibling .shx/.dbf/.prj)
 geosetta roads.geojson roads.shp        # GeoJSON    -> Shapefile
 geosetta data.gpkg     out/ --to shp    # multi-layer GeoPackage -> one .shp set per layer

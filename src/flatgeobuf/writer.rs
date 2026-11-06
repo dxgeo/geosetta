@@ -240,7 +240,8 @@ fn build_header(
     // GeoPackage edit loop append a duplicate layer instead of replacing one
     // (`plans/edit-composability.org` D4). A nameless collection writes no
     // name rather than inventing one — naming an output is the caller's job,
-    // and `main.rs` supplies one from `--layer` or the input's stem.
+    // which `--layer` does through `pipeline`. The input's stem names only a
+    // GeoPackage layer or a file in a directory output, never this header.
     let name = fc.name.as_deref().map(|n| b.create_string(n));
     let title = native.and_then(|n| n.title.as_deref()).map(|s| b.create_string(s));
     let description = native.and_then(|n| n.description.as_deref()).map(|s| b.create_string(s));

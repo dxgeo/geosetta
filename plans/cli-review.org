@@ -13,7 +13,8 @@ what changed. All of it is built, apart from § SPLIT OUT; § BUILT says where.
 
 ** THE MODULE
 =src/cli.rs=: =parse=, =Args= (14 public fields), =Mode= (exhaustive), =USAGE=,
-and 25 unit tests. =src/main.rs= is its only user, in the crate and out of it.
+and 25 unit tests, as reviewed. =src/main.rs= is its only user, in the crate and
+out of it. § BUILT has its shape since.
 
 ** BUGS
 *** C1 -- a non-UTF-8 argument panics

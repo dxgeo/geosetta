@@ -96,9 +96,9 @@ A new struct rather than new fields on =WriteOptions=, which is =Copy= and is
 what =write_features_with= takes: a CRS is not =Copy=, and none of these is a
 property of a single-buffer encode.
 
-- =layer= selects a GeoPackage source's layer, and names the layer a
-  single-collection source becomes in a GeoPackage output -- the =--layer=
-  flag's two meanings, kept as one field because the flag is one.
+- =layer= selects a GeoPackage source's layer, and names a single-collection
+  source, which sets its =fc.name= -- the =--layer= flag's two meanings, kept as
+  one field because the flag is one (=cli-review.org= C3).
 - =default_layer_name= is the third choice for that name, after =layer= and
   the collection's own =name= (=plans/edit-composability.org= D4). The binary
   passes the input file's stem; a library caller has no path to draw one from,
@@ -187,6 +187,14 @@ the warnings, in other words -- and not at all for a GeoPackage or Shapefile
 target, which never reach =write_features_with=. Now =WriteOptions::check=
 is the one rule: =cli.rs= calls it at argument time, =pipeline::prepare=
 before it reads, and =write_features_with= before it encodes.
+
+=cli-review.org= extended the rule: =WriteOptions::check= refuses =compact= where
+there is no layout, and =ConvertOptions::check=, the one =cli.rs= and =prepare=
+now call, adds =rtree=, =envelope= and an empty =layer=. Its one exception to
+parity is =--layer= on one file that holds no name, which the binary alone
+refuses, since a library caller has the name from =Prepared::layers= and only the
+binary knows the output is not a directory. The sweep states it, in
+=a_layer_with_nowhere_to_go=.
 
 ** CHANGES THE USER CAN SEE
 - =--progress= on a GeoPackage path now reports a Hilbert sort, as the

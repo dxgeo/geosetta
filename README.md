@@ -101,6 +101,11 @@ Options, each refused where the output cannot use it:
                         memory and time only, the output is the same
     --progress          report each stage on stderr
     --quiet             no warnings on stderr
+    --help, --version   say what this is, on stdout
+
+`--` ends the options, for a file whose name starts with `-`. An output that is
+a directory, or ends in `/`, gets one file per layer, named after it; a layer
+whose name is not a plain file name is refused rather than written elsewhere.
 
 ### Pipes
 
@@ -350,7 +355,8 @@ Every format is implemented from its specification:
 -   **`shapefile/`:** the `.shp`/`.shx` and `.dbf` codecs.
 -   **`kml/`, `xml.rs`, `zip.rs`:** KML and KMZ, and the XML and ZIP codecs.
 -   **`crs.rs`, `crs/`:** the CRS model and WKT↔PROJJSON translation.
--   **`cli.rs`, `convert.rs`:** argument parsing and the conversion pipeline.
+-   **`cli.rs`, `convert.rs`:** argument parsing, private to the binary, and the
+    conversion pipeline.
 
 
 ## PRIOR ART

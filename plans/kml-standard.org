@@ -148,9 +148,10 @@ the crate's convention everywhere else.
 
 *** D-K2 -- the output version is the flag, else the source's, else 2.2
 =--kml-version <2.2|2.3>= is a format-specific output flag like
-=--rtree= and =--envelope=, with one difference: those are ignored for other
+=--rtree= and =--envelope=, with one difference: those were ignored for other
 output formats, and this one is a *usage error* unless the output is
 =kml=/=kmz=. Ignoring an explicit request about content would be a silent drop.
+The difference is gone: =cli-review.org= § DECISIONS refuses those as well.
 
 Resolution, in order:
 1. =--kml-version=, if given;

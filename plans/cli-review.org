@@ -3,16 +3,17 @@
 
 * The Argument Parser's Review
 
-** STATUS -- reviewed 2026-11-06; nothing here is built
+** STATUS -- reviewed 2026-11-06; re-checked and decided the same day
 What =columnar.org= D-C18's API review left out for =cli=, reviewed before the
 breaking release that makes =cli='s shape expensive to change afterwards. Every
-behaviour below was run on the binary at c7207fe, not read off the code. Two
-decisions are the owner's (§ DECISIONS); the fixes wait on them, because the
-first changes what several fixes reject, and the second where they are written.
+behaviour below was run on the binary at c7207fe, not read off the code, unless
+it says otherwise. The owner has settled § DECISIONS. A second pass over this
+review corrected C1, C3, C4, C6 and C7 and added C8 and C9, each of which says
+what changed. C9 went first and alone, and is built; the rest are not.
 
 ** THE MODULE
 =src/cli.rs=: =parse=, =Args= (14 public fields), =Mode= (exhaustive), =USAGE=,
-and 29 unit tests. =src/main.rs= is its only user, in the crate and out of it.
+and 25 unit tests. =src/main.rs= is its only user, in the crate and out of it.
 
 ** BUGS
 *** C1 -- a non-UTF-8 argument panics
@@ -24,7 +25,17 @@ converted at all.
 /Fix:/ =args_os=, with paths kept as =OsString= so these files convert (closest
 fidelity, not a nicer refusal). =--layer= names a table, which is text, and gets
 a usage error. The largest fix here: paths are =String= throughout =main.rs=, and
-=Format::from_path= takes =&str=.
+=Format::from_path= takes =&str=. It should take a =Path=, a public break for the
+migration note.
+
+The =to_string_lossy= calls have to go with the =String=s, or a non-UTF-8 path
+stops panicking and starts going wrong: =main.rs:510= would write a fan-out
+under a different directory's name, =794= and =804= and =818= would look for the
+wrong siblings, and =878= would change the default layer name, which must warn
+if it stays lossy (the name is text, as =--layer= is).
+
+macOS refuses to create such a file (errno 92), so a real conversion test can
+only run on Linux; on macOS a test can only see that the argument does not panic.
 
 *** C2 -- a flag can be taken for the value before it
 =--layer --rtree= exits 0, creates a table named =--rtree= and builds no R-tree:
@@ -43,7 +54,36 @@ for =geojson=, =fgb=, =parquet=, =csv= and =kml= (=cmp=). =in.geojson
 source says =no layer named "nope"=. Its doc comment (=cli.rs:57=) describes only
 GeoPackage; nothing tells the user.
 
-/Fix:/ a usage error unless the source or the target is GeoPackage.
+/Fix (the owner's, replacing "refuse unless GeoPackage"):/ =--layer= is refused
+only where the output cannot hold a name. If an output can, it is honoured:
+
+| Output                        | Where the name goes             | Today             | Fix            |
+|-------------------------------+---------------------------------+-------------------+----------------|
+| GeoPackage                    | table name                      | works             | keep           |
+| Any format, directory output  | file name (=write_layers=)      | works             | keep           |
+| GeoJSON                       | =name=, which GDAL reads        | ignored           | honour         |
+| FlatGeobuf                    | header =NAME=, which GDAL reads | ignored           | honour         |
+| KML, KMZ                      | =<Document><name>=              | not read or written | see below    |
+| Shapefile, plain path         | the stem, already typed         | ignored           | refuse         |
+| Parquet, CSV, WKT, plain path | no slot                         | ignored           | refuse         |
+
+The first review tested plain paths only, so its fix would have broken directory
+output, where =in.geojson od/ --to csv --layer NAMED= writes =od/NAMED.csv=.
+
+For GeoJSON and FlatGeobuf, =pipeline.rs:233= works out the name and never sets
+=fc.name=. Set it only when =layer= is given, so no existing output changes. A
+GeoPackage source already selects by =--layer=, and that layer's name is the one
+that reaches the output.
+
+A diagnostic has no output, so =--layer= there needs a GeoPackage source.
+
+/This refusal is the binary's, not the library's./ A library caller gets the name
+back from =Prepared::layers=, as the binary does for a directory, so =layer= is
+not ignored for it even on Parquet; and only the binary knows whether the output
+is a directory. The check has to run before the read, which =write_layers= does
+not. The parity sweep needs a stated exception for it.
+
+/KML is its own item (§ SPLIT OUT)/; until then a plain KML or KMZ path refuses.
 
 *** C4 -- diagnostics take write flags and ignore them
 =--print-crs= accepts =--to=, =--sort-hilbert=, =--rtree=, =--envelope= and
@@ -51,8 +91,12 @@ GeoPackage; nothing tells the user.
 (=cli.rs:227--247=, =297=). The refusal's reason, that a flag with nothing to act
 on should not suggest it acted, applies to all of them.
 
-/Fix:/ refuse those five. =--layout=, =--layer=, =--from=, =--quiet= and
-=--progress= still mean something to a run that reads.
+/Fix:/ refuse those five. =--layer=, =--from=, =--quiet= and =--progress= still
+mean something to a run that reads.
+
+=--layout= should too, and does not: =read_crs_sources= (=main.rs:291=) builds
+default options and never uses it. The first review had it on the list above;
+this is read off the code, not measured. Pass =args.read_options()=.
 
 *** C5 -- a repeated flag silently takes the last value
 =--to parquet --to wkt= writes WKT; =--from wkt --from geojson= reads GeoJSON;
@@ -65,7 +109,10 @@ on should not suggest it acted, applies to all of them.
 =parse= returns it as =Err(Error::Usage)= (=cli.rs:151=), and
 =errors_on_bad_usage= pins that (=cli.rs:416=). =--version= is an unknown option.
 
-/Fix:/ both to stdout with exit 0, through =Mode=, and the test rewritten.
+/Fix:/ both to stdout with exit 0, and the test rewritten. Not through =Mode=, as
+this first said: =Args= requires =input= and =from=, which =--help= does not have,
+so =parse= needs an outer return type above =Args=. Fix with C8, or =--help | head=
+gains its panic.
 
 *** C7 -- a bare format name counts as an extension
 =geosetta in.geojson wkt= writes WKT to a file named =wkt=, and an input file
@@ -73,7 +120,36 @@ named =geojson= is read as GeoJSON: =path.rsplit('.').next()= is the whole strin
 when there is no dot (=format.rs:88=). Library code, but =parse= is what reaches
 it, and =Format::from_path= is public.
 
-/Fix:/ only what follows a dot in the file's name is an extension.
+/Fix:/ what =Path::extension= says is an extension, so a dotfile named =.geojson=
+has none. It reads as GeoJSON today; moving to =Path= for C1 changes that either
+way, so it is chosen here rather than by accident.
+
+*** C8 -- writing to a closed pipe panics
+=geosetta in.geojson --print-crs-code | true= exits 101 with a panic from
+=println!=, where a conversion to the same pipe exits 1 with =i/o error: Broken
+pipe=. =--print-crs= uses the same =println!= (=main.rs:276=, =350=, =352=); that
+one is read off the code. Not in the first review.
+
+/Fix:/ write through =write_bytes='s path, so a closed pipe is an ordinary error.
+
+*** C9 -- a layer name can write outside the output directory
+A directory output names each file after its layer (=main.rs:509=), and that name
+comes from the input: =dir.join= takes =../x= past the directory and an absolute
+name in place of it. =evil.geojson od/ --to csv= with a =name= of =../report=
+writes =od/../report.csv=; an absolute =name= writes exactly there. A GeoPackage
+table and a FlatGeobuf header reach it the same way, a Shapefile output sends all
+its siblings, and =std::fs::write= overwrites what it finds (read off the code).
+The extension stays =--to='s, which is what limits it. Not in the first review.
+
+/Fix:/ before anything is written, refuse a name that is not one plain file name,
+naming the layer. Refusing, not rewriting: a quietly changed name is a file the
+user did not ask for. A multi-layer source can still convert the other layers
+with =--layer=. In the binary, which is what turns a name into a path; the rustdoc
+of =Prepared::layers= warns a library caller doing the same.
+
+/Built 2026-11-06:/ =refuse_unless_file_name= (=main.rs=), =tests/layer_file_names.rs=.
+Six of its eight tests failed before the fix; the other two pin what must not
+change. =equiv.py= under all three layouts: 8 991 identical against ee626ab.
 
 ** SMALLER ISSUES
 - *File errors name no path.* A missing input, a bad output directory and a bad
@@ -84,7 +160,13 @@ it, and =Format::from_path= is public.
   reads back. Refuse it.
 - *No =--= terminator.* =-dash.geojson= is reached only as =./-dash.geojson=, and
   the =unknown option= error does not say so. =--from=geojson= is refused too,
-  which is clear enough to leave.
+  which is clear enough to leave. Add =--=; it is also the only thing that could
+  follow C2 for a positional beginning with a dash.
+- *A layer really named after a flag.* After C2, =--layer --rtree= cannot select
+  a table named =--rtree=. Converting to a directory still reaches it, so this
+  stays as a known limit.
+- *=--quiet= still prints =wrote …=.* Left as it is, correcting the comment only:
+  =--no-warn= is an alias of the same flag, which reads as warnings alone.
 - *Stale docs.* =quiet='s comment (=cli.rs:83=) says it hides CRS warnings, where
   =reporter= drops every warning. =--no-warn= is undocumented. =USAGE= lists
   =--rtree=, =--envelope=, =--sort-hilbert=, =--progress= and =--layer= without
@@ -92,27 +174,42 @@ it, and =Format::from_path= is public.
   =parses_quiet_flag= (=cli.rs:402=) holds unrelated =--compact= assertions and a
   garbled comment.
 
-** DECISIONS -- the owner's, open
-*** Should =--rtree=, =--envelope= and =--compact= be refused where the output cannot use them?
+** DECISIONS -- settled by the owner, 2026-11-06
+*** =--rtree=, =--envelope= and =--compact= are refused where the output cannot use them
 Each is ignored today, and says so (=cli.rs:72=, =78=, =102=, =290=), while
 =cli.rs:237= calls refusing an argument that cannot mean anything the crate's
 standing convention.
-- /Refuse (recommended):/ matches the convention, and C3 and C4.
-- /Warn:/ keeps a script working that passes one set of flags to every format.
 
-*** Should =cli= move into the binary?
+/In the library,/ on a check =pipeline::prepare= calls and the CLI calls before
+reading, extending =WriteOptions::check=. A refusal only in =parse= would leave
+=ConvertOptions { rtree: true, .. }= silently ignored for a library caller, and
+fail the parity sweep. =--compact= applies to GeoJSON, KML and KMZ, measured.
+
+*** =cli= moves into the binary, in this release
 Public, =cli= is API: every new flag is a field on =Args=, every new mode a
 variant on =Mode=, and =USAGE= is a public string. =lib.rs= says it is public so
-"downstream tooling can reuse the same parsing"; nothing does.
+"downstream tooling can reuse the same parsing"; nothing does, in the workspace
+or out of it.
 
-/Recommended: move it, in this release./ Tried in a scratch copy of c7207fe: =mod
-cli;= in =main.rs=, =pub mod cli= out of =lib.rs=, one import line, and =cli.rs='s
-=crate::= paths become =geosetta::=. It compiled first try, and the binary's 29
-unit tests pass.
-=Format::parse=, =Layout::parse=, =KmlVersion::parse= and =WriteOptions::check=
-stay in the library, so the rule the CLI enforces is still the library's
-(=library-pipeline.org=). That plan's "already library-side for reuse" (line 47)
-would need correcting.
+Tried in a scratch copy of c7207fe: =mod cli;= in =main.rs=, =pub mod cli= out of
+=lib.rs=, one import line, and =cli.rs='s =crate::= paths become =geosetta::=. It
+compiled first try, and the binary's 29 unit tests (=cli.rs='s 25 and =main.rs='s
+4) pass. =Format::parse=, =Layout::parse=, =KmlVersion::parse= and
+=WriteOptions::check= stay in the library, so the rule the CLI enforces is still
+the library's (=library-pipeline.org=), which holds only once the check above is
+there: today it is true of =--kml-version= alone. That plan's "already
+library-side for reuse" (line 47) needs correcting.
+
+** SPLIT OUT
+*** KML's collection name
+=<Document><name>= is KML's slot for a collection name, and GDAL reads it as the
+layer name (measured). Geosetta neither reads nor writes it for =fc.name=: the
+writer uses =fc.name= only for a typed =<Schema>=, so an untyped collection loses
+it, and it never reads back. Owner's call to make it a separate item, because the
+read changes output that runs today: KML to GeoPackage would name its table after
+the document instead of the stem, and KML to GeoJSON would gain a =name=. That
+cannot meet § ACCEPTANCE's byte-identical =equiv.py=. When built, =--layer= stops
+being refused on a plain KML or KMZ path, which breaks nothing.
 
 ** CHECKED, AND FINE
 - =--crs= with a diagnostic, =--crs -= with stdin as the input, and the two
@@ -128,9 +225,14 @@ would need correcting.
 since D-C18, =Format::from_path= apart. So is the rest of =main.rs=.
 
 ** ACCEPTANCE
-- Each of C1--C7 and each smaller issue has a test, and each refusal is a usage
-  error naming the flag.
+- Each of C1--C9 and each smaller issue that changes behaviour has a test, and
+  each refusal is a usage error naming the flag, or for C9 the layer.
 - =bench/equiv.py= is byte-identical: no conversion that ran correctly changes
-  output, only what a command line is allowed to ask.
+  output, only what a command line is allowed to ask. It already passes each flag
+  only to a target that uses it.
 - The CLI/library warning and error parity sweep covers the new refusals
-  (=library-pipeline.org=).
+  (=library-pipeline.org=). Its all-options row in =tests/library_pipeline.rs=
+  sets =compact= and =rtree= together, which no target accepts once they are
+  refused, so it would be refused everywhere, the two sides would agree on the
+  error, and the row would stop testing =sort_hilbert=, =crs= and
+  =Layout::Columns= while still passing. Split it by target.

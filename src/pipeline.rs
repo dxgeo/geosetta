@@ -243,6 +243,10 @@ fn read_as(
 impl Prepared {
     /// The layers that will be written, in order, each with its name. One for
     /// a single-collection source.
+    ///
+    /// A name comes from the source, so it is untrusted: a caller building a path
+    /// from one must first see that it is one plain file name. It may be
+    /// `../../x`, or absolute (`plans/cli-review.org` C9).
     pub fn layers(&self) -> &[(String, FeatureCollection)] {
         &self.layers
     }

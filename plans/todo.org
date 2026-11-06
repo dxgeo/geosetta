@@ -12,10 +12,11 @@ DONE included). Each entry is just a link to its real plan/section for detail;
 check it off and remove it once the item ships or is shelved.
 
 - [ ] [[file:cli-review.org][cli-review.org]] — the argument parser's review,
-  due before the breaking release: a panic on a non-UTF-8 argument, flags taken
-  for values or silently ignored, =--help= exiting 1. Two decisions open first:
-  refuse or warn on =--rtree= and its like, and whether =cli= moves into the
-  binary.
+  due before the breaking release: a layer name writing outside the output
+  directory, a panic on a non-UTF-8 argument, flags taken for values or silently
+  ignored, =--help= exiting 1. Its § DECISIONS are settled.
+- [ ] [[file:cli-review.org][cli-review.org]] § SPLIT OUT — read and write KML's
+  =<Document><name>= as the collection's name, and honour =--layer= there.
 - [ ] [[file:native-inventory.org][native-inventory.org]] — M1 of
   =same-format-fidelity.org=: what each reader discards, classified. First pass
   *complete* (all 9 spokes, measured or traced), and the nine hostile fixtures

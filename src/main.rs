@@ -48,8 +48,9 @@
 //! replacing it would newly expose a run that truncates its only copy before
 //! writing.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use geosetta::pipeline::{self, ConvertOptions, Event, Output, Prepared, Source};
 use geosetta::{cli, shapefile};
@@ -503,6 +504,10 @@ fn write_layers(
         ));
     }
 
+    // Every name before the first file, so one bad name leaves nothing behind.
+    for (name, _) in layers {
+        refuse_unless_file_name(name, out.path)?;
+    }
     std::fs::create_dir_all(out.path)?;
     let dir = std::path::Path::new(out.path);
     for (i, (name, _)) in layers.iter().enumerate() {
@@ -510,6 +515,27 @@ fn write_layers(
         write_layer(out.format, &path.to_string_lossy(), prepared, i, args.quiet, report)?;
     }
     Ok(())
+}
+
+/// Refuse a layer name that would not stay in `dir` as one file.
+///
+/// A name comes from the input — a GeoJSON `name`, a FlatGeobuf header, a
+/// GeoPackage table — so it is untrusted, and `Path::join` would take `../x` past
+/// the directory and an absolute name in place of it, overwriting whatever is
+/// there (`plans/cli-review.org` C9). Refused rather than rewritten, because a
+/// quietly changed name is a file nobody asked for. The name is printed by
+/// `{:?}` since it may hold bytes that would act on a terminal.
+fn refuse_unless_file_name(name: &str, dir: &str) -> Result<()> {
+    let mut parts = Path::new(name).components();
+    // Comparing the part to the whole catches what `components` normalises away:
+    // `x/` and `x/.` are each one part.
+    if matches!((parts.next(), parts.next()), (Some(Component::Normal(part)), None) if part == OsStr::new(name)) {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "layer {name:?} is not a plain file name, so it cannot name a file in {dir}; \
+         write it to a file path, or pick another layer with --layer"
+    )))
 }
 
 /// Encode layer `index` and write it to `output_path`. Shapefile is

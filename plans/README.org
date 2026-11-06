@@ -284,6 +284,11 @@ why, not to implement the spec's table from symmetry.
   standing rule: =tests/library_pipeline.rs= sweeps every source, target and
   option set through both and requires the same warnings and errors, and is
   built so a new format or option cannot compile until the sweep covers it.
+- [[file:cli-review.org][cli-review.org]] :: The argument parser's review, due
+  before the breaking release: seven bugs, run on the binary, led by a panic on
+  a non-UTF-8 argument and flags taken for values or silently ignored, and
+  whether =cli= belongs in the binary rather than the public API. *Reviewed
+  2026-11-06; not built*, with two decisions open.
 - [[file:cross-format-audit.org][cross-format-audit.org]] :: What a write
   loses without saying: a round trip through each tabular target, against
   FlatGeobuf as the control, filing every unwarned difference. Found one

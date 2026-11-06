@@ -1,0 +1,136 @@
+#+TITLE: Plan: The Argument Parser's Review
+#+AUTHOR: Daniel Okuniewicz Jr.
+
+* The Argument Parser's Review
+
+** STATUS -- reviewed 2026-11-06; nothing here is built
+What =columnar.org= D-C18's API review left out for =cli=, reviewed before the
+breaking release that makes =cli='s shape expensive to change afterwards. Every
+behaviour below was run on the binary at c7207fe, not read off the code. Two
+decisions are the owner's (§ DECISIONS); the fixes wait on them, because the
+first changes what several fixes reject, and the second where they are written.
+
+** THE MODULE
+=src/cli.rs=: =parse=, =Args= (14 public fields), =Mode= (exhaustive), =USAGE=,
+and 29 unit tests. =src/main.rs= is its only user, in the crate and out of it.
+
+** BUGS
+*** C1 -- a non-UTF-8 argument panics
+=geosetta $'\xff\xfe.geojson' out.parquet=, a non-UTF-8 output path and a
+non-UTF-8 =--layer= value each exit 101 with a panic from =std::env::args()=
+(=main.rs:103=). Such a filename is legal on Linux, so that file cannot be
+converted at all.
+
+/Fix:/ =args_os=, with paths kept as =OsString= so these files convert (closest
+fidelity, not a nicer refusal). =--layer= names a table, which is text, and gets
+a usage error. The largest fix here: paths are =String= throughout =main.rs=, and
+=Format::from_path= takes =&str=.
+
+*** C2 -- a flag can be taken for the value before it
+=--layer --rtree= exits 0, creates a table named =--rtree= and builds no R-tree:
+no =rtree_= in the file, where a real =--rtree= gives 15 mentions. =--crs --quiet=
+tries to open a file named =--quiet=, and says only =i/o error: No such file or
+directory= (§ SMALLER ISSUES). =--from --to= fails only because =--to= is no
+format. All at =cli.rs:161--196=.
+
+/Fix:/ refuse a value that is exactly a known flag. Any other value starting
+with =-= stays allowed, since a layer may be named so.
+
+*** C3 -- =--layer= is ignored outside GeoPackage
+=in.geojson a.<ext> --layer NAMED= is byte-identical to the same run without it
+for =geojson=, =fgb=, =parquet=, =csv= and =kml= (=cmp=). =in.geojson
+--print-crs-code --layer nope= reports a CRS and exits 0, where a GeoPackage
+source says =no layer named "nope"=. Its doc comment (=cli.rs:57=) describes only
+GeoPackage; nothing tells the user.
+
+/Fix:/ a usage error unless the source or the target is GeoPackage.
+
+*** C4 -- diagnostics take write flags and ignore them
+=--print-crs= accepts =--to=, =--sort-hilbert=, =--rtree=, =--envelope= and
+=--compact= and does nothing with them, yet refuses =--kml-version= and =--crs=
+(=cli.rs:227--247=, =297=). The refusal's reason, that a flag with nothing to act
+on should not suggest it acted, applies to all of them.
+
+/Fix:/ refuse those five. =--layout=, =--layer=, =--from=, =--quiet= and
+=--progress= still mean something to a run that reads.
+
+*** C5 -- a repeated flag silently takes the last value
+=--to parquet --to wkt= writes WKT; =--from wkt --from geojson= reads GeoJSON;
+=--layout rows --layout columns= holds columns (=cli.rs:161--196=).
+
+/Fix:/ refuse a repeat of a flag that takes a value.
+
+*** C6 -- =--help= counts as failure
+=--help= and =-h= exit 1, on stderr, so =geosetta --help | less= shows nothing.
+=parse= returns it as =Err(Error::Usage)= (=cli.rs:151=), and
+=errors_on_bad_usage= pins that (=cli.rs:416=). =--version= is an unknown option.
+
+/Fix:/ both to stdout with exit 0, through =Mode=, and the test rewritten.
+
+*** C7 -- a bare format name counts as an extension
+=geosetta in.geojson wkt= writes WKT to a file named =wkt=, and an input file
+named =geojson= is read as GeoJSON: =path.rsplit('.').next()= is the whole string
+when there is no dot (=format.rs:88=). Library code, but =parse= is what reaches
+it, and =Format::from_path= is public.
+
+/Fix:/ only what follows a dot in the file's name is an extension.
+
+** SMALLER ISSUES
+- *File errors name no path.* A missing input, a bad output directory and a bad
+  =--crs= each print =i/o error: No such file or directory= (=read_bytes= and
+  =write_bytes=, =main.rs:60--78=). Not =cli.rs=, but what makes C2 hard to
+  diagnose.
+- *An empty layer name.* =--layer ""= creates a table with an empty name, which
+  reads back. Refuse it.
+- *No =--= terminator.* =-dash.geojson= is reached only as =./-dash.geojson=, and
+  the =unknown option= error does not say so. =--from=geojson= is refused too,
+  which is clear enough to leave.
+- *Stale docs.* =quiet='s comment (=cli.rs:83=) says it hides CRS warnings, where
+  =reporter= drops every warning. =--no-warn= is undocumented. =USAGE= lists
+  =--rtree=, =--envelope=, =--sort-hilbert=, =--progress= and =--layer= without
+  explaining them. The module doc's usage block predates most flags.
+  =parses_quiet_flag= (=cli.rs:402=) holds unrelated =--compact= assertions and a
+  garbled comment.
+
+** DECISIONS -- the owner's, open
+*** Should =--rtree=, =--envelope= and =--compact= be refused where the output cannot use them?
+Each is ignored today, and says so (=cli.rs:72=, =78=, =102=, =290=), while
+=cli.rs:237= calls refusing an argument that cannot mean anything the crate's
+standing convention.
+- /Refuse (recommended):/ matches the convention, and C3 and C4.
+- /Warn:/ keeps a script working that passes one set of flags to every format.
+
+*** Should =cli= move into the binary?
+Public, =cli= is API: every new flag is a field on =Args=, every new mode a
+variant on =Mode=, and =USAGE= is a public string. =lib.rs= says it is public so
+"downstream tooling can reuse the same parsing"; nothing does.
+
+/Recommended: move it, in this release./ Tried in a scratch copy of c7207fe: =mod
+cli;= in =main.rs=, =pub mod cli= out of =lib.rs=, one import line, and =cli.rs='s
+=crate::= paths become =geosetta::=. It compiled first try, and the binary's 29
+unit tests pass.
+=Format::parse=, =Layout::parse=, =KmlVersion::parse= and =WriteOptions::check=
+stay in the library, so the rule the CLI enforces is still the library's
+(=library-pipeline.org=). That plan's "already library-side for reuse" (line 47)
+would need correcting.
+
+** CHECKED, AND FINE
+- =--crs= with a diagnostic, =--crs -= with stdin as the input, and the two
+  =--print-crs*= flags together are refused, each with a clear message.
+- =--kml-version= goes through the library's own =WriteOptions::check=.
+- Upper-case extensions and =.json= infer as they should; an output with no
+  extension is a clear error.
+- =Args::read_options= leaves =target= unset, which looked like a lost KML memory
+  saving: =pipeline::prepare= passes =Some(to)= itself (=pipeline.rs:131=).
+
+** NOT REVIEWED
+=pipeline=, the =Native= payloads, =Error= and =Format= as API remain unreviewed
+since D-C18, =Format::from_path= apart. So is the rest of =main.rs=.
+
+** ACCEPTANCE
+- Each of C1--C7 and each smaller issue has a test, and each refusal is a usage
+  error naming the flag.
+- =bench/equiv.py= is byte-identical: no conversion that ran correctly changes
+  output, only what a command line is allowed to ask.
+- The CLI/library warning and error parity sweep covers the new refusals
+  (=library-pipeline.org=).

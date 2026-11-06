@@ -2,7 +2,7 @@
 #+AUTHOR: Daniel Okuniewicz Jr.
 
 * Handoff
-Written 2026-11-05, on the =columnar-ir= branch. What is open lives in
+Written 2026-11-05 and brought up to date 2026-11-06, on the =columnar-ir= branch. What is open lives in
 [[file:plans/todo.org][plans/todo.org]], and why each piece is shaped the way it is lives in the plan it
 links to. This session's work is [[file:plans/columnar.org][plans/columnar.org]] C6 and D-C16, and
 it closed C6 and with it the plan; § MILESTONES C6 holds what each step
@@ -109,13 +109,25 @@ The review owed before the breaking release, and all nine of its changes, are
 =Value::to_owned= is =to_json_value=, =ColumnRef= and =ColumnValues= borrow only
 the collection, =set= takes =impl Into<JsonValue>=, =keys()= exists, =Debug=
 hides the blocks, and the missing exports and standard traits are in.
-=tests/public_api.rs= pins each. Not reviewed: =pipeline=, =cli=, the =Native=
-payloads, =Error= and =Format=. =cli= is public and worth a look before release.
+=tests/public_api.rs= pins each. Not reviewed: =pipeline=, the =Native= payloads,
+=Error= and =Format=.
+
+** THE CLI REVIEW -- 2026-11-06
+=cli= was reviewed next, and every finding is =plans/cli-review.org=, run on the
+binary at c7207fe: seven bugs (C1--C7), led by a panic on a non-UTF-8 argument
+and =--layer --rtree= silently naming a table =--rtree=. Nothing is fixed yet.
 
 ** NEXT
+- First, the two owner's decisions in =cli-review.org= § DECISIONS: refuse or
+  warn on =--rtree=, =--envelope= and =--compact= where the output cannot use
+  them (refuse recommended), and whether =cli= moves into the binary (recommended;
+  it compiled and its tests passed in a scratch copy). Then C1--C7 and the smaller
+  issues, a test each. C1 is the largest, since paths are =String= throughout
+  =main.rs=.
 - Merging =columnar-ir= into =main=, and the breaking release it implies,
-  are the owner's (=columnar.org= C5, /Open/). The release wants the migration
-  note § RISKS asks for, covering D-C18's breaks too.
+  are the owner's (=columnar.org= C5, /Open/), and should follow that work, since
+  moving =cli= is itself a break. The release wants the migration note § RISKS
+  asks for, covering D-C18's breaks too.
 - The open list is =plans/todo.org=. Its next entry is
   =cross-format-audit.org= A2 (=bench/audit.py=); A1 was built 2026-10-31
   with =library-warnings.org= L1. F6 there now holds a GeoPackage FID

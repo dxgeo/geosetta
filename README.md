@@ -87,8 +87,11 @@ GeoPackage files hold several layers:
     geosetta roads.geojson data.gpkg          # create data.gpkg with layer "roads"
     geosetta rivers.csv    data.gpkg          # add layer "rivers" to data.gpkg
 
-Options:
+Options, each refused where the output cannot use it:
 
+    --layer NAME        pick a GeoPackage source's layer, or name the output's,
+                        where a GeoPackage, GeoJSON, FlatGeobuf or a file in a
+                        directory output can hold it
     --rtree             write GeoPackage's R*Tree spatial index
     --envelope          store each geometry's bbox in its GeoPackage header
     --sort-hilbert      order features by spatial locality

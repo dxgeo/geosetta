@@ -127,7 +127,7 @@ pub struct WriteOptions {
     /// its members or elements — `--compact`, to save space. A KML read
     /// written back loses its own layout too, since that is what was asked
     /// for. Laid out otherwise (`plans/kml-layout.org` D-L2, D-L8). The other
-    /// formats have no layout, and ignore it.
+    /// formats have no layout, and refuse it ([`WriteOptions::check`]).
     pub compact: bool,
 }
 
@@ -146,10 +146,9 @@ impl WriteOptions {
     /// place that decides, so the binary's argument check, the pipeline and
     /// [`write_features_with`] refuse alike, in the same words.
     ///
-    /// A KML version is a statement about the output's content, so asking for
-    /// one is a usage error for any format but KML and KMZ rather than
-    /// ignored. `compact` is not: an output with no layout has nothing for it
-    /// to change.
+    /// An option a format has no use for is a usage error rather than ignored
+    /// (`plans/cli-review.org` § DECISIONS): a KML version for anything but KML
+    /// and KMZ, and `compact` for an output with no layout to change.
     pub fn check(&self, target: Format) -> Result<()> {
         if let Some(version) = self.kml_version
             && !matches!(target, Format::Kml | Format::Kmz)
@@ -157,6 +156,12 @@ impl WriteOptions {
             return Err(Error::Usage(format!(
                 "--kml-version {} chooses the KML version of the output, and the output here is {}",
                 version.as_str(),
+                target.display_name()
+            )));
+        }
+        if self.compact && !matches!(target, Format::GeoJson | Format::Kml | Format::Kmz) {
+            return Err(Error::Usage(format!(
+                "--compact writes GeoJSON and KML on one line, and the output here is {}",
                 target.display_name()
             )));
         }

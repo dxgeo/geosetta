@@ -59,7 +59,7 @@ fn every_fixture_writes_the_same_under_every_layout() {
     inputs.sort();
     let mut checked = 0;
     for input in &inputs {
-        let Some(from) = Format::from_path(&input.to_string_lossy()) else { continue };
+        let Some(from) = Format::from_path(input) else { continue };
         for to in Format::ALL {
             for sort_hilbert in [false, true] {
                 let options = |layout| ConvertOptions {

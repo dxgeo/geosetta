@@ -9,7 +9,7 @@ breaking release that makes =cli='s shape expensive to change afterwards. Every
 behaviour below was run on the binary at c7207fe, not read off the code, unless
 it says otherwise. The owner has settled § DECISIONS. A second pass over this
 review corrected C1, C3, C4, C6 and C7 and added C8 and C9, each of which says
-what changed. C9 went first and alone, and is built; the rest are not.
+what changed. All of it is built, apart from § SPLIT OUT; § BUILT says where.
 
 ** THE MODULE
 =src/cli.rs=: =parse=, =Args= (14 public fields), =Mode= (exhaustive), =USAGE=,
@@ -223,6 +223,25 @@ being refused on a plain KML or KMZ path, which breaks nothing.
 ** NOT REVIEWED
 =pipeline=, the =Native= payloads, =Error= and =Format= as API remain unreviewed
 since D-C18, =Format::from_path= apart. So is the rest of =main.rs=.
+
+** BUILT -- 2026-11-06
+- The library's check is =ConvertOptions::check=, which =prepare= and =cli= both
+  call; =WriteOptions::check= gained =compact=, and =Format::records_name= says
+  which formats hold a name. =pipeline::read= refuses an empty =--layer= too, for
+  the diagnostics.
+- =cli= is private to the binary. =parse= returns =Invocation= (=Run=, =Help=,
+  =Version=) and takes =OsString=s.
+- =--help= also explains the flags =USAGE= only listed, and =--no-warn=.
+- =tests/cli_review.rs= holds what shows only in a whole run, =cli.rs= the
+  parsing, =tests/layer_file_names.rs= C9, and =tests/library_pipeline.rs= the
+  split sweep and its stated exception, =a_layer_with_nowhere_to_go=.
+
+/For the migration note:/ =geosetta::cli= is gone. =Format::from_path= takes
+=impl AsRef<Path>=, and a dotfile or a bare name no longer has an extension.
+=prepare= and =write_features_with= refuse =compact= where there is no layout,
+and =prepare= refuses =rtree= and =envelope= off GeoPackage, where each was
+ignored. =layer= now sets a single-collection source's =fc.name=, and an empty one
+is refused. On the command line, each refusal above is new.
 
 ** ACCEPTANCE
 - Each of C1--C9 and each smaller issue that changes behaviour has a test, and

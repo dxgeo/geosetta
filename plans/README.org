@@ -288,7 +288,7 @@ why, not to implement the spec's table from symmetry.
   before the breaking release: nine bugs, run on the binary, led by a layer name
   writing outside the output directory, a panic on a non-UTF-8 argument and flags
   taken for values or silently ignored, and =cli= moving into the binary rather
-  than the public API. *Reviewed and decided 2026-11-06.*
+  than the public API. *Built 2026-11-06*, but for KML's collection name (§ SPLIT OUT).
 - [[file:cross-format-audit.org][cross-format-audit.org]] :: What a write
   loses without saying: a round trip through each tabular target, against
   FlatGeobuf as the control, filing every unwarned difference. Found one

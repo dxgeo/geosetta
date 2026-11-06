@@ -44,7 +44,7 @@ by audit, since there is one pipeline to have it.
 ** WHAT STAYS IN THE BINARY, AND WHY
 Each of these touches a path, a stream or a terminal, which the library never
 sees:
-- argument parsing (=cli.rs=, already library-side for reuse) and reading the
+- argument parsing (=cli.rs=, private to the binary since =cli-review.org=) and reading the
   =--crs= file or stdin;
 - reading the input and writing the output, including locating a Shapefile's
   siblings and writing its file set;

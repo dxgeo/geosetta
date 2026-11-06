@@ -87,21 +87,38 @@ fn fixture(format: Format) -> &'static str {
 
 const UTM_33N: &str = r#"PROJCS["WGS 84 / UTM zone 33N",GEOGCS["WGS 84",DATUM["WGS_1984",SPHEROID["WGS 84",6378137,298.257223563]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Transverse_Mercator"],UNIT["metre",1],AUTHORITY["EPSG","32633"]]"#;
 
-/// The option sets the sweep runs: none, every flag at once, and the one flag
-/// that is only valid for some targets. The two forced layouts ride along,
-/// one each, rather than doubling the sweep.
-fn option_sets() -> Vec<ConvertOptions> {
+/// The option sets the sweep runs: none, every flag `to` can use at once, every
+/// flag at once, and the one flag that is only valid for some targets. The third
+/// is refused for every target, since no output takes both `compact` and `rtree`,
+/// so the second is what runs them. The two forced layouts ride along, one each,
+/// rather than doubling the sweep.
+fn option_sets(from: Format, to: Format) -> Vec<ConvertOptions> {
+    let everything = ConvertOptions {
+        crs: Some(Crs::from_definition_text(UTM_33N).unwrap()),
+        sort_hilbert: true,
+        read: ReadOptions { layout: Layout::Columns, ..Default::default() },
+        ..ConvertOptions::default()
+    };
+    let compact = matches!(to, Format::GeoJson | Format::Kml | Format::Kmz);
+    let gpkg = to == Format::Gpkg;
     vec![
         ConvertOptions::default(),
         ConvertOptions {
+            write: WriteOptions { compact, ..WriteOptions::default() },
+            // The binary's one refusal the library does not share: one file
+            // with no slot for a name, where a library caller still gets the
+            // name back. `a_layer_with_nowhere_to_go` holds that case. A
+            // GeoPackage source is selecting, and goes to a directory here.
+            layer: (from == Format::Gpkg || to.records_name()).then(|| "cities".into()),
+            rtree: gpkg,
+            envelope: gpkg,
+            ..everything.clone()
+        },
+        ConvertOptions {
             write: WriteOptions { compact: true, ..WriteOptions::default() },
-            crs: Some(Crs::from_definition_text(UTM_33N).unwrap()),
-            sort_hilbert: true,
-            layer: Some("cities".into()),
             rtree: true,
             envelope: true,
-            read: ReadOptions { layout: Layout::Columns, ..Default::default() },
-            ..ConvertOptions::default()
+            ..everything
         },
         ConvertOptions {
             write: WriteOptions { kml_version: Some(KmlVersion::V2_3), ..WriteOptions::default() },
@@ -225,7 +242,7 @@ fn every_conversion_says_the_same_through_both() {
     let mut seq = 0;
     for from in Format::ALL {
         for to in Format::ALL {
-            for options in option_sets() {
+            for options in option_sets(from, to) {
                 seq += 1;
                 let dir = root.join(format!("case{seq}"));
                 std::fs::create_dir_all(&dir).unwrap();
@@ -248,6 +265,23 @@ fn every_conversion_says_the_same_through_both() {
         }
     }
     assert!(disagreements.is_empty(), "{} disagreement(s):\n{}", disagreements.len(), disagreements.join("\n"));
+}
+
+/// The stated exception to the sweep: `--layer` on one file of a format that
+/// records no name is refused by the binary, which alone knows the output is not
+/// a directory, and answered by the library through `Prepared::layers`.
+#[test]
+fn a_layer_with_nowhere_to_go() {
+    let dir = tmp_dir();
+    let input = Path::new(fixture(Format::GeoJson));
+    let options = ConvertOptions { layer: Some("cities".into()), ..ConvertOptions::default() };
+    let flags = flags(&options, &dir);
+    let (_, cli) = run_cli(input, &dir.join("out.parquet"), &flags);
+    assert!(cli.unwrap_err().contains("--layer"));
+
+    let bytes = std::fs::read(input).unwrap();
+    let prepared = pipeline::prepare(Format::GeoJson, Format::Parquet, Source::Bytes(&bytes), options, &mut |_| {}).unwrap();
+    assert_eq!(prepared.layers()[0].0, "cities");
 }
 
 /// An append surveys the destination too, which only the binary used to do.

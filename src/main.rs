@@ -48,40 +48,57 @@
 //! replacing it would newly expose a run that truncates its only copy before
 //! writing.
 
-use std::ffi::OsStr;
+mod cli;
+
+use std::borrow::Cow;
+use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use geosetta::pipeline::{self, ConvertOptions, Event, Output, Prepared, Source};
-use geosetta::{cli, shapefile};
+use geosetta::shapefile;
 use geosetta::Crs;
 use geosetta::{Error, FeatureCollection, Format, Result};
 
+/// An i/o failure, saying which path it was about: `No such file or directory`
+/// alone does not say which of an input, an output and a `--crs` is missing.
+fn at(path: impl AsRef<Path>) -> impl FnOnce(std::io::Error) -> Error {
+    move |e| Error::Io(std::io::Error::new(e.kind(), format!("{}: {e}", path.as_ref().display())))
+}
+
 /// Read `path`'s bytes, or all of stdin when `path` is `"-"`.
-fn read_bytes(path: &str) -> Result<Vec<u8>> {
+fn read_bytes(path: &OsStr) -> Result<Vec<u8>> {
     if path == "-" {
         let mut buf = Vec::new();
         std::io::stdin().lock().read_to_end(&mut buf)?;
         Ok(buf)
     } else {
-        Ok(std::fs::read(path)?)
+        std::fs::read(path).map_err(at(path))
     }
 }
 
 /// Write `bytes` to `path`, or to stdout when `path` is `"-"`.
-fn write_bytes(path: &str, bytes: &[u8]) -> Result<()> {
+fn write_bytes(path: &OsStr, bytes: &[u8]) -> Result<()> {
     if path == "-" {
-        std::io::stdout().lock().write_all(bytes)
+        write_stdout(bytes)
     } else {
-        std::fs::write(path, bytes)
+        std::fs::write(path, bytes).map_err(at(path))
     }
-    .map_err(Error::from)
 }
 
-/// A human label for `--progress`/status messages: `path` verbatim, or
-/// `"stdin"`/`"stdout"` for `"-"` (which direction depends on the caller).
-fn io_label<'a>(path: &'a str, when_dash: &'a str) -> &'a str {
-    if path == "-" { when_dash } else { path }
+/// Write `bytes` to stdout, where a closed pipe is an error like any other.
+/// `println!` panics on one: `geosetta in.geojson --print-crs-code | true`.
+fn write_stdout(bytes: &[u8]) -> Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(bytes)?;
+    stdout.flush().map_err(Error::from)
+}
+
+/// A human label for `--progress`/status messages: `path` as text, or
+/// `"stdin"`/`"stdout"` for `"-"` (which direction depends on the caller). Lossy,
+/// which is why it is only ever for a message and never for a file.
+fn io_label<'a>(path: &'a OsStr, when_dash: &'a str) -> Cow<'a, str> {
+    if path == "-" { Cow::Borrowed(when_dash) } else { path.to_string_lossy() }
 }
 
 /// An error for a multi-file format (Shapefile) asked to read/write `"-"` —
@@ -101,7 +118,13 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let args = cli::parse(std::env::args())?;
+    let args = match cli::parse(std::env::args_os())? {
+        cli::Invocation::Run(args) => args,
+        cli::Invocation::Help => return write_stdout(format!("{}\n", cli::USAGE).as_bytes()),
+        cli::Invocation::Version => {
+            return write_stdout(format!("geosetta {}\n", env!("CARGO_PKG_VERSION")).as_bytes());
+        }
+    };
 
     // The `--print-crs*` flags read a source and report on it: no output, no
     // conversion. They return before every write-side path below, GeoPackage's
@@ -116,6 +139,7 @@ fn run() -> Result<()> {
     // Before anything is read or written: an output that would overwrite its
     // own input is refused outright (D4).
     refuse_same_file(&args.input, args.from, &out)?;
+    refuse_layer_with_nowhere_to_go(&args, &out)?;
 
     // Read the `--crs` override up front: a malformed one should fail before
     // anything has been read or written, not midway through.
@@ -129,6 +153,7 @@ fn run() -> Result<()> {
     let input = read_input(&args)?;
     let mut report = reporter(&args, out.format);
     let prepared = pipeline::prepare(args.from, out.format, input.source(), convert_options(&args, &out, crs), &mut report)?;
+    print_warnings(&lossy_layer_name_warning(&args.input, prepared.layers()), args.quiet);
     if out.format == Format::Gpkg {
         return write_geopackage(&out, prepared, args.progress, &mut report);
     }
@@ -139,7 +164,7 @@ fn run() -> Result<()> {
 /// Lifted out of [`cli::Mode::Convert`] once, in [`run`], so nothing downstream
 /// has to re-match the mode to find out whether it has an output at all.
 struct Destination<'a> {
-    path: &'a str,
+    path: &'a OsStr,
     format: Format,
 }
 
@@ -156,8 +181,8 @@ fn convert_options(args: &cli::Args, out: &Destination, crs: Option<Crs>) -> Con
         default_layer_name: Some(layer_stem(&args.input)),
         rtree: args.rtree,
         envelope: args.envelope,
-        source_label: Some(io_label(&args.input, "stdin").into()),
-        destination_label: Some(io_label(out.path, "stdout").into()),
+        source_label: Some(io_label(&args.input, "stdin").into_owned()),
+        destination_label: Some(io_label(out.path, "stdout").into_owned()),
     }
 }
 
@@ -229,7 +254,7 @@ fn load_crs_override(args: &cli::Args) -> Result<Option<Crs>> {
         std::io::stdin().lock().read_to_string(&mut s)?;
         s
     } else {
-        std::fs::read_to_string(path)?
+        std::fs::read_to_string(path).map_err(at(path))?
     };
     Crs::from_definition_text(&text).map(Some)
 }
@@ -273,10 +298,7 @@ fn print_crs_code(args: &cli::Args) -> Result<()> {
             io_label(&args.input, "stdin"),
         )));
     }
-    for code in &codes {
-        println!("{code}");
-    }
-    Ok(())
+    write_stdout(codes.iter().map(|code| format!("{code}\n")).collect::<String>().as_bytes())
 }
 
 /// The collections a `--print-crs*` diagnostic should report on, each paired
@@ -289,7 +311,7 @@ fn print_crs_code(args: &cli::Args) -> Result<()> {
 /// which layers are in scope.
 fn read_crs_sources(args: &cli::Args) -> Result<Vec<(Option<String>, FeatureCollection)>> {
     let input = read_input(args)?;
-    let options = ConvertOptions { layer: args.layer.clone(), ..ConvertOptions::default() };
+    let options = ConvertOptions { read: args.read_options(), layer: args.layer.clone(), ..ConvertOptions::default() };
     let layers = pipeline::read(args.from, input.source(), &options, &mut reporter(args, args.from))?;
     let multi_layer = args.from == Format::Gpkg;
     Ok(layers
@@ -347,12 +369,8 @@ fn print_crs(args: &cli::Args) -> Result<()> {
     match bodies.as_slice() {
         [] => Err(nothing_to_print(args, &sources)),
         [(body, _)] => {
-            if args.escape {
-                println!("{}", escape_control_bytes(body));
-            } else {
-                println!("{body}");
-            }
-            Ok(())
+            let text = if args.escape { escape_control_bytes(body) } else { (*body).to_string() };
+            write_stdout(format!("{text}\n").as_bytes())
         }
         many => Err(Error::Usage(format!(
             "{}: the selected layers carry {} different CRS definitions, and a definition \
@@ -493,8 +511,7 @@ fn write_layers(
     // in the current directory — a multi-layer .gpkg piped out is rejected
     // below by the same "give a directory or --layer" error a plain file path
     // gets, since a single stream can't fan out to more than one layer.
-    let as_dir = out.path != "-"
-        && (out.path.ends_with('/') || std::path::Path::new(out.path).is_dir());
+    let as_dir = is_directory_output(out.path);
     if layers.len() == 1 && !as_dir {
         return write_layer(out.format, out.path, prepared, 0, args.quiet, report);
     }
@@ -508,13 +525,39 @@ fn write_layers(
     for (name, _) in layers {
         refuse_unless_file_name(name, out.path)?;
     }
-    std::fs::create_dir_all(out.path)?;
+    std::fs::create_dir_all(out.path).map_err(at(out.path))?;
     let dir = std::path::Path::new(out.path);
     for (i, (name, _)) in layers.iter().enumerate() {
         let path = dir.join(format!("{name}.{}", out.format.extension()));
-        write_layer(out.format, &path.to_string_lossy(), prepared, i, args.quiet, report)?;
+        write_layer(out.format, path.as_os_str(), prepared, i, args.quiet, report)?;
     }
     Ok(())
+}
+
+/// Whether `path` names a directory to fan out into: one that exists, or that a
+/// trailing `/` asks for. `"-"` never does, whatever is in the current directory.
+fn is_directory_output(path: &OsStr) -> bool {
+    path != "-" && (path.as_encoded_bytes().ends_with(b"/") || Path::new(path).is_dir())
+}
+
+/// Refuse `--layer` where it could do nothing: it names no layer of the source,
+/// and the output has nowhere to keep a name.
+///
+/// A GeoPackage source is selecting. A directory names its files after their
+/// layers. Otherwise the format decides ([`Format::records_name`]). Here and not
+/// in `cli.rs` because a directory is a question for the disk, and not in the
+/// library because a caller there gets the name back from
+/// [`Prepared::layers`], so the option is never ignored for it
+/// (`plans/cli-review.org` C3).
+fn refuse_layer_with_nowhere_to_go(args: &cli::Args, out: &Destination) -> Result<()> {
+    if args.layer.is_none() || args.from == Format::Gpkg || out.format.records_name() || is_directory_output(out.path) {
+        return Ok(());
+    }
+    Err(Error::Usage(format!(
+        "--layer names the output, and one {} file has nowhere to record a name; give a \
+         directory as the output to name the file after it",
+        out.format.display_name()
+    )))
 }
 
 /// Refuse a layer name that would not stay in `dir` as one file.
@@ -525,7 +568,7 @@ fn write_layers(
 /// there (`plans/cli-review.org` C9). Refused rather than rewritten, because a
 /// quietly changed name is a file nobody asked for. The name is printed by
 /// `{:?}` since it may hold bytes that would act on a terminal.
-fn refuse_unless_file_name(name: &str, dir: &str) -> Result<()> {
+fn refuse_unless_file_name(name: &str, dir: &OsStr) -> Result<()> {
     let mut parts = Path::new(name).components();
     // Comparing the part to the whole catches what `components` normalises away:
     // `x/` and `x/.` are each one part.
@@ -533,8 +576,9 @@ fn refuse_unless_file_name(name: &str, dir: &str) -> Result<()> {
         return Ok(());
     }
     Err(Error::Usage(format!(
-        "layer {name:?} is not a plain file name, so it cannot name a file in {dir}; \
-         write it to a file path, or pick another layer with --layer"
+        "layer {name:?} is not a plain file name, so it cannot name a file in {}; \
+         write it to a file path, or pick another layer with --layer",
+        Path::new(dir).display(),
     )))
 }
 
@@ -546,7 +590,7 @@ fn refuse_unless_file_name(name: &str, dir: &str) -> Result<()> {
 /// writes each file before encoding the next.
 fn write_layer(
     to: Format,
-    output_path: &str,
+    output_path: &OsStr,
     prepared: &Prepared,
     index: usize,
     quiet: bool,
@@ -569,17 +613,20 @@ fn write_layer(
 
 /// Read a Shapefile given its `.shp` path, locating `.dbf` (required),
 /// `.prj`, and `.cpg` (both optional) alongside it.
-fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<Input> {
-    let shp = std::fs::read(shp_path)?;
+fn read_shapefile_from_path(shp_path: &OsStr, progress: bool) -> Result<Input> {
+    let shown = Path::new(shp_path).display();
+    let shp = std::fs::read(shp_path).map_err(at(shp_path))?;
     let dbf_path = sibling_path(shp_path, "dbf")
-        .ok_or_else(|| Error::Usage(format!("shapefile: no .dbf found alongside {shp_path}")))?;
-    let dbf = std::fs::read(&dbf_path)?;
-    let prj = sibling_path(shp_path, "prj").map(std::fs::read_to_string).transpose()?;
-    let cpg = sibling_path(shp_path, "cpg").map(std::fs::read_to_string).transpose()?;
+        .ok_or_else(|| Error::Usage(format!("shapefile: no .dbf found alongside {shown}")))?;
+    let dbf = std::fs::read(&dbf_path).map_err(at(&dbf_path))?;
+    let text = |ext| sibling_path(shp_path, ext).map(|p| std::fs::read_to_string(&p).map_err(at(&p))).transpose();
+    let prj = text("prj")?;
+    let cpg = text("cpg")?;
     if progress {
         eprintln!(
-            "read {shp_path} ({} bytes) + {dbf_path} ({} bytes){}",
+            "read {shown} ({} bytes) + {} ({} bytes){}",
             shp.len(),
+            dbf_path.display(),
             dbf.len(),
             if prj.is_some() { " + .prj" } else { "" },
         );
@@ -595,15 +642,15 @@ fn read_shapefile_from_path(shp_path: &str, progress: bool) -> Result<Input> {
 ///
 /// `-` contributes nothing — stdin and stdout are different streams even when
 /// both are the same terminal.
-fn touched_paths(path: &str, format: Format) -> Vec<PathBuf> {
+fn touched_paths(path: &OsStr, format: Format) -> Vec<PathBuf> {
     if path == "-" {
         return Vec::new();
     }
-    let raw = if format == Format::Shapefile {
+    let raw: Vec<PathBuf> = if format == Format::Shapefile {
         let stem = strip_shp_extension(path);
-        ["shp", "shx", "dbf", "prj", "cpg"].iter().map(|e| format!("{stem}.{e}")).collect()
+        ["shp", "shx", "dbf", "prj", "cpg"].iter().map(|e| with_suffix(&stem, e)).collect()
     } else {
-        vec![path.to_string()]
+        vec![PathBuf::from(path)]
     };
     raw.iter().filter_map(|p| canonical_for_compare(p)).collect()
 }
@@ -614,8 +661,7 @@ fn touched_paths(path: &str, format: Format) -> Vec<PathBuf> {
 /// fails on a missing file, so fall back to canonicalising the *parent* — which
 /// does exist — and rejoining the file name. That still resolves `./a.fgb`,
 /// `a.fgb` and a symlinked directory to one answer, which is the point.
-fn canonical_for_compare(path: &str) -> Option<PathBuf> {
-    let p = Path::new(path);
+fn canonical_for_compare(p: &Path) -> Option<PathBuf> {
     if let Ok(c) = p.canonicalize() {
         return Some(c);
     }
@@ -643,7 +689,7 @@ fn canonical_for_compare(path: &str) -> Option<PathBuf> {
 /// This deliberately changes the GeoPackage path's behaviour, which used to
 /// permit an in-place run. That permissiveness rested on the append path
 /// reading the output before overwriting it — luck, not design.
-fn refuse_same_file(input: &str, from: Format, out: &Destination) -> Result<()> {
+fn refuse_same_file(input: &OsStr, from: Format, out: &Destination) -> Result<()> {
     let ins = touched_paths(input, from);
     let outs = touched_paths(out.path, out.format);
     let Some(clash) = outs.iter().find(|o| ins.contains(o)) else {
@@ -664,21 +710,26 @@ fn refuse_same_file(input: &str, from: Format, out: &Destination) -> Result<()> 
 /// Writes every file it can and deletes none, then reports the sidecars it left
 /// behind — see [`stale_sidecar_warnings`] and `plans/shapefile.org`
 /// § THE SIDECAR POLICY.
-fn write_shapefile_to_path(output_path: &str, encoded: &shapefile::Encoded, features: usize, quiet: bool) -> Result<()> {
+fn write_shapefile_to_path(output_path: &OsStr, encoded: &shapefile::Encoded, features: usize, quiet: bool) -> Result<()> {
     let stem = strip_shp_extension(output_path);
-    std::fs::write(format!("{stem}.shp"), &encoded.shp)?;
-    std::fs::write(format!("{stem}.shx"), &encoded.shx)?;
-    std::fs::write(format!("{stem}.dbf"), &encoded.dbf)?;
-    std::fs::write(format!("{stem}.cpg"), encoded.cpg)?;
+    let write = |ext: &str, bytes: &[u8]| {
+        let path = with_suffix(&stem, ext);
+        std::fs::write(&path, bytes).map_err(at(&path))
+    };
+    write("shp", &encoded.shp)?;
+    write("shx", &encoded.shx)?;
+    write("dbf", &encoded.dbf)?;
+    write("cpg", encoded.cpg.as_bytes())?;
     if let Some(prj) = &encoded.prj {
-        std::fs::write(format!("{stem}.prj"), prj)?;
+        write("prj", prj.as_bytes())?;
     }
     // After writing: say what of the destination's existing file set this run
     // left behind, because those files now describe the output beside them.
     // See `stale_sidecar_warnings` on why this cannot be checked beforehand.
     print_warnings(&stale_sidecar_warnings(&stem, encoded), quiet);
     eprintln!(
-        "wrote {stem}.shp + .shx + .dbf + .cpg{} ({features} features)",
+        "wrote {}.shp + .shx + .dbf + .cpg{} ({features} features)",
+        Path::new(&stem).display(),
         if encoded.prj.is_some() { " + .prj" } else { "" },
     );
     Ok(())
@@ -746,13 +797,13 @@ const UNWRITTEN_SIDECARS: &[(&str, &str)] = &[
 /// no evidence anything is wrong. That asymmetry is why `.cpg` is written
 /// rather than warned about — encoding is the one member of the set whose
 /// right answer this writer always knows.
-fn stale_sidecar_warnings(stem: &str, encoded: &shapefile::Encoded) -> Vec<String> {
-    let stem_path = std::path::Path::new(stem);
+fn stale_sidecar_warnings(stem: &OsStr, encoded: &shapefile::Encoded) -> Vec<String> {
+    let stem_path = Path::new(stem);
     let dir = match stem_path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => std::path::PathBuf::from("."),
     };
-    let Some(base) = stem_path.file_name().and_then(|n| n.to_str()) else {
+    let Some(base) = stem_path.file_name() else {
         return Vec::new();
     };
     let Ok(entries) = std::fs::read_dir(&dir) else {
@@ -762,13 +813,18 @@ fn stale_sidecar_warnings(stem: &str, encoded: &shapefile::Encoded) -> Vec<Strin
     let mut warnings = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name();
-        let Some(name) = name.to_str() else { continue };
-        // Only this output's own basename, and only a sidecar of it.
-        let Some(ext) = name.strip_prefix(base).and_then(|rest| rest.strip_prefix('.')) else {
+        // Only this output's own basename, and only a sidecar of it. Every
+        // extension here is ASCII, so one that is not text is no sidecar.
+        let Some(ext) = name
+            .as_encoded_bytes()
+            .strip_prefix(base.as_encoded_bytes())
+            .and_then(|rest| rest.strip_prefix(b"."))
+            .and_then(|rest| std::str::from_utf8(rest).ok())
+        else {
             continue;
         };
         let lower = ext.to_ascii_lowercase();
-        let path = dir.join(name);
+        let path = dir.join(&name);
 
         // An extension we wrote. Ours landed at the lower-case spelling, so
         // anything else is only a second file if its bytes still differ.
@@ -783,10 +839,11 @@ fn stale_sidecar_warnings(stem: &str, encoded: &shapefile::Encoded) -> Vec<Strin
         if let Some(ours) = written {
             if ext != lower && std::fs::read(&path).is_ok_and(|on_disk| on_disk != ours) {
                 warnings.push(format!(
-                    "shapefile: {} already exists and this run wrote {stem}.{lower}, so both \
+                    "shapefile: {} already exists and this run wrote {}.{lower}, so both \
                      spellings are present and readers disagree about which one wins \
                      (plans/shapefile.org)",
                     path.display(),
+                    stem_path.display(),
                 ));
             }
             continue;
@@ -814,20 +871,29 @@ fn stale_sidecar_warnings(stem: &str, encoded: &shapefile::Encoded) -> Vec<Strin
     warnings
 }
 
-fn strip_shp_extension(path: &str) -> String {
-    let p = std::path::Path::new(path);
+fn strip_shp_extension(path: &OsStr) -> OsString {
+    let p = Path::new(path);
     match p.extension().and_then(|e| e.to_str()) {
-        Some(ext) if ext.eq_ignore_ascii_case("shp") => p.with_extension("").to_string_lossy().into_owned(),
-        _ => path.to_string(),
+        Some(ext) if ext.eq_ignore_ascii_case("shp") => p.with_extension("").into_os_string(),
+        _ => path.to_os_string(),
     }
+}
+
+/// `stem.ext`. Not `Path::with_extension`, which would replace what follows a
+/// dot already in the stem: `a.b` and `shp` make `a.b.shp`.
+fn with_suffix(stem: &OsStr, ext: &str) -> PathBuf {
+    let mut name = stem.to_os_string();
+    name.push(".");
+    name.push(ext);
+    PathBuf::from(name)
 }
 
 /// Find a sibling file next to `shp_path` with extension `ext`, trying the
 /// `.shp` path's own case first and its opposite second — real-world
 /// shapefiles mix `.DBF`/`.dbf` casing. `None` when neither casing exists.
-fn sibling_path(shp_path: &str, ext: &str) -> Option<String> {
-    let path = std::path::Path::new(shp_path);
-    let stem = path.file_stem()?.to_string_lossy().into_owned();
+fn sibling_path(shp_path: &OsStr, ext: &str) -> Option<PathBuf> {
+    let path = Path::new(shp_path);
+    let stem = path.file_stem()?;
     let dir = path.parent().filter(|p| !p.as_os_str().is_empty());
     let shp_ext_is_upper = path
         .extension()
@@ -836,12 +902,12 @@ fn sibling_path(shp_path: &str, ext: &str) -> Option<String> {
     let candidates =
         if shp_ext_is_upper { [ext.to_ascii_uppercase(), ext.to_string()] } else { [ext.to_string(), ext.to_ascii_uppercase()] };
     candidates.into_iter().find_map(|e| {
-        let name = format!("{stem}.{e}");
+        let name = with_suffix(stem, &e);
         let p = match dir {
             Some(d) => d.join(&name),
-            None => std::path::PathBuf::from(&name),
+            None => name,
         };
-        p.exists().then(|| p.to_string_lossy().into_owned())
+        p.exists().then_some(p)
     })
 }
 
@@ -894,20 +960,54 @@ fn print_warnings(warnings: &[String], quiet: bool) {
 /// The file stem of `path`, used as a default layer name of *last* resort:
 /// `--layer` and the collection's own [`FeatureCollection::name`] are both
 /// consulted first. `"-"` (stdin) has no filename to draw one from, so it falls
-/// back to `"layer"` same as an extension-less/empty path does.
-fn layer_stem(path: &str) -> String {
+/// back to `"layer"` same as an extension-less/empty path does. A layer's name
+/// is text, so this is lossy for a stem that is not:
+/// [`lossy_layer_name_warning`] says so when it mattered.
+fn layer_stem(path: &OsStr) -> String {
     if path == "-" {
         return "layer".into();
     }
-    std::path::Path::new(path)
+    Path::new(path)
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "layer".into())
 }
 
+/// The warning for a layer that took its name from a stem which is not text, so
+/// that the output's name differs from the input's.
+fn lossy_layer_name_warning(input: &OsStr, layers: &[(String, FeatureCollection)]) -> Vec<String> {
+    let lossy = Path::new(input).file_stem().is_some_and(|stem| stem.to_str().is_none());
+    let stem = layer_stem(input);
+    if !lossy || !layers.iter().any(|(name, _)| *name == stem) {
+        return Vec::new();
+    }
+    vec![format!("the input's file name is not UTF-8, so its layer is named {stem:?}; give --layer to choose")]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// C1's lossy default name. On macOS no such file can exist, so this is
+    /// tested on the name alone.
+    #[cfg(unix)]
+    #[test]
+    fn a_layer_named_from_a_stem_that_is_not_text_says_so() {
+        use std::os::unix::ffi::OsStrExt;
+        let input = OsStr::from_bytes(b"\xff.geojson");
+        let stem = layer_stem(input);
+        let layer = |name: &str| vec![(name.to_string(), FeatureCollection::default())];
+        assert_eq!(lossy_layer_name_warning(input, &layer(&stem)).len(), 1);
+        assert_eq!(lossy_layer_name_warning(input, &layer("chosen")), Vec::<String>::new());
+        assert_eq!(lossy_layer_name_warning(OsStr::new("a.geojson"), &layer("a")), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_suffix_keeps_the_dots_in_the_stem() {
+        assert_eq!(with_suffix(OsStr::new("dir/a.b"), "shp"), Path::new("dir/a.b.shp"));
+        assert_eq!(strip_shp_extension(OsStr::new("a.b.SHP")), "a.b");
+        assert_eq!(strip_shp_extension(OsStr::new("a.b")), "a.b");
+    }
 
     #[test]
     fn escape_renders_the_bytes_that_would_act_on_a_terminal() {

@@ -74,10 +74,6 @@ pub mod geopackage;
 pub mod pipeline;
 pub mod shapefile;
 
-// The CLI argument parser, used by the `geosetta` binary. Exposed so downstream
-// tooling can reuse the same parsing if desired.
-pub mod cli;
-
 // Format spokes and shared machinery. These are crate-internal: library users
 // go through `convert::{read_features, write_features}` keyed by `Format`
 // rather than calling a spoke directly.

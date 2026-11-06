@@ -114,20 +114,19 @@ hides the blocks, and the missing exports and standard traits are in.
 
 ** THE CLI REVIEW -- 2026-11-06
 =cli= was reviewed next, and every finding is =plans/cli-review.org=, run on the
-binary at c7207fe: seven bugs (C1--C7), led by a panic on a non-UTF-8 argument
-and =--layer --rtree= silently naming a table =--rtree=. Nothing is fixed yet.
+binary at c7207fe: nine bugs (C1--C9), led by a layer name writing outside the
+output directory. A second pass corrected several of the first's fixes, the owner
+settled its decisions, and all of it is built, =cli= now private to the binary.
+C9 is committed alone, on =columnar-ir= only: the owner chose not to touch =main=.
+=cli-review.org= § BUILT has what to carry into the migration note. =--layer= is
+honoured wherever an output can hold a name (C3's table).
 
 ** NEXT
-- First, the two owner's decisions in =cli-review.org= § DECISIONS: refuse or
-  warn on =--rtree=, =--envelope= and =--compact= where the output cannot use
-  them (refuse recommended), and whether =cli= moves into the binary (recommended;
-  it compiled and its tests passed in a scratch copy). Then C1--C7 and the smaller
-  issues, a test each. C1 is the largest, since paths are =String= throughout
-  =main.rs=.
+- KML's collection name, =cli-review.org= § SPLIT OUT: =<Document><name>= read and
+  written, which changes output that runs today, so =equiv.py= will differ.
 - Merging =columnar-ir= into =main=, and the breaking release it implies,
-  are the owner's (=columnar.org= C5, /Open/), and should follow that work, since
-  moving =cli= is itself a break. The release wants the migration note § RISKS
-  asks for, covering D-C18's breaks too.
+  are the owner's (=columnar.org= C5, /Open/). The release wants the migration
+  note § RISKS asks for, covering D-C18's breaks and =cli-review.org= § BUILT too.
 - The open list is =plans/todo.org=. Its next entry is
   =cross-format-audit.org= A2 (=bench/audit.py=); A1 was built 2026-10-31
   with =library-warnings.org= L1. F6 there now holds a GeoPackage FID
@@ -149,9 +148,6 @@ and =--layer --rtree= silently naming a table =--rtree=. Nothing is fixed yet.
   point-heavy workload makes it matter.
 
 ** TRAPS
-- =bench/compare.py= has no =if __name__ == "__main__"= guard: importing it
-  runs the whole benchmark (ogr2ogr, duckdb, ...). Copy a generator out
-  rather than import it.
 - Timing with =memprobe= while =equiv.py= runs is meaningless; equiv runs
   six conversions at a time.
 - The pinned binaries =equiv.py= caches live under

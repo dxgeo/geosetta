@@ -51,15 +51,19 @@ pub struct ConvertOptions {
     /// Reorder features by Hilbert-curve locality — `--sort-hilbert`.
     pub sort_hilbert: bool,
     /// `--layer`: the one layer of a GeoPackage source to convert, and the name
-    /// a single-collection source is written under in a GeoPackage output.
+    /// of a single-collection source. That name is the collection's own from
+    /// then on, so an output that records one ([`Format::records_name`]) has it,
+    /// and it is what [`Prepared::layers`] reports.
     pub layer: Option<String>,
     /// The name for that GeoPackage layer when neither [`Self::layer`] nor the
     /// collection's own name gives one. The binary passes the input's file
     /// stem; without it the layer is called `layer`.
     pub default_layer_name: Option<String>,
     /// Write a GeoPackage output with an R*Tree spatial index — `--rtree`.
+    /// Refused for any other output ([`Self::check`]).
     pub rtree: bool,
     /// Cache each geometry's envelope in a GeoPackage output — `--envelope`.
+    /// Refused for any other output ([`Self::check`]).
     pub envelope: bool,
     /// How the GeoPackage survey messages name the source container (a path,
     /// or `stdin`). "the source" without one.
@@ -84,6 +88,33 @@ pub enum Event<'a> {
     Sorted { features: usize },
     /// Every check has run and the encode starts.
     Encoding,
+}
+
+impl ConvertOptions {
+    /// Whether these options can be written as `target` at all: the one place
+    /// that decides, so the binary's argument check and [`prepare`] refuse
+    /// alike, in the same words. See [`WriteOptions::check`], which it extends.
+    pub fn check(&self, target: Format) -> Result<()> {
+        self.write.check(target)?;
+        check_layer_name(self)?;
+        for (on, flag) in [(self.rtree, "--rtree"), (self.envelope, "--envelope")] {
+            if on && target != Format::Gpkg {
+                return Err(Error::Usage(format!(
+                    "{flag} is a GeoPackage option, and the output here is {}",
+                    target.display_name()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A table or a file can hold no empty name, so it cannot be what was meant.
+fn check_layer_name(options: &ConvertOptions) -> Result<()> {
+    if options.layer.as_deref() == Some("") {
+        return Err(Error::Usage("--layer needs a name, and this one is empty".into()));
+    }
+    Ok(())
 }
 
 /// A conversion that has run every step but the encode. See [`prepare`].
@@ -126,7 +157,7 @@ pub fn prepare(
 ) -> Result<Prepared> {
     // Before anything is read: options that cannot apply to the target fail
     // the conversion outright, as the binary's argument check does.
-    options.write.check(to)?;
+    options.check(to)?;
     // The target is known here, so a read keeps only what its writer reads.
     let mut layers = read_as(from, source, &options, events, options.read.layout, Some(to))?;
     let mut carried = geopackage::Carried::default();
@@ -190,6 +221,7 @@ pub fn read(
     options: &ConvertOptions,
     events: &mut dyn FnMut(Event<'_>),
 ) -> Result<Vec<(String, FeatureCollection)>> {
+    check_layer_name(options)?;
     read_as(from, source, options, events, options.read.layout, options.read.target)
 }
 
@@ -203,7 +235,7 @@ fn read_as(
     target: Option<Format>,
 ) -> Result<Vec<(String, FeatureCollection)>> {
     let mut warnings = Vec::new();
-    let fc = match (from, source) {
+    let mut fc = match (from, source) {
         (Format::Gpkg, Source::Bytes(bytes)) => {
             let mut layers = geopackage::read_layers_as(bytes, layout)?;
             events(Event::Read { layers: &layers });
@@ -228,6 +260,11 @@ fn read_as(
     };
     for w in warnings {
         events(Event::Warning(w));
+    }
+    // Only for a name that was asked for: a default name is the file's stem,
+    // which no output should start recording unasked.
+    if let Some(layer) = &options.layer {
+        fc.name = Some(layer.clone());
     }
     let name = options
         .layer

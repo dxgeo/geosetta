@@ -12,8 +12,8 @@
 //!
 //! - *The compiler catches these.* They match on the variant exhaustively, so
 //!   the build breaks until each is filled in: [`Format::extension`],
-//!   [`Format::display_name`], [`Format::supports_m`], the read/write dispatch
-//!   in [`mod@crate::convert`], and [`crate::crs::Crs::downgrade_warning`] (which
+//!   [`Format::display_name`], [`Format::supports_m`], [`Format::records_name`],
+//!   the read/write dispatch in [`mod@crate::convert`], and [`crate::crs::Crs::downgrade_warning`] (which
 //!   is where you decide what the new format *cannot* record — see
 //!   `plans/lossy-conversion-warnings.org`; a spoke that silently drops
 //!   something is a bug, not a gap).
@@ -25,6 +25,8 @@
 //! Beyond this module, a spoke needs its reader/writer against the IR and, if
 //! its on-disk shape is not one file (GeoPackage's many layers, Shapefile's
 //! sibling files), I/O handling in `main.rs`.
+
+use std::path::Path;
 
 use crate::error::{Error, Result};
 use crate::schema::DeclType;
@@ -83,9 +85,14 @@ impl Format {
         }
     }
 
-    /// Infer a format from a file path's extension.
-    pub fn from_path(path: &str) -> Option<Format> {
-        let ext = path.rsplit('.').next()?.to_ascii_lowercase();
+    /// Infer a format from a file path's extension. A file named `wkt` or
+    /// `.wkt` has none, and neither has a directory's trailing `x.wkt/`.
+    pub fn from_path(path: impl AsRef<Path>) -> Option<Format> {
+        let path = path.as_ref();
+        if path.as_os_str().as_encoded_bytes().ends_with(b"/") {
+            return None;
+        }
+        let ext = path.extension()?.to_str()?.to_ascii_lowercase();
         match ext.as_str() {
             "geojson" | "json" => Some(Format::GeoJson),
             "parquet" => Some(Format::Parquet),
@@ -97,6 +104,17 @@ impl Format {
             "kml" => Some(Format::Kml),
             "kmz" => Some(Format::Kmz),
             _ => None,
+        }
+    }
+
+    /// Whether one file of this format records the collection's name, so
+    /// that `--layer` has somewhere to go on a plain output path. An exhaustive
+    /// match on purpose. KML's `<Document><name>` is `plans/cli-review.org`
+    /// § SPLIT OUT, and a Shapefile's name is the stem of the path already given.
+    pub fn records_name(self) -> bool {
+        match self {
+            Format::GeoJson | Format::FlatGeobuf | Format::Gpkg => true,
+            Format::Parquet | Format::Csv | Format::Wkt | Format::Shapefile | Format::Kml | Format::Kmz => false,
         }
     }
 
